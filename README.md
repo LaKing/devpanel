@@ -100,7 +100,10 @@ npm run preview -- implementation --issue <project>/<issue-id>   # dry run: read
   directories named `<name>-project`. Each one is a project you can file issues against, labelled `<name>`.
   The root and this naming rule are defined once, in `gui/server/project-path.mjs`; the server and the seat
   fence (whose other-project canaries are the root's other entries) both read them from there.
-  `projects/<name>-project.yaml`
+  Alternatively the host settings' `projectDiscovery` (`{ "pattern": "*/*", "markers": ["package.json"] }`) makes every
+  matching directory below the root that holds a marker a project, identified by its relative path
+  (`2026/shop` → `2026-shop-project`, labelled `2026-shop`); see [docs/host-config.md](docs/host-config.md#host-settings).
+  `projects/<id>.yaml`
   is optional: it adds the source repository and integration branch, the workspace policy, the seat tooling,
   staging and deployment infrastructure, and operator actions (`schemas/project.schema.json`).
 - **Host configuration.** What belongs to one installation (its project files, roster entries naming a person's
@@ -112,6 +115,13 @@ npm run preview -- implementation --issue <project>/<issue-id>   # dry run: read
   git-ignored host data). It is set on its own and never derived from the projects root.
 - **When these are read.** The issue store reads both variables once, when the server loads; the run supervisor
   reads `DEVPANEL_PROJECTS_DIR` at load and takes the issue root from the issue store. Other readers read them on each use. Set them before starting the panel and restart it after changing them.
+- **Host overrides.** Without touching the tracked defaults, `host-config/` can replace a playbook
+  (`host-config/playbooks/<id>.yaml`), leave out a runtime the host does not have (`harnesses.disabled`),
+  bind a toolchain under the home into the seat fence (`fence.readOnly: ["~/.nvm"]`) and exempt directories
+  inside the home from the forbidden-root rule (`selection.allowedHomePaths`), keep the panel's data outside the checkout
+  (`dataRoot`) and keep its snapshots, refs and candidate branches out of the project repositories (`gitStore`), and give runs the content
+  of repositories nested in a monorepo instead of empty gitlinks (`nestedRepositories: "include"`);
+  see [docs/host-config.md](docs/host-config.md).
 - **Roster.** `roster/*.yaml` lists one concrete model per file, bound to a harness, with its supported
   `efforts` and `verification.status`. Unverified entries resolve for preview but are refused for live runs.
   The paid `npm run live` checks are how an entry gets verified.

@@ -1,11 +1,10 @@
-import { isProjectName, projectLabel, projectsRoot, resolveProjectPath } from './project-path.mjs'
+import { issuesRoot, listProjectDirs, projectLabel, projectPath as projectSourceDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import { withStepReservation } from './step-allocation.mjs'
 import { writeAtomic, writeJson } from './runtime/persistence.mjs'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 import { runResult } from './runtime/run-result.mjs'
@@ -27,13 +26,11 @@ import { brief, families } from './issue-family.mjs'
  * name alone and a folder made by hand still shows up.
  */
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
 
 // Read once, at load: tests import a fresh copy after setting the variable.
 const PROJECTS_DIR = projectsRoot()
 
-export const ISSUES_DIR = process.env.DEVPANEL_ISSUES_DIR ??
-  path.resolve(HERE, '..', '..', 'issues')
+export const ISSUES_DIR = issuesRoot()
 
 const META_FILE = 'issue.json'
 const ISSUE_PATTERN = /^(\d{4}-\d{2}-\d{2})-(.+)$/
@@ -80,23 +77,7 @@ function requireName (value, what, maxLength = 64) {
 // --- projects --------------------------------------------------------------
 
 async function projectDirNames () {
-  let entries
-  try {
-    entries = await fs.readdir(PROJECTS_DIR, { withFileTypes: true })
-  } catch {
-    return []
-  }
-
-  // A symlinked project counts only while it resolves to a directory: one dangling
-  // link must not fail every listing that resolves project paths.
-  const names = await Promise.all(entries
-    .filter((entry) => (entry.isDirectory() || entry.isSymbolicLink()) && isProjectName(entry.name))
-    .map(async (entry) => {
-      if (entry.isDirectory()) return entry.name
-      const target = await fs.stat(path.join(PROJECTS_DIR, entry.name)).catch(() => null)
-      return target?.isDirectory() ? entry.name : null
-    }))
-  return names.filter(Boolean).sort()
+  return (await listProjectDirs(PROJECTS_DIR)).map(({ id }) => id)
 }
 
 async function countIssues (project) {
@@ -413,7 +394,7 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
     const value = input.trim()
     if (!value.includes('\n') && (/^(?:\/|\.\.?\/|~\/)/.test(value) || /\.md$/i.test(value))) {
       if (!/\.md$/i.test(value)) throw new IssueError('The local file must have a .md extension')
-      sourcePath = path.resolve(PROJECTS_DIR, project, value.startsWith('~/') ? path.join(process.env.HOME, value.slice(2)) : value)
+      sourcePath = path.resolve(projectSourceDir(project, PROJECTS_DIR), value.startsWith('~/') ? path.join(process.env.HOME, value.slice(2)) : value)
       let handle
       try {
         handle = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NONBLOCK)

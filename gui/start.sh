@@ -7,11 +7,11 @@
 #
 # Environment:
 #   PORT              API/app port                      (default 443)
-#   HOST              API/app bind address              (default 0.0.0.0)
+#   HOST              API/app bind address, or a comma-separated list (default 0.0.0.0)
 #   DEVPANEL_DEV_PORT Vite dev server port, dev only    (default 5173)
 #   DEVPANEL_TICK_MS  metrics broadcast interval in ms  (default 2000)
 #   DEVPANEL_TLS      set to 0 to serve plain HTTP      (default on)
-#   DEVPANEL_CERT_DIR where localhost.crt/.key live     (default ../cert)
+#   DEVPANEL_CERT_DIR where localhost.crt/.key live     (default <dataRoot>/cert, else ../cert)
 #
 # Runs entirely as the invoking user (the project owner) — never as root. Port 443 works
 # unprivileged because /usr/bin/node-22 carries cap_net_bind_service.
@@ -26,6 +26,8 @@ MODE="${1:-prod}"
 # Starting a second copy by hand is how you end up with several panels and one
 # port: the newcomer loses the bind, and the browser keeps talking to whichever
 # process won — usually the oldest one, running the oldest code.
+# A user-level service (systemctl --user) on another port is another instance
+# with its own data root and is left alone; only the same port is a conflict.
 if systemctl is-active --quiet devpanel.service 2>/dev/null; then
   printf '\033[33mwarning:\033[0m devpanel.service is already running this panel.\n' >&2
   printf '         Use it instead of starting a second copy:\n' >&2
@@ -35,7 +37,13 @@ if systemctl is-active --quiet devpanel.service 2>/dev/null; then
   exit 1
 fi
 
-if pgrep -f 'node.*server/index\.js' >/dev/null 2>&1; then
+if command -v ss >/dev/null 2>&1; then
+  if ss -Hltn "sport = :${PORT:-443}" 2>/dev/null | grep -q .; then
+    printf '\033[33mwarning:\033[0m port %s is already in use (another devpanel?).\n' "${PORT:-443}" >&2
+    printf '         Stop it first, or start this one on another PORT.\n' >&2
+    exit 1
+  fi
+elif pgrep -f 'node.*server/index\.js' >/dev/null 2>&1; then
   printf '\033[33mwarning:\033[0m another devpanel process is already running.\n' >&2
   printf '         Stop it first:  pkill -f '"'"'node.*server/index\.js'"'"'\n' >&2
   exit 1
@@ -57,7 +65,7 @@ SCHEME=https
 if [[ "${DEVPANEL_TLS:-1}" == "0" ]]; then
   SCHEME=http
 else
-  CERT_DIR="${DEVPANEL_CERT_DIR:-$(cd "$HERE/.." && pwd)/cert}"
+  CERT_DIR="${DEVPANEL_CERT_DIR:-$(node "$HERE/tools/data-path.mjs" cert)}"
   if [[ ! -f "$CERT_DIR/localhost.crt" || ! -f "$CERT_DIR/localhost.key" ]]; then
     say "no certificate yet — generating one"
     ./make-cert.sh

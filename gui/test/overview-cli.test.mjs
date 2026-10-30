@@ -91,6 +91,7 @@ export default async function (t) {
         env: {
           PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME,
           DEVPANEL_PROJECTS_DIR: projects, DEVPANEL_ISSUES_DIR: issuesDir, DEVPANEL_IMPORT_LOG: importLog,
+          DEVPANEL_HOST_CONFIG_DIR: process.env.DEVPANEL_HOST_CONFIG_DIR,
           DEVPANEL_CLAUDE_BIN: path.join(bin, 'claude'), DEVPANEL_CODEX_BIN: path.join(bin, 'codex')
         },
         maxBuffer: 16 << 20

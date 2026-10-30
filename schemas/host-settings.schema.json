@@ -5,11 +5,47 @@
   "description": "One installation's own defaults (<host-config>/settings.json, docs/host-config.md \"Host settings\"). Every key is optional; an absent key keeps the neutral default, which names no installation.",
   "type": "object",
   "additionalProperties": false,
+  "dependentRequired": { "gitStore": ["dataRoot"] },
   "properties": {
     "projectsRoot": {
       "type": "string",
       "pattern": "^/",
       "description": "The directory whose <name>-project entries are the projects. DEVPANEL_PROJECTS_DIR still wins; without either it is the directory holding the panel's own checkout."
+    },
+    "dataRoot": {
+      "type": "string",
+      "pattern": "^(/|~/)",
+      "not": { "pattern": "(^|/)\\.\\.?(/|$)" },
+      "description": "Where the panel keeps what it writes: the issue root is <dataRoot>/issues (issues, runs, their worktrees, private Git directories and scratch, supervisor state) the server log <dataRoot>/logs, the operator token <dataRoot>/.devpanel-token and the TLS certificate <dataRoot>/cert. DEVPANEL_ISSUES_DIR, DEVPANEL_LOG_DIR, DEVPANEL_TOKEN_FILE and DEVPANEL_CERT_DIR still win; without either it is the panel checkout. `~/` is the home of the account running the panel."
+    },
+    "gitStore": {
+      "type": "boolean",
+      "description": "Keep what the engine writes into Git — snapshot objects, refs/devpanel/*, the candidate branches devpanel/<issue>/<run> — in a store of the panel's own, <dataRoot>/repos/<project>.git, which reads the project's objects through alternates (runtime/git-store.mjs). The project repository is then only read, and fetched into for an operator-approved merge. Needs dataRoot; default false: the project repository is the store."
+    },
+    "nestedRepositories": {
+      "enum": ["gitlink", "include"],
+      "description": "What a working-tree snapshot takes of a repository nested in the project's checkout (a monorepo's parts). `gitlink` (default): what `git add -A` records, the nested repository's HEAD commit id and no content, so its directory is empty in the run's worktree. `include`: what that repository would carry (tracked and untracked, unignored files, as they are on disk; never its .git), so the run sees the whole tree; apply-to-source writes changes there in place, and a commit delivery that touches one is refused. runtime/working-tree.mjs includeNested."
+    },
+    "projectDiscovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern"],
+      "description": "Find projects below the projects root instead of taking its <name>-project entries (project-path.mjs discoveredProjects). A matching directory is a project when it holds one of the markers; its identity is its relative path joined with '-', plus '-project'.",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "pattern": "^[^/\\\\]+(/[^/\\\\]+)*$",
+          "not": { "pattern": "(^|/)\\.\\.?(/|$)" },
+          "description": "Relative path segments under the projects root, `*` matching within one segment: \"*/*\" is every directory two levels down."
+        },
+        "markers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[^/]+$" },
+          "description": "File names any one of which makes a matching directory a project. Default [\"package.json\"]."
+        }
+      }
     },
     "proxyLogin": {
       "type": "object",
@@ -67,6 +103,36 @@
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
           "description": "Entries of the projects root named <prefix>.<anything> are container filesystems no run may read (runtime/selection.mjs forbiddenRoots). Replaces the default [\"production\", \"staging\"]."
+        },
+        "allowedHomePaths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^(/|~/)", "not": { "pattern": "(^|/)\\.\\.?(/|$)" } },
+          "description": "Directories inside the home that are not forbidden for being in it: an allowed root or materialized target within one passes the home rule (every other forbidden root still applies, and one that contains the home is still refused). `~/` is the home of the account running the panel. Default none: the whole home is forbidden, because it holds the operator's keys and CLI logins."
+        }
+      }
+    },
+    "harnesses": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disabled": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["claude", "codex", "gemini"] },
+          "description": "Runtimes this installation does not have. Their roster entries are left out of the configuration, so no playbook seat, supervisor or fallback can use them; a playbook that names one fails resolution saying so (override it in host-config/playbooks/)."
+        }
+      }
+    },
+    "fence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "readOnly": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^(/|~/)", "not": { "pattern": "(^|/)\\.\\.?(/|$)" } },
+          "description": "Directories bound read-only into every seat fence besides the system ones, for a toolchain installed under the home (`~/.nvm`). The home itself, a directory containing it, and the CLI credential directories are refused; the fence proof covers each like any other read-only grant."
         }
       }
     },

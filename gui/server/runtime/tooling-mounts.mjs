@@ -3,7 +3,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import { forbiddenRoots, PANEL_ROOT } from './selection.mjs'
+import { forbiddenRoots, homeExemption, PANEL_ROOT } from './selection.mjs'
+import { certDir, issuesRoot, logDir, tokenFile } from '../project-path.mjs'
 
 /*
  * Seat tooling mounts (`workspace.tooling.mounts` in projects/<id>.yaml): host
@@ -65,11 +66,12 @@ async function sourceErrors (real, source, { projectPath }) {
   // Inside the panel's or the project's own checkout is allowed (a dependency
   // tree beside the source); the checkout itself, or anything containing it, is not.
   const hosts = [panel, project].filter(Boolean)
+  const exempt = await homeExemption()
   for (const f of await forbiddenRoots()) {
+    if (exempt(f, real)) continue
     if (within(real, f) || (within(f, real) && !hosts.includes(f))) return [`tooling.mounts: ${source} reaches ${f}, which no seat may read`]
   }
-  for (const rel of ['issues', 'cert', 'logs', '.devpanel-token']) {
-    const p = path.join(panel, rel)
+  for (const [rel, p] of [['issues', issuesRoot()], ['cert', certDir()], ['logs', logDir()], ['.devpanel-token', tokenFile()]]) {
     if (within(p, real) || within(real, p)) return [`tooling.mounts: ${source} reaches the panel's ${rel}, which no seat may read`]
   }
   if (await fs.lstat(path.join(real, '.git')).then(() => true, () => false)) return [`tooling.mounts: ${source} is a Git repository; a mount is tooling, never source`]

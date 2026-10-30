@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Ajv2020 } from 'ajv/dist/2020.js'
 
-import { DEFAULT_CONFIG_ROOT, HOST_CONFIG_ENV, hostConfigDir } from './host-config.mjs'
+import { bootDataRoot, DEFAULT_CONFIG_ROOT, HOST_CONFIG_ENV, hostConfigDir } from './host-config.mjs'
 
 /*
  * One installation's own defaults (docs/host-config.md "Host settings"):
@@ -27,6 +27,7 @@ export const MOVE_MANIFEST = path.join('tools', 'host-move', 'manifest.json')
 
 export const DEFAULT_DIGEST_FILES = ['.hash']
 export const DEFAULT_FORBIDDEN_PREFIXES = ['production', 'staging']
+export const DEFAULT_PROJECT_MARKERS = ['package.json']
 
 let validate = null
 const compiled = () => (validate ??= new Ajv2020({ allErrors: true, strict: false }).compile(JSON.parse(fs.readFileSync(SCHEMA, 'utf8'))))
@@ -57,9 +58,11 @@ function parse (file) {
 
 const cache = new Map()
 
+const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
+
 /**
- * The effective settings for a config root: {file, pending, projectsRoot, proxyLogin, projectActions,
- * testDrive, selection, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
+ * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, projectDiscovery, proxyLogin, projectActions,
+ * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
 export function hostSettings ({ root = DEFAULT_CONFIG_ROOT, env = process.env, hostDir = hostConfigDir({ root, env }) } = {}) {
@@ -72,22 +75,33 @@ export function hostSettings ({ root = DEFAULT_CONFIG_ROOT, env = process.env, h
   }
   const stat = file ? statOf(file) : null
   const key = file ? `${file}\0${stat?.mtimeMs}\0${stat?.size}` : `none\0${root}`
-  if (!cache.has(key)) cache.set(key, resolve(file ? parse(file) : {}, { root, file, pending }))
-  return cache.get(key)
+  // A host-config directory found in the data root makes that the data root
+  // unless the settings name another.
+  const data = bootDataRoot(env)
+  const impliedDataRoot = !env[HOST_CONFIG_ENV] && data && hostDir === path.join(data, 'host-config') ? data : null
+  const cacheKey = `${key}\0${impliedDataRoot}`
+  if (!cache.has(cacheKey)) cache.set(cacheKey, resolve(file ? parse(file) : {}, { root, file, pending, impliedDataRoot }))
+  return cache.get(cacheKey)
 }
 
-function resolve (data, { root, file, pending }) {
+function resolve (data, { root, file, pending, impliedDataRoot = null }) {
   return {
     file,
     pending,
     projectsRoot: data.projectsRoot ?? path.dirname(path.resolve(root)),
+    dataRoot: data.dataRoot ? expandHome(data.dataRoot) : impliedDataRoot,
+    gitStore: data.gitStore === true,
+    nestedRepositories: data.nestedRepositories ?? 'gitlink',
+    projectDiscovery: data.projectDiscovery ? { pattern: data.projectDiscovery.pattern, markers: data.projectDiscovery.markers ?? DEFAULT_PROJECT_MARKERS } : null,
     proxyLogin: {
       usersDir: data.proxyLogin?.usersDir ? data.proxyLogin.usersDir.replaceAll('{hostname}', os.hostname()) : null,
       digestFiles: data.proxyLogin?.digestFiles ?? DEFAULT_DIGEST_FILES
     },
     projectActions: { headerMarkers: ['DEVPANEL', ...(data.projectActions?.headerMarkers ?? []).filter((m) => m !== 'DEVPANEL')] },
     testDrive: { confinement: { user: data.testDrive?.confinement?.user ?? null, home: data.testDrive?.confinement?.home ?? null } },
-    selection: { forbiddenPrefixes: data.selection?.forbiddenPrefixes ?? DEFAULT_FORBIDDEN_PREFIXES },
+    selection: { forbiddenPrefixes: data.selection?.forbiddenPrefixes ?? DEFAULT_FORBIDDEN_PREFIXES, allowedHomePaths: (data.selection?.allowedHomePaths ?? []).map(expandHome) },
+    harnesses: { disabled: data.harnesses?.disabled ?? [] },
+    fence: { readOnly: (data.fence?.readOnly ?? []).map(expandHome) },
     skill: { linkBaseVariable: data.skill?.linkBaseVariable ?? null },
     reporter: { panelUrl: data.reporter?.panelUrl ?? null },
     seatGuidance: { projects: data.seatGuidance?.projects ?? [] }

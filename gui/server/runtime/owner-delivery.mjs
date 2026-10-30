@@ -13,6 +13,7 @@ const git = async (cwd, args, options = {}) => (await exec('git', ['-C', cwd, ..
 const hash = bytes => 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex')
 const inside = (root, file) => file === root || file.startsWith(root + path.sep)
 const safe = rel => typeof rel === 'string' && rel.length && !path.isAbsolute(rel) && rel.split('/').every(p => p && p !== '.' && p !== '..' && p.toLowerCase() !== '.git')
+const reconstructionRepository = (workspace) => workspace.repository?.kind === 'private' && workspace.gitDir ? ['--git-dir', workspace.gitDir] : ['-C', workspace.source.path]
 const same = (a, b) => (a?.contentHash ?? null) === (b?.contentHash ?? null) && (a?.mode ?? null) === (b?.mode ?? null)
 
 export async function bindSourceOwners (projectPath, symlinks, sourceTarget) {
@@ -158,7 +159,9 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     if (hash(patch) !== receipt.patchHash) return refuse('unverifiable', 'The verified patch changed; no source was written.')
     temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-owner-delivery-'))
     rebuilt = path.join(temporary, 'candidate')
-    await git(source.path, ['worktree', 'add', '--detach', '--quiet', rebuilt, workspace.baseCommit])
+    // Cut from the run's own repository: a private run's base lives in its
+    // engine directory (and in the panel's Git store, never in the source).
+    await exec('git', [...reconstructionRepository(workspace), 'worktree', 'add', '--detach', '--quiet', rebuilt, workspace.baseCommit], { maxBuffer: 256 * 1024 * 1024 })
     await applyPatch(rebuilt, patch)
     if ((await fingerprint(rebuilt, { baseline, baseCommit: workspace.baseCommit, clock })).fingerprint !== revision) return refuse('unverifiable', 'The captured patch no longer reconstructs the approved candidate.')
     // Build one normal Git patch per OWNER, from immutable reconstructed bytes.
@@ -220,7 +223,7 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     if (error.simulatedCrash) throw error
     return refuse(application.state === 'applying' ? 'recovery-required' : 'failed', error.message)
   } finally {
-    if (rebuilt) await git(workspace.source.path, ['worktree', 'remove', '--force', rebuilt]).catch(() => {})
+    if (rebuilt) await exec('git', [...reconstructionRepository(workspace), 'worktree', 'remove', '--force', rebuilt]).catch(() => {})
     if (temporary) await fs.rm(temporary, { recursive: true, force: true }).catch(() => {})
     for (const lock of locks.reverse()) await lock.release()
   }

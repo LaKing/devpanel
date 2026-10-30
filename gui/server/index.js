@@ -16,7 +16,7 @@ import {
   addStepFile, createIssue, createStep, getIssue, IssueError,
   listIssues, listProjects, MAX_FILE_BYTES, readStepFile
 } from './issues.js'
-import { projectPath } from './project-path.mjs'
+import { certDir, logDir, projectPath } from './project-path.mjs'
 import { loadToken, requireToken, socketAuth, tokenFile } from './auth.mjs'
 import { localLogin, localLoginMiddleware } from './local-login.mjs'
 import { getRun, listPlaybooks, listRuns, preview, readLiveOutput, readStepResponse } from './runs-api.mjs'
@@ -52,7 +52,7 @@ const ROOT = path.resolve(HERE, '..')
 // scratch directory for the browser suite, so dist/ never enters a candidate).
 const DIST = process.env.DEVPANEL_DIST_DIR ?? path.join(ROOT, 'dist')
 const logger = installLogging({
-  dir: process.env.DEVPANEL_LOG_DIR ?? path.join(ROOT, '..', 'logs'),
+  dir: logDir(),
   maxBytes: Number(process.env.DEVPANEL_LOG_MAX_BYTES ?? 10 * 1024 * 1024),
   backups: Number(process.env.DEVPANEL_LOG_BACKUPS ?? 5)
 })
@@ -69,12 +69,16 @@ try {
 }
 
 const PORT = Number(process.env.PORT ?? 443)
-const HOST = process.env.HOST ?? '0.0.0.0'
+// HOST is one bind address, or a comma-separated list of them (e.g. a LAN and a
+// VPN address). A list binds the wildcard and drops every connection that did
+// not arrive at one of the listed addresses.
+const HOSTS = (process.env.HOST ?? '0.0.0.0').split(',').map((h) => h.trim()).filter(Boolean)
+const HOST = HOSTS.length > 1 ? '0.0.0.0' : HOSTS[0] ?? '0.0.0.0'
 const TICK_MS = Number(process.env.DEVPANEL_TICK_MS ?? 2000)
 
 // TLS from <project>/cert/localhost.{crt,key} (make-cert.sh writes them).
 // Set DEVPANEL_TLS=0 to serve plain HTTP instead.
-const CERT_DIR = process.env.DEVPANEL_CERT_DIR ?? path.join(path.dirname(ROOT), 'cert')
+const CERT_DIR = certDir()
 const TLS_CERT = process.env.DEVPANEL_TLS_CERT ?? path.join(CERT_DIR, 'localhost.crt')
 const TLS_KEY = process.env.DEVPANEL_TLS_KEY ?? path.join(CERT_DIR, 'localhost.key')
 const TLS_ENABLED = process.env.DEVPANEL_TLS !== '0'
@@ -123,7 +127,7 @@ logger.addSecret(TOKEN)
 // Before the gate on purpose: a private-network peer may open an issue and nothing else (report.mjs).
 app.use(reportRouter({ createIssue, emit: (payload) => io.emit('issues:changed', payload) }))
 app.use('/api', identify())
-const LOCAL = localLogin({ host: HOST, port: PORT })
+const LOCAL = localLogin({ host: HOSTS.length > 1 ? HOSTS.join(',') : HOST, port: PORT })
 app.use('/api', localLoginMiddleware(LOCAL))
 app.use('/api', requireToken(TOKEN))
 
@@ -1006,12 +1010,21 @@ io.on('connection', (socket) => {
   startTicker()
 })
 
+if (HOSTS.length > 1) {
+  const allowed = new Set(HOSTS)
+  server.on('connection', (socket) => {
+    if (!allowed.has(socket.localAddress?.replace(/^::ffff:/, ''))) socket.destroy()
+  })
+}
+
 server.listen(PORT, HOST, () => {
   const mode = hasBuild ? 'serving dist/' : 'API only — no dist/ build found'
   // 0.0.0.0 is not something you can type into a browser.
-  const shown = HOST === '0.0.0.0' || HOST === '::' ? os.hostname() : HOST
   const port = (scheme === 'https' && PORT === 443) || (scheme === 'http' && PORT === 80) ? '' : `:${PORT}`
-  console.log(`devpanel gui  ${scheme}://${shown}${port}  (${mode})`)
+  for (const host of HOSTS.length > 1 ? HOSTS : [HOST]) {
+    const shown = host === '0.0.0.0' || host === '::' ? os.hostname() : host
+    console.log(`devpanel gui  ${scheme}://${shown}${port}  (${mode})`)
+  }
   console.log(`              API and socket require a bearer token — ${tokenFile()}`)
   if (!tls) console.log('              TLS is off — serving plain HTTP')
 })

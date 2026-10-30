@@ -141,3 +141,26 @@ export function createModelOracle ({ model, effort = null, loadAdapter = (harnes
     }
   }
 }
+
+/**
+ * A decision provider of `kind: model` (decisions/<id>.yaml): the roster model
+ * it names, asked through its CLI as above, so a host whose only access is a
+ * logged-in CLI (a subscription) can still have a provider. The roster entry is
+ * resolved at the first ask and must be verified, as the Assess bar requires.
+ */
+export function createRosterModelOracle ({ config, loadRoster = async () => (await import('../config/load.mjs')).loadConfig().then((c) => c.roster), ...options }) {
+  let oracle = null
+  return {
+    id: `model:${config.model}`,
+    model: `${config.model}${config.effort ? `@${config.effort}` : ''}`,
+    async ask (args) {
+      if (!oracle) {
+        const model = (await loadRoster()).get(config.model)
+        if (!model) throw new DecisionError('configuration', `decisions/${config.id}.yaml names roster model "${config.model}", which is not in the roster`, { attempts: 0, charged: 'no' })
+        if (model.verification?.status !== 'verified') throw new DecisionError('configuration', `${model.id} is not verified; a decision provider may name only a verified roster model`, { attempts: 0, charged: 'no' })
+        oracle = createModelOracle({ model, effort: config.effort ?? null, ...(config.timeoutMs ? { timeoutMs: config.timeoutMs } : {}), ...options })
+      }
+      return oracle.ask(args)
+    }
+  }
+}

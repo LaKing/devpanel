@@ -11,7 +11,8 @@
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CERT_DIR="${DEVPANEL_CERT_DIR:-$(cd "$HERE/.." && pwd)/cert}"
+# DEVPANEL_CERT_DIR, else <dataRoot>/cert from the host settings, else ../cert.
+CERT_DIR="${DEVPANEL_CERT_DIR:-$(node "$HERE/tools/data-path.mjs" cert)}"
 CRT="$CERT_DIR/localhost.crt"
 KEY="$CERT_DIR/localhost.key"
 DAYS="${DEVPANEL_CERT_DAYS:-825}"

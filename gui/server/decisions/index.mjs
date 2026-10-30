@@ -7,6 +7,7 @@ import { Ajv2020 } from 'ajv/dist/2020.js'
 
 import { interpret } from './questions.mjs'
 import { DecisionError } from './jev.mjs'
+import { hostConfigDir } from '../config/host-config.mjs'
 
 /*
  * Advisory decisions: typed questions to a cheap classifier, recorded before
@@ -38,6 +39,20 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 export const CONFIG_ROOT = process.env.DEVPANEL_CONFIG_ROOT ?? path.resolve(HERE, '..', '..', '..')
 const PURPOSE = /^[a-z0-9][a-z0-9-]{0,63}$/
 
+/**
+ * decisions/<name>: the host config's copy when it has one (host-config/decisions/,
+ * docs/host-config.md), else the tracked one. Which provider is active and how it
+ * is reached are this installation's choices, so they can be made without editing
+ * the tracked files.
+ */
+async function readDecisionsFile (root, name) {
+  const hostDir = hostConfigDir({ root })
+  try { return await fs.readFile(path.join(hostDir, 'decisions', name), 'utf8') } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error
+  }
+  return fs.readFile(path.join(root, 'decisions', name), 'utf8')
+}
+
 /** Sorted keys, so the same question about the same state has one key however it was built. */
 export function canonical (value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
@@ -59,7 +74,7 @@ const PROVIDER_ID = /^[a-z0-9-]+$/
  */
 export async function activeDecisionProviderId ({ root = CONFIG_ROOT } = {}) {
   let text
-  try { text = await fs.readFile(path.join(root, 'decisions', 'active.yaml'), 'utf8') } catch (error) {
+  try { text = await readDecisionsFile(root, 'active.yaml') } catch (error) {
     if (error.code === 'ENOENT') return { id: DEFAULT_DECISION_PROVIDER, selected: false }
     throw error
   }
@@ -86,7 +101,7 @@ export async function loadDecisionProvider ({ id = null, root = CONFIG_ROOT } = 
   if (id == null) ({ id, selected } = await activeDecisionProviderId({ root }))
   const fail = (message) => Object.assign(new Error(message), { provider: id })
   let text
-  try { text = await fs.readFile(path.join(root, 'decisions', `${id}.yaml`), 'utf8') } catch (error) {
+  try { text = await readDecisionsFile(root, `${id}.yaml`) } catch (error) {
     if (error.code === 'ENOENT') {
       if (selected) throw fail(`decisions/active.yaml selects "${id}", but decisions/${id}.yaml does not exist`)
       return null

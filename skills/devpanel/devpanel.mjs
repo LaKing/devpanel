@@ -7,6 +7,8 @@
 // same playbook after an owner answer.
 import fs from 'node:fs';
 import https from 'node:https';
+import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,19 +20,39 @@ const URL_FILE = path.join(ROOT, '.devpanel-url');
 const SERVER = new URL(process.env.DEVPANEL_URL ?? (fs.existsSync(URL_FILE) ? fs.readFileSync(URL_FILE, 'utf8').trim() : 'https://localhost:443'));
 const LINKBASE = linkBase();
 
-// Where paths in the output link to: DEVPANEL_LINKBASE, else the variable an editor's terminal exports under
-// its own name, which the host settings name (skill.linkBaseVariable; docs/host-config.md "Host settings").
-// Read without the server's modules: the host-config settings, or their carried copy while a move is pending.
-function linkBase () {
-    if (process.env.DEVPANEL_LINKBASE) return process.env.DEVPANEL_LINKBASE;
+// Declarations, not constants: LINKBASE above is computed before this point.
+function expandHome(p) { return p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p; }
+function isDir(dir) { try { return fs.statSync(dir).isDirectory(); } catch { return false; } }
+
+// Where the host configuration lives, by the server's rule (server/config/host-config.mjs hostConfigDir):
+// DEVPANEL_HOST_CONFIG_DIR, else the checkout's host-config/ if it exists, else <data root>/host-config if that
+// exists (only when DEVPANEL_DATA_ROOT is set), else the checkout's. `data` is set when it came from the data root.
+function hostConfig () {
+    if (process.env.DEVPANEL_HOST_CONFIG_DIR) return { dir: path.resolve(ROOT, process.env.DEVPANEL_HOST_CONFIG_DIR), data: null };
+    const inTree = path.join(ROOT, 'host-config');
+    if (isDir(inTree)) return { dir: inTree, data: null };
+    const data = process.env.DEVPANEL_DATA_ROOT ? path.resolve(process.env.DEVPANEL_DATA_ROOT) : null;
+    return data && isDir(path.join(data, 'host-config')) ? { dir: path.join(data, 'host-config'), data } : { dir: inTree, data: null };
+}
+
+// The host settings, read without the server's modules: the host-config settings, or their carried copy while
+// a move is pending.
+function hostSettings () {
     const read = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
-    const hostDir = path.resolve(ROOT, process.env.DEVPANEL_HOST_CONFIG_DIR || 'host-config');
+    const hostDir = hostConfig().dir;
     let settings = read(path.join(hostDir, 'settings.json'));
     if (!settings && !process.env.DEVPANEL_HOST_CONFIG_DIR) {
         const carried = read(path.join(ROOT, 'tools', 'host-move', 'manifest.json'))?.entries?.find((e) => e.to === 'host:settings.json');
         if (typeof carried?.from === 'string' && !carried.from.split('/').includes('..')) settings = read(path.join(ROOT, carried.from));
     }
-    const name = settings?.skill?.linkBaseVariable;
+    return settings;
+}
+
+// Where paths in the output link to: DEVPANEL_LINKBASE, else the variable an editor's terminal exports under
+// its own name, which the host settings name (skill.linkBaseVariable; docs/host-config.md "Host settings").
+function linkBase () {
+    if (process.env.DEVPANEL_LINKBASE) return process.env.DEVPANEL_LINKBASE;
+    const name = hostSettings()?.skill?.linkBaseVariable;
     return (typeof name === 'string' && /^[A-Z][A-Z0-9_]*$/.test(name) && process.env[name]) || '';
 }
 
@@ -43,7 +65,10 @@ const USAGE = `usage: devpanel.mjs [-p <project>] <command> ...
   answer <id> <file.json|->   answer triage questions; RESTARTS the run (paid)
   preview <id> <playbook>     what a start would run: checks, rounds, budgets, prerequisites (free)
   start <id> <playbook>       preview, then start that exact configuration (paid; only on the user's word)
-<id> may be a unique prefix or slug fragment. Project defaults to the nearest *-project directory above the cwd.`;
+  watch [<id>] [--until-settled]
+                              one line per run event of the project (or issue) as it happens; with
+                              --until-settled, exit when the issue's run finishes, pauses or stops
+<id> may be a unique prefix or slug fragment. Project defaults to the one the cwd is in (projectDiscovery, else the nearest *-project directory).`;
 
 function fail(message) {
     console.error(message);
@@ -53,9 +78,19 @@ function fail(message) {
 // The token is readable by the panel's owner only; a fenced seat cannot see it, which is the point (general §008).
 // Without it the request goes out bare: a local install (DEVPANEL_AUTH=local) admits a loopback client, any other
 // server answers 401, and that error names the file.
+// Where the server keeps it (server/project-path.mjs tokenFile): DEVPANEL_TOKEN_FILE, else the host settings'
+// <dataRoot>/.devpanel-token, else the panel's checkout.
+function tokenPath() {
+    if (process.env.DEVPANEL_TOKEN_FILE) return process.env.DEVPANEL_TOKEN_FILE;
+    const dataRoot = hostSettings()?.dataRoot;
+    if (typeof dataRoot === 'string' && dataRoot) return path.join(expandHome(dataRoot), '.devpanel-token');
+    const implied = hostConfig().data;
+    return path.join(implied ?? ROOT, '.devpanel-token');
+}
+
 function token() {
     try {
-        return process.env.DEVPANEL_TOKEN?.trim() || fs.readFileSync(path.join(ROOT, '.devpanel-token'), 'utf8').trim();
+        return process.env.DEVPANEL_TOKEN?.trim() || fs.readFileSync(tokenPath(), 'utf8').trim();
     } catch {
         return null;
     }
@@ -74,7 +109,7 @@ function api(method, url, body) {
             res.on('end', () => {
                 const type = res.headers['content-type'] ?? '';
                 const data = type.includes('json') ? JSON.parse(text || 'null') : text;
-                const hint = res.statusCode === 401 && !bearer ? ` (no token: cannot read ${ROOT}/.devpanel-token)` : '';
+                const hint = res.statusCode === 401 && !bearer ? ` (no token: cannot read ${tokenPath()})` : '';
                 if (res.statusCode >= 400) reject(new Error(`${method} ${url}: ${res.statusCode} ${data?.error ?? data?.message ?? text}${hint}`));
                 else resolve(data);
             });
@@ -92,10 +127,35 @@ function readInput(file) {
 const link = (p, text = path.basename(p)) => (LINKBASE ? `[${text}](${LINKBASE}${p})` : p);
 const base = (project) => `/api/projects/${encodeURIComponent(project)}`;
 
-// The nearest ancestor named *-project, wherever the projects live (/srv on the hosts, DEVPANEL_PROJECTS_DIR on a Mac).
+// The project the working directory is in, by the server's rule (server/project-path.mjs): with the host
+// settings' projectDiscovery, the directory below the projects root that matches its pattern and holds one of its
+// markers, identified by its relative path (`2026/shop` -> `2026-shop-project`); otherwise the nearest ancestor
+// named *-project, wherever the projects live (/srv on the hosts, DEVPANEL_PROJECTS_DIR on a Mac).
+function discoveredProject(cwd) {
+    const settings = hostSettings();
+    const discovery = settings?.projectDiscovery;
+    if (typeof discovery?.pattern !== 'string') return null;
+    const root = process.env.DEVPANEL_PROJECTS_DIR ?? (typeof settings.projectsRoot === 'string' ? settings.projectsRoot : path.dirname(ROOT));
+    let real;
+    try { real = fs.realpathSync(root); } catch { return null; }
+    const rel = path.relative(real, cwd);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+    const globs = discovery.pattern.split('/').filter(Boolean);
+    const parts = rel.split(path.sep).slice(0, globs.length);
+    if (parts.length < globs.length) return null;
+    const matches = (glob, name) => (!name.startsWith('.') || glob.startsWith('.'))
+        && new RegExp(`^${glob.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`).test(name);
+    if (!globs.every((glob, i) => matches(glob, parts[i]))) return null;
+    const markers = Array.isArray(discovery.markers) && discovery.markers.length ? discovery.markers : ['package.json'];
+    if (!markers.some((m) => fs.existsSync(path.join(real, ...parts, m)))) return null;
+    return `${parts.join('-')}-project`;
+}
+
 function projectOf(given) {
-    const name = given ?? process.cwd().split(path.sep).reverse().find((part) => part.endsWith('-project'));
-    if (!name) fail('no project: pass -p <project> or run inside a <name>-project directory');
+    let cwd = process.cwd();
+    try { cwd = fs.realpathSync(cwd); } catch { /* as given */ }
+    const name = given ?? discoveredProject(cwd) ?? cwd.split(path.sep).reverse().find((part) => part.endsWith('-project'));
+    if (!name) fail('no project: pass -p <project> or run inside a project directory');
     return name.endsWith('-project') ? name : `${name}-project`;
 }
 
@@ -196,7 +256,42 @@ const commands = {
         const r = await api('POST', `${base(project)}/issues/${id}/runs/${run.runId}/owner-input`, body);
         console.log(JSON.stringify(r, null, 2));
     },
+
+    // The panel's own socket, so a caller (a person's terminal, an orchestrating session) learns of a run's progress
+    // when it happens instead of polling. Output chunks and activity ticks are left out: they are on disk.
+    async watch(project, ...flags) {
+        const untilSettled = flags.includes('--until-settled');
+        const wanted = flags.find((f) => !f.startsWith('--'));
+        const id = wanted ? await resolveId(project, wanted) : null;
+        if (untilSettled && !id) fail('--until-settled needs the issue whose run to wait for');
+        const settledRun = async () => {
+            const run = (await api('GET', `${base(project)}/issues/${id}`)).latestRun;
+            return run && (!run.live || run.status === 'paused') ? run : null;
+        };
+        if (untilSettled) {
+            const run = await settledRun();
+            if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); return; }
+        }
+        const { io } = createRequire(path.join(ROOT, 'gui', 'package.json'))('socket.io-client');
+        const socket = io(SERVER.origin, { auth: { token: token() }, rejectUnauthorized: false, transports: ['websocket'] });
+        const time = () => new Date().toTimeString().slice(0, 8);
+        socket.on('connect', () => console.log(`${time()} watching ${project}${id ? `/${id}` : ''}`));
+        socket.on('connect_error', (e) => console.log(`${time()} cannot connect: ${e.data?.reason ?? e.message}`));
+        socket.on('disconnect', (reason) => console.log(`${time()} disconnected: ${reason}`));
+        socket.on('run:event', async (e) => {
+            if (e.type === 'live' || e.type === 'activity' || e.project !== project || (id && e.issueId !== id)) return;
+            const detail = [e.role, e.stepId, e.status ?? e.outcome ?? e.reason].filter(Boolean).join(' ');
+            console.log(`${time()} ${id ? '' : `${e.issueId} `}${e.runId ?? ''} ${e.type}${detail ? ` ${detail}` : ''}`);
+            // The run record, not the event, says whether it settled: a pause or an end is persisted before it is emitted.
+            if (untilSettled && SETTLING.has(e.type)) {
+                const run = await settledRun().catch(() => null);
+                if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); socket.close(); }
+            }
+        });
+    },
 };
+
+const SETTLING = new Set(['finished', 'paused', 'cancelled', 'run-recovery-required', 'run-finished', 'run-abandoned']);
 
 async function previewOf(project, wanted, playbook) {
     if (!playbook) fail('name the playbook, e.g. implementation, plan-and-implement, analysis, staging');

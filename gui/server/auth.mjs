@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { proxyLogin } from './proxy-user.mjs'
+import { tokenFile as tokenFileFor } from './project-path.mjs'
 
 /*
  * A shared bearer token guarding the API and the socket.
@@ -15,8 +15,7 @@ import { proxyLogin } from './proxy-user.mjs'
  * sent to the browser except by the operator pasting it in.
  */
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-const TOKEN_FILE = process.env.DEVPANEL_TOKEN_FILE ?? path.resolve(HERE, '..', '..', '.devpanel-token')
+const TOKEN_FILE = tokenFileFor()
 
 let cached = null
 
@@ -35,6 +34,7 @@ export async function loadToken () {
   } catch { /* generate below */ }
 
   const token = crypto.randomBytes(32).toString('base64url')
+  await fs.mkdir(path.dirname(TOKEN_FILE), { recursive: true, mode: 0o700 })
   await fs.writeFile(TOKEN_FILE, token + String.fromCharCode(10), { mode: 0o600 })
   await fs.chmod(TOKEN_FILE, 0o600)
   cached = token

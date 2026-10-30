@@ -7,10 +7,11 @@ import { Ajv2020 } from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
 import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-options.mjs'
 import { infrastructureErrors, localChecksErrors, localTarget, stagingTarget, tierErrors } from '../infrastructure.mjs'
-import { forbiddenRoots, PANEL_ROOT } from '../runtime/selection.mjs'
+import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
 import { DEFAULT_CONFIG_ROOT, hostConfigDir, discover } from './host-config.mjs'
+import { hostSettings } from './host-settings.mjs'
 import { harnessRefusal } from '../runtime/confinement-policy.mjs'
 import { hostPlatform } from '../runtime/platform.mjs'
 
@@ -148,8 +149,10 @@ async function listFiles (dir, ext) {
 
 /**
  * Every roster entry, strategy, playbook and adapter file, schema-validated.
- * Roster and projects are each the union of the in-tree directory and the host
- * directory's (host-config.mjs); a host file shadows the in-tree one of the same name.
+ * Roster, playbooks and projects are each the union of the in-tree directory and the
+ * host directory's (host-config.mjs); a host file shadows the in-tree one of the same
+ * name. A roster entry on a harness the host settings disable is left out, so no
+ * seat, supervisor or fallback can name it.
  */
 export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir({ root }) } = {}) {
   const errors = []
@@ -165,9 +168,12 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     return files
   }
 
+  const disabled = new Set(hostSettings({ root, hostDir }).harnesses.disabled)
+  const disabledModels = new Map()
   for (const { name, file } of await hostFiles('roster')) {
     const { data, hash } = await readYaml(file)
     if (!await validate(root, 'roster-model', data, file, errors)) continue
+    if (disabled.has(data.harness)) { disabledModels.set(data.id, data.harness); continue }
     if (data.defaultEffort != null && !(data.efforts ?? []).includes(data.defaultEffort)) {
       err(errors, `defaultEffort "${data.defaultEffort}" is not in efforts`, file, '/defaultEffort')
       continue
@@ -203,8 +209,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     strategies.set(read.data.id, strategy)
   }
 
-  for (const name of await listFiles(path.join(root, 'playbooks'), '.yaml')) {
-    const file = path.join(root, 'playbooks', name)
+  for (const { file } of await hostFiles('playbooks')) {
     const { data, hash } = await readYaml(file)
     if (!await validate(root, 'playbook', data, file, errors)) continue
     if (projectOnlyTooling(data, file, errors)) continue
@@ -237,7 +242,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     projects.set(data.id, { ...data, file, hash })
   }
 
-  return { root, hostDir, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed }
+  return { root, hostDir, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, disabledModels }
 }
 
 /** A project's source repository and integration branch, declared or defaulted. */
@@ -367,6 +372,8 @@ function checkWorkflow (strategy, errors) {
  * An unverified model is NOT a hard error — it resolves for preview and is
  * reported through liveExecution.blockers, which preflight enforces.
  */
+const offHarness = (cfg, id) => cfg.disabledModels?.has(id) ? ` (its harness, ${cfg.disabledModels.get(id)}, is disabled in the host settings; override this playbook in host-config/playbooks/)` : ''
+
 export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, runOptions = {}, projectId = null, platform = hostPlatform() } = {}) {
   const optionErrors = runOptionErrors(runOptions)
   if (optionErrors.length) return { ok: false, errors: optionErrors }
@@ -405,12 +412,12 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   const participants = {}
   const blockers = []
   for (const id of playbook.fallbackModels ?? []) {
-    if (!cfg.roster.has(id)) err(errors, `fallback model "${id}" is not in the roster`, playbook.file, '/fallbackModels')
+    if (!cfg.roster.has(id)) err(errors, `fallback model "${id}" is not in the roster${offHarness(cfg, id)}`, playbook.file, '/fallbackModels')
   }
   for (const [role, p] of Object.entries(playbook.participants)) {
     const field = `/participants/${role}`
     const model = cfg.roster.get(p.model)
-    if (!model) { err(errors, `model "${p.model}" is not in the roster`, playbook.file, `${field}/model`); continue }
+    if (!model) { err(errors, `model "${p.model}" is not in the roster${offHarness(cfg, p.model)}`, playbook.file, `${field}/model`); continue }
     if (!cfg.harnesses.includes(model.harness)) {
       err(errors, `model "${model.id}" needs harness "${model.harness}", which has no adapter in harness/`, model.file, '/harness')
     }
@@ -683,13 +690,14 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
 export async function allowedRootErrors (roots, { projectPath = null } = {}) {
   const out = []
   const forbidden = await forbiddenRoots()
+  const exempt = await homeExemption()
   const panel = await fs.realpath(PANEL_ROOT).catch(() => PANEL_ROOT)
   const within = (root, p) => p === root || p.startsWith(root + path.sep)
   for (const root of roots) {
     const real = await fs.realpath(root).catch(() => null)
     if (!real) { out.push(`allowedRoots: ${root} does not exist`); continue }
     if (within(panel, real) && !within(path.join(panel, 'tools'), real)) { out.push(`allowedRoots: ${root} is inside the panel's own checkout; only its tools/ subtree may be granted`); continue }
-    const hit = [...forbidden].find((f) => f !== panel && (within(f, real) || within(real, f)))
+    const hit = [...forbidden].find((f) => f !== panel && (within(f, real) || within(real, f)) && !exempt(f, real))
     if (hit) { out.push(`allowedRoots: ${root} reaches ${hit}, which no run may read`); continue }
     if (projectPath && within(await fs.realpath(projectPath).catch(() => projectPath), real)) { out.push(`allowedRoots: ${root} is inside the project checkout, which the run reads through its snapshot`); continue }
     if (await fs.lstat(path.join(real, '.git')).then(() => true, () => false)) out.push(`allowedRoots: ${root} is a Git repository; a root is read-only tooling, never source`)

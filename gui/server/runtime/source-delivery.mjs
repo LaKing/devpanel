@@ -7,7 +7,7 @@ import { fingerprint } from './fingerprint.mjs'
 import { acquire } from './lock.mjs'
 import { writeJson } from './persistence.mjs'
 import { systemClock } from './clock.mjs'
-import { compositionPaths } from './working-tree.mjs'
+import { compositionPaths, nestedFiles } from './working-tree.mjs'
 import { applyToOwners } from './owner-delivery.mjs'
 import { selectionState } from './selection.mjs'
 export { bindSourceOwners } from './owner-delivery.mjs'
@@ -47,7 +47,15 @@ export async function destinationFingerprint (workspace, baseline, clock = syste
   const underLink = (rel) => materialize.some((root) => rel === root || rel.startsWith(root + '/'))
   const composition = (await compositionPaths({ projectPath: workspace.source.path,
     run: (args, options) => git(args[1], args.slice(2), options), tracked: true, excludes })).filter((rel) => !owned || !underLink(rel))
-  const selected = new Set([...composition, ...baselinePaths, ...candidatePaths, ...(owned?.paths ?? [])])
+  // A nested repository the snapshot included (working-tree.mjs includeNested)
+  // is a directory entry to the outer checkout: what it carries now is read
+  // the way launch read it, so a file added there since is drift too.
+  const nested = []
+  for (const { path: root } of workspace.base?.nested ?? []) {
+    nested.push(...(await nestedFiles({ projectPath: workspace.source.path, root, excludes, run: (args) => git(args[1], args.slice(2)) })).map((f) => f.rel))
+  }
+  const nestedRoots = new Set((workspace.base?.nested ?? []).map((n) => n.path))
+  const selected = new Set([...composition.filter((rel) => !nestedRoots.has(rel.replace(/\/$/, ''))), ...nested, ...baselinePaths, ...candidatePaths, ...(owned?.paths ?? [])])
   const ancestors = new Set()
   for (const rel of selected) {
     for (let parent = path.posix.dirname(rel); parent !== '.'; parent = path.posix.dirname(parent)) ancestors.add(parent)

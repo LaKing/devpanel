@@ -33,3 +33,5 @@ __pycache__/
 /gui/live/reports/
 # Its notes for agents, beside CLAUDE.md.
 /CLAUDE.local.md
+# Webstorm
+.idea

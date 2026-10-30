@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises'
-import { isProjectName, projectsRoot, resolveProjectPath } from '../project-path.mjs'
+import { listProjectDirs, projectsRoot, resolveProjectPath } from '../project-path.mjs'
 import { probeProjectSandbox } from '../runtime/sandbox-probe.mjs'
 /*
  * Resolve configuration offline; explicit --preflight runs local diagnostics.
@@ -65,18 +65,14 @@ try {
   console.log(`  ${c.red}✗${c.off} ${error.message}`)
   process.exit(1)
 }
-console.log(`${c.dim}adapters${c.off} ${config.harnesses.join(', ') || '(none)'}   ${c.dim}models${c.off} ${config.roster.size}   ${c.dim}strategies${c.off} ${config.strategies.size}   ${c.dim}playbooks${c.off} ${config.playbooks.size}\n`)
+console.log(`${c.dim}adapters${c.off} ${config.harnesses.join(', ') || '(none)'}   ${c.dim}models${c.off} ${config.roster.size}${config.disabledModels.size ? ` (${config.disabledModels.size} left out: disabled ${[...new Set(config.disabledModels.values())].join(', ')})` : ''}   ${c.dim}strategies${c.off} ${config.strategies.size}   ${c.dim}playbooks${c.off} ${config.playbooks.size}\n`)
 
 const ids = target ? [target] : [...config.playbooks.keys()]
 let failed = 0
 
 if (flag('--preflight')) {
   const projectsDir = projectsRoot()
-  const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(error => {
-    if (error.code === 'ENOENT') return []
-    throw error
-  })
-  const projects = projectId ? [projectId] : [...new Set([...config.projects.keys(), ...entries.filter(e => (e.isDirectory() || e.isSymbolicLink()) && isProjectName(e.name)).map(e => e.name)])].sort()
+  const projects = projectId ? [projectId] : [...new Set([...config.projects.keys(), ...(await listProjectDirs(projectsDir)).map(({ id }) => id)])].sort()
   console.log('Project sandbox preflight (local commands only; no model calls)')
   for (const project of projects) {
     let result

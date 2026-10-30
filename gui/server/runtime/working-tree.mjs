@@ -141,3 +141,86 @@ export function describeBlocking (blocking) {
   const more = blocking.length - 1
   return `the working tree cannot be snapshotted: ${first.path} ${first.reason}${more > 0 ? ` (and ${more} other path${more === 1 ? '' : 's'})` : ''}`
 }
+
+/*
+ * Nested repositories (host settings nestedRepositories: include). A monorepo
+ * that keeps its parts as repositories of their own inside its checkout gets
+ * them as gitlinks from `git add -A`: a commit id and no content, so a run's
+ * worktree held empty directories. Included, each one's place in the snapshot
+ * holds what that repository itself would carry — its tracked files as they
+ * are on disk and its untracked, unignored ones; never its .git — so the
+ * worktree, fingerprint, patch and checks see the whole tree. The project's
+ * own repository records the gitlink still, which is why the source base keeps
+ * it and a commit delivery that touches a nested path is refused (it cannot be
+ * merged into the outer history), while apply-to-source writes the files in
+ * place, where the nested repository sees them as its own uncommitted changes.
+ */
+
+const NUL = String.fromCharCode(0)
+
+/** The gitlinks of an index whose directories in the checkout are repositories. */
+export async function nestedRepositories ({ projectPath, git }) {
+  const out = []
+  for (const line of (await git(['ls-files', '--stage', '-z'])).split(NUL)) {
+    const m = /^160000 [0-9a-f]+ \d\t(.+)$/.exec(line)
+    if (!m) continue
+    const dir = path.join(projectPath, m[1])
+    if (await fs.lstat(path.join(dir, '.git')).then(() => true, () => false)) out.push(m[1])
+  }
+  return out.sort()
+}
+
+/**
+ * What a nested repository would carry, as paths relative to the outer
+ * checkout: [{ rel, full, link, exec }]. A repository nested in it in turn is
+ * read the same way. Paths matching `excludes` (globs, as the snapshot's) are left out.
+ */
+export async function nestedFiles ({ projectPath, root, excludes = [], run }) {
+  const out = []
+  const listed = (await run(['-C', path.join(projectPath, root), 'ls-files', '--cached', '--others', '--exclude-standard', '-z'])).split(NUL).filter(Boolean)
+  for (const name of [...new Set(listed)].sort()) {
+    const rel = `${root}/${name.replace(/\/$/, '')}`
+    if (excludes.some((pattern) => path.matchesGlob(rel, pattern))) continue
+    const full = path.join(projectPath, rel)
+    const stat = await fs.lstat(full).catch(() => null)
+    if (!stat) continue   // tracked there, deleted on disk: absent, as the outer snapshot treats its own
+    if (stat.isDirectory()) {
+      if (await fs.lstat(path.join(full, '.git')).then(() => true, () => false)) out.push(...await nestedFiles({ projectPath, root: rel, excludes, run }))
+      continue
+    }
+    if (stat.isSymbolicLink()) out.push({ rel, full, link: true, exec: false })
+    else if (stat.isFile()) out.push({ rel, full, link: false, exec: (stat.mode & 0o100) !== 0 })
+  }
+  return out
+}
+
+/**
+ * Replace each nested repository's gitlink in the index `env` names with its
+ * files, as blobs written where `env` sends objects. `runProcess`-shaped
+ * `exec` (stdin), `git` bound to the outer checkout and `env`.
+ */
+export async function includeNested ({ projectPath, nested, excludes, git, exec, env }) {
+  const record = []
+  const plain = (args) => exec({ command: 'git', args, env: process.env }).then((r) => { if (r.code !== 0) throw new Error(r.stderr.trim()); return r.stdout })
+  for (const root of nested) {
+    const head = (await plain(['-C', path.join(projectPath, root), 'rev-parse', '-q', '--verify', 'HEAD']).catch(() => '')).trim() || null
+    const files = await nestedFiles({ projectPath, root, excludes, run: plain })
+    await git(['update-index', '--force-remove', '--', root], { env })
+    const regular = files.filter((f) => !f.link && !f.full.includes('\n'))
+    const hashed = regular.length
+      ? (await exec({ command: 'git', args: ['-C', projectPath, 'hash-object', '-w', '--no-filters', '--stdin-paths'], env, stdin: regular.map((f) => f.full).join('\n') + '\n' })).stdout.trim().split('\n')
+      : []
+    if (hashed.length !== regular.length) throw new Error(`could not hash the files of nested repository ${root}`)
+    const entries = regular.map((f, i) => `${f.exec ? '100755' : '100644'} ${hashed[i]}\t${f.rel}`)
+    for (const f of files.filter((f) => f.link)) {
+      const sha = (await exec({ command: 'git', args: ['-C', projectPath, 'hash-object', '-w', '--stdin'], env, stdin: await fs.readlink(f.full) })).stdout.trim()
+      entries.push(`120000 ${sha}\t${f.rel}`)
+    }
+    if (entries.length) {
+      const added = await exec({ command: 'git', args: ['-C', projectPath, 'update-index', '--add', '-z', '--index-info'], env, stdin: entries.join(NUL) + NUL })
+      if (added.code !== 0) throw new Error(`could not record nested repository ${root}: ${added.stderr.trim()}`)
+    }
+    record.push({ path: root, head, files: entries.length })
+  }
+  return record
+}

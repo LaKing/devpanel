@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 
 import { projectConfig } from '../config/load.mjs'
 import * as store from './store.mjs'
+import { fetchFromStore, isStoreOf } from './git-store.mjs'
 
 /*
  * Integration: an operator's approval, bound to a revision and a target,
@@ -62,7 +63,7 @@ export async function integrationTarget ({ project, projectPath, configRoot, run
     const r = await store.readRun(issuePath, runId).catch(() => null)
     candidateRepository = r?.delivery?.repository ? await fs.realpath(r.delivery.repository).catch(() => r.delivery.repository) : null
   }
-  return { declared: cfg.declared, file: cfg.file, sourceRepository: source, repository, branch, head, candidateRepository, sameRepository: repository && candidateRepository ? repository === candidateRepository : null }
+  return { declared: cfg.declared, file: cfg.file, sourceRepository: source, repository, branch, head, candidateRepository, sameRepository: repository && candidateRepository ? repository === candidateRepository || await isStoreOf(candidateRepository, repository) : null }
 }
 
 /** One integration at a time per repository, in this process. */
@@ -102,7 +103,11 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
   const candidateRepo = await fs.realpath(delivery.repository).catch(() => delivery.repository)
   const sourceCommon = await run('git', ['-C', source, 'rev-parse', '--path-format=absolute', '--git-common-dir']).then((r) => fs.realpath(r.stdout.trim())).catch(() => null)
   if (!sourceCommon) throw refuse(`the project's source repository ${source} is not a git repository`)
-  if (sourceCommon !== candidateRepo) {
+  // A candidate in the panel's Git store (git-store.mjs) is the project's own:
+  // the store reads exactly this repository's objects. Its commit is brought
+  // over, objects only, so the merge below builds on it as on any other.
+  const fromStore = sourceCommon !== candidateRepo && await isStoreOf(candidateRepo, sourceCommon)
+  if (sourceCommon !== candidateRepo && !fromStore) {
     throw refuse(`the candidate is committed in ${candidateRepo}, but the project's declared source repository is ${sourceCommon}. Integrating would put the change in the wrong place; the mapping between the two is a project decision${cfg.file ? ` (see ${cfg.file})` : ' (declare it in projects/<project>.yaml)'}`)
   }
 
@@ -114,7 +119,11 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
   // merge onto what they saw, not onto whatever is there now.
   if (targetHeadBefore !== expectedTargetHead) throw refuse(`${branch} is at ${targetHeadBefore.slice(0, 12)}, not ${String(expectedTargetHead).slice(0, 12)} as approved; it moved since the approval was given. Read the target again and re-approve`)
 
-  const record = { approvedBy, revision: delivery.revision, repository: sourceCommon, targetBranch: branch, targetHeadBefore, mergeCommit: null, method: null, at: clock.iso(), error: null }
+  if (fromStore) {
+    try { await fetchFromStore({ source, store: candidateRepo, branch: delivery.branch, commit: delivery.commit }) } catch (error) { throw refuse(`the candidate could not be brought from the panel's Git store ${candidateRepo}: ${error.message}`) }
+  }
+
+  const record = { approvedBy, revision: delivery.revision, repository: sourceCommon, ...(fromStore ? { store: candidateRepo } : {}), targetBranch: branch, targetHeadBefore, mergeCommit: null, method: null, at: clock.iso(), error: null }
   const env = { ...process.env, GIT_AUTHOR_NAME: 'devpanel', GIT_AUTHOR_EMAIL: 'devpanel@localhost', GIT_COMMITTER_NAME: 'devpanel', GIT_COMMITTER_EMAIL: 'devpanel@localhost' }
   const message = `Integrate ${delivery.branch} (${delivery.revision.slice(0, 23)}) approved by ${approvedBy}`
 

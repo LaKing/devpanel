@@ -2,7 +2,7 @@ import { checksOnlyBlock, continueUnavailable, resumeUnavailable, ownerLossRecov
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
-import { projectsRoot, resolveProjectPath } from './project-path.mjs'
+import { projectPath as projectDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -331,7 +331,7 @@ export function createSupervisor ({
     record.finished = drive(record, {
       harnesses,
       configRoot: root,
-      projectPath, projectAlias: path.join(projectsDir, project)
+      projectPath, projectAlias: projectDir(project, projectsDir)
     })
 
     return { runId: record.runId, status: 'preflighting' }
@@ -481,7 +481,7 @@ export function createSupervisor ({
           deliveryProvider: worktreeDiffDelivery,
           configRoot,
           projectPath: await resolveProjectPath(project, { projectsDir }),
-          projectAlias: path.join(projectsDir, project),
+          projectAlias: projectDir(project, projectsDir),
           availability,
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })
@@ -973,7 +973,7 @@ export function createSupervisor ({
           deliveryProvider: worktreeDiffDelivery,
           configRoot,
           projectPath: await resolveProjectPath(project, { projectsDir }),
-          projectAlias: path.join(projectsDir, project),
+          projectAlias: projectDir(project, projectsDir),
           availability,
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })

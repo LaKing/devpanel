@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import { acquire, LockHeld } from './runtime/lock.mjs'
 import { runProcess } from './runtime/process.mjs'
 import { ISSUES_DIR as DEFAULT_ISSUES_DIR } from './issues.js'
-import { projectsRoot } from './project-path.mjs'
+import { projectPath as projectDir, projectsRoot } from './project-path.mjs'
 import { hostSettings } from './config/host-settings.mjs'
 
 /*
@@ -92,7 +92,7 @@ function assertProject (project) {
  */
 export async function listProjectActions (project, { root, projectsDir = projectsRoot(), issuesDir = ISSUES_DIR() } = {}) {
   assertProject(project)
-  const projectPath = path.join(projectsDir, project)
+  const projectPath = projectDir(project, projectsDir)
   let stat
   try { stat = await fs.stat(projectPath) } catch { throw fail('no such project', 404) }
   if (!stat.isDirectory()) throw fail('no such project', 404)

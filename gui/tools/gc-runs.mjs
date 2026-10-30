@@ -27,16 +27,15 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { fileURLToPath } from 'node:url'
 
 import { writeJson } from '../server/runtime/persistence.mjs'
 import { ownerLiveness } from '../server/runtime/lock.mjs'
 import { supportedActions, LIVE_STATUSES } from '../server/supervisor.mjs'
 import { repositoryGitArgs } from '../server/runtime/engine-git.mjs'
+import { issuesRoot } from '../server/project-path.mjs'
 
 const exec = promisify(execFile)
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-const ISSUES = process.env.DEVPANEL_ISSUES_DIR ?? path.resolve(HERE, '..', '..', 'issues')
+const ISSUES = issuesRoot()
 const argv = process.argv.slice(2)
 const apply = argv.includes('--apply')
 const force = argv.includes('--force')

@@ -1,18 +1,24 @@
+import fsSync from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /*
  * Installation-specific configuration (docs/host-config.md): this host's
- * projects, host-only roster entries, release targets and live-check reports.
+ * projects, host-only roster entries, playbook overrides, release targets and
+ * live-check reports.
  * They live in one git-ignored directory beside the publishable tree, and the
  * in-tree files keep working beside them: each category is the union of both by
  * file name, and on the same name the host-config file wins (the in-tree one is
  * reported as shadowed, never an error).
  *
- * One rule for every consumer, JS and tools/releases/host_targets.py alike:
- * DEVPANEL_HOST_CONFIG_DIR, relative to the config root when relative, and
- * <config root>/host-config when unset. An empty value is unset, for this and
+ * One rule for every consumer, JS, tools/releases/host_targets.py and the
+ * devpanel skill client alike: DEVPANEL_HOST_CONFIG_DIR, relative to the config
+ * root when relative; when unset, <config root>/host-config if it exists, else
+ * DEVPANEL_DATA_ROOT/host-config if that variable is set and the directory
+ * exists (an installation that keeps its data outside the checkout keeps its
+ * configuration there too), else <config root>/host-config. Nothing is looked
+ * for outside the checkout unless the variable says where. An empty value is unset, for this and
  * for DEVPANEL_CONFIG_ROOT. Imports nothing of the loader's, so the migration
  * script runs without gui/node_modules.
  */
@@ -22,20 +28,34 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 export const HOST_CONFIG_ENV = 'DEVPANEL_HOST_CONFIG_DIR'
 export const DEFAULT_CONFIG_ROOT = process.env.DEVPANEL_CONFIG_ROOT || path.resolve(HERE, '..', '..', '..')
 
+export const DATA_ROOT_ENV = 'DEVPANEL_DATA_ROOT'
+const isDir = (dir) => { try { return fsSync.statSync(dir).isDirectory() } catch { return false } }
+
+/** The data root a host-config directory may live in before any settings are read: DEVPANEL_DATA_ROOT from `env`, else none. */
+export function bootDataRoot (env = process.env) {
+  return env[DATA_ROOT_ENV] ? path.resolve(env[DATA_ROOT_ENV]) : null
+}
+
 /** Where host configuration lives for this config root; read at call time. */
 export function hostConfigDir ({ root = DEFAULT_CONFIG_ROOT, env = process.env } = {}) {
-  return path.resolve(root, env[HOST_CONFIG_ENV] || 'host-config')
+  if (env[HOST_CONFIG_ENV]) return path.resolve(root, env[HOST_CONFIG_ENV])
+  const inTree = path.resolve(root, 'host-config')
+  if (isDir(inTree)) return inTree
+  const data = bootDataRoot(env)
+  return data && isDir(path.join(data, 'host-config')) ? path.join(data, 'host-config') : inTree
 }
 
 /*
  * The categories. `tree` is relative to the config root, `host` to the host
  * directory; `match` selects what the loader and discovery read, `moves` what
  * the migration moves (a roster entry is host-specific only when it names a
- * person's login: the rest of the roster is the public catalogue).
+ * person's login: the rest of the roster is the public catalogue; a playbook is
+ * the shared default, and a host copy of it is an override, so none moves).
  */
 export const CATEGORIES = [
   { id: 'projects', tree: 'projects', host: 'projects', match: (name) => name.endsWith('.yaml'), moves: () => true },
   { id: 'roster', tree: 'roster', host: 'roster', match: (name) => name.endsWith('.yaml'), moves: (name, text) => /^account\s*:/m.test(text) },
+  { id: 'playbooks', tree: 'playbooks', host: 'playbooks', match: (name) => name.endsWith('.yaml'), moves: () => false },
   { id: 'releases', tree: 'tools/releases', host: 'releases', match: (name) => name.endsWith('-targets.json'), moves: () => true },
   { id: 'live-reports', tree: 'gui/live/reports', host: 'live-reports', match: () => true, moves: () => true }
 ]

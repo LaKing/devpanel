@@ -4,15 +4,22 @@
   "title": "Decision provider",
   "description": "An advisory classifier (decisions/<id>.yaml). It answers typed questions with probabilities and is never a harness, a seat or an authority: below the threshold, or unavailable, the caller falls back to its own behaviour.",
   "type": "object",
-  "required": ["id", "endpoint", "model", "credentialRef", "threshold", "pricing", "maxCallCostUsd"],
+  "required": ["id", "model", "threshold", "maxCallCostUsd"],
   "additionalProperties": false,
+  "if": { "properties": { "kind": { "const": "model" } }, "required": ["kind"] },
+  "then": {
+    "description": "A roster model asked through its CLI: model is a roster id, reached through that CLI's own login, so there is no endpoint, key or price list (the CLI reports what each turn cost).",
+    "not": { "anyOf": [{ "required": ["endpoint"] }, { "required": ["credentialRef"] }, { "required": ["pricing"] }] }
+  },
+  "else": { "required": ["endpoint", "credentialRef", "pricing"], "not": { "required": ["effort"] } },
   "properties": {
     "id": { "type": "string", "pattern": "^[a-z0-9-]+$" },
     "title": { "type": "string" },
     "kind": {
-      "enum": ["jev", "openai"],
-      "description": "Which client speaks to the endpoint: jev (TypeSafe Jev, the default when absent) or openai (the OpenAI Decisions API). Which provider is ACTIVE is decisions/active.yaml's choice, not this field's."
+      "enum": ["jev", "openai", "model"],
+      "description": "Which client speaks to the endpoint: jev (TypeSafe Jev, the default when absent), openai (the OpenAI Decisions API) or model (a verified roster model through its CLI, e.g. a Claude subscription). Which provider is ACTIVE is decisions/active.yaml's choice, not this field's."
     },
+    "effort": { "type": "string", "description": "kind model only: the effort to ask the roster model at; one of its efforts." },
     "endpoint": { "type": "string", "pattern": "^https://" },
     "model": { "type": "string", "minLength": 1 },
     "credentialRef": {
@@ -21,7 +28,7 @@
       "description": "Where the key is read from at each call (env:NAME or file:PATH, ~/ meaning the service user's home). The value is never stored, logged or recorded."
     },
     "threshold": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-    "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 120000 },
+    "timeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
     "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
     "maxWaitMs": { "type": "integer", "minimum": 0, "maximum": 60000 },
     "pricing": {

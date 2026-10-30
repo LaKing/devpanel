@@ -13,9 +13,11 @@ import { resolvePlaybook } from '../config/load.mjs'
 import { preflight, assertLaunchable } from '../config/preflight.mjs'
 import { systemClock } from './clock.mjs'
 import { baselineOf, escapingLinks, fingerprint, workspaceProjection } from './fingerprint.mjs'
-import { walkSelection, authorizer, knownProjectRoots, forbiddenRootsReport, copySelected, exportProject, SELECTION_RULE } from './selection.mjs'
+import { walkSelection, authorizer, knownProjectRoots, forbiddenRootsReport, homeExemption, copySelected, exportProject, SELECTION_RULE } from './selection.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
 import { worktreeGitArgs, repositoryGitArgs, engineGitEnv, HARDENED, LOCAL_TRANSPORT } from './engine-git.mjs'
+import { ensureGitStore, gitStoreDir } from './git-store.mjs'
+import { hostSettings } from '../config/host-settings.mjs'
 import { Engine } from './engine.mjs'
 import { requireUnarchived } from '../issue-archive.mjs'
 import { acquire } from './lock.mjs'
@@ -23,7 +25,8 @@ import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
 import * as store from './store.mjs'
-import { classifyUntracked, describeBlocking, snapshotPathspec } from './working-tree.mjs'
+import { classifyUntracked, describeBlocking, includeNested, nestedRepositories, snapshotPathspec } from './working-tree.mjs'
+import { runProcess } from './process.mjs'
 import { applyToSource, sourceTarget, bindSourceOwners } from './source-delivery.mjs'
 import { carryForward } from './carry-forward.mjs'
 import { publishCandidate } from './publication.mjs'
@@ -181,7 +184,7 @@ async function commitDelivery ({ revision, fingerprint: fp, baseCommit, baseline
   // integration would merge; the reviewed commit is kept beside it.
   if (!reconstruction.verified) return { ...patchReceipt, reconstruction, commit, branch, repository: null }
   const publication = await publishCandidate({ repository: privateRepository, runId: path.basename(runDir), runDir, reviewed: commit, filteredBase: baseCommit,
-    sourceBase: workspace.sourceBase ?? baseCommit, branch, materialized: workspace.symlinks?.materialized ?? [] })
+    sourceBase: workspace.sourceBase ?? baseCommit, branch, materialized: [...(workspace.symlinks?.materialized ?? []), ...(workspace.base?.nested ?? []).map((n) => n.path)] })
   if (!publication.published) {
     return { ...patchReceipt, reconstruction: { ...reconstruction, verified: false, detail: publication.reason }, commit, branch, repository: null, publication }
   }
@@ -310,6 +313,15 @@ export const gitWorktreeProvider = {
   isolation: 'git-worktree',
   async create ({ projectPath, runId, root, policy = {} }) {
     const git = (args, opts = {}) => run('git', ['-C', projectPath, ...args], { ...BIG, ...opts })
+    // The panel's own Git store (git-store.mjs), when the host keeps one: the
+    // snapshot's objects and refs and the worktree's registration go there, and
+    // the project repository is only read. Private repositories only (0d): a
+    // legacy run's worktree stays registered in the project.
+    const gitStore = policy.repository === 1 && policy.store
+      ? await ensureGitStore({ dir: policy.store, sourceRepository: (await git(['rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim() })
+      : null
+    const objectEnv = gitStore ? { GIT_OBJECT_DIRECTORY: gitStore.objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: gitStore.sourceObjects } : {}
+    const repo = gitStore ? (args, opts = {}) => run('git', ['--git-dir', gitStore.dir, ...args], { ...BIG, ...opts }) : git
     const headCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim()
     const status = (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.split(String.fromCharCode(10)).filter(Boolean)
     const dirtyPaths = status.filter((l) => !l.startsWith('??')).length
@@ -338,6 +350,9 @@ export const gitWorktreeProvider = {
     const checkoutMounts = await withinCheckout(projectPath, toolingMounts)
     let baseCommit
     let snapshotRef = null
+    // Nested repositories whose content the snapshot carries (working-tree only).
+    let nestedRoots = []
+    let nested = []
     let ref = null
     // A: the commit the snapshot was cut from, before exclusions and
     // materialization. Only what the reviewed delta changes may reach it.
@@ -363,7 +378,7 @@ export const gitWorktreeProvider = {
       // index so the project's own index is never touched. Parent HEAD, so
       // history shows what it was cut from.
       const indexFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-base-')), 'index')
-      const env = engineGitEnv({ GIT_INDEX_FILE: indexFile, ...snapshotIdentity })
+      const env = engineGitEnv({ GIT_INDEX_FILE: indexFile, ...snapshotIdentity, ...objectEnv })
       // The same classification the launch condition read with. If it says the
       // tree cannot be snapshotted, say so here rather than letting `git add -A`
       // fail halfway through with its own words: a reading and a build that
@@ -386,13 +401,21 @@ export const gitWorktreeProvider = {
           try { await run('git', ['-C', projectPath, 'check-ignore', '-q', '--', target], BIG); ignoredMounts.add(target) } catch { /* not ignored */ }
         }
         await git(['add', '-A', '--', ...snapshotPathspec([...checkoutExcludes, ...checkoutMounts.filter((t) => !ignoredMounts.has(t))])], { env })
+        // Nested repositories (host settings nestedRepositories: include) are
+        // gitlinks in that index; their content replaces them below.
+        if (policy.nested === 'include') nestedRoots = await nestedRepositories({ projectPath, git: (args) => git(args, { env }).then((r) => r.stdout) })
         // Private repositories (0d) integrate through the source base A: the
         // checkout as it is, except that an excluded path keeps HEAD's content
         // (tracked) or is left out (untracked), so no excluded secret reaches
-        // any commit. S, the snapshot, is A without the excluded tracked paths.
-        if (policy.repository === 1 && checkoutExcludes.length) {
+        // any commit. S, the snapshot, is A without the excluded tracked paths
+        // and with the nested repositories' content in place of their gitlinks.
+        if (policy.repository === 1 && (checkoutExcludes.length || nestedRoots.length)) {
           const unfiltered = (await git(['write-tree'], { env })).stdout.trim()
           sourceBase = (await git(['commit-tree', unfiltered, '-p', headCommit, '-m', 'devpanel source base'], { env })).stdout.trim()
+        }
+        if (nestedRoots.length) {
+          nested = await includeNested({ projectPath, nested: nestedRoots, excludes: [...checkoutExcludes, ...checkoutMounts], env, exec: runProcess,
+            git: (args, opts) => git(args, opts) })
         }
         // A path excluded from the snapshot but present in HEAD would otherwise
         // survive through read-tree; the base must not carry what it excludes.
@@ -404,7 +427,7 @@ export const gitWorktreeProvider = {
         await fs.rm(path.dirname(indexFile), { recursive: true, force: true }).catch(() => {})
       }
       snapshotRef = `refs/devpanel/base/${runId}`
-      await git(['update-ref', snapshotRef, baseCommit])
+      await repo(['update-ref', snapshotRef, baseCommit])
     } else {
       ref = base.commit
       baseCommit = (await git(['rev-parse', '--verify', `${ref}^{commit}`])).stdout.trim()
@@ -418,7 +441,7 @@ export const gitWorktreeProvider = {
     let sourceRevision = null
     if (selection && kind !== 'working-tree' && checkoutExcludes.length) {
       const indexFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-filter-')), 'index')
-      const env = engineGitEnv({ GIT_INDEX_FILE: indexFile, ...snapshotIdentity })
+      const env = engineGitEnv({ GIT_INDEX_FILE: indexFile, ...snapshotIdentity, ...objectEnv })
       try {
         await git(['read-tree', baseCommit], { env })
         await git(['rm', '-r', '-q', '--cached', '--ignore-unmatch', '--', ...checkoutExcludes.map((p) => `:(glob)${p}`)], { env })
@@ -427,7 +450,7 @@ export const gitWorktreeProvider = {
           sourceRevision = baseCommit
           baseCommit = (await git(['commit-tree', tree, '-p', baseCommit, '-m', 'devpanel filtered base'], { env })).stdout.trim()
           snapshotRef = `refs/devpanel/base/${runId}`
-          await git(['update-ref', snapshotRef, baseCommit])
+          await repo(['update-ref', snapshotRef, baseCommit])
         }
       } finally {
         await fs.rm(path.dirname(indexFile), { recursive: true, force: true }).catch(() => {})
@@ -435,7 +458,7 @@ export const gitWorktreeProvider = {
     }
 
     const dir = path.join(root, `worktree-${runId}`)
-    await git(['worktree', 'add', '--detach', dir, baseCommit])
+    await repo(['worktree', 'add', '--detach', dir, baseCommit])
 
     // Symlinks that leave the worktree are the one way a candidate reaches live
     // files. The policy decides; nothing is silently kept.
@@ -453,7 +476,7 @@ export const gitWorktreeProvider = {
       if (dangling.length) symlinks.dangling = dangling.map((l) => ({ path: l.path, target: l.target }))
     }
     if (escaping.length && symlinks.policy === 'reject') {
-      await git(['worktree', 'remove', '--force', dir]).catch(() => {})
+      await repo(['worktree', 'remove', '--force', dir]).catch(() => {})
       const error = new Error(`${escaping.length} symlink(s) in the checkout point outside it (${escaping.slice(0, 3).map((l) => `${l.path} -> ${l.target}`).join(', ')}${escaping.length > 3 ? ', …' : ''}). A write through such a link changes a live file the candidate does not record. Choose symlinks "materialize" to copy their targets into the worktree, or "allow" to accept that.`)
       error.code = 'ESCAPING_SYMLINKS'
       throw error
@@ -464,7 +487,7 @@ export const gitWorktreeProvider = {
         // Selection v1: every target is authorized BEFORE anything is copied,
         // and each carries only what its owning repository would carry.
         const { roots: forbidden, mounts } = await forbiddenRootsReport()
-        const authorize = authorizer({ known: await knownProjectRoots(), grants: policy.materializeGrants ?? [], forbidden })
+        const authorize = authorizer({ known: await knownProjectRoots(), grants: policy.materializeGrants ?? [], forbidden, exempt: await homeExemption() })
         // How the container mounts were found (read, unreadable, not applicable on darwin).
         const record = { rule: SELECTION_RULE, consumerExcludes: [...excludes, ...toolingMounts], owners: [], skipped: [], mounts }
         const plans = []
@@ -478,8 +501,8 @@ export const gitWorktreeProvider = {
             record.owners.push(...owners)
           }
         } catch (error) {
-          await git(['worktree', 'remove', '--force', dir]).catch(() => {})
-          if (snapshotRef && kind !== 'working-tree') await git(['update-ref', '-d', snapshotRef]).catch(() => {})
+          await repo(['worktree', 'remove', '--force', dir]).catch(() => {})
+          if (snapshotRef && kind !== 'working-tree') await repo(['update-ref', '-d', snapshotRef]).catch(() => {})
           throw error
         }
         for (const { link, files, directory } of plans) {
@@ -517,7 +540,7 @@ export const gitWorktreeProvider = {
         const tree = (await wt(['write-tree'])).stdout.trim()
         const materializedCommit = (await wt(['commit-tree', tree, '-p', baseCommit, '-m', `devpanel materialized ${symlinks.materialized.length} escaping symlink(s)`])).stdout.trim()
         snapshotRef = `refs/devpanel/base/${runId}`
-        await git(['update-ref', snapshotRef, materializedCommit])
+        await repo(['update-ref', snapshotRef, materializedCommit])
         await run('git', ['-C', dir, 'update-ref', 'HEAD', materializedCommit])
         // The temporary index built the new commit; the candidate's real index
         // still names the original symlinks. Align it with the materialized
@@ -539,12 +562,12 @@ export const gitWorktreeProvider = {
     let repository = null
     if (policy.repository === 1) {
       try {
-        ;({ gitDir, gitEntry, repository } = await privateRepositories({ projectPath, dir, runDir: path.join(root, runId), runId, baseCommit, snapshotRef, linkedGitDir: gitDir }))
+        ;({ gitDir, gitEntry, repository } = await privateRepositories({ projectPath, dir, runDir: path.join(root, runId), runId, baseCommit, snapshotRef, linkedGitDir: gitDir, store: gitStore?.dir ?? null }))
         snapshotRef = repository.snapshotRef
       } catch (error) {
         // Nothing has run in it: take the fresh checkout down with whatever of
         // the repositories was built, and refuse the start with the reason.
-        await git(['worktree', 'remove', '--force', dir]).catch(() => {})
+        await repo(['worktree', 'remove', '--force', dir]).catch(() => {})
         await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
         await fs.rm(path.join(root, runId, 'git'), { recursive: true, force: true }).catch(() => {})
         throw Object.assign(new Error(`the run's private repository could not be built: ${error.message.split(String.fromCharCode(10))[0]}`), { code: 'PRIVATE_REPOSITORY' })
@@ -557,7 +580,7 @@ export const gitWorktreeProvider = {
       gitEntry,
       ...(repository ? { repository, sourceBase } : {}),
       isolation: 'git-worktree',
-      base: { policy: kind, ref, headCommit, snapshotRef, dirtyPaths, untrackedPaths, excludes, ...(selection ? { selection: SELECTION_RULE } : {}), ...(sourceRevision ? { sourceRevision } : {}) },
+      base: { policy: kind, ref, headCommit, snapshotRef, dirtyPaths, untrackedPaths, excludes, ...(selection ? { selection: SELECTION_RULE } : {}), ...(sourceRevision ? { sourceRevision } : {}), ...(nested.length ? { nested } : {}) },
       // Left out of every fingerprint of this worktree (workspaceProjection).
       ...(toolingMounts.length ? { toolingMounts } : {}),
       symlinks,
@@ -579,13 +602,16 @@ export const gitWorktreeProvider = {
 /**
  * Build the run's engine and worker Git directories (0d; engine-git.mjs) and
  * move the fresh work tree onto them. The snapshot ref is always pinned in the
- * source (base pinning), so the depth-1 fetch and the candidate's parent stay
+ * source (the project repository, or the panel's Git store when the host keeps
+ * one: base pinning), so the depth-1 fetch and the candidate's parent stay
  * reachable after the run's directories are gone.
  */
-async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommit, snapshotRef, linkedGitDir }) {
+async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommit, snapshotRef, linkedGitDir, store = null }) {
   const env = engineGitEnv()
   const g = (args) => run('git', [...HARDENED, ...args], { ...BIG, env })
-  const source = await fs.realpath((await g(['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
+  // With the panel's Git store, the store is the run's source repository: the
+  // snapshot is pinned and fetched there, and publication writes there.
+  const source = store ?? await fs.realpath((await g(['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
   if (!linkedGitDir.startsWith(path.join(source, 'worktrees') + path.sep)) throw new Error(`the fresh worktree's git directory ${linkedGitDir} is not a registration of ${source}`)
   const ref = snapshotRef ?? `refs/devpanel/base/${runId}`
   if (!snapshotRef) await g(['--git-dir', source, 'update-ref', ref, baseCommit])
@@ -802,7 +828,9 @@ export async function provisionRun (reservation, {
   if (!staged && reservation.resolution.resolved.workspace.isolation === 'in-place') workspaceProvider = inPlaceProvider
   const workspace = await workspaceProvider.create({
     projectPath, runId, root: path.join(issuePath, 'runs'),
-    policy: { ...reservation.resolution.resolved.workspace, selection: reservation.resolution.resolved.fence?.selection ?? 0, repository: reservation.resolution.resolved.fence?.repository ?? 0 }
+    policy: { ...reservation.resolution.resolved.workspace, selection: reservation.resolution.resolved.fence?.selection ?? 0, repository: reservation.resolution.resolved.fence?.repository ?? 0,
+      // The issue lives at <issue root>/<project>/<issue>: the project names its store.
+      store: gitStoreDir(path.basename(path.dirname(issuePath))), nested: hostSettings().nestedRepositories }
   })
 
   // Run-owned scratch space, outside the worktree so nothing written there can
@@ -845,7 +873,9 @@ export async function provisionRun (reservation, {
     // After the baseline, so a carried-forward patch is part of this candidate.
     const writes = Object.values(reservation.resolution.resolved.participants ?? {}).some((p) => p.writesCode)
     if (writes && !staged && workspace.isolation !== 'in-place') {
-      const sourceRepository = workspace.source?.repository ?? await promisify(execFile)('git', ['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir']).then((r) => r.stdout.trim(), () => null)
+      // The earlier run's base snapshot is in the run's source repository: the
+      // panel's Git store when the host keeps one, else the project's.
+      const sourceRepository = workspace.repository?.source ?? workspace.source?.repository ?? await promisify(execFile)('git', ['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir']).then((r) => r.stdout.trim(), () => null)
       const seed = await carryForward({ issuePath, runId, workspace: run.workspace, sourceRepository })
       if (seed) {
         run.workspace.seed = seed

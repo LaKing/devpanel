@@ -38,7 +38,31 @@ switching needs no restart. Records carry the provider id in their key, so switc
 from the other provider's record.
 
 A provider file's `kind` names the client that speaks to its endpoint: `jev` (the default when absent, so
-`jev.yaml` needs none) or `openai`. `advisor.mjs` builds the oracle from that `kind` (`oracleFor`).
+`jev.yaml` needs none), `openai` or `model`. `advisor.mjs` builds the oracle from that `kind` (`oracleFor`).
+
+Both files are read from the host config first (`host-config/decisions/`, docs/host-config.md), then from the
+tracked `decisions/`, so an installation chooses and tunes its provider without editing tracked files.
+
+### A roster model as the provider (`kind: model`)
+
+A host whose only access is a logged-in CLI (a Claude subscription, say) can make a verified roster model the
+provider. It is asked exactly as the Assess bar asks one (`model-oracle.mjs`: one tool-free turn, answers
+checked by `checkAnswers`), so there is no endpoint, key or price list; the schema refuses them. Each ask
+reserves `maxCallCostUsd` and settles what the CLI reported. An unknown or unverified roster id is a
+`configuration` failure, never charged.
+
+```yaml
+# host-config/decisions/claude.yaml (with host-config/decisions/active.yaml: "provider: claude")
+id: claude
+kind: model
+model: haiku-4-5      # a roster id
+threshold: 0.9
+maxCallCostUsd: 0.05
+timeoutMs: 120000
+```
+
+It draws on the same subscription limits as the runs, and each ask is a CLI turn of some seconds, not a
+sub-second API call.
 
 ### The OpenAI Decisions API (`decisions/openai.yaml`, `gui/server/decisions/openai.mjs`)
 

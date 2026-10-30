@@ -17,13 +17,12 @@
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 import { writeRunResultStep } from '../server/run-result-step.mjs'
+import { issuesRoot } from '../server/project-path.mjs'
 import { archiveState } from '../server/issue-archive.mjs'
 
-const HERE = path.dirname(fileURLToPath(import.meta.url))
-const ISSUES = process.env.DEVPANEL_ISSUES_DIR ?? path.resolve(HERE, '..', '..', 'issues')
+const ISSUES = issuesRoot()
 const apply = process.argv.includes('--apply')
 const rewrite = process.argv.includes('--rewrite')
 const ENDED = ['completed', 'blocked', 'failed', 'cancelled']

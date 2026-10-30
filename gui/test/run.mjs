@@ -27,6 +27,9 @@ process.env.DEVPANEL_FENCE ??= 'off'
 const os = await import('node:os')
 const EMPTY_HOST_CONFIG = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-no-host-config-'))
 process.env.DEVPANEL_HOST_CONFIG_DIR = EMPTY_HOST_CONFIG
+// Nor the data root a host-config may be found in (~/devpanel by default): a
+// suite that unsets the setting above must not find this host's there either.
+process.env.DEVPANEL_DATA_ROOT = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-no-data-root-'))
 // Nor the host's projects: the suites' projects root holds only the panel's own
 // project, empty (the engine fixtures file their issues under it). A suite that
 // needs other projects points DEVPANEL_PROJECTS_DIR at a fixture of its own.

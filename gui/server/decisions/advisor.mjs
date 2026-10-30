@@ -1,7 +1,7 @@
 import { createDecisions, loadDecisionProvider } from './index.mjs'
 import { createJevOracle, readCredential } from './jev.mjs'
 import { createOpenAIOracle } from './openai.mjs'
-import { createModelOracle } from './model-oracle.mjs'
+import { createModelOracle, createRosterModelOracle } from './model-oracle.mjs'
 
 /** What one assessment by a roster model may cost at most, reserved before it is asked. */
 export const MODEL_ASK_CEILING_USD = 1
@@ -30,7 +30,7 @@ export const MODEL_ASK_CEILING_USD = 1
 export const decisionAvailabilityId = (providerId) => `decision:${providerId}`
 
 /** The client a provider declares with `kind` (decisions/<id>.yaml); Jev when it declares none. */
-const ORACLES = { jev: createJevOracle, openai: createOpenAIOracle }
+const ORACLES = { jev: createJevOracle, openai: createOpenAIOracle, model: createRosterModelOracle }
 export function oracleFor (config, options = {}) {
   const create = ORACLES[config.kind ?? 'jev']
   if (!create) throw new Error(`decision provider "${config.id}" declares an unknown kind "${config.kind}"`)
@@ -136,8 +136,12 @@ export async function decisionProviderStatus ({ loadProvider, store, advisors = 
   const id = decisionAvailabilityId(config.id)
   const record = (await store.all()).find((r) => r.modelId === id) ?? null
   let credential
-  try { await readCredential(config.credentialRef); credential = { ref: config.credentialRef, ok: true } } catch (error) {
-    credential = { ref: config.credentialRef, ok: false, error: error.message }
+  // A roster model is reached through its CLI's own login, not a key the provider names.
+  if (config.kind === 'model') credential = { ref: null, ok: true }
+  else {
+    try { await readCredential(config.credentialRef); credential = { ref: config.credentialRef, ok: true } } catch (error) {
+      credential = { ref: config.credentialRef, ok: false, error: error.message }
+    }
   }
   const outcomes = advisors.map((a) => a?.lastOutcome?.()).filter(Boolean).sort((a, b) => (a.at < b.at ? 1 : -1))
   return [{
@@ -145,7 +149,7 @@ export async function decisionProviderStatus ({ loadProvider, store, advisors = 
     provider: config.id,
     title: config.title ?? config.id,
     kind: config.kind ?? 'jev',
-    endpoint: config.endpoint,
+    endpoint: config.endpoint ?? null,
     model: config.model,
     threshold: config.threshold,
     configured: true,

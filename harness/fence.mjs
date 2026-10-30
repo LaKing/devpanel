@@ -3,7 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { runProcess, ProcessError } from '../gui/server/runtime/process.mjs'
-import { projectsRoot } from '../gui/server/project-path.mjs'
+import { discoveredProjects, issuesRoot, projectsRoot, tokenFile } from '../gui/server/project-path.mjs'
+import { hostSettings } from '../gui/server/config/host-settings.mjs'
 import { fencePolicy } from '../gui/server/runtime/confinement-policy.mjs'
 import { hostPlatform } from '../gui/server/runtime/platform.mjs'
 
@@ -189,7 +190,8 @@ export async function proveFence ({ fence, spec, canaries = [], command = null, 
  * Paths that must be invisible in every fence, whatever the turn grants: the
  * operator's keys, the panel's token and supervisor state, every CLI home not
  * bound for this turn, and each entry of the projects root (project-path.mjs
- * projectsRoot) outside the granted paths (other projects, container mounts).
+ * projectsRoot) and each discovered project outside the granted paths (other
+ * projects, container mounts).
  */
 export async function defaultCanaries ({ home = os.homedir(), granted = [], projectsDir = projectsRoot(), panelRoot = null, keep = [] } = {}) {
   const grantedReal = []
@@ -217,9 +219,15 @@ export async function defaultCanaries ({ home = os.homedir(), granted = [], proj
     for (const name of names) await protect(path.join(p, name))
   }
   if (panelRoot) {
-    for (const rel of ['.devpanel-token', 'issues/.supervisor']) await protect(path.join(panelRoot, rel))
-    // Other projects' issues and runs live beside this run's own directories.
-    for (const dir of [panelRoot, path.join(panelRoot, 'issues')]) {
+    const issues = issuesRoot()
+    // The host's data root (host settings dataRoot) holds what the panel's
+    // checkout holds by default: its configuration, token, logs, certificate,
+    // Git stores and every other run. Everything in it but this turn's grants.
+    const dataRoot = hostSettings().dataRoot
+    for (const p of [path.join(panelRoot, '.devpanel-token'), tokenFile(), path.join(issues, '.supervisor'), ...(dataRoot ? [dataRoot] : [])]) await protect(p)
+    // Other projects' issues and runs live beside this run's own directories,
+    // under the issue root (the panel's issues/ unless the host moved it).
+    for (const dir of [panelRoot, issues]) {
       let names = []
       try { names = await fs.readdir(dir) } catch { /* none */ }
       for (const name of names) {
@@ -236,6 +244,12 @@ export async function defaultCanaries ({ home = os.homedir(), granted = [], proj
     const real = await canonical(p).catch(() => null)
     if (!real || covered(real)) continue
     out.push(p)
+  }
+  // Discovered projects sit below a root entry that may hold this run's own
+  // project too, and so is covered: each of them is a canary of its own.
+  for (const p of discoveredProjects(projectsDir)?.values() ?? []) {
+    const real = await canonical(p).catch(() => null)
+    if (real && !covered(real) && !out.includes(p)) out.push(p)
   }
   return out
 }
@@ -264,6 +278,28 @@ export function assertFenced (fenced, { turn = 'this turn', mounts = [], platfor
     { kind: 'environment-error', started: false })
 }
 
+/** The CLI logins and keys under the home that no host grant may reach. */
+const PRIVATE_HOME = ['.ssh', '.claude', '.claude.json', '.codex', '.gemini', '.config']
+
+/**
+ * The host settings' fence.readOnly (a toolchain under the home, `~/.nvm`),
+ * resolved. Throws on the home itself, a directory containing it, or one that
+ * reaches a private entry of it: such a grant would undo the fence.
+ */
+export async function hostReadOnly ({ home = os.homedir(), dirs = hostSettings().fence.readOnly } = {}) {
+  const realHome = await canonical(home).catch(() => path.resolve(home))
+  const out = []
+  for (const dir of dirs) {
+    if (!await exists(dir)) continue
+    const real = await canonical(dir)
+    if (real === realHome || realHome.startsWith(real + '/')) throw new Error(`fence.readOnly: ${dir} is or contains the home`)
+    const hit = PRIVATE_HOME.map((n) => path.join(realHome, n)).find((p) => real === p || real.startsWith(p + '/') || p.startsWith(real + '/'))
+    if (hit) throw new Error(`fence.readOnly: ${dir} reaches ${hit}, which no seat may read`)
+    out.push(real)
+  }
+  return out
+}
+
 /**
  * Build, prove and return the wrapper for one invocation. The engine supplies
  * the run's paths (`spec`); the adapter supplies what its CLI needs
@@ -280,7 +316,7 @@ export async function applyFence ({ spec, manifest = {}, command = null, signal 
       home: manifest.home ?? os.homedir(),
       homeBinds: manifest.homeBinds ?? [],
       writable: [...(spec.writable ?? []), ...(manifest.writable ?? [])],
-      readOnly: [...(spec.readOnly ?? []), ...(manifest.readOnly ?? [])],
+      readOnly: [...(spec.readOnly ?? []), ...(manifest.readOnly ?? []), ...await hostReadOnly()],
       entries: [...(spec.entries ?? []), ...(manifest.entries ?? [])],
       binds: manifest.binds ?? [],
       mounts: spec.mounts ?? [],

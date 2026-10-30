@@ -3,6 +3,10 @@
 Some configuration belongs to one installation, not to devpanel:
 
 - the projects it serves (`projects/<id>.yaml`): their containers, SSH targets and paths;
+- its own versions of catalogue playbooks (`playbooks/<id>.yaml`): other seats, models,
+  efforts or budgets, while the tracked `playbooks/` stays the shared default;
+- which decision provider is active and how it is reached (`decisions/active.yaml`,
+  `decisions/<id>.yaml`), read before the tracked `decisions/` (docs/decisions.md);
 - roster entries that name a person's login (`account:`), or carry the installation's own
   dated verification evidence; the tracked `roster/` is the shared model catalogue;
 - release targets (`tools/releases/<site>-targets.json`): hosts, instance directories, state roots, service accounts;
@@ -18,6 +22,10 @@ show the layout with reserved `example.invalid` names; nothing there is loaded.
 ## The setting
 
 `DEVPANEL_HOST_CONFIG_DIR` names the directory. Unset or empty, it is
+`<config root>/host-config` if that exists, else `<data root>/host-config` if that
+exists and `DEVPANEL_DATA_ROOT` names a data root (nothing outside the checkout is
+looked for without it; a host-config found there also makes it the settings'
+`dataRoot` unless they name another), else
 `<config root>/host-config`; a relative value is relative to the config root (the
 loader's root: `DEVPANEL_CONFIG_ROOT`, else this checkout); an absolute one is used as
 is. The same rule holds everywhere: the loader and `config:check`
@@ -31,6 +39,9 @@ runs: they were never part of a run's snapshot.
 host-config/
   projects/<id>.yaml
   roster/<id>.yaml
+  playbooks/<id>.yaml
+  decisions/active.yaml
+  decisions/<id>.yaml
   releases/<site>-targets.json
   releases/README.md
   live-reports/<report>
@@ -41,7 +52,7 @@ host-config/
 
 ## Precedence
 
-Each category (projects, roster, releases, live reports) is the union of the in-tree
+Each category (projects, roster, playbooks, releases, live reports) is the union of the in-tree
 directory and the host-config one, by file name. When both hold a file of the same
 name, **the host-config file is used** and the in-tree one is shadowed: `config:check`
 lists it as a warning, not an error. Two different file names declaring the same id
@@ -73,10 +84,18 @@ neutral default, which names no installation:
 | Key | Default | Meaning |
 |---|---|---|
 | `projectsRoot` | the directory holding the panel's checkout | where the `<name>-project` directories are (`DEVPANEL_PROJECTS_DIR` wins) |
+| `dataRoot` | none: the panel's checkout | where the panel keeps what it writes: the issue root becomes `<dataRoot>/issues` (issues, runs, their worktrees, private Git directories, scratch, supervisor state) the server log `<dataRoot>/logs`, the operator token `<dataRoot>/.devpanel-token` and the TLS certificate `<dataRoot>/cert`; `DEVPANEL_ISSUES_DIR`, `DEVPANEL_LOG_DIR`, `DEVPANEL_TOKEN_FILE` and `DEVPANEL_CERT_DIR` still win. The data root is a forbidden root and a fence canary like the panel's checkout |
+| `gitStore` | `false`: the project repository | with `dataRoot`: snapshot objects, `refs/devpanel/*` and the candidate branches `devpanel/<issue>/<run>` go to `<dataRoot>/repos/<project>.git`, a bare store reading the project's objects through alternates (`runtime/git-store.mjs`); the project repository is only read, and an operator-approved merge fetches the candidate's objects into it (no ref). Rewriting and pruning the project's history can leave an old run's snapshot without its parent |
+| `nestedRepositories` | `gitlink`: what `git add -A` records, an empty directory in the run's worktree | `include`: a repository nested in the checkout (a monorepo's part) is snapshotted as that repository would carry it — tracked and unignored files as they are on disk, never its `.git` — so the run sees the whole tree; `apply-to-source` writes there in place (the part sees uncommitted changes), a `commit` delivery touching it is refused, and the source base keeps the gitlink (`runtime/working-tree.mjs` `includeNested`) |
+| `projectDiscovery.pattern` | none: the `<name>-project` entries of the root | find projects below the root instead: `*` per path segment (`"*/*"` is two levels down); identity is the relative path joined with `-` plus `-project` (`2026/shop` → `2026-shop-project`) |
+| `projectDiscovery.markers` | `["package.json"]` | file names any one of which makes a matching directory a project |
 | `proxyLogin.usersDir` | none: a login name is attribution only | the reverse proxy's users directory; `{hostname}` is replaced by the host's name (`DEVPANEL_USERS_DIR` wins) |
 | `proxyLogin.digestFiles` | `[".hash"]` | files in a user's directory holding a SHA-512 hex digest that admits |
 | `projectActions.headerMarkers` | none | marker words read in script headers (`# <MARKER> key: value`) besides `DEVPANEL` |
 | `testDrive.confinement` | none: a `kind: candidate` command needs the project's own | `{user, home}` of candidate commands when the project's `testDrive.confinement` omits them |
+| `selection.allowedHomePaths` | none: the whole home is forbidden | directories inside the home (`~/work`) where an allowed root, tooling mount or materialized target is not refused for being in the home; every other forbidden root still applies |
+| `harnesses.disabled` | none | runtimes this host does not have (`codex`, `gemini`): their roster entries are left out, and a playbook naming one fails resolution saying so (override it in `playbooks/`) |
+| `fence.readOnly` | none | directories bound read-only into every seat fence, for a toolchain under the home (`~/.nvm`); the home, anything containing it and the CLI login directories are refused |
 | `selection.forbiddenPrefixes` | `["production", "staging"]` | projects-root entries named `<prefix>.*` are container filesystems no run may read |
 | `skill.linkBaseVariable` | none | the variable the devpanel skill client reads as its link base after `DEVPANEL_LINKBASE` |
 | `reporter.panelUrl` | none | the panel's private address for `gui/tools/provision-reporter.mjs` |

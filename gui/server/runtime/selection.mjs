@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { isProjectName, projectsRoot } from '../project-path.mjs'
+import { issuesRoot, listProjectDirs, projectsRoot } from '../project-path.mjs'
 import { hostSettings } from '../config/host-settings.mjs'
 import { hostPlatform } from './platform.mjs'
 
@@ -49,20 +49,17 @@ export class SelectionError extends Error {
 }
 
 /**
- * The repositories of the projects the panel resolves: every `*-project` entry
- * of the projects directory (project-path.mjs projectsRoot), reduced to
+ * The repositories of the projects the panel resolves (project-path.mjs
+ * listProjectDirs: the `*-project` entries or the discovered ones), reduced to
  * its canonical repository root, so an alias and its target are one project and
  * a directory that merely looks like a project is not one.
  */
 export async function knownProjectRoots (projectsDir = projectsRoot()) {
   const roots = new Set()
-  let entries = []
-  try { entries = await fs.readdir(projectsDir, { withFileTypes: true }) } catch { return roots }
   const panel = await fs.realpath(PANEL_ROOT).catch(() => PANEL_ROOT)
-  for (const entry of entries) {
-    if (!(entry.isDirectory() || entry.isSymbolicLink()) || !isProjectName(entry.name)) continue
+  for (const { dir } of await listProjectDirs(projectsDir)) {
     try {
-      const real = await fs.realpath(path.join(projectsDir, entry.name))
+      const real = await fs.realpath(dir)
       const root = await fs.realpath((await git(real, ['rev-parse', '--show-toplevel'])).trim())
       // The panel's own checkout is a project too, but never a source of
       // materialized content: it holds the token, every issue and every run.
@@ -90,11 +87,20 @@ export const PANEL_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pat
  * table that was not read is never mistaken for one without mounts. A test
  * names its own `mountinfo` file.
  */
-export async function forbiddenRootsReport ({ home = os.homedir(), projectsDir = projectsRoot(), panelRoot = PANEL_ROOT, mountinfo = null, prefixes = hostSettings().selection.forbiddenPrefixes, platform = hostPlatform() } = {}) {
+export async function forbiddenRootsReport ({ home = os.homedir(), projectsDir = projectsRoot(), panelRoot = PANEL_ROOT, issuesDir = issuesRoot(), dataRoot = hostSettings().dataRoot, mountinfo = null, prefixes = hostSettings().selection.forbiddenPrefixes, platform = hostPlatform() } = {}) {
   const roots = new Set()
   const add = async (p) => { roots.add(await fs.realpath(p).catch(() => path.resolve(p))) }
   await add(home)
   await add(panelRoot)
+  // Every run's worktree, scratch and evidence, and the panel's Git stores:
+  // covered by the panel's checkout by default, roots of their own when the
+  // host moved them (host settings dataRoot).
+  const panel = await fs.realpath(PANEL_ROOT).catch(() => PANEL_ROOT)
+  for (const dir of [issuesDir, dataRoot]) {
+    if (!dir) continue
+    const real = await fs.realpath(dir).catch(() => path.resolve(dir))
+    if (!inside(panel, real)) roots.add(real)
+  }
   let entries = []
   try { entries = await fs.readdir(projectsDir) } catch { /* none */ }
   const conventional = new RegExp(`^(?:${prefixes.join('|')})\\.`)
@@ -110,6 +116,22 @@ export async function forbiddenRootsReport ({ home = os.homedir(), projectsDir =
 }
 
 export const forbiddenRoots = async (options) => (await forbiddenRootsReport(options)).roots
+
+/**
+ * The home rule's one exception (host settings selection.allowedHomePaths):
+ * `exempt(root, p)` is true when the forbidden `root` is the home and `p` lies
+ * inside one of the allowed directories, each strictly inside the home. Every
+ * other forbidden root still applies, and a path containing the home never passes.
+ */
+export async function homeExemption ({ home = os.homedir(), allowed = hostSettings().selection.allowedHomePaths } = {}) {
+  const realHome = await fs.realpath(home).catch(() => path.resolve(home))
+  const dirs = []
+  for (const dir of allowed) {
+    const real = await fs.realpath(dir).catch(() => path.resolve(dir))
+    if (real.startsWith(realHome + path.sep)) dirs.push(real)
+  }
+  return (root, p) => root === realHome && dirs.some((dir) => inside(dir, p))
+}
 const NL = String.fromCharCode(10)
 
 async function ownerRoot (resolved, directory) {
@@ -229,9 +251,10 @@ export async function walkSelection ({ linkPath, resolved, consumerExcludes = []
 /**
  * The authorization launch applies to every target, nested ones included.
  */
-export function authorizer ({ known, grants = [], forbidden = new Set() }) {
+export function authorizer ({ known, grants = [], forbidden = new Set(), exempt = () => false }) {
   return async ({ owner, resolved, path: rel }) => {
     for (const root of forbidden) {
+      if (exempt(root, resolved)) continue
       if (inside(root, resolved) || inside(resolved, root)) {
         throw new SelectionError(`materialized target ${rel} (${resolved}) reaches ${root}, which no run may read`, 'MATERIALIZE_FORBIDDEN', { path: rel, root })
       }
