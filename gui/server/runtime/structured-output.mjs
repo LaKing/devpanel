@@ -139,7 +139,11 @@ export function contractError (value, contract, { ajv, id, defs } = {}) {
   if (missing.length) return `missing ${missing.join(', ')}`
   const validate = ajv?.getSchema(`${id}#/$defs/${contract}`)
   if (validate && !validate(value)) {
-    const detail = validate.errors.slice(0, 5).map((e) => `${e.instancePath || '/'} ${e.message}`).join('; ')
+    // A length violation names the actual length: told only the limit, a coordinator
+    // shortened blind and missed it twice in a row (2026-11-01).
+    const at = (pointer) => pointer.split('/').slice(1).reduce((v, k) => v?.[k.replace(/~1/g, '/').replace(/~0/g, '~')], value)
+    const length = (e) => e.keyword === 'maxLength' && typeof at(e.instancePath) === 'string' ? ` (it has ${at(e.instancePath).length}; shorten by at least ${at(e.instancePath).length - e.params.limit})` : ''
+    const detail = validate.errors.slice(0, 5).map((e) => `${e.instancePath || '/'} ${e.message}${length(e)}`).join('; ')
     return `does not satisfy the ${contract} contract — ${detail}`
   }
   return null

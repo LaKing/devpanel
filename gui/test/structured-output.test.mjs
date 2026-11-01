@@ -63,6 +63,9 @@ export default async function (t) {
 
     const bad = await extractOutput(fence(JSON.stringify({ verdict: 'maybe', artifactRevision: null, findings: [] })), 'reviewResult', { root })
     t.ok('an enum violation is reported with its path', /\/verdict/.test(bad.error), bad.error)
+
+    const long = await extractOutput(fence(JSON.stringify({ targetRole: 'author', prompt: 'x'.repeat(2950) })), 'handoff', { root })
+    t.ok('a length violation names the actual length and how much to cut', /\/prompt must NOT have more than 2400 characters \(it has 2950; shorten by at least 550\)/.test(long.error), long.error)
   }
 
   t.section('6. no JSON at all is classified as no structured output')
