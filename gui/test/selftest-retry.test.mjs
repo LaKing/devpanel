@@ -29,6 +29,24 @@ export default async function (t) {
         t.eq('the retry is an attempt', out.attempts[0].dir, 'checks/003')
     }
 
+    t.section('a different unstable test in the retry: nothing failed twice, so nothing is new')
+    {
+        const again = { selftest: { ...fresh(['service/fox']), baselineKnown: [{ command: 'collect', test: 'seed' }] } }
+        const { out } = await attempt({ first: drive('checks/004', fresh(['service/settlement', 'fox/capture'])), retry: drive('checks/005', null), again })
+        t.eq('the retry replaces the first drive, flaky', [out.dir, out.flaky, out.selftestReproduced], ['checks/005', true, undefined])
+        t.eq('its comparison passes the gate: no new failures, the inherited ones kept', [out.baselineComparison.selftest.verdict, out.baselineComparison.selftest.newFailures], ['baseline-known', []])
+        t.eq('every one-drive failure is named as flaky', out.baselineComparison.selftest.flakyFailures.map((f) => f.test), ['service/settlement', 'fox/capture', 'service/fox'])
+    }
+
+    t.section('a partial reproduction names only what failed twice')
+    {
+        const { out } = await attempt({ first: drive('checks/002', fresh(['admin/(thread-ready)', 'seed-apply', 'service/fox'])), retry: drive('checks/003', null), again: { selftest: fresh(['seed-apply']) } })
+        t.eq('the first drive stands, reproduced', [out.dir, out.selftestReproduced], ['checks/002', true])
+        t.eq('new failures are the intersection', out.baselineComparison.selftest.newFailures.map((f) => f.test), ['seed-apply'])
+        t.eq('the rest are flaky', out.baselineComparison.selftest.flakyFailures.map((f) => f.test), ['admin/(thread-ready)', 'service/fox'])
+        t.eq('the gate still fails it', out.baselineComparison.selftest.verdict, 'new-failures')
+    }
+
     t.section('nothing else is retried')
     {
         const cases = {

@@ -272,10 +272,13 @@ A drive that **passed** but whose selftest report names failures the base does
 not have (`baselineComparison.selftest.verdict: new-failures`) fails the gate
 too, and runs once more on the same revision under the same allowance
 (`runtime/selftest-retry.mjs`; the event carries `reason: new-selftest-failures`).
-A second drive that names none of those tests again replaces the first, marked
-`flaky`, with the first kept in `attempts` beside the `newFailures` it named;
-one that names any of them again leaves the first standing with
-`selftestReproduced: true`. Either way only then does the author get a round.
+Only a test that fails in both drives counts as new. When none does, the second
+drive replaces the first, marked `flaky`, with the first kept in `attempts`
+beside the `newFailures` it named, and its comparison cleared of the one-drive
+failures, which stay listed as `selftest.flakyFailures` (a different unstable
+test in the second drive does not fail it). When some do, the first stands with
+`selftestReproduced: true` and `newFailures` narrowed to those, the rest listed
+as `flakyFailures`; only then does the author get a round.
 
 When every reviewer approved a revision, its check failed, and the author's
 next answer is the **same revision**, the loop stops as
