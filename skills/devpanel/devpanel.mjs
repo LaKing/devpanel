@@ -275,7 +275,17 @@ const commands = {
         const { io } = createRequire(path.join(ROOT, 'gui', 'package.json'))('socket.io-client');
         const socket = io(SERVER.origin, { auth: { token: token() }, rejectUnauthorized: false, transports: ['websocket'] });
         const time = () => new Date().toTimeString().slice(0, 8);
-        socket.on('connect', () => console.log(`${time()} watching ${project}${id ? `/${id}` : ''}`));
+        const settleIfSettled = async () => {
+            const run = await settledRun().catch(() => null);
+            if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); socket.close(); }
+        };
+        socket.on('connect', () => {
+            console.log(`${time()} watching ${project}${id ? `/${id}` : ''}`);
+            // Events emitted before this (re)connection were never seen: the run may have settled before the first
+            // connect, or while the panel restarted (a panel shutting down closes its sockets before it announces
+            // the runs it stopped), so ask the record again.
+            if (untilSettled) settleIfSettled();
+        });
         socket.on('connect_error', (e) => console.log(`${time()} cannot connect: ${e.data?.reason ?? e.message}`));
         socket.on('disconnect', (reason) => console.log(`${time()} disconnected: ${reason}`));
         socket.on('run:event', async (e) => {
@@ -283,10 +293,7 @@ const commands = {
             const detail = [e.role, e.stepId, e.status ?? e.outcome ?? e.reason].filter(Boolean).join(' ');
             console.log(`${time()} ${id ? '' : `${e.issueId} `}${e.runId ?? ''} ${e.type}${detail ? ` ${detail}` : ''}`);
             // The run record, not the event, says whether it settled: a pause or an end is persisted before it is emitted.
-            if (untilSettled && SETTLING.has(e.type)) {
-                const run = await settledRun().catch(() => null);
-                if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); socket.close(); }
-            }
+            if (untilSettled && SETTLING.has(e.type)) await settleIfSettled();
         });
     },
 };
