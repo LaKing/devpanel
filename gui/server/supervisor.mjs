@@ -1,4 +1,4 @@
-import { checksOnlyBlock, continueUnavailable, resumeUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
+import { continueUnavailable, integrateUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
@@ -463,7 +463,7 @@ export function createSupervisor ({
    * resumes, so a crash right after leaves the decision on disk. The same
    * one-live-run-per-project rule applies as for a start.
    */
-  async function answer ({ project, issueId, runId, text, actor, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false }) {
+  async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
@@ -510,7 +510,7 @@ export function createSupervisor ({
       }
       if (!resume && !recover && !integrity && !retryInput && !refreshChecks && !continueRun && engine.run.status !== 'paused') throw err(409, 'this run is not waiting for a decision')
       if (recover) {
-        const outcome = await engine.recoverOwnerLoss({ budgets })
+        const outcome = await engine.recoverOwnerLoss({ budgets, actor, origin })
         if (!outcome.resumed) {
           // Reconciliation is recorded; what is left needs a person.
           await engine.runLock?.release().catch(() => {})
@@ -519,7 +519,7 @@ export function createSupervisor ({
           return { runId, status: engine.run.status, recovered: false, reason: outcome.reason }
         }
       }
-      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)) }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(stagingTarget(await projectInfrastructure(project, { root: configRoot }))) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
       // The worktree was handed back when the run paused; it is ours again.
       if (engine.run.workspace?.state === 'retained') {
         engine.run.workspace.state = 'active'
@@ -1588,14 +1588,14 @@ function translate (error) {
  * unproved cleanup comes first, whatever else the run offers (an abandoned run
  * included): proving it where this host can scan, acknowledging it always.
  */
-export function supportedActions (run, { active = false } = {}) {
-  const base = baseActions(run, { active })
+export function supportedActions (run, { active = false, refresh } = {}) {
+  const base = baseActions(run, { active, refresh })
   const open = openCleanup(run)
   if (!open.length || active || LIVE_STATUSES.includes(run.status)) return base
   return [...(open.some((e) => e.structural) || !hostPlatform().descendantScan?.proved ? [] : ['prove-cleanup']), 'acknowledge-cleanup', ...base]
 }
 
-function baseActions (run, { active = false } = {}) {
+function baseActions (run, { active = false, refresh } = {}) {
   if (run.abandonment && run.status === 'cancelled') return ['start-new']
   // A restart, not a fault of the run: reconcile and continue, or give it up.
   if (!active && ownerLossRecoverable(run)) return ['recover', 'abandon']
@@ -1614,25 +1614,24 @@ function baseActions (run, { active = false } = {}) {
   // Manual pauses resume directly; policy questions still require an answer.
   if (run.status === 'paused') return run.pause?.kind === 'manual' ? (resumeUnavailable(run) ? ['abandon'] : ['resume', 'abandon']) : ['answer', 'abandon']
   // Stopped only by failed checks on an approved revision: rerunning them is the remedy, beside resume.
-  const refreshable = checksOnlyBlock(run) && run.integrity?.status === 'clear' && !run.release && run.workspace?.state !== 'removed'
+  const refreshable = !refreshChecksUnavailable(run, refresh)
   if (!resumeUnavailable(run)) return refreshable ? ['refresh-checks', 'resume', 'start-new'] : ['resume', 'start-new']
   if (run.status === 'blocked') {
     // Other blockers retain their specific recovery and finalization controls.
     if (run.blockedReason === 'recovery-required' || run.recovery?.required) return ['abandon']
     // Stopped at the hand-off with the approved candidate still on disk: the
     // reviews stand, so closure may be evaluated again once the cause is fixed.
-    if ((['closure-conditions-unmet', 'refreshed-checks-failed'].includes(run.blockedReason) || refreshable) && run.integrity?.status === 'clear' && !run.release && run.workspace?.state !== 'removed') return continueUnavailable(run) ? ['refresh-checks', 'start-new'] : ['continue', 'refresh-checks', 'start-new']
-    if (run.blockedReason === 'checks-failed-unchanged' && !continueUnavailable(run)) return ['continue', 'start-new']
+    const continuable = !continueUnavailable(run)
+    if (continuable || refreshable) return [...(continuable ? ['continue'] : []), ...(refreshable ? ['refresh-checks'] : []), 'start-new']
     const finalizable = FINALIZABLE_BLOCKS.includes(run.blockedReason) && run.workspace?.path && run.workspace.state !== 'removed' && run.integrity?.status !== 'quarantined'
     // Refused for drift on the approved patch's own paths: merging it onto the source is the remedy.
     if (finalizable && !reconcileUnavailable(run)) return ['reconcile-delivery', 'finalize', 'start-new']
     return finalizable ? ['finalize', 'start-new'] : ['start-new']
   }
-  if (run.status === 'failed' && /input_too_large|Input exceeds the maximum length/i.test(run.failures?.at(-1)?.evidence ?? '') && run.integrity?.status === 'clear' && !run.recovery?.required && !run.release && run.workspace?.state !== 'removed') return ['retry-input', 'start-new']
+  if (!retryInputUnavailable(run)) return ['retry-input', 'start-new']
   if (['completed', 'cancelled', 'failed'].includes(run.status)) {
     // A committed, verified, not-yet-integrated candidate may be integrated.
-    const integrable = run.integrity?.status !== 'abandoned' && run.delivery?.action === 'commit' && run.delivery.completedAt && run.delivery.commit && !run.integration?.mergeCommit && !['publishing', 'published'].includes(run.integration?.phase)
-    return integrable ? ['start-new', 'integrate'] : ['start-new']
+    return integrateUnavailable(run) ? ['start-new'] : ['start-new', 'integrate']
   }
   return active ? ['stop'] : []
 }

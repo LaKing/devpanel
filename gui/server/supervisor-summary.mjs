@@ -67,7 +67,7 @@ export function runReading (run) {
 
 /** A run of a packed issue, read from its bundle's record (`record` is run.json): no steps, its ending and its delivery. */
 export function summarisePackedRun ({ runId, project, issueId, record }) {
-  return { runId, project, issueId, packed: true, status: record.status, outcome: record.outcome ?? null, blockedReason: record.blockedReason ?? null,
+  return { runId, project, issueId, packed: true, actions: [], status: record.status, outcome: record.outcome ?? null, blockedReason: record.blockedReason ?? null,
     budgets: record.budgets ?? null, modelSubstitutions: record.modelSubstitutions ?? [],
     landed: record.landed ?? null, reconciliation: decidedReconciliation(record.reconciliations), artifactApplication: record.artifactApplication ?? null,
     delivery: record.delivery ? { action: record.delivery.action, completedAt: record.delivery.completedAt, application: record.delivery.application ?? null } : null,
@@ -143,7 +143,9 @@ export function summariseRun (detail) {
     workspace: detail.workspace ?? null,
     diagnostics: detail.diagnostics ?? null,
     active: detail.active ?? [],
-    supportedActions: detail.supportedActions ?? [],
+    actions: detail.actions ?? [],
+    // The same list under its older name: a session already running was told to read it.
+    supportedActions: detail.actions ?? [],
     steps,
     detail: 'Each step\'s prompt, response and structured output: get_step {project, issueId, runId, step}.'
   }

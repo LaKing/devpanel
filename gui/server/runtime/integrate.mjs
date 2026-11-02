@@ -1,3 +1,4 @@
+import { integrateUnavailable } from './run-control.mjs'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -84,12 +85,9 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
   await store.requireCompleteEvents(issuePath, runId)
   const runRecord = await store.readRun(issuePath, runId).catch(() => null)
   if (!runRecord) throw refuse('no such run', 404)
-  if (['quarantined', 'abandoned'].includes(runRecord.integrity?.status) || runRecord.recovery?.required) throw refuse('source integrity requires an explicit recovery disposition before integration')
+  const refusal = integrateUnavailable(runRecord)
+  if (refusal) throw refuse(refusal)
   const delivery = runRecord.delivery
-  if (['publishing', 'published'].includes(runRecord.integration?.phase)) throw refuse('a previous publication is unfinished; it is reconciled at startup, or reconcile it explicitly before approving again')
-  if (runRecord.integration?.mergeCommit) throw refuse(`already integrated as ${runRecord.integration.mergeCommit.slice(0, 12)} into ${runRecord.integration.targetBranch}`)
-  if (!delivery?.completedAt || delivery.action !== 'commit' || !delivery.commit) throw refuse('this run has no committed, verified candidate to integrate')
-  if (delivery.reconstruction?.verified !== true) throw refuse('the delivered commit was not verified against the revision')
   if (expectedRevision !== delivery.revision) throw refuse(`approval names revision ${String(expectedRevision).slice(0, 23)}…, but the delivered revision is ${delivery.revision.slice(0, 23)}…; review the run again before approving`)
 
   const cfg = await projectConfig(project, { root: configRoot, projectPath })

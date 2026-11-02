@@ -41,7 +41,7 @@ destination shown in readiness/preview and verify it before resolution. Select
 checkouts, preserving links, indexes and history. Source drift or an unbound owner
 blocks application; finalize can retry retained approved work after correction.
 When the drift reached the approved patch's own paths, `reconcile_delivery_run
-{project, issueId, runId}` (a run it owns whose `supportedActions` include
+{project, issueId, runId}` (a run it owns whose `actions` include
 `reconcile-delivery`) has the engine merge that patch three-way onto the current
 source, revalidate the merged candidate with the run's configured checks, carry
 the approvals (`reconciledFrom`) and deliver it — the same bounded authority,

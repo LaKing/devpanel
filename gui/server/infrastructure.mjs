@@ -166,10 +166,10 @@ export async function projectInfrastructure (project, { root } = {}) {
 export async function inspectEnvironment ({ project, environment, resource = 'status' }, { root, signal } = {}) {
   const infra = await projectInfrastructure(project, { root })
   const env = infra && [infra.staging, ...infra.deployments].find(e => e.id === environment)
-  if (!env) throw new Error('Unknown configured environment')
+  if (!env) throw Object.assign(new Error('Unknown configured environment'), { status: 400 })
   const file = Object.hasOwn(env.files, resource) ? env.files[resource] : null
   const command = resource === 'status' ? env.statusCommand : file ? `tail -c 32768 -- ${quote(file)}` : null
-  if (!command) throw new Error('Unknown configured diagnostic resource')
+  if (!command) throw Object.assign(new Error('Unknown configured diagnostic resource'), { status: 400 })
   const { sshConnection } = await import('./runtime/ssh.mjs')
   const ssh = await sshConnection(env.ssh)
   const timeout = AbortSignal.timeout(20000)

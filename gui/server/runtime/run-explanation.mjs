@@ -40,6 +40,21 @@ function driveWords (run) {
   return smoke ? ' The full drive never ran on the last revision: its audit held blocking findings that do not wait for it.' : ''
 }
 
+/**
+ * A run whose last audit held nothing but findings awaiting the drive, and that
+ * drive did not pass: the reviewers were waiting on it, not disagreeing.
+ */
+function awaitedDriveFailed (run) {
+  const findings = run.outstandingFindings ?? []
+  if (!findings.length || !findings.every((f) => f.awaitsCheck === true)) return null
+  const revision = run.revisions?.at(-1)?.fingerprint
+  const full = (run.checkHistory ?? []).filter((h) => h.revision === revision && h.tier !== 'smoke').at(-1)
+  const outcome = full?.gating ?? full?.result
+  if (!['failed', 'unavailable'].includes(outcome)) return null
+  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && c.tier !== 'smoke').at(-1)
+  return { outcome, findings: findings.map((f) => f.id), timedOut: (check?.commands ?? []).filter((c) => c.timedOut).map((c) => c.id) }
+}
+
 const ROLE = (role) => {
   if (!role) return 'an agent'
   if (role === 'coordinator') return 'the coordinator'
@@ -461,6 +476,13 @@ function blocked (run, outputs, kept) {
         return { ...base, headline: 'Stopped: the reviewers approved, but the automated checks failed',
           detail: `${checkFailureWords(check?.baselineComparison?.failures, check?.commands)}${selftestWords(check?.baselineComparison?.selftest)}${reason === 'checks-failed-unchanged' ? 'The author answered the failure with an unchanged candidate, so another round could only repeat it.' : 'The review loop reached its round limit.'}`,
           next: `Refresh checks reruns them on this candidate (after a flaky or environmental failure is fixed). ${reason === 'checks-failed-unchanged' ? 'Continue gives the author another round with your instruction.' : 'Resume gives the author one more round.'}` }
+      }
+      const awaited = reason === 'rounds-exhausted' ? awaitedDriveFailed(run) : null
+      if (awaited) {
+        const how = awaited.timedOut.length ? 'hung' : awaited.outcome === 'unavailable' ? 'was unavailable' : 'failed'
+        return { ...base, headline: `Stopped: the last audit only awaited the drive, and the drive ${how}`,
+          detail: `The last audit's only blocking findings (${awaited.findings.join(', ')}) awaited the drive of the last revision.${awaited.timedOut.length ? ` Timed out: ${awaited.timedOut.join(', ')}.` : ''}${driveWords(run)}`,
+          next: "Resume for one more round; its brief carries the drive's result. If the drive itself is at fault (staging, timeouts), fix that first." }
       }
       const denied = run.extensionDenied
       return { ...base, headline: "Stopped: the author and reviewers didn't agree in time",

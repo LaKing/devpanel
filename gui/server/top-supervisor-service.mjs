@@ -99,8 +99,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    inspectEnvironment:a=>inspectEnvironment(a,{root:configRoot}),
    deployStaging:async(a,{signal}={})=>{
     const issue=await issues.getIssue(a.project,a.issueId)
-    if(issue.archived)throw new Error('Cannot deploy for an archived issue')
-    if(supervisor.isActive(a.project,a.issueId))throw new Error('Stop the active issue run before a shared staging deployment')
+    if(issue.archived)throw Object.assign(new Error('Cannot deploy for an archived issue'),{status:409})
+    if(supervisor.isActive(a.project,a.issueId))throw Object.assign(new Error('Stop the active issue run before a shared staging deployment'),{status:409})
     const result=await deployStaging({project:a.project,issuePath:issue.path,root:configRoot,signal})
     await mutate(()=>issues.createStep(a.project,a.issueId,{name:'staging-deployment',text:deploymentReport(result),format:'md',invocationId:`staging-deployment:${result.id}`}))
     return result

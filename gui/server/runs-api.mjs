@@ -1,4 +1,4 @@
-import { resumeUnavailable } from './runtime/run-control.mjs'
+import { refreshFacts, resumeUnavailable } from './runtime/run-control.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -60,7 +60,8 @@ export async function listRuns (issuePath) {
         timing: run.timing ?? null,
         preflight: run.preflight ? { state: run.preflight.state, attempts: run.preflight.attempts } : null,
         workspaceState: run.workspace?.state ?? null,
-        supportedActions: supportedActions(run)
+        // Only a blocked run can offer refresh-checks, which needs its snapshot.
+        supportedActions: supportedActions(run, run.status === 'blocked' ? { refresh: refreshFacts(await store.readSnapshot(issuePath, run.runId).catch(() => null)) } : {})
       })
     } catch { /* a half-written run directory is not a run */ }
   }
@@ -170,6 +171,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     }))
 
   const approvals = run.approvals.map((a) => ({ ...a, appliesToCurrentRevision: a.revision === currentRevision }))
+  const actions = supportedActions(run, { active: isActive, refresh: refreshFacts(snapshot) })
   const checkResults = run.checkResults.map((c) => ({ ...c, appliesToCurrentRevision: c.revision === currentRevision }))
 
   return {
@@ -184,7 +186,9 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     explanation: explainRun(run, { outputs, active, ownership }),
     // Only what the backend will actually accept. A button for anything else
     // would promise something the server refuses.
-    supportedActions: supportedActions(run, { active: isActive }),
+    actions,
+    // The same list under its older name, for the panel and supervisor sessions that read it.
+    supportedActions: actions,
     recovery: run.recovery,
     abandonment: run.abandonment ? { at: run.abandonment.at, by: run.abandonment.by } : null,
     pause: run.pause ?? null,

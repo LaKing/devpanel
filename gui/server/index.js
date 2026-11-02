@@ -147,6 +147,8 @@ app.get('/api/whoami', (req, res) => res.json({ user: req.actor, verified: req.l
 // Small wrapper so a rejected promise becomes a 500 instead of an unhandled
 // rejection that takes the process down.
 const route = (handler) => (req, res, next) => Promise.resolve(handler(req, res)).catch(next)
+// Who a resume is recorded under: the login, else the name given, else no name is known.
+const resumingActor = (req) => req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || 'operator')
 
 app.get('/api/projects', route(async (_req, res) => {
   res.json(await listProjects())
@@ -652,7 +654,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/pause', route(async (req
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/resume', route(async (req, res) => {
   const { project, id: issueId, runId } = req.params
-  res.status(202).json(await supervisor.resume({ project, issueId, runId, budgets: req.body?.budgets ?? {} }))
+  res.status(202).json(await supervisor.resume({ project, issueId, runId, budgets: req.body?.budgets ?? {}, actor: resumingActor(req), origin: 'panel' }))
 }))
 
 app.get('/api/projects/:project/issues/:id/runs/:runId/integrity', route(async (req, res) => {
@@ -673,7 +675,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/integrity', route(async 
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/recover', route(async (req, res) => {
   const { project, id: issueId, runId } = req.params
-  res.status(202).json(await supervisor.recover({ project, issueId, runId, budgets: req.body?.budgets ?? {} }))
+  res.status(202).json(await supervisor.recover({ project, issueId, runId, budgets: req.body?.budgets ?? {}, actor: resumingActor(req), origin: 'panel' }))
 }))
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/answer', route(async (req, res) => {

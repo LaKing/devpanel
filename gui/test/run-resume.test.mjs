@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { startRun, resumeRun, releaseOwnership } from '../server/runtime/launch.mjs'
-import { readSnapshot } from '../server/runtime/store.mjs'
+import { inspectRunJournal, readSnapshot } from '../server/runtime/store.mjs'
 import { supportedActions, workspaceDisposition } from '../server/supervisor.mjs'
 import { engineFixture, scriptFor, blocking, pausingStrategy } from './fakes/fixture.mjs'
 
@@ -28,7 +28,10 @@ export default async t => {
     await releaseOwnership(engine)
     f.clock.advance(8 * 86400000)
     const resumed = await reload(f, engine.runId)
-    await resumed.resumeExecution()
+    await resumed.resumeExecution({ actor: 'ada', origin: 'panel' })
+    t.eq('the history says who resumed it and from where', [resumed.run.resumeHistory.at(-1).actor, resumed.run.resumeHistory.at(-1).origin], ['ada', 'panel'])
+    const resumedEvent = (await inspectRunJournal(f.issuePath, engine.runId)).events.filter((e) => e.type === 'operator-resumed').at(-1)
+    t.eq('and so does the event', [resumedEvent?.actor, resumedEvent?.origin], ['ada', 'panel'])
     t.eq('usage is preserved', resumed.run.budgets.used, usage)
     t.eq('sessions are preserved', Object.fromEntries(Object.entries(resumed.run.participants).map(([k,p]) => [k,p.session])), sessions)
     t.eq('paused time does not exhaust the budget', resumed.budgetExceeded(), null)
@@ -91,6 +94,7 @@ export default async t => {
     t.eq(`${kind} is blocked`, engine.run.blockedReason, kind === 'rounds' ? 'rounds-exhausted' : 'protocol-repair-exhausted')
     const count = engine.run.steps.length
     await engine.resumeExecution()
+    t.eq(`${kind}: with no name known it says operator, from the panel`, [engine.run.resumeHistory.at(-1).actor, engine.run.resumeHistory.at(-1).origin], ['operator', 'panel'])
     await releaseOwnership(engine)
     const resumed = await reload(f, engine.runId)
     await resumed.drive()

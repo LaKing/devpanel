@@ -351,7 +351,7 @@ async function recoverRun () {
   recovering.value = true
   actionError.value = ''
   try {
-    const result = await api.recoverRun(project.value, issueId.value, run.value.runId)
+    const result = await api.recoverRun(project.value, issueId.value, run.value.runId, actorName(answerActor.value) || undefined)
     if (result.recovered === false) actionError.value = `Recovery could not continue the run: ${result.reason}`
     await load()
   } catch (error) { actionError.value = error.message } finally { recovering.value = false }
@@ -540,7 +540,7 @@ async function resumeRun () {
   resuming.value = true
   actionError.value = ''
   try {
-    await api.resumeRun(project.value, issueId.value, run.value.runId, resumeBudgets.value)
+    await api.resumeRun(project.value, issueId.value, run.value.runId, resumeBudgets.value, actorName(answerActor.value) || undefined)
     resumeDialog.value = false
     await load()
   } catch (error) { actionError.value = error.message }

@@ -1,4 +1,4 @@
-import { checksOnlyBlock, continueUnavailable, resumeUnavailable } from './run-control.mjs'
+import { continueUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable } from './run-control.mjs'
 import { describeCommand } from './command-line.mjs'
 import { checkSummary } from './check-summary.mjs'
 import { earlierDrives, reproducedSelftests, retryNewSelftestFailures, sameFailureEarlier } from './selftest-retry.mjs'
@@ -1297,7 +1297,7 @@ export class Engine {
    * clear workspace resumes — from the replayed record, with the time nobody
    * owned it counted as suspended rather than as budget.
    */
-  async recoverOwnerLoss ({ budgets = {} } = {}) {
+  async recoverOwnerLoss ({ budgets = {}, actor, origin } = {}) {
     await this.assertJournal()
     if (!ownerLost(this.run)) throw Object.assign(new Error('Only a run whose owning process disappeared can be recovered this way.'), { status: 409 })
     if (this.run.integrity?.status !== 'clear') throw Object.assign(new Error('Resolve the run’s source-integrity quarantine first.'), { status: 409 })
@@ -1320,7 +1320,7 @@ export class Engine {
     this.run.recovery = { required: false, reason: null, detectedAt: null }
     this.run.status = 'blocked'
     this.run.blockedReason = 'owner-lost'
-    const entry = await this.resumeExecution({ budgets, stoppedAt: lostAt ?? detectedAt })
+    const entry = await this.resumeExecution({ budgets, stoppedAt: lostAt ?? detectedAt, actor, origin })
     return { resumed: true, entry }
   }
 
@@ -2415,7 +2415,7 @@ export class Engine {
   }
 
   /** Keep the immutable launch snapshot and record explicit continuation allowances separately. */
-  async resumeExecution ({ budgets = {}, stoppedAt = null, unrecordedBarrier = [] } = {}) {
+  async resumeExecution ({ budgets = {}, stoppedAt = null, unrecordedBarrier = [], actor = 'operator', origin = 'panel' } = {}) {
     await this.assertJournal()
     const refusal = resumeUnavailable(this.run)
     if (refusal) throw Object.assign(new Error(refusal), { status: 409 })
@@ -2446,7 +2446,7 @@ export class Engine {
     if (previousReason === 'protocol-repair-exhausted') overrides.repairAttempts = this.snapshot.reviewPolicy.protocolRepair.maxAttempts + 1
     this.run.controlOverrides = overrides
     this.applyControlOverrides()
-    const entry = { at: this.clock.iso(), previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides }
+    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides }
     this.run.resumeHistory ??= []
     this.run.resumeHistory.push(entry)
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
@@ -2480,16 +2480,18 @@ export class Engine {
    */
   async refreshClosureChecks (target) {
     await this.assertJournal()
-    if (this.run.status !== 'blocked' || !(['closure-conditions-unmet', 'refreshed-checks-failed'].includes(this.run.blockedReason) || checksOnlyBlock(this.run)) || !this.snapshot.tactic || this.run.release) throw new Error('Only a retained code run blocked at closure, or stopped only by failed checks on an approved revision, can refresh checks')
-    if (!target || this.run.integrity?.status !== 'clear' || this.run.recovery?.required || Object.values(this.run.participants).some(p => p.pendingInvocation || p.state === 'recovery-required')) throw new Error('Check refresh needs a configured target and clear integrity')
+    // The project's target as configured now, else the one this run was cut with
+    // (a project's local checks, a playbook's own target).
+    const refreshTarget = target ?? this.snapshot.checks?.target ?? null
+    const refusal = refreshChecksUnavailable(this.run, { tactic: Boolean(this.snapshot.tactic), target: Boolean(refreshTarget) })
+    if (refusal) throw Object.assign(new Error(refusal), { status: 409 })
     const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
     const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
-    if (current.hash !== checkpoint.hash) throw new Error('Retained workspace changed; inspect integrity before refreshing checks')
-    const revision = this.run.revisions.at(-1)?.fingerprint
-    if (!revision) throw new Error('No candidate revision exists')
+    if (current.hash !== checkpoint.hash) throw Object.assign(new Error('Retained workspace changed; inspect integrity before refreshing checks'), { status: 409 })
+    const revision = this.run.revisions.at(-1).fingerprint
     this.run.checkRefreshHistory ??= []
     if (this.run.checkRefresh) this.run.checkRefreshHistory.push(this.run.checkRefresh)
-    this.run.checkRefresh = { target, revision, requestedAt: this.clock.iso(), pending: true }
+    this.run.checkRefresh = { target: refreshTarget, revision, requestedAt: this.clock.iso(), pending: true }
     this.run.supersededSteps = [...new Set([...(this.run.supersededSteps ?? []), ...this.run.steps.filter(s => this.outputs[s.number]?.contract === 'closureConfirmation').map(s => s.number)])]
     const stoppedAt = Date.parse(this.run.endedAt ?? this.run.closure?.at)
     if (Number.isFinite(stoppedAt)) this.run.checkRefreshSuspendedMs = (this.run.checkRefreshSuspendedMs ?? 0) + Math.max(0, this.clock.now() - stoppedAt)
@@ -2498,7 +2500,7 @@ export class Engine {
     this.run.endedAt = null
     this.run.closure = null
     for (const [role, p] of Object.entries(this.run.participants)) if (this.snapshot.participants[role].coordinationOnly) { p.session = null; p.readSession = null; p.state = 'uninitialised' }
-    await this.persist({ type: 'checks-refresh-requested', revision, target })
+    await this.persist({ type: 'checks-refresh-requested', revision, target: refreshTarget })
     return { kind: 'checks-refresh', revision }
   }
 
@@ -2573,17 +2575,16 @@ export class Engine {
 
   async retryInputFailure () {
     await this.assertJournal()
-    const failure = this.run.failures?.at(-1)
-    if (this.run.status !== 'failed' || !/input_too_large|Input exceeds the maximum length/i.test(failure?.evidence ?? '')) throw new Error('Only a confirmed input-size rejection can use this retry')
-    if (this.run.release || this.run.recovery?.required || this.run.integrity?.status !== 'clear' || Object.values(this.run.participants).some(p => p.pendingInvocation || p.state === 'recovery-required')) throw new Error('Run requires recovery before retry')
+    const refusal = retryInputUnavailable(this.run)
+    if (refusal) throw Object.assign(new Error(refusal), { status: 409 })
+    const failure = this.run.failures.at(-1)
     const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
     const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
-    if (current.hash !== checkpoint.hash) throw new Error('Retained workspace changed; inspect integrity before retry')
+    if (current.hash !== checkpoint.hash) throw Object.assign(new Error('Retained workspace changed; inspect integrity before retry'), { status: 409 })
     const participant = this.run.participants[failure.role]
     participant.session = null
     participant.state = 'uninitialised'
     const stoppedAt = Date.parse(this.run.endedAt ?? failure.at)
-    if (!Number.isFinite(stoppedAt)) throw new Error('The failed run has no recorded stop time')
     const suspendedMs = Math.max(0, this.clock.now() - stoppedAt)
     this.run.inputRetrySuspendedMs = (this.run.inputRetrySuspendedMs ?? 0) + suspendedMs
     this.run.status = 'pending'

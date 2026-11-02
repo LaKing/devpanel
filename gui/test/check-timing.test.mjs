@@ -420,6 +420,7 @@ export default async function (t) {
     const [, second] = revisionsOf(engine)
     t.eq('a drive that fails too ends the loop, one drive, no second try', [stopped(engine), await fullDrives(engine), fullOf(engine, second)], ['blocked/rounds-exhausted', [second], 'failed'])
     t.ok('and the explanation says so', explainRun(engine.run).detail.includes('after its smoke failed and failed'), explainRun(engine.run).detail)
+    t.eq('this audit also held an ordinary blocker: that is disagreement, whatever the drive did', explainRun(engine.run).headline, "Stopped: the author and reviewers didn't agree in time")
     await releaseWorkspace(engine)
   }
   {
@@ -460,6 +461,7 @@ export default async function (t) {
     // The note's rule (not adopted): a round whose only findings await the drive still counts.
     const { engine } = await scenario({ check: 'test ! -f round-0.txt', target: '    timing: approved\n    retryFailed: 0\n', cap: 2, awaits: () => true })
     t.eq('rounds whose findings all await a failing drive count, and stop at the cap', [stopped(engine), engine.run.revisions.length, engine.run.checkHistory.map((h) => h.result)], ['blocked/rounds-exhausted', 2, ['failed', 'failed']])
+    t.eq('and the explanation says the audit awaited the failed drive', explainRun(engine.run).headline, 'Stopped: the last audit only awaited the drive, and the drive failed')
     await releaseWorkspace(engine)
   }
 

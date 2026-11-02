@@ -63,6 +63,9 @@ export default async function (t) {
     let unknown = false
     try { await inspectEnvironment({ project: 'devpanel-project', environment: 'production', resource: '/etc/passwd' }, { root: f.configRoot }) } catch { unknown = true }
     t.ok('unconfigured diagnostic paths cannot be requested', unknown)
+    const refusedStatus = (args) => inspectEnvironment(args, { root: f.configRoot }).then(() => null, (error) => error.status)
+    t.eq('an unknown resource is a refusal, not a fault', await refusedStatus({ project: 'devpanel-project', environment: 'production', resource: '/etc/passwd' }), 400)
+    t.eq('an unknown environment too', await refusedStatus({ project: 'devpanel-project', environment: 'nowhere' }), 400)
     for (const resource of ['constructor', '__proto__', 'toString']) {
       let denied = false
       try { await inspectEnvironment({ project: 'devpanel-project', environment: 'production', resource }, { root: f.configRoot }) } catch (error) { denied = error.message === 'Unknown configured diagnostic resource' }

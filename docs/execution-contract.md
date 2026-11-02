@@ -1999,7 +1999,10 @@ allowances must be explicitly increased. The UI defaults elapsed time to seven
 days (10,080 minutes). Time spent stopped or waiting for an operator answer is
 excluded from the deadline; spent steps and tokens are never reset. Resume grants
 one additional review round or protocol repair when that is the exhausted limit.
-Changes are recorded in `resumeHistory` and `controlOverrides`; the original
+Changes are recorded in `resumeHistory` and `controlOverrides`, and each
+`resumeHistory` entry and `operator-resumed` event names its `actor` and `origin`
+(`panel` or `supervisor`; `operator` when no name was known; older entries carry
+neither and are not rewritten); the original
 resolved playbook snapshot stays immutable. Explicit continuation does not imply
 approval of any outstanding finding or automatic resolution of the issue.
 

@@ -13,10 +13,15 @@ export default async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-supervisor-limits-'))
   const events = []
   let continues = 0, followUps = 0, step = 0
+  const recoveries = []
   const plan = [
     { type: 'preview', project: 'p', issueId: 'a', playbook: 'x' },
     (e) => ({ type: 'start_run', project: 'p', issueId: 'a', previewId: e.result.previewId }),
+    { type: 'recover_run', project: 'p', issueId: 'a', runId: 'r1' },
+    // A model naming who it is: the protocol refuses the reply, and the repair event brings the next step.
+    { type: 'recover_run', project: 'p', issueId: 'a', runId: 'r1', actor: 'someone-else' },
     { type: 'continue_run', project: 'p', issueId: 'a', runId: 'r1', instruction: 'once more' },
+    { type: 'recover_run', project: 'p', issueId: 'a', runId: 'r1', origin: 'panel' },
     { type: 'continue_run', project: 'p', issueId: 'a', runId: 'r1', instruction: 'and again' },
     { type: 'create_followups', project: 'p', issueId: 'a', runId: 'r1' }
   ]
@@ -34,6 +39,7 @@ export default async function (t) {
     start: async () => ({ runId: 'r1', status: 'blocked' }),
     getRun: async () => ({ runId: 'r1', status: 'blocked' }),
     continueRun: async () => { continues++; return { ok: true } },
+    recover: async (a) => { recoveries.push(a); return { ok: true } },
     createFollowUps: async () => { followUps++; return { created: [] } },
     stop: async () => {}, archive: async () => {}, createIssue: async () => ({ id: 'c' }), addNote: async () => ({ number: '000' }) }
   const agent = await createTopSupervisor({ dir, models, adapter, tools, pollMs: 20 })
@@ -41,6 +47,8 @@ export default async function (t) {
     await agent.start({ model: 'test-model', projects: ['p'], message: 'go', limits: { maxCalls: 50, maxRuns: 5, maxConcurrent: 1, maxStartsPerIssue: 2 } })
     await wait(() => step >= plan.length && events.length > plan.length && agent.get().status === 'active')
     const seen = JSON.stringify(events)
+    t.eq('a recovery is attributed to the supervisor', recoveries.map((a) => [a.actor, a.origin]), [['supervisor', 'supervisor']])
+    t.eq('a reply naming its own actor or origin is refused and never reaches the tool', [recoveries.length, events.filter((e) => /Unexpected action argument/.test(e.error ?? '')).length], [1, 2])
     t.eq('the first continue went through', continues, 1)
     t.ok('the second was refused, pointing at the operator', /already continued this run 1 time/.test(seen) && /ask_operator/.test(seen))
     t.eq('no follow-up was created', followUps, 0)

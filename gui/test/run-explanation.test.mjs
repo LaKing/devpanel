@@ -85,6 +85,25 @@ export default async function (t) {
   t.eq('a journal fault keeps the generic wording', explainRun({ status: 'blocked', blockedReason: 'recovery-required', journal: { recoveryRequired: true }, integrity: { status: 'quarantined', latest: { changes: { changed: true } } } }).headline,
     'Interrupted: the panel restarted while this run was working')
 
+  t.section('rounds exhausted: the last audit only awaited a drive that did not pass')
+  const AWAITING = [{ id: 'auditor-1-drive', awaitsCheck: true, blocking: true }]
+  const stopped = (extra) => explainRun({ status: 'blocked', blockedReason: 'rounds-exhausted', revisions: [{ fingerprint: 'r1' }], ...extra })
+  const drive = (result, extra = {}) => ({ checkHistory: [{ revision: 'r1', result, ...extra }] })
+  const DISAGREED = "Stopped: the author and reviewers didn't agree in time"
+  const failedDrive = stopped({ outstandingFindings: AWAITING, ...drive('failed') })
+  t.eq('a failed drive is what it says', failedDrive.headline, 'Stopped: the last audit only awaited the drive, and the drive failed')
+  t.ok('it names the awaited finding and the drive', /auditor-1-drive/.test(failedDrive.detail) && /The full drive ran on the last revision and failed/.test(failedDrive.detail), failedDrive.detail)
+  const hung = stopped({ outstandingFindings: AWAITING, ...drive('failed'), checkResults: [{ revision: 'r1', commands: [{ id: 'selftest', timedOut: true }, { id: 'prepare', timedOut: false }] }] })
+  t.eq('a hung drive says hung', hung.headline, 'Stopped: the last audit only awaited the drive, and the drive hung')
+  t.ok('and names the command', /Timed out: selftest\./.test(hung.detail), hung.detail)
+  t.eq('an unavailable drive says so', stopped({ outstandingFindings: AWAITING, ...drive('unavailable') }).headline, 'Stopped: the last audit only awaited the drive, and the drive was unavailable')
+  t.eq('a passed drive leaves real disagreement', stopped({ outstandingFindings: AWAITING, ...drive('passed') }).headline, DISAGREED)
+  t.eq('inherited failures count as passed', stopped({ outstandingFindings: AWAITING, ...drive('failed', { gating: 'passed' }) }).headline, DISAGREED)
+  t.eq('a mixed audit is disagreement', stopped({ outstandingFindings: [...AWAITING, { id: 'auditor-1-bug', blocking: true }], ...drive('failed') }).headline, DISAGREED)
+  t.eq('no findings on record is not an awaited drive', stopped(drive('failed')).headline, DISAGREED)
+  t.eq('only a failed smoke is not the drive', stopped({ outstandingFindings: AWAITING, ...drive('failed', { tier: 'smoke' }) }).headline, DISAGREED)
+  t.eq('a drive of an earlier revision does not count', stopped({ outstandingFindings: AWAITING, checkHistory: [{ revision: 'r0', result: 'failed' }] }).headline, DISAGREED)
+
   t.section('finished runs say what they achieved')
   t.eq('patch-only delivery leaves the project unchanged',
     explainRun({ status: 'completed', outcome: 'resolved', delivery: { action: 'worktree-diff', completedAt: 'x' } }).headline, 'Done: a patch is ready')
