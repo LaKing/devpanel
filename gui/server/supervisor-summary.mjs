@@ -26,7 +26,15 @@ const gist = (text, n = 200) => {
 /** The latest reconciliation that ended: an entry persisted as `merging` has decided nothing yet. */
 function decidedReconciliation (entries) {
   const entry = (entries ?? []).findLast((e) => e.endedAt)
-  return entry ? { n: entry.n, state: entry.state, by: entry.by ?? null, endedAt: entry.endedAt, revision: entry.revision ?? null, conflicts: entry.conflicts ?? [], error: clip(entry.error, 500) } : null
+  if (!entry) return null
+  // An earlier refused attempt's check stays readable too: get_check_log finds it by the directory named here.
+  const earlier = entries.filter((e) => e.endedAt && e.checks && e !== entry).map(reconciliationSummary)
+  return { ...reconciliationSummary(entry), ...(earlier.length ? { earlier } : {}) }
+}
+
+function reconciliationSummary (entry) {
+  return { n: entry.n, state: entry.state, by: entry.by ?? null, endedAt: entry.endedAt, revision: entry.revision ?? null, conflicts: entry.conflicts ?? [], error: clip(entry.error, 500),
+    ...(entry.checks ? { checks: { ...checkSummary(entry.checks), gating: entry.checks.gating ?? null, reason: entry.checks.reason ?? null } } : {}) }
 }
 
 /**

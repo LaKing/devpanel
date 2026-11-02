@@ -10,7 +10,7 @@ import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
 import { infrastructureErrors } from '../server/infrastructure.mjs'
 import { readEvents } from '../server/runtime/store.mjs'
-import { outputParts, compareFailures, failureFingerprints, gatingResult, inconclusiveBase, selftestReport, failedSelftests, compareSelftestReports, isSelftestReport, unfinishedSuites } from '../server/runtime/baseline-failures.mjs'
+import { outputParts, compareFailures, failureFingerprints, gateReason, gatingResult, inconclusiveBase, selftestReport, failedSelftests, compareSelftestReports, isSelftestReport, unfinishedSuites } from '../server/runtime/baseline-failures.mjs'
 
 export const name = 'inherited check failures — baseline-known failures do not block, new ones do'
 
@@ -364,6 +364,24 @@ export default async function (t) {
     t.eq('baseline-known by the byte rules, with a new selftest failure: failed', gatingResult({ result: 'failed', baselineComparison: { failures: known, selftest: { verdict: 'new-failures' } } }, run), 'failed')
     t.eq('baseline-known by the byte rules, inherited selftests: passed', gatingResult({ result: 'failed', baselineComparison: { failures: known, selftest: { verdict: 'baseline-known' } } }, run), 'passed')
     t.eq('a byte-rule failure stays failed whatever the report says', gatingResult({ result: 'failed', baselineComparison: { failures: { verdict: 'new-failures', sourceRevision: SOURCE }, selftest: { verdict: 'none' } } }, run), 'failed')
+  }
+
+  t.section('the gate names the condition that failed')
+  {
+    const run = { workspace: { baseCommit: SOURCE } }
+    const known = { verdict: 'baseline-known', sourceRevision: SOURCE }
+    const failedCommands = [{ id: 'drive', required: true, passed: false }, { id: 'lint', required: false, passed: false }]
+    t.eq('a pass names nothing', gateReason({ result: 'passed' }, run), null)
+    t.eq('an inherited failure names nothing', gateReason({ result: 'failed', commands: failedCommands, baselineComparison: { failures: known } }, run), null)
+    t.eq('a selftest verdict, new', gateReason({ result: 'passed', baselineComparison: { selftest: { verdict: 'new-failures', newFailures: [{ command: 'collect', test: 'a' }] } } }, run), 'selftest verdict new-failures: collect: a')
+    t.eq('a selftest verdict, not made', gateReason({ result: 'passed', baselineComparison: { selftest: { verdict: 'not-made', reason: 'collect: no baseline' } } }, run), 'selftest verdict not-made: collect: no baseline')
+    t.eq('new failures, with the failed command', gateReason({ result: 'failed', commands: failedCommands, baselineComparison: { failures: { verdict: 'new-failures', newFailures: [{ command: 'drive', test: '(command)', message: 'passes on the base' }] } } }, run), 'required command drive failed; not on the base: drive: (command) (passes on the base)')
+    t.eq('a comparison not made', gateReason({ result: 'failed', commands: failedCommands, baselineComparison: { failures: { verdict: 'not-made', reason: 'the base could not be checked' } } }, run), 'required command drive failed; comparison with the base not made: the base could not be checked')
+    t.eq('no comparison at all', gateReason({ result: 'failed', commands: failedCommands }, run), 'required command drive failed; no comparison with the base was made')
+    t.eq('inherited, but of another revision', gateReason({ result: 'failed', commands: failedCommands, baselineComparison: { failures: { verdict: 'baseline-known', sourceRevision: 'other' } } }, run), 'required command drive failed; known only on other, not this source revision')
+    t.eq('an inherited failure is not blamed for the selftest that gated', gateReason({ result: 'failed', commands: failedCommands, baselineComparison: { failures: known, selftest: { verdict: 'not-made', reason: 'r' } } }, run), 'selftest verdict not-made: r')
+    t.eq('a check that could not run', gateReason({ result: 'unavailable', error: 'ssh refused' }, run), 'the check did not complete (unavailable): ssh refused')
+    t.ok('a long list is bounded', gateReason({ result: 'passed', baselineComparison: { selftest: { verdict: 'new-failures', newFailures: Array.from({ length: 7 }, (_, i) => ({ command: 'c', test: `t${i}` })) } } }, run).endsWith('c: t4 and 2 more'))
   }
 
   t.section('a new selftest failure fails a passing check: the author gets a round, fixes it, and the run closes')

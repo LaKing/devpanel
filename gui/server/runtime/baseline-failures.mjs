@@ -430,3 +430,28 @@ export function gatingResult (check, run) {
   const f = check.baselineComparison?.failures
   return f?.verdict === 'baseline-known' && Boolean(f.sourceRevision) && f.sourceRevision === run?.workspace?.baseCommit && !selftestBlocks(check) ? 'passed' : 'failed'
 }
+
+/**
+ * In words, which condition made `gatingResult` anything but passed, or null
+ * when it passed: only what gated, so a failure inherited from the base is not
+ * named beside the selftest that blocked. The records it reads stay on the check.
+ */
+export function gateReason (check, run) {
+  if (gatingResult(check, run) === 'passed') return null
+  if (!['passed', 'failed'].includes(check?.result)) return `the check did not complete (${check?.result ?? 'no result'})${check?.error ? `: ${check.error}` : ''}`
+  const named = (list) => `${list.slice(0, 5).map((f) => `${f.command ?? '?'}: ${f.test}${f.message ? ` (${f.message})` : ''}`).join(', ')}${list.length > 5 ? ` and ${list.length - 5} more` : ''}`
+  const parts = []
+  const f = check.baselineComparison?.failures
+  if (check.result === 'failed' && !(f?.verdict === 'baseline-known' && Boolean(f.sourceRevision) && f.sourceRevision === run?.workspace?.baseCommit)) {
+    const failed = (check.commands ?? []).filter((c) => c.required !== false && !c.passed).map((c) => c.id)
+    parts.push(failed.length ? `required ${failed.length === 1 ? 'command' : 'commands'} ${failed.join(', ')} failed` : check.error ?? 'the check failed')
+    if (f?.verdict === 'new-failures') parts.push(`not on the base: ${named(f.newFailures)}`)
+    else if (f?.verdict === 'not-made') parts.push(`comparison with the base not made: ${f.reason}`)
+    else if (f?.verdict === 'baseline-known') parts.push(`known only on ${f.sourceRevision ?? 'an unknown revision'}, not this source revision`)
+    else parts.push('no comparison with the base was made')
+  }
+  const selftest = check.baselineComparison?.selftest
+  if (selftest?.verdict === 'new-failures') parts.push(`selftest verdict new-failures: ${named(selftest.newFailures)}`)
+  else if (selftest?.verdict === 'not-made') parts.push(`selftest verdict not-made: ${selftest.reason}`)
+  return parts.join('; ')
+}

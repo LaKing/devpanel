@@ -12,6 +12,9 @@ import { readEvents } from '../server/runtime/store.mjs'
 import { undeliveredApproval } from '../server/runtime/carry-forward.mjs'
 import { supportedActions, createSupervisor } from '../server/supervisor.mjs'
 import { autoReconcileRefusal } from '../server/runtime/auto-reconcile.mjs'
+import { readCheckLog } from '../server/runtime/check-log.mjs'
+import { getRun } from '../server/runs-api.mjs'
+import { summariseRun } from '../server/supervisor-summary.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 
 const exec = promisify(execFile)
@@ -29,7 +32,8 @@ const lines = (n, edit = {}) => Array.from({ length: n }, (_, i) => edit[i + 1] 
  * approved candidate and on the source alone (no inherited failure) and fails
  * on a merge of the two.
  */
-async function blockedRun ({ worktree, source }) {
+const COMPATIBLE = '      - id: compatible\n        run: "! (grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs)"\n'
+async function blockedRun ({ worktree, source, commands = COMPATIBLE }) {
   let engine
   const script = scriptFor()
   const f = await engineFixture({ playbook: 'implementation', delivery: 'apply-to-source', script: async (turn) => {
@@ -44,7 +48,7 @@ async function blockedRun ({ worktree, source }) {
   await git(f.projectPath, 'add', '-A')
   await git(f.projectPath, 'commit', '-qm', 'source')
   await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
-    '\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n      - id: compatible\n        run: "! (grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs)"\n')
+    `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n${commands}`)
   const options = { base: 'working-tree', participants: { 'auditor-1': { model: 'opus-5' } } }
   const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
@@ -54,6 +58,8 @@ async function blockedRun ({ worktree, source }) {
 }
 
 const read = (f, file) => fs.readFile(path.join(f.projectPath, file), 'utf8')
+const getRunView = async (f, engine) => summariseRun(await getRun(f.issuePath, engine.runId, { issues: f.issues, project: 'devpanel-project', issueId: f.issue.id }))
+const checkNumber = (dir) => dir.split('/')[1]
 
 export default async function (t) {
   const temps = []
@@ -166,6 +172,42 @@ export default async function (t) {
       t.eq('still blocked as before', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked source-delivery-blocked')
       t.eq('the source is untouched', await read(f, 'server.mjs'), lines(10, { 1: 'line 1 INCOMPATIBLE' }))
       t.ok('no approval was carried', !engine.run.approvals.some((a) => a.reconciledFrom))
+      const reason = 'required command compatible failed; not on the base: compatible: (command) (passes on the base)'
+      t.eq('the entry names the condition that failed', attempt.checks.reason, reason)
+      t.eq('and so does the refusal', attempt.error, `the checks on the merged candidate did not pass the gate (gating failed; drive result failed): ${reason}`)
+      t.ok('the refused check is no check of the approved revision', engine.run.checkResults.every((c) => c.revision === attempt.from && c.dir !== attempt.checks.dir))
+      t.eq('closure still reads the approved revision', engine.run.closure.revision, attempt.from)
+      const view = await getRunView(f, engine)
+      t.eq('get_run shows the check and its reason', [view.reconciliation.checks.dir, view.reconciliation.checks.gating, view.reconciliation.checks.reason, view.reconciliation.checks.commands.map((c) => c.id)], [attempt.checks.dir, 'failed', reason, ['compatible']])
+      const log = await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(attempt.checks.dir), command: 'compatible' })
+      t.eq('get_check_log reads its log, bound to the merged candidate', [log.result, log.exitCode, log.revision], ['failed', attempt.checks.commands[0].exitCode, attempt.revision])
+      t.ok('a command it did not record is still refused', await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(attempt.checks.dir), command: 'other' }).then(() => false, (e) => /No recorded command log/.test(e.message)))
+
+      await engine.reconcileDelivery({ policy: {} })
+      const second = engine.run.reconciliations.at(-1)
+      const again = await getRunView(f, engine)
+      t.eq('a second attempt keeps its own check', [second.n, second.state, second.checks.dir !== attempt.checks.dir], [2, 'revalidation-failed', true])
+      t.eq('get_run still shows the earlier attempt\'s check', [again.reconciliation.n, again.reconciliation.earlier.map((e) => [e.n, e.checks.dir, e.checks.reason])], [2, [[1, attempt.checks.dir, reason]]])
+      t.eq('and its log is still readable', (await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(attempt.checks.dir), command: 'compatible' })).result, 'failed')
+      t.eq('closure and approvals as before', [engine.run.closure.revision, engine.run.approvals.some((a) => a.reconciledFrom)], [attempt.from, false])
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('4a. a merged candidate whose drive passes and whose selftest is new is refused, and says so')
+    {
+      // The failed test appears only on the merge: the approved candidate and the source alone report none.
+      const collect = '      - id: collect\n        report: selftest\n        run: |\n          if grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs; then t=\',{"test":"core/new","error":"regression"}\'; fi\n          echo "== runtime/selftest.report"\n          printf \'{\\n  "total": 1,\\n  "tests": [{"test":"core/a"}%s]\\n}\\n\' "$t"\n'
+      const { f, engine } = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) }, commands: collect })
+      t.eq('the approved candidate passed its gate', engine.run.blockedReason, 'source-delivery-blocked', JSON.stringify(engine.run.checkResults.at(-1)?.baselineComparison))
+      await engine.reconcileDelivery({ policy: {} })
+      const attempt = engine.run.reconciliations.at(-1)
+      const reason = 'selftest verdict new-failures: collect: core/new'
+      t.eq('the drive passed and the gate failed', [attempt.state, attempt.checks.result, attempt.checks.gating], ['revalidation-failed', 'passed', 'failed'], JSON.stringify(attempt))
+      t.eq('the entry names the selftest', attempt.checks.reason, reason)
+      t.ok('the refusal does too', attempt.error.endsWith(reason), attempt.error)
+      t.eq('the record behind it is kept', attempt.checks.baselineComparison.selftest.newFailures, [{ command: 'collect', test: 'core/new' }])
+      t.eq('get_run shows it', (await getRunView(f, engine)).reconciliation.checks.reason, reason)
+      t.eq('its log is readable', (await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(attempt.checks.dir), command: 'collect' })).result, 'passed')
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
     }
 

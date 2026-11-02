@@ -924,8 +924,11 @@ that is busy at that moment leaves the run blocked with the button offered.
 Every attempt is journaled in `run.reconciliations` (`reconcile-started`, then
 `reconciled` or `reconcile-refused`) and always merges the originally approved
 patch. A refusal delivers nothing and leaves the run blocked exactly as it was,
-with the conflicting or changed paths listed; the next run of the issue still
-starts from the approved patch (carry-forward). There is no new verification
+with the conflicting or changed paths listed, or for failed revalidation the
+check's whole record on the entry (`checks`, never in `checkResults`, so it
+counts for nothing at closure) with `checks.reason` naming the gating condition
+that failed; `get_run` and `get_check_log` read it. The next run of the issue
+still starts from the approved patch (carry-forward). There is no new verification
 level, and integration merges (`integrate.mjs`) are not involved.
 
 ## Workspace disposal

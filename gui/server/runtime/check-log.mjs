@@ -6,8 +6,8 @@ import { readRun, runDir } from './store.mjs'
 export async function readCheckLog ({ issuePath, runId, check, command }) {
   if (!/^[A-Za-z0-9_-]+$/.test(runId) || !/^\d{3,}$/.test(check)) throw Error('Invalid run or check identifier')
   const run = await readRun(issuePath, runId)
-  // A retried check keeps its earlier attempts on the result that replaced them.
-  const result = (run.checkResults ?? []).flatMap(c => [c, ...(c.attempts ?? []).map(a => ({ ...a, revision: c.revision }))]).find(c => c.dir === `checks/${check}`)
+  // A retried check keeps its earlier attempts on the result that replaced them; a refused reconcile keeps its check on its entry.
+  const result = [...(run.checkResults ?? []), ...(run.reconciliations ?? []).map(r => r.checks).filter(c => c?.dir)].flatMap(c => [c, ...(c.attempts ?? []).map(a => ({ ...a, revision: c.revision }))]).find(c => c.dir === `checks/${check}`)
   const record = result?.commands?.find(c => c.id === command)
   if (!record || !record.log || path.basename(record.log) !== record.log) throw Error('No recorded command log matches this check')
   const root = await fs.realpath(runDir(issuePath, runId))

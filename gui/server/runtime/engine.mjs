@@ -25,7 +25,7 @@ import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline } from './checks.mjs'
 import { baselineCacheFor, tierTarget } from './baseline-cache.mjs'
-import { compareFailures, compareSelftestReports, failureFingerprints, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
+import { compareFailures, compareSelftestReports, failureFingerprints, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { infrastructureBrief } from '../infrastructure.mjs'
@@ -3284,12 +3284,14 @@ export class Engine {
       const requirement = this.snapshot.checks.requirement
       const runs = Boolean(target) && (target.kind === 'local' || requirement === 'required')
       const check = runs ? await this.checkCandidate({ target, revision, fingerprint: candidate.fingerprint, baseCommit: candidate.baseCommit, baseline: candidate.baseline, workspacePath: candidate.path }) : null
-      const gating = check ? gatingResult(check, { ...this.run, workspace: { ...this.run.workspace, baseCommit: candidate.baseCommit } }) : 'unavailable'
-      entry.checks = check ? { result: check.result, gating, dir: check.dir, error: check.error ?? null }
+      const gateRun = { ...this.run, workspace: { ...this.run.workspace, baseCommit: candidate.baseCommit } }
+      const gating = check ? gatingResult(check, gateRun) : 'unavailable'
+      // The whole record: a refused check never joins checkResults (closure reads those), so its commands stay readable from here (check-log.mjs).
+      entry.checks = check ? { ...check, gating, reason: gateReason(check, gateRun), error: check.error ?? null }
         : { result: 'not-run', gating, reason: target ? 'the staging drive runs on a reconciled candidate only when checks are required' : 'no check target' }
       const satisfied = requirement === 'none' ? true : requirement === 'optional' ? gating !== 'failed' : gating === 'passed'
       // The raw result alone misleads: a drive can pass while a selftest new against the baseline still gates it.
-      if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'})`)
+      if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
 
       // Accepted: the merged candidate is the run's revision, with the approvals carried.
       const original = this.run.approvals.filter((a) => a.revision === approved.revision && !a.reconciledFrom)
