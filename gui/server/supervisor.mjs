@@ -637,7 +637,7 @@ export function createSupervisor ({
     try {
       const issue = await issues.getIssue(project, issueId)
       inquiry = issue.kind === 'inquiry'
-      await writeRunResultStep({ issuePath: issue.path, runId })
+      await writeRunResultStep({ issuePath: issue.path, runId, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
     } catch (error) {
       console.warn(`[devpanel] could not write the result of ${project}/${issueId} run ${runId}: ${error.message}`)
     }

@@ -198,7 +198,7 @@ async function commitDelivery ({ revision, fingerprint: fp, baseCommit, baseline
  * fingerprints, not a "git apply succeeded" — apply can succeed and still leave
  * a file whose mode or content the fingerprint records differently.
  */
-export async function verifyReconstruction ({ workspacePath, baseCommit, baseline, patchFile, expected, expectedPaths = null, clock, gitDir = null }) {
+export async function verifyReconstruction ({ workspacePath, baseCommit, baseline, patchFile, expected, expectedPaths = null, clock, gitDir = null, rule }) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-reconstruct-'))
   const result = { verified: false, fingerprint: null, expected, detail: null, paths: null }
   try {
@@ -231,7 +231,7 @@ export async function verifyReconstruction ({ workspacePath, baseCommit, baselin
     }
 
     await reconstructInto({ dir, workspacePath, baseCommit, patchFile, gitDir })
-    const rebuilt = await fingerprint(dir, { baseCommit, baseline, clock })
+    const rebuilt = await fingerprint(dir, { baseCommit, baseline, clock, rule })
     result.fingerprint = rebuilt.fingerprint
     result.verified = rebuilt.fingerprint === expected
     if (!result.verified) {

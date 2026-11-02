@@ -4,6 +4,7 @@ import path from 'node:path'
 import { withStepReservation } from './step-allocation.mjs'
 import { writeAtomic } from './runtime/persistence.mjs'
 import * as store from './runtime/store.mjs'
+import { approvedCheckPatch } from './runtime/apply-artifact.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
 import { runResult } from './runtime/run-result.mjs'
 
@@ -37,7 +38,7 @@ const mtok = (n) => {
 }
 
 /** The account itself, as Markdown. Exported for tests. */
-export function renderResult (run, outputs = {}) {
+export function renderResult (run, outputs = {}, { approvedPatch = false } = {}) {
   const e = explainRun(run, { outputs }) ?? { headline: run.status }
   const result = runResult(run, outputs)
   const steps = (run.steps ?? []).map((s) => s.number)
@@ -73,6 +74,7 @@ export function renderResult (run, outputs = {}) {
   else if (d.action === 'in-place') lines.push('Changed directly in the project checkout.')
   else if (d.action === 'none') lines.push('The report is the result; no files changed.')
   if (d?.artifactRef) lines.push('', 'The change is in `changes.patch` next to this file.')
+  if (approvedPatch) lines.push('', 'The approved revision\'s patch is in `changes.patch` next to this file: its check artifact, verified against the revision\'s fingerprint. It reached no project.')
   lines.push('')
   const asked = run.ownerInput
   if (asked?.questions?.length) {
@@ -128,22 +130,27 @@ export function renderResult (run, outputs = {}) {
  * null when the run has not ended. Never throws for a missing optional piece:
  * a run that failed at launch still gets its account.
  */
-export async function writeRunResultStep ({ issuePath, runId }) {
+export async function writeRunResultStep ({ issuePath, runId, projectPath = null }) {
   const run = await store.readRun(issuePath, runId).catch(() => null)
   if (!run || !ENDED.includes(run.status)) return null
   const outputs = await store.readOutputs(issuePath, runId).catch(() => ({}))
-  const text = renderResult(run, outputs)
+  // A check artifact that does not verify is simply not carried, like any other missing piece.
+  const approved = await approvedCheckPatch({ issuePath, runId, projectPath }).catch(() => null)
+  const source = approved?.file ?? (run.delivery?.artifactRef ? path.join(store.runDir(issuePath, runId), run.delivery.artifactRef) : null)
   let patch = null
-  if (run.delivery?.artifactRef) {
-    const file = path.join(store.runDir(issuePath, runId), run.delivery.artifactRef)
-    const stat = await fs.stat(file).catch(() => null)
-    if (stat?.isFile() && stat.size <= PATCH_LIMIT) patch = await fs.readFile(file)
+  if (source) {
+    const stat = await fs.stat(source).catch(() => null)
+    // The limit is the delivered copy's: an approved check artifact is the same bytes /patch serves, whatever their size.
+    if (stat?.isFile() && (approved || stat.size <= PATCH_LIMIT)) patch = await fs.readFile(source)
   }
+  const text = renderResult(run, outputs, { approvedPatch: Boolean(approved && patch) })
   return withStepReservation(issuePath, { slug: 'result', invocationId: `run-result:${runId}` }, async (entry) => {
     const folder = path.join(issuePath, entry.folder)
     await fs.mkdir(folder, { recursive: true })
     await writeAtomic(path.join(folder, 'result.md'), text)
+    // A later end may have left no patch: one an earlier end copied must not stand for this one.
     if (patch) await writeAtomic(path.join(folder, 'changes.patch'), patch)
+    else await fs.rm(path.join(folder, 'changes.patch'), { force: true })
     return folder
   })
 }

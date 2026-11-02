@@ -906,7 +906,13 @@ Old snapshots retain their delivery policy. An explicit operator request to
 approved retained patch, reconstructing a removed worktree from its base. It uses
 the same source primitive and records `artifactApplication` separately; it does
 not rewrite historical delivery or the snapshot. Missing base or proof refuses
-application. `GET …/runs/:runId/patch` downloads the retained patch.
+application. `GET …/runs/:runId/patch` downloads the retained patch. A settled
+run with an approved revision and no delivery attempt has none, so it serves that
+revision's check artifact (`checks/<n>/artifacts/`), labelled as such, and the run's
+result step carries it as `changes.patch`. It is served only when base + patch
+rebuilds the revision's fingerprint at that moment, so it needs no worktree. It is
+for landing by hand: `patch-check` and `apply-artifact` still answer only for a
+delivered patch.
 
 **Finalize.** A run that stopped at the hand-off — `delivery-unverifiable`,
 `delivery-failed`, `delivery-unavailable`, `candidate-changed-during-delivery`,

@@ -42,7 +42,7 @@ import { triageAgreement } from './decisions/triage-shadow.mjs'
 import { installLogging } from './logging.mjs'
 import { LockHeld } from './runtime/lock.mjs'
 import { integrateRun, integrationTarget, reconcileIntegration } from './runtime/integrate.mjs'
-import { applyRunArtifact, retainedPatch } from './runtime/apply-artifact.mjs'
+import { applyRunArtifact, approvedCheckPatch, retainedPatch } from './runtime/apply-artifact.mjs'
 import { checkPatch } from './runtime/patch-check.mjs'
 import { availabilityReport } from './availability-api.mjs'
 import { createModelPerformanceService } from './model-performance.mjs'
@@ -349,6 +349,10 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/integrate', route(async 
 app.get('/api/projects/:project/issues/:id/runs/:runId/patch', route(async (req, res) => {
   const { project, id, runId } = req.params
   const issue = await unpackedIssue(project, id)
+  const approved = await approvedCheckPatch({ issuePath: issue.path, runId, projectPath: projectPath(project) })
+  if (approved) {
+    return res.download(approved.file, approved.filename, { headers: { 'X-Devpanel-Patch-Kind': approved.kind, 'X-Devpanel-Patch-Revision': approved.revision } })
+  }
   const { file } = await retainedPatch(issue.path, runId)
   res.download(file)
 }))
