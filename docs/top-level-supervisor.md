@@ -79,8 +79,8 @@ Starting invokes the model; previewing the page never does. Model calls have a
 | Limit | Default | Scope | Reset behavior |
 | --- | --- | --- | --- |
 | `maxCalls` | 2000 | Model-call attempts in this session, including action-result and repair turns | Start and a server restart resume the count; New session resets it |
-| `maxStartsPerIssue` | 20 | Launch attempts for each project/issue pair in this session; failed launches count | Start, server restart and model/scope changes resume the count; New session resets it |
-| `maxRuns` | 200 | Launch attempts across every issue in this session | Start and a server restart resume the count; New session resets it |
+| `maxStartsPerIssue` | 20 | Launch attempts for each project/issue pair in this session; failed launches count, a start refused for momentary occupancy does not | Start, server restart and model/scope changes resume the count; New session resets it |
+| `maxRuns` | 200 | Launch attempts across every issue in this session, with the same exception | Start and a server restart resume the count; New session resets it |
 | `maxConcurrent` | 3 | Live owned runs **plus unresolved launch reservations** | Capacity is released only by a known terminal run or an attributed non-start |
 
 These are **session limits**, and the session boundary is explicit: only an

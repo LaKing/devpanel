@@ -6,6 +6,8 @@ import { admits, describeRefusal } from './runtime/spending-policy.mjs'
 
 const live = ['pending', 'preflighting', 'running', 'stopping']
 const fail = (message) => Object.assign(new Error(message), { status: 409 })
+// Refused for what is occupied right now: the identical start may pass later, so it is never guarded or charged.
+const occupied = (message) => Object.assign(fail(message), { started: false, retryable: true })
 const issueKey = (p) => `${p.project}/${p.issueId}`
 const failureKey = (p, key) => JSON.stringify([p.project, p.issueId, key])
 export const concurrentStarts = (state) => (state.launches ?? []).filter((a) => ['reserved', 'uncertain'].includes(a.status) || (a.status === 'started' && live.includes(a.runStatus))).length
@@ -131,6 +133,15 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
     state.failedLaunches[failureKey(attempt, attempt.inputKey)] = { launchId: attempt.id, runId: attempt.runId ?? null, reason, at: new Date().toISOString() }
   }
 
+  function returnCharge (state, attempt) {
+    const key = issueKey(attempt)
+    state.starts = Math.max(0, state.starts - 1)
+    state.activationStarts = Math.max(0, (state.activationStarts ?? 0) - 1)
+    if ((state.startsByIssue[key] ?? 0) > 1) state.startsByIssue[key]--
+    else delete state.startsByIssue[key]
+    attempt.chargeReturned = true
+  }
+
   async function refresh (state) {
     // One unreadable run keeps its own slot (below) but does not stop the others being refreshed; the
     // failures are thrown together once every attempt has been read.
@@ -184,7 +195,7 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
     start: async (preview) => {
       const attempt = await serial(async () => {
         const state = getState()
-        if (stopping() || state.finishing) throw fail('Supervisor is stopping or finishing; no further starts')
+        if (stopping() || state.finishing) throw occupied('Supervisor is stopping or finishing; no further starts')
         await refresh(state)
         await save()
         const key = issueKey(preview)
@@ -207,10 +218,10 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
             maxCostUsd: preview.maxCostUsd ?? null,
             concurrent: concurrentStarts(state)
           })
-          if (!verdict.ok) throw Object.assign(fail(`Refused by ${verdict.limit}: ${describeRefusal(verdict)}`), { limit: verdict.limit, until: verdict.until })
+          if (!verdict.ok) throw Object.assign(fail(`Refused by ${verdict.limit}: ${describeRefusal(verdict)}`), { limit: verdict.limit, until: verdict.until, ...(verdict.limit === 'concurrent' ? { started: false, retryable: true } : {}) })
         }
         if (state.launches.some((a) => ['reserved', 'uncertain'].includes(a.status) && issueKey(a) === key)) throw fail('This issue has an unresolved launch reservation; reconcile it before retrying')
-        if (concurrentStarts(state) >= state.limits.maxConcurrent) throw fail('Concurrent-run limit reached, including pending launch reservations')
+        if (concurrentStarts(state) >= state.limits.maxConcurrent) throw occupied('Concurrent-run limit reached, including pending launch reservations')
         const condition = tools.launchState ? await tools.launchState(preview) : { key: preview.configHash }
         // The condition classified itself; pass that on, or the supervisor is told
         // only that something is wrong and not whether it may act on it.
@@ -219,7 +230,7 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
         if (typeof inputKey !== 'string' || !inputKey) throw fail('Cannot establish launch input state')
         const previous = state.failedLaunches[failureKey(preview, inputKey)]
         if (previous) throw fail(`Unchanged failed launch is blocked: ${previous.reason}. Resolve the condition or change the relevant launch inputs before retrying.`)
-        if (stopping() || state.finishing) throw fail('Supervisor stopping')
+        if (stopping() || state.finishing) throw occupied('Supervisor stopping')
         const reservation = { id: crypto.randomUUID(), ...preview, inputKey, status: 'reserved', activationId: state.activationId, at: new Date().toISOString() }
         // Committed before the external call, so a crash between the two leaves
         // the money held rather than spendable twice. The ledger id is the
@@ -232,13 +243,14 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
         state.activationStarts = (state.activationStarts ?? 0) + 1
         state.startsByIssue[key] = (state.startsByIssue[key] ?? 0) + 1
         state.launches.push(reservation)
-        // Persisted before the external operation; a crash never refunds it.
+        // Persisted before the external operation; a crash never refunds it, and
+        // only a start positively refused for occupancy does (returnCharge).
         await save()
         return reservation
       })
       let result
       try {
-        if (stopping() || getState().finishing) throw Object.assign(fail('Supervisor stopped before launch'), { started: false, retryable: true })
+        if (stopping() || getState().finishing) throw occupied('Supervisor stopped before launch')
         result = await tools.start({ ...preview, launchId: attempt.id })
         if (!result?.runId || !result.status) throw new Error('Launch returned no attributable run')
       } catch (error) {
@@ -249,6 +261,10 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
           attempt.status = error.started === false ? 'failed' : 'uncertain'
           attempt.error = error.message
           if (!error.retryable) recordFailure(state, attempt, error.message)
+          // Refused for momentary occupancy: nothing started and nothing is wrong with
+          // the inputs, so the attempt gives back the charge taken at reservation.
+          // Otherwise repeated refusals would use up the start they only delayed.
+          else if (error.started === false) returnCharge(state, attempt)
           // A definite non-start spent nothing, so the window gets it back — with
           // the reason on the record. An UNCERTAIN outcome does not: nobody knows
           // whether it is running, and the honest accounting is that the money is

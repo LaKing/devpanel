@@ -76,6 +76,13 @@ export const LIVE_STATUSES = ['preflighting', 'pending', 'running', 'stopping']
 const err = (status, message, detail = {}) =>
   Object.assign(new Error(message), { status, ...detail })
 
+/**
+ * A start refused for what holds the issue, the project or a model right now.
+ * It says nothing about the launch's inputs and the identical start can pass once
+ * that clears, so the start gate neither guards it nor keeps the attempt's charge.
+ */
+const occupied = (message, detail = {}) => err(409, message, { started: false, retryable: true, ...detail })
+
 export function createSupervisor ({
   issues,
   emit = null,
@@ -212,15 +219,15 @@ export function createSupervisor ({
 
     // Two guards, because they fail differently: this one catches a double-click
     // in one process, the run lock catches a second process.
-    if (starting.has(k)) throw err(409, 'a run is already being started for this issue')
-    if (active.has(k)) throw err(409, 'a run is already active for this issue', { runId: active.get(k).runId })
+    if (starting.has(k)) throw occupied('a run is already being started for this issue')
+    if (active.has(k)) throw occupied('a run is already active for this issue', { runId: active.get(k).runId })
     // Reserve synchronously, before any I/O, so different issues in one project
     // cannot race each other through preflight. All panel and supervisor starts
     // share this guard; stopping still owns its slot until drive settles.
     const holder = [...active.values()].find((run) => run.project === project)?.issueId ??
       [...starting].find((id) => id.startsWith(`${project}/`))?.slice(project.length + 1) ?? null
     if (holder) {
-      throw err(409, `a run is already active on this project (issue ${holder}); wait for it to finish`, { issueId: holder })
+      throw occupied(`a run is already active on this project (issue ${holder}); wait for it to finish`, { issueId: holder })
     }
     starting.add(k)
 
@@ -235,7 +242,7 @@ export function createSupervisor ({
       // candidates cut from one base commit are two patches that conflict at
       // integration, and nothing reviews that.
       const busy = await projectBusy(project, issueId)
-      if (busy) throw err(409, `a run is already active on this project (issue ${busy.issueId}); wait for it to finish`, { runId: busy.runId, issueId: busy.issueId })
+      if (busy) throw occupied(`a run is already active on this project (issue ${busy.issueId}); wait for it to finish`, { runId: busy.runId, issueId: busy.issueId })
 
       const issue = await issues.getIssue(project, issueId)
       if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
@@ -249,7 +256,7 @@ export function createSupervisor ({
       if (resolution.ok) {
         for (const [role, participant] of Object.entries(resolution.resolved.participants)) {
           const cooling = await availability.check(participant.model.id)
-          if (cooling) throw err(409, `model ${participant.model.id} (${role}) is exhausted until ${cooling.exhaustedUntil}${cooling.assumed ? ' (assumed hold)' : ''}: ${cooling.reason}${cooling.runId ? ` (observed in run ${cooling.runId})` : ''}. Wait, choose another model, or clear the record.`, { availability: cooling })
+          if (cooling) throw occupied(`model ${participant.model.id} (${role}) is exhausted until ${cooling.exhaustedUntil}${cooling.assumed ? ' (assumed hold)' : ''}: ${cooling.reason}${cooling.runId ? ` (observed in run ${cooling.runId})` : ''}. Wait, choose another model, or clear the record.`, { availability: cooling })
         }
       }
       // The source checkout is proven readable before anything is reserved or
@@ -1568,7 +1575,7 @@ function refusalOf (result) {
 
 /** Map internal failures onto answers a caller can act on. */
 function translate (error) {
-  if (error instanceof LockHeld) return err(409, 'another run already holds this issue')
+  if (error instanceof LockHeld) return occupied('another run already holds this issue')
   // The refusal names what was unproven. A generic message would leave the
   // operator with a button that fails for no stated reason.
   if (error.message?.startsWith('refusing to launch')) return err(422, error.message)

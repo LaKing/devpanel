@@ -1312,6 +1312,15 @@ not recorded: it says nothing about the inputs, so the same start may pass, and
 `maxStartsPerIssue` still bounds the retries. `run.preflight.counts`
 (`failures`, `unproven`) carries the distinction; a record without it is guarded.
 
+A start refused for what is occupied right now carries `started: false` and
+`retryable: true`: a run active or starting on the issue or project, a held run or
+admission lock, the concurrency limit, a stopping server or supervisor, a model on
+an availability hold. The identical start can pass once that clears, so the gate
+records no guard, releases the reservation and gives the attempt's charge back to
+`maxRuns` and `maxStartsPerIssue` (`chargeReturned` on the launch). An archived
+issue, a closed inquiry and the repository, base-policy and configuration refusals
+are not momentary and stay guarded.
+
 What this gate does **not** judge is cleanliness. A dirty checkout is a legitimate
 start under `working-tree`, and refusing it under `head` is the base policy's
 decision (`DIRTY_BASE`), taken against the tree as it is when the workspace is

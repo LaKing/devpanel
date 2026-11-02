@@ -315,6 +315,80 @@ export default async function (t) {
       await olderGate.refresh()
       t.eq('a record without counts (older runs) stays guarded as before', Object.keys(older.failedLaunches).length, 1)
     }
+
+    t.section('a start refused for momentary occupancy is neither guarded nor charged, however often it happens')
+    {
+      const state = fresh({ maxStartsPerIssue: 2, maxRuns: 3 }), released = []
+      let busy = true, launched = 0
+      const gate = createStartGate({
+        getState: () => state, save: async () => {},
+        ledger: { reserve: async () => {}, settle: async () => {}, release: async (r) => { released.push(r.id) } },
+        tools: {
+          getRun: async () => ({ status: 'running' }),
+          start: async () => {
+            if (busy) throw Object.assign(new Error('a run is already active on this project (issue x); wait for it to finish'), { status: 409, started: false, retryable: true })
+            return { runId: `r${++launched}`, status: 'running' }
+          }
+        }
+      })
+      for (let n = 0; n < 5; n++) t.ok(`refusal ${n + 1} reaches the caller as retryable`, (await rejected(() => gate.start(preview('a'))))?.retryable === true)
+      t.eq('no guard was recorded', state.failedLaunches, {})
+      t.eq('no slot or reservation is held', [concurrentStarts(state), state.launches.filter((a) => a.status === 'reserved' || a.status === 'uncertain').length], [0, 0])
+      t.eq('every ledger reservation was released', released.length, 5)
+      t.eq('and no start was spent', [state.starts, state.activationStarts, JSON.stringify(state.startsByIssue)], [0, 0, '{}'])
+      t.ok('each attempt says its charge came back', state.launches.every((a) => a.status === 'failed' && a.chargeReturned === true))
+      busy = false
+      await gate.start(preview('a'))
+      t.eq('once the occupancy clears the identical start is admitted', launched, 1)
+      t.eq('and that genuine launch is charged', [state.starts, state.startsByIssue['p/a']], [1, 1])
+      await gate.start(preview('a'))
+      t.ok('so the per-issue cap still bounds real launches', /Start limit reached for this issue/.test((await rejected(() => gate.start(preview('a'))))?.message))
+      t.eq('and no third launch was made', launched, 2)
+    }
+
+    t.section('a retryable error with no proof of a non-start keeps its reservation and its charge')
+    {
+      const state = fresh()
+      const gate = createStartGate({ getState: () => state, save: async () => {}, tools: {
+        getRun: async () => ({ status: 'running' }),
+        start: async () => { throw Object.assign(new Error('connection lost mid-launch'), { retryable: true }) }
+      } })
+      await rejected(() => gate.start(preview('a')))
+      t.eq('the outcome stays uncertain, holding the slot', [state.launches[0].status, concurrentStarts(state)], ['uncertain', 1])
+      t.eq('and the charge', state.starts, 1)
+      t.eq('with no guard', state.failedLaunches, {})
+    }
+
+    t.section('the gate marks its own occupancy refusals')
+    {
+      const state = fresh({ maxConcurrent: 1 })
+      let stoppingNow = false, launched = 0
+      const gate = createStartGate({ getState: () => state, save: async () => {}, stopping: () => stoppingNow, tools: {
+        getRun: async () => ({ status: state.launches[0]?.finishedForTest ? 'completed' : 'running' }),
+        start: async () => ({ runId: `r${++launched}`, status: 'running' })
+      } })
+      await gate.start(preview('a'))
+      const full = await rejected(() => gate.start(preview('b')))
+      t.ok('the concurrency limit refuses', /Concurrent-run limit/.test(full?.message), full?.message)
+      t.eq('as retryable, with nothing started', [full?.retryable, full?.started], [true, false])
+      t.eq('charging nothing', state.starts, 1)
+      state.launches[0].finishedForTest = true
+      await gate.start(preview('b'))
+      t.eq('the same start passes once the slot frees', launched, 2)
+      stoppingNow = true
+      const stopped = await rejected(() => gate.start(preview('c')))
+      t.eq('a stopping supervisor refuses retryably too', [/stopping/.test(stopped?.message), stopped?.retryable, stopped?.started], [true, true, false])
+      stoppingNow = false
+
+      const policyState = fresh()
+      const policyGate = createStartGate({
+        getState: () => policyState, save: async () => {}, tools: {},
+        ledger: { usage: () => ({ day: {}, month: {} }) },
+        policy: { active: true, policy: { concurrent: 0, daily: {}, monthly: {}, perWakeCalls: 1 } }
+      })
+      const policyRefused = await rejected(() => policyGate.start(preview('a')))
+      t.eq('the spending policy\'s concurrency limit is marked as well', [policyRefused?.limit, policyRefused?.retryable, policyRefused?.started], ['concurrent', true, false])
+    }
   } finally {
     for (const s of services) await s.shutdown()
     await fs.rm(root, { recursive: true, force: true })

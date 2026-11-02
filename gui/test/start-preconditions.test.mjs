@@ -343,6 +343,112 @@ export default async function (t) {
     } finally { await s.supervisor.settle() }
   }
 
+  // The real supervisor behind the real gate, without the service's wrapper, so
+  // the classification has to be on the refusals themselves.
+  const gateOver = async (s, state) => {
+    const { createStartGate } = await import('../server/supervisor-starts.mjs')
+    const launched = []
+    const gate = createStartGate({
+      getState: () => state, save: async () => {},
+      tools: {
+        getRun: async () => ({ status: 'running' }),
+        start: async (p) => { const r = await s.supervisor.start({ project: p.project, issueId: p.issueId, playbookId: 'implementation', configRoot: s.f.configRoot, supervisorLaunchId: p.launchId }); launched.push(r); return r }
+      }
+    })
+    return { gate, launched }
+  }
+  const gateState = () => ({ status: 'active', starts: 0, calls: 0, startsByIssue: {}, launches: [], failedLaunches: {}, ownedRuns: [], activationStarts: 0, activationId: 'a', limits: { maxRuns: 2, maxStartsPerIssue: 2, maxConcurrent: 5, maxCalls: 20 } })
+  const previewOf = (issueId) => ({ project: 'devpanel-project', issueId, playbook: 'implementation', runOptions: {}, configHash: 'config' })
+  const holdPreflight = async (ms) => {
+    const control = process.env.DEVPANEL_FAKE_CONTROL
+    await fs.writeFile(control, JSON.stringify({ ...JSON.parse(await fs.readFile(control, 'utf8')), probeDelayMs: ms }))
+  }
+
+  t.section('10c. a busy project refuses the same start repeatedly, and admits it once the project frees')
+  {
+    const s = await supervisorOver(null)
+    const issueId = s.f.issue.id
+    const second = await s.f.issues.createIssue('devpanel-project', { input: 'Another issue of the same project' })
+    try {
+      await holdPreflight(60000)
+      const holding = await s.start()
+      const state = gateState()
+      const { gate, launched } = await gateOver(s, state)
+      for (let n = 0; n < 4; n++) {
+        const refused = await refusal(() => gate.start(previewOf(second.id)))
+        t.ok(`refusal ${n + 1} names the busy project`, /already active on this project/.test(refused?.message ?? ''), refused?.message)
+        t.eq('and is marked', [refused?.status, refused?.started, refused?.retryable], [409, false, true])
+      }
+      t.eq('nothing is recorded in failedLaunches', state.failedLaunches, {})
+      t.eq('no launch reservation or slot is held', state.launches.filter((a) => ['reserved', 'uncertain'].includes(a.status)).length, 0)
+      t.eq('no start was used, past both caps', [state.starts, JSON.stringify(state.startsByIssue)], [0, '{}'])
+
+      const again = await refusal(() => s.start())
+      t.eq('the holding issue itself refuses as active, marked', [/already active for this issue/.test(again?.message ?? ''), again?.started, again?.retryable], [true, false, true])
+
+      // A second process sees the run only in persisted state: its lock owner.
+      const { createSupervisor } = await import('../server/supervisor.mjs')
+      const other = createSupervisor({ issues: s.f.issues, harnessDir: path.join(s.f.configRoot, 'harness'), projectsDir: path.join(s.f.issuesDir, 'projects'), configRoot: s.f.configRoot })
+      const persisted = await refusal(() => other.start({ project: 'devpanel-project', issueId: second.id, playbookId: 'implementation', configRoot: s.f.configRoot }))
+      t.eq('another process\'s run on the project refuses the same way', [/already active on this project/.test(persisted?.message ?? ''), persisted?.started, persisted?.retryable], [true, false, true])
+
+      await s.supervisor.stop({ project: 'devpanel-project', issueId, runId: holding.runId })
+      await s.supervisor.settle()
+      await holdPreflight(0)
+      const result = await gate.start(previewOf(second.id))
+      t.ok('once the project frees the identical start is admitted', Boolean(result?.runId))
+      t.eq('as a real launch', launched.length, 1)
+      t.eq('charged once', [state.starts, state.startsByIssue[`devpanel-project/${second.id}`]], [1, 1])
+    } finally { await holdPreflight(0); await s.supervisor.settle() }
+  }
+
+  t.section('10d. the other occupancy refusals of a start are marked')
+  {
+    const s = await supervisorOver(null)
+    try {
+      const [first, racing] = await Promise.allSettled([s.start(), s.start()])
+      t.eq('a double start: the first goes ahead', first.status, 'fulfilled')
+      t.eq('the second is refused as starting, marked', [/already being started/.test(racing.reason?.message ?? ''), racing.reason?.started, racing.reason?.retryable], [true, false, true])
+      await s.supervisor.settle()
+
+      const { acquire } = await import('../server/runtime/lock.mjs')
+      const held = await acquire(path.join(s.f.issuePath, '.run.lock'), { purpose: 'test', runId: 'held' })
+      const locked = await refusal(() => s.start())
+      await held.release()
+      t.eq('a held run lock is marked', [locked?.message, locked?.status, locked?.started, locked?.retryable], ['another run already holds this issue', 409, false, true])
+
+      const { createAvailabilityStore } = await import('../server/runtime/failure.mjs')
+      const { resolvePlaybook } = await import('../server/config/load.mjs')
+      const resolved = await resolvePlaybook('implementation', { root: s.f.configRoot, runOptions: {}, projectId: 'devpanel-project' })
+      const model = Object.values(resolved.resolved.participants)[0].model.id
+      const store = createAvailabilityStore(path.join(s.f.issuesDir, '.availability.json'))
+      await store.recordExhausted({ modelId: model, reason: 'test hold', retryAfterMs: 3600000 })
+      const cooling = await refusal(() => s.start())
+      t.eq('a model on an availability hold is marked', [/is exhausted until/.test(cooling?.message ?? ''), cooling?.started, cooling?.retryable], [true, false, true])
+      await store.clear(model)
+      const state = gateState()
+      t.ok('and the start passes once the hold is cleared', Boolean((await (await gateOver(s, state)).gate.start(previewOf(s.f.issue.id)))?.runId))
+    } finally { await s.supervisor.settle() }
+  }
+
+  t.section('10e. a persistent fault stays guarded on the unchanged start')
+  {
+    const s = await supervisorOver(await checkout({ commit: false }))
+    try {
+      const state = gateState()
+      const { gate, launched } = await gateOver(s, state)
+      const issueKey = `devpanel-project/${s.f.issue.id}`
+      const first = await refusal(() => gate.start(previewOf(s.f.issue.id)))
+      t.eq('the fault is refused as not retryable', [first?.code, first?.started, first?.retryable], ['EMPTY_REPOSITORY', false, false])
+      t.eq('and is recorded in failedLaunches', Object.keys(state.failedLaunches).length, 1)
+      t.eq('its start stays charged', [state.starts, state.startsByIssue[issueKey]], [1, 1])
+      const second = await refusal(() => gate.start(previewOf(s.f.issue.id)))
+      t.ok('the unchanged start is refused', /Unchanged failed launch is blocked/.test(second?.message ?? ''), second?.message)
+      t.eq('without reaching the supervisor or charging again', [launched.length, state.launches.length, state.starts], [0, 1, 1])
+      t.eq('no run exists', (await s.runs()).length, 0)
+    } finally { await s.supervisor.settle() }
+  }
+
   t.section('11. over HTTP, a refused start is a 422 that carries the code, the class and the remedy')
   {
     const { startStage } = await import('./browser/stage.mjs')
