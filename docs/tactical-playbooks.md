@@ -112,8 +112,9 @@ in particular) it is recorded as ignored (`coordinatorEffects[step].ignored`) an
 the plan simply takes its next loop round, so `maxRounds` stays in force. Plan
 and implementation review exhaust by rule (`extend-if-converging`, 2026-10-01):
 after five rounds a loop whose last round left fewer substantial findings than
-the one before gets one more round without asking; otherwise the run ends
-unresolved, keeping the work so far.
+the one before, none of them reopened after an earlier round closed it, gets one
+more round without asking; otherwise the run ends unresolved, keeping the work so
+far, and its explanation names any reopened finding.
 
 ## Autonomous runs
 

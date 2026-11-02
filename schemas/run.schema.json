@@ -109,6 +109,30 @@
       ],
       "description": "Set whenever status is blocked \u2014 protocol-repair-exhausted, recovery-required, workspace-unavailable, checks-unavailable-but-required, closure-not-authorised, cleanup-unproved (a turn's escaped descendants were not proved gone; see cleanup)."
     },
+    "extensionDenied": {
+      "type": "object",
+      "description": "On a run ended as rounds-exhausted under extend-if-converging: the deciding round (0-based) and the finding ids it reopened, so it got no extra round.",
+      "required": [
+        "phase",
+        "round",
+        "reopened"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "type": "string"
+        },
+        "round": {
+          "type": "integer"
+        },
+        "reopened": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "startedAt": {
       "type": "string",
       "format": "date-time"

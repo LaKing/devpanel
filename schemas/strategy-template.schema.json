@@ -571,7 +571,7 @@
                 "await-input",
                 "extend-if-converging"
               ],
-              "description": "unresolved: round exhaustion blocks the run. await-input: the run pauses and the operator may answer `continue` (exactly one more round) or `stop`. extend-if-converging: no question; one extra round is granted when the last round left fewer substantial findings (a failed check counts as one) than the round before it, otherwise the run ends as unresolved."
+              "description": "unresolved: round exhaustion blocks the run. await-input: the run pauses and the operator may answer `continue` (exactly one more round) or `stop`. extend-if-converging: no question; one extra round is granted when the last round left fewer substantial findings (a failed check counts as one) than the round before it and none of them reopens a finding id an earlier round of the loop closed, otherwise the run ends as unresolved."
             },
             "steps": {
               "type": "array",

@@ -388,6 +388,31 @@ const renderQuestion = (template, ctx) => String(template ?? '').replace(/\{\{([
 })
 
 /**
+ * The finding ids round `last` of a loop names that an earlier round had closed.
+ * Nothing records a closure, so it is derived: a round closes an id when every
+ * seat that has named it reviewed that round and no seat names it as substantial
+ * (a seat that did not review has closed nothing). Ids compare exactly: seats
+ * prefix theirs, so one seat's id is not another's. An id stays reopened for as
+ * long as it stays open afterwards.
+ *
+ * @param rounds per round, Map(seat → Set(substantial finding id))
+ */
+function reopenedFindings (rounds, last) {
+  const reporters = new Map()
+  const closed = new Set()
+  for (const seats of rounds.slice(0, last)) {
+    const named = new Set([...seats.values()].flatMap((ids) => [...ids]))
+    for (const [id, by] of reporters) {
+      if (!named.has(id) && [...by].every((seat) => seats.has(seat))) closed.add(id)
+    }
+    for (const [seat, ids] of seats) {
+      for (const id of ids) reporters.set(id, (reporters.get(id) ?? new Set()).add(seat))
+    }
+  }
+  return [...new Set([...rounds[last].values()].flatMap((ids) => [...ids]))].filter((id) => closed.has(id))
+}
+
+/**
  * Where are we? A pure function of the snapshot and what has been recorded.
  */
 export function plan (snapshot, steps, outputs, { skip = null, checkResults = [] } = {}) {
@@ -498,12 +523,16 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     // Substantial findings per round (a failed check counts as one): whether the
     // loop is converging, for `extend-if-converging`.
     const weight = []
+    // Which substantial finding ids each seat named per round, and the deciding
+    // round's reopened ones while the loop has not gone past that round.
+    const named = []
+    let extensionDenied = null
     // The previous round's revision when only its checks kept it from passing.
     let checksOnlyFailed = null
     // A round's reviews folded into its verdict, the revision they examined,
     // their substantial findings and how many of those only the checks'
     // result can settle (`awaitsCheck`).
-    const tally = () => ({ review: phase.loop.consensus ? { verdict: 'approved', substantial: false } : null, reviewed: null, findings: 0, substantial: 0, awaiting: 0, reviews: [] })
+    const tally = () => ({ review: phase.loop.consensus ? { verdict: 'approved', substantial: false } : null, reviewed: null, findings: 0, substantial: 0, awaiting: 0, reviews: [], named: new Map() })
     const count = (t, step, r) => {
       const result = summariseReview(r.output, policy, priorBefore(prior, r.done.number))
       const blockers = result.findings.filter((f) => isSubstantial([f], policy))
@@ -515,8 +544,10 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       } else t.review = result
       t.reviewed = r.output?.artifactRevision ?? t.reviewed
       t.reviews.push({ step, r, blocking: blockers.length > 0 })
+      t.named.set(step.role, new Set([...(t.named.get(step.role) ?? []), ...blockers.map((f) => f.id)]))
     }
     for (let round = 0; round < maxRounds && !satisfied; round++) {
+      extensionDenied = null
       let t = tally()
       for (const step of phase.loop.steps) {
         if (!snapshot.participants[step.role]) continue
@@ -590,12 +621,19 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       if (review && continued.has(round)) review = { ...review, verdict: 'changes-needed', operatorContinued: true }
       if (review && evaluate(phase.loop.until, { review })) satisfied = true
       weight[round] = findings + (review?.checksFailed || review?.operatorContinued ? 1 : 0)
+      named[round] = t.named
       // One extra round, never asked for, when the last regular round made
-      // progress on the one before it. Derived from the record, so a replay
-      // grants the same round.
+      // progress on the one before it and brought back nothing an earlier round
+      // had closed. Derived from the record, so a replay grants the same round;
+      // an extra round already on the record (granted before reopenings counted)
+      // stands.
       const base = phase.loop.maxRounds + granted
-      if (!satisfied && phase.loop.onExhausted === 'extend-if-converging' && round === base - 1 && round > 0 &&
-          weight[round] < weight[round - 1]) maxRounds = base + 1
+      if (!satisfied && phase.loop.onExhausted === 'extend-if-converging' && round === base - 1 && round > 0) {
+        const reopened = reopenedFindings(named, round)
+        const ranExtra = steps.some((s) => s.phase === phase.id && s.role !== 'operator' && Number.isInteger(s.round) && s.round >= base)
+        if (weight[round] < weight[round - 1] && (reopened.length === 0 || ranExtra)) maxRounds = base + 1
+        if (reopened.length) extensionDenied = { phase: phase.id, round, reopened }
+      }
     }
     if (!satisfied) {
       if (phase.loop.onExhausted === 'await-input') {
@@ -606,7 +644,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
           return pause(roundsKey, `Phase "${phase.title ?? phase.id}" used its ${maxRounds} round${maxRounds === 1 ? '' : 's'} without the review passing. Answer "continue" to grant exactly one more round, or "stop" to leave the issue unresolved.`, { options: ['continue', 'stop'], askedBy: { phase: phase.id, stepId: null, step: lastNumber }, kind: 'rounds-exhausted' })
         }
       }
-      return terminal('rounds-exhausted')
+      return terminal('rounds-exhausted', 'unresolved', extensionDenied ? { extensionDenied } : {})
     }
   }
 
@@ -3174,6 +3212,9 @@ export class Engine {
   }
 
   async finish (result) {
+    // What the last ending said about the extra round; an earlier ending's goes with it.
+    if (result.extensionDenied) this.run.extensionDenied = result.extensionDenied
+    else delete this.run.extensionDenied
     if (result.reason === 'complete') {
       // An automatic return reopened the review loop: the run goes on.
       if (await this.evaluateClosure({ mayReturn: true }) === 'returned') return 'returned'

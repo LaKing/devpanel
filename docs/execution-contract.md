@@ -1627,8 +1627,14 @@ A run may stop for a human without ending. Three things ask:
   The shipped Implementation and Plan and implement loops use
   `extend-if-converging` instead, which asks nobody: when the last regular round
   left fewer substantial findings (a failed check counts as one) than the round
-  before it, the loop gets exactly one more round, derived from the record so a
-  replay grants the same; otherwise it ends as `rounds-exhausted`;
+  before it, and none of them is reopened, the loop gets exactly one more round,
+  derived from the record so a replay grants the same (an extra round already on
+  the record stands); otherwise it ends as `rounds-exhausted`. A finding is
+  reopened when its exact id was closed in an earlier round of the loop: every
+  seat that named it reviewed that round and none listed it as substantial. One
+  that stays open from round to round is not reopened. `run.extensionDenied`
+  (`phase`, `round`, `reopened`) records the ids and the run's explanation names
+  them;
 - the coordinator itself, through `operatorRequest` on its `handoff`, as a last
   resort (below).
 

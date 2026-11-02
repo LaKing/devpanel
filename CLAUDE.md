@@ -548,7 +548,7 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   but autonomous ends the run after triage via `to: ask-owner` (`run.ownerInput`, result `needs-input`, no
   slot held), and `POST …/runs/:runId/owner-input` (`server/owner-input.mjs`) records the answer, writes it as
   an issue note and restarts the same configHash, or turns an accepted split into issues. Shipped review loops
-  use `onExhausted: extend-if-converging` (one extra round only when findings shrank; nobody is asked).
+  use `onExhausted: extend-if-converging` (one extra round only when findings shrank and none reopened; nobody is asked).
   `operatorRequest` needs a `category` (`live-checkout` | `owner-gate` | `authorization` |
   `requirement-conflict`) and a `recommendation`; technical choices go to handoff `assumptions`, listed in
   `result.md`.

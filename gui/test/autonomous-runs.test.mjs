@@ -2,7 +2,7 @@ import path from 'node:path'
 import fs from 'node:fs/promises'
 
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
-import { triageProblem } from '../server/runtime/engine.mjs'
+import { triageProblem, plan } from '../server/runtime/engine.mjs'
 import { runResult } from '../server/runtime/run-result.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { readRun, readOutputs } from '../server/runtime/store.mjs'
@@ -182,6 +182,83 @@ export default async (t) => {
     const resumed = await engine.drive()
     t.eq('resume runs a fourth round, which passes', `${resumed.status}/${resumed.steps.filter((s) => s.stepId === 'audit-implement-1').length}`, 'completed/4', resumed.blockedReason)
     await releaseWorkspace(engine)
+  }
+
+  t.section('7b. a loop whose findings oscillate is not converging')
+  {
+    const capped = async (implReviews, cap) => {
+      const f = await engineFixture({ script: scriptFor({ implReviews }) })
+      await patch(path.join(f.configRoot, 'playbooks', 'implementation.yaml'), 'budgets:\n', `overrides:\n  implement-review.maxRounds: ${cap}\nbudgets:\n`)
+      const engine = await launch(f)
+      const run = await engine.drive()
+      return { f, engine, run, audits: () => run.steps.filter((s) => s.stepId === 'audit-implement-1').length }
+    }
+    const minor = (id) => ({ ...blocking(id), severity: 'minor', blocking: false })
+
+    // Fewer findings than the round before, so the count alone would grant it.
+    {
+      const { engine, run, audits } = await capped([[blocking('F1'), blocking('F2')], [blocking('F2'), blocking('F3')], [blocking('F1')], []], 3)
+      t.eq('reported, closed, reopened with fewer findings: ends at the cap', `${run.status}/${run.blockedReason}/${audits()}`, 'blocked/rounds-exhausted/3')
+      t.eq('nobody is asked', run.steps.filter((s) => s.role === 'operator').length, 0)
+      t.eq('the record names the reopened id', run.extensionDenied, { phase: 'implement-review', round: 2, reopened: ['F1'] })
+      const explained = explainRun(run)
+      t.ok('the explanation names it', explained.detail.includes('Round 3 reopened F1'), explained.detail)
+      await engine.resumeExecution()
+      const resumed = await engine.drive()
+      t.eq('resume still buys a round, which passes', `${resumed.status}/${resumed.extensionDenied ?? null}`, 'completed/null', resumed.blockedReason)
+      await releaseWorkspace(engine)
+    }
+
+    // The reported pattern: one finding per round, each one returning.
+    {
+      const { engine, run, audits } = await capped([[blocking('auditor-1-004')], [blocking('auditor-1-005')], [blocking('auditor-1-004')], [blocking('auditor-1-005')], []], 4)
+      t.eq('one finding per round, alternating: ends at the cap', `${run.blockedReason}/${audits()}`, 'rounds-exhausted/4')
+      t.ok('and the explanation names the returning id', explainRun(run).detail.includes('reopened auditor-1-005'), explainRun(run).detail)
+      await releaseWorkspace(engine)
+    }
+
+    // Reopened earlier and still open in the deciding round.
+    {
+      const { engine, run, audits } = await capped([[blocking('F1'), blocking('F2')], [blocking('F2')], [blocking('F1'), blocking('F2'), blocking('F3')], [blocking('F1')], []], 4)
+      t.eq('reopened in an earlier round and still open: no extension', `${run.blockedReason}/${audits()}/${run.extensionDenied?.reopened}`, 'rounds-exhausted/4/F1')
+      await releaseWorkspace(engine)
+    }
+
+    // Left the substantial findings as a minor note, then came back.
+    {
+      const { engine, run, audits } = await capped([[blocking('F1'), blocking('F2'), blocking('F3')], [minor('F1'), blocking('F2'), blocking('F3')], [blocking('F1')], []], 3)
+      t.eq('downgraded below substantial, then back: reopened', `${run.blockedReason}/${audits()}/${run.extensionDenied?.reopened}`, 'rounds-exhausted/3/F1')
+      await releaseWorkspace(engine)
+    }
+
+    // Genuine convergence.
+    {
+      const { engine, run, audits } = await capped([[blocking('F1'), blocking('F2')], [blocking('F1'), blocking('F2'), blocking('F3')], [blocking('F1')], []], 3)
+      t.eq('a finding that stayed open is not reopened: extension granted', `${run.status}/${audits()}`, 'completed/4', run.blockedReason)
+      t.eq('and no denial is recorded', run.extensionDenied ?? null, null)
+      await releaseWorkspace(engine)
+    }
+    {
+      const { engine, run, audits } = await capped([[blocking('F1'), blocking('F2')], [blocking('F2'), blocking('F3')], [blocking('F3')], []], 3)
+      t.eq('a finding that closed and stayed closed: extension granted', `${run.status}/${audits()}`, 'completed/4', run.blockedReason)
+      await releaseWorkspace(engine)
+    }
+
+    // A run extended before reopenings counted: its recorded round still replays.
+    {
+      const { f, engine, run, audits } = await capped([[blocking('F1'), blocking('F2')], [blocking('F2'), blocking('F3')], [blocking('F1')], []], 4)
+      t.eq('the record: four audits, the last passing', `${run.status}/${audits()}`, 'completed/4', run.blockedReason)
+      const outputs = await readOutputs(f.issuePath, engine.runId)
+      const snapshot = structuredClone(engine.snapshot)
+      snapshot.phases.find((p) => p.id === 'implement-review').loop.maxRounds = 3
+      const options = { checkResults: engine.checkEvidence() }
+      const replayed = plan(snapshot, engine.activeSteps(), outputs, options)
+      t.eq('replayed at a cap of three, the recorded extra round stands', `${replayed.kind}/${replayed.reason}/${replayed.extensionDenied ?? null}`, 'terminal/complete/null')
+      const cut = engine.activeSteps().filter((s) => !(s.phase === 'implement-review' && s.round === 3))
+      const without = plan(snapshot, cut, outputs, options)
+      t.eq('without that round on the record it is not granted', `${without.reason}/${without.extensionDenied?.reopened}`, 'rounds-exhausted/F1')
+      await releaseWorkspace(engine)
+    }
   }
 
   t.section('8. assumptions the coordinator made are listed in the result')

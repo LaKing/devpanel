@@ -443,7 +443,9 @@ function blocked (run, outputs, kept) {
           detail: `${checkFailureWords(check?.baselineComparison?.failures, check?.commands)}${selftestWords(check?.baselineComparison?.selftest)}${reason === 'checks-failed-unchanged' ? 'The author answered the failure with an unchanged candidate, so another round could only repeat it.' : 'The review loop reached its round limit.'}`,
           next: `Refresh checks reruns them on this candidate (after a flaky or environmental failure is fixed). ${reason === 'checks-failed-unchanged' ? 'Continue gives the author another round with your instruction.' : 'Resume gives the author one more round.'}` }
       }
-      return { ...base, headline: "Stopped: the author and reviewers didn't agree in time", detail: 'The review loop reached its round limit.',
+      const denied = run.extensionDenied
+      return { ...base, headline: "Stopped: the author and reviewers didn't agree in time",
+        detail: `The review loop reached its round limit.${denied ? ` Round ${denied.round + 1} reopened ${denied.reopened.join(', ')}, which an earlier round had closed, so the loop was not converging and got no extra round.` : ''}`,
         next: 'Resume for one more round, or start a new run with clearer guidance.' }
     }
     case 'protocol-repair-exhausted': {
