@@ -280,6 +280,30 @@ test in the second drive does not fail it). When some do, the first stands with
 `selftestReproduced: true` and `newFailures` narrowed to those, the rest listed
 as `flakyFailures`; only then does the author get a round.
 
+Neither retry runs when an earlier revision of the run already answered it
+(`runtime/selftest-retry.mjs`). The result then carries `retrySkipped`, shown in
+`checks.latest`, with a `checks-retry-skipped` event beside it. What the decision
+reads survives a new revision as `checkHistory[].retryEvidence`. An earlier
+revision counts only for a drive of the same target (`targetKey`: a smoke and a
+full drive are different targets) and on a revision other than this one (a refresh
+reads the other revisions like any drive, never its own); a reconciled candidate
+has another base and reads no history. An older record without the evidence is a first occurrence.
+
+- **`selftest-reproduced-earlier`**: every new failure was named by both drives of
+  an earlier revision. `selftestReproduced` from a retry comparison that was
+  `not-made` named no test twice and does not count; any other new failure means
+  the retry runs.
+- **`failed-same-way`**: every failed required command already stood failed on an
+  earlier revision the same way, and the base known at the decision passed it. The
+  same way is the same command with either `timeout-no-output` (timed out having
+  printed nothing but the systemd-run and ssh status lines and the launcher's fence
+  notices) or the same crash
+  signature (`failureIdentities`, baseline-failures.mjs: a core-dump signal and the
+  command's distinct crash lines, numbers and hex ids replaced). A failure a retry
+  cleared on the earlier revision is not one: that is instability. A base not driven
+  yet is not driven to decide this; like a base that failed the command too, it
+  leaves the retry to run.
+
 When every reviewer approved a revision, its check failed, and the author's
 next answer is the **same revision**, the loop stops as
 `checks-failed-unchanged` instead of replaying the recorded failure until its

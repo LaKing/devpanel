@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { FENCE_NOTICES } from './remote-check-process.mjs'
 
 /*
  * Inherited check failures (execution-contract.md "Inherited check failures").
@@ -203,6 +204,45 @@ export async function failureFingerprints ({ runDir, check, target }) {
     })
   }
   return failures
+}
+
+/*
+ * How a failed required command failed, when that names one failure across
+ * revisions of a run (the retry rule, selftest-retry.mjs). Read off the complete
+ * log, so an unreadable one names nothing and the failure is retried.
+ *
+ *   timeout-no-output  it timed out having printed nothing. The status lines of
+ *                      systemd-run and ssh around a remote command, and the
+ *                      launcher's exact fence notices, are the wrapper's, not the
+ *                      command's output
+ *   crash:<sha256>     its output holds crash lines, or it died of a core-dump
+ *                      signal: the signal and the distinct crash lines, numbers
+ *                      and hex ids replaced, so a pid or a restart count does not
+ *                      make another crash. Result lines (PASS, FAIL) are not crash
+ *                      lines: a test named after a crash is a test
+ *
+ * Anything else has `way: null`.
+ */
+const WRAPPER_LINE = /^(?:Running (?:scope )?as unit: |Finished with result: |Main processes terminated with: |Service runtime: |CPU time consumed: |Memory (?:swap )?peak: |IP traffic (?:received|sent): |IO bytes (?:read|written): |Warning: Permanently added |Connection to \S+ closed)/
+const LAUNCHER_LINES = new Set(Object.values(FENCE_NOTICES))
+const CRASH_LINE = /\b(?:crash(?:ed|es|ing)?|panic(?:ked)?|segmentation fault|core dumped|uncaught|unhandled (?:exception|rejection)|fatal error|out of memory)\b/i
+const CORE_SIGNALS = new Set(['SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL', 'SIGFPE'])
+const crashLineKey = (line) => line.replace(ENGINE_NAMES, 'devpanel-check-*').replace(/\b(?=[0-9a-f]*\d)[0-9a-f]+\b/gi, '#').replace(/\d+/g, '#').trim()
+
+export async function failureIdentities ({ runDir, check }) {
+  const identities = []
+  for (const c of (check.commands ?? []).filter((x) => x.required !== false && !x.passed)) {
+    const output = await readOutput(runDir, check, c)
+    if (output === null) { identities.push({ command: c.id, way: null }); continue }
+    const lines = [output.stdout, output.stderr ?? ''].flatMap((text) => splitLines(text.replace(/\r\n/g, '\n'))).filter((l) => l.trim() !== '')
+    if (c.timedOut && lines.every((l) => WRAPPER_LINE.test(l) || LAUNCHER_LINES.has(l))) { identities.push({ command: c.id, way: 'timeout-no-output' }); continue }
+    const crashes = lines.filter((l) => CRASH_LINE.test(l) && !FAIL.test(l) && !PASS.test(l))
+    const core = CORE_SIGNALS.has(c.signal) ? c.signal : null
+    identities.push(crashes.length || core
+      ? { command: c.id, way: `crash:${sha256(JSON.stringify([core, ...[...new Set(crashes.map(crashLineKey))].sort()]))}`, marker: clip(crashes[0]?.trim() ?? core) }
+      : { command: c.id, way: null })
+  }
+  return identities
 }
 
 /**

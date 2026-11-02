@@ -10,7 +10,8 @@ import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
 import { infrastructureErrors } from '../server/infrastructure.mjs'
 import { readEvents } from '../server/runtime/store.mjs'
-import { outputParts, compareFailures, failureFingerprints, gateReason, gatingResult, inconclusiveBase, selftestReport, failedSelftests, compareSelftestReports, isSelftestReport, unfinishedSuites } from '../server/runtime/baseline-failures.mjs'
+import { FENCE_NOTICES } from '../server/runtime/remote-check-process.mjs'
+import { outputParts, compareFailures, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, selftestReport, failedSelftests, compareSelftestReports, isSelftestReport, unfinishedSuites } from '../server/runtime/baseline-failures.mjs'
 
 export const name = 'inherited check failures — baseline-known failures do not block, new ones do'
 
@@ -64,7 +65,7 @@ const tap = (points) => `TAP version 13\n${points.join('\n')}\n1..${points.lengt
  * With `regression`, the first round also writes break.txt and the second
  * removes it: the author fixing what the check found.
  */
-async function scenario (commands, { regression = false, retryFailed = 0 } = {}) {
+async function scenario (commands, { regression = false, retryFailed = 0, regressionRounds = 1 } = {}) {
   const prompts = []
   let engine = null
   const script = async (turn) => {
@@ -74,7 +75,9 @@ async function scenario (commands, { regression = false, retryFailed = 0 } = {})
     if (stepId === 'implement') {
       if (round === 0) await fs.writeFile(path.join(engine.run.workspace.path, 'work.txt'), 'work\n')
       if (regression && round === 0) await fs.writeFile(path.join(engine.run.workspace.path, 'break.txt'), 'regression\n')
-      if (regression && round === 1) await fs.rm(path.join(engine.run.workspace.path, 'break.txt'))
+      // A later round that leaves the regression changes something else: another revision, the same failure.
+      if (regression && round > 0 && round < regressionRounds) await fs.writeFile(path.join(engine.run.workspace.path, 'work.txt'), `work ${round}\n`)
+      if (regression && round === regressionRounds) await fs.rm(path.join(engine.run.workspace.path, 'break.txt'))
       if (regression) return fence({ summary: round ? 'Fixed the new selftest failure' : 'Implemented', basedOnRevision: revision(prompt) })
       return fence({ summary: round ? 'The failing check is not caused by this change' : 'Implemented', basedOnRevision: revision(prompt) })
     }
@@ -400,6 +403,56 @@ export default async function (t) {
     t.ok('the author was told the failure reproduced', /they reproduce/.test(implement1?.prompt ?? ''))
     t.eq('closure records the inherited failure, which did not block', [run.closure?.checks?.selftest?.verdict, run.closure?.checks?.selftest?.baselineKnown?.map((x) => x.test)], ['baseline-known', ['socket — old-test']])
     await releaseWorkspace(engine)
+  }
+
+  t.section('AC1: a regression reproduced on one revision is not driven twice on the next, and the record says so')
+  {
+    const { engine, prompts, implementTurns } = await scenario([{ id: 'collect', run: COLLECT, report: 'selftest' }], { regression: true, retryFailed: 1, regressionRounds: 2 })
+    const run = engine.run
+    t.eq('the run completes after two author rounds', [`${run.status} ${run.outcome}`, implementTurns], ['completed resolved', 3], `${run.blockedReason}`)
+    t.eq('the first revision recorded what reproduced', run.checkHistory[0].retryEvidence.reproduced, [{ command: 'collect', test: 'socket — new-test' }])
+    const events = (await readEvents(engine.issuePath, engine.runId)).events
+    t.eq('its retry drive ran', events.filter((e) => e.type === 'checks-retry').map((e) => e.revision), [run.revisions[0].fingerprint])
+    t.eq('the second revision\'s did not, and the journal says why', events.filter((e) => e.type === 'checks-retry-skipped').map((e) => [e.revision, e.reason, e.failures]),
+      [[run.revisions[1].fingerprint, 'selftest-reproduced-earlier', [{ command: 'collect', test: 'socket — new-test', revision: run.revisions[0].fingerprint }]]])
+    t.ok('the author was told why', /already failed in two drives of an earlier revision/.test(prompts.find((p) => p.stepId === 'implement' && p.round === 2)?.prompt ?? ''))
+    t.eq('the gate still failed that revision', run.checkHistory[1].gating, 'failed')
+    await releaseWorkspace(engine)
+  }
+
+  t.section('how a failed command failed: the identity a later revision is compared on')
+  {
+    const identify = async (record, { stdout = '', stderr = '' } = {}) => {
+      const runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-identity-'))
+      temps.push(runDir)
+      await fs.mkdir(path.join(runDir, 'checks/001'), { recursive: true })
+      await fs.writeFile(path.join(runDir, 'checks/001/cmd.log'), `$ run\n\n${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ''}\n--- exit null in 1 ms ---\n`)
+      await fs.writeFile(path.join(runDir, 'checks/001/cmd.stdout'), stdout)
+      return (await failureIdentities({ runDir, check: { dir: 'checks/001', commands: [{ id: 'cmd', run: 'run', log: 'cmd.log', required: true, passed: false, ...record }] } }))[0]
+    }
+    const way = async (...args) => (await identify(...args)).way
+    t.eq('a timeout with nothing printed', await way({ timedOut: true }), 'timeout-no-output')
+    t.eq('only the wrapper\'s status lines are still nothing', await way({ timedOut: true }, { stderr: 'Running as unit: devpanel-check-abc.service; invocation ID: 12\nFinished with result: timeout\nService runtime: 15min\n' }), 'timeout-no-output')
+    for (const [variant, notice] of Object.entries(FENCE_NOTICES)) {
+      t.eq(`the launcher's ${variant} notice is still nothing`, await way({ timedOut: true }, { stderr: `${notice}\nRunning as unit: devpanel-check-abc.service\n` }), 'timeout-no-output')
+      t.eq(`that notice beside real output is output (${variant})`, await way({ timedOut: true }, { stdout: 'progress\n', stderr: `${notice}\n` }), null)
+    }
+    t.eq('a line that only starts like a fence notice is output', await way({ timedOut: true }, { stderr: 'fence: my own message\n' }), null)
+    t.eq('a timeout that printed', await way({ timedOut: true }, { stdout: 'progress\n' }), null)
+    t.eq('silence without a timeout', await way({ exitCode: 1 }), null)
+    const crash = (text) => way({ exitCode: 1 }, { stdout: text })
+    t.ok('a crash line names a signature', (await crash('thread admin crashed\n')).startsWith('crash:'))
+    t.eq('a pid, a count, a time and an id do not make another crash', await crash('2026-11-01T12:33:00.874Z thread admin crashed (pid 41, id 7f3a9c)\n'), await crash('2026-11-02T01:02:03.100Z thread admin crashed (pid 977, id 11bb22)\n'))
+    t.eq('repeating a line does not either', await crash('thread admin crashed\nthread admin crashed\n'), await crash('thread admin crashed\n'))
+    t.ok('another line does', await crash('thread admin crashed\n') !== await crash('thread worker crashed\n'))
+    t.eq('a test named after a crash is a test', await crash('FAIL crash-recovery — expected 1 got 2\nPASS no crash here\n'), null)
+    t.eq('an ordinary failure has none', await crash('expected 1 got 2\n'), null)
+    t.ok('a core-dump signal is a crash', (await way({ signal: 'SIGSEGV' })).startsWith('crash:'))
+    t.eq('being killed from outside is not', await way({ signal: 'SIGTERM' }), null)
+    const runDir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-identity-'))
+    temps.push(runDir)
+    t.eq('an unreadable log names nothing, so the failure is retried', await failureIdentities({ runDir, check: { dir: 'gone', commands: [{ id: 'cmd', run: 'run', log: 'cmd.log', passed: false, timedOut: true }] } }), [{ command: 'cmd', way: null }])
+    t.eq('a command that may fail is not asked', await failureIdentities({ runDir, check: { dir: 'gone', commands: [{ id: 'cmd', required: false, passed: false }] } }), [])
   }
 
   t.section('a new selftest failure that a second drive does not repeat costs no author round')

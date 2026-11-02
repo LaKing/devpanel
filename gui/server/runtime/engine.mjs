@@ -1,7 +1,7 @@
 import { checksOnlyBlock, continueUnavailable, resumeUnavailable } from './run-control.mjs'
 import { describeCommand } from './command-line.mjs'
 import { checkSummary } from './check-summary.mjs'
-import { retryNewSelftestFailures } from './selftest-retry.mjs'
+import { earlierDrives, reproducedSelftests, retryNewSelftestFailures, sameFailureEarlier } from './selftest-retry.mjs'
 import { writeJson } from './persistence.mjs'
 import fs from 'node:fs/promises'
 import { executeRelease, recoverRelease } from './release.mjs'
@@ -25,7 +25,7 @@ import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline } from './checks.mjs'
 import { baselineCacheFor, tierTarget } from './baseline-cache.mjs'
-import { compareFailures, compareSelftestReports, failureFingerprints, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
+import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { infrastructureBrief } from '../infrastructure.mjs'
@@ -47,6 +47,7 @@ export function harnessUnavailable (harnesses, id) {
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log })) })
+const targetKeyOf = (target) => crypto.createHash('sha256').update(JSON.stringify(target)).digest('hex')
 
 export const FINALIZABLE_BLOCKS = ['delivery-unverifiable', 'delivery-failed', 'delivery-unavailable', 'candidate-changed-during-delivery', 'source-delivery-blocked', 'source-delivery-interrupted']
 import { candidateDiff } from './diff.mjs'
@@ -1575,7 +1576,11 @@ export class Engine {
     const afterApproval = this.run.approvals.some((a) => a.revision === current)
     const tierOf = level ? { tier: level } : {}
     await this.persist({ type: 'checks-started', revision: current, target: target.kind, ...tierOf, step: step?.number ?? null })
-    const result = await this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path })
+    const result = await this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory })
+    // What later revisions' retry decisions read (selftest-retry.mjs). A failure a retry
+    // cleared is instability, not a reproduction: only a standing one counts.
+    const retryEvidence = { targetKey: targetKeyOf(target), reproduced: reproducedSelftests(result),
+      failures: result.result === 'failed' ? (await failureIdentities({ runDir: store.runDir(this.issuePath, this.runId), check: result })).filter((f) => f.way) : [] }
     this.run.checkResults.push({ ...result, ...tierOf, step: step?.number ?? null })
     // checkResults holds only the current revision's evidence; the history is
     // what replay needs to know that an earlier round's revision failed.
@@ -1583,16 +1588,17 @@ export class Engine {
     this.run.checkHistory.push({ revision: current, ...tierOf, result: result.result, gating: gatingResult(result, this.run), ...(inconclusiveBase(result, this.run) ? { inconclusive: true } : {}), at: this.clock.iso(), step: step?.number ?? null, afterApproval,
       // Each check run's own interval (the retried attempts too), so check time
       // stays measurable after a later revision drops this from checkResults.
-      runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })) })
+      runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence })
     await this.persist({ type: 'checks', revision: current, ...tierOf, result: result.result, commands: result.commands?.length ?? 0 })
   }
 
   /**
    * The check runner on one candidate (base commit + baseline + a worktree
    * holding it), with the failed-check retry and the base comparison. Shared
-   * by the revision checks and a reconciled candidate's revalidation.
+   * by the revision checks and a reconciled candidate's revalidation (which
+   * passes no `history`: another base, so no earlier revision speaks for it).
    */
-  async checkCandidate ({ target, revision: current, fingerprint: fp, baseCommit, baseline, workspacePath }) {
+  async checkCandidate ({ target, revision: current, fingerprint: fp, baseCommit, baseline, workspacePath, history = [] }) {
     const common = {
       target,
       baseCommit,
@@ -1609,7 +1615,8 @@ export class Engine {
     // revisions. compareBaseline runs it beside the first candidate check;
     // otherwise it is captured when a candidate check fails, since only then
     // can a failure be inherited.
-    const targetKey = crypto.createHash('sha256').update(JSON.stringify(target)).digest('hex')
+    const targetKey = targetKeyOf(target)
+    const earlier = earlierDrives(history, { revision: current, targetKey })
     const sourceRevision = baseCommit
     this.run.baselineChecks ??= []
     const held = this.run.baselineChecks.filter((b) => b.targetKey === targetKey && b.baseCommit === sourceRevision && b.result !== 'unavailable' && !b.unfinished)
@@ -1649,7 +1656,7 @@ export class Engine {
         return target.compareBaseline === true ? { base: await runBase() } : null
       })()
     ])
-    const result = await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target })
+    const result = await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target, earlier, base: early?.known ?? early?.base ?? null })
     const known = early?.known ?? null
     let base = known ?? early?.base ?? null
     // A selftest report listing failures needs the base too, even on a pass:
@@ -1699,7 +1706,7 @@ export class Engine {
     // A base from another run of the same key says so to every reader.
     if (base?.reused && result.baselineComparison) result.baselineComparison.reused = base.reused
     return retryNewSelftestFailures({ result, limit: Number.isInteger(target.retryFailed) ? target.retryFailed : 1, aborted: () => this.controller.signal.aborted,
-      rerun: () => runChecks({ ...common, revision: current, fingerprint: fp }), record: attemptRecord, persist: (event) => this.persist(event),
+      rerun: () => runChecks({ ...common, revision: current, fingerprint: fp }), record: attemptRecord, persist: (event) => this.persist(event), earlier,
       compare: async (retry) => {
         const comparison = base && base.result !== 'unavailable' ? await compareWithBaseline({ runDir: common.runDir, baseline: base, candidate: retry }) : { ...(result.baselineComparison ?? {}) }
         const again = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: retry, sourceRevision })
@@ -1715,11 +1722,21 @@ export class Engine {
    * engine's. Only a valid pass replaces a failure (marked `flaky`, so
    * reviewers see the instability); a retry that could not run (`unavailable`)
    * proves nothing and leaves the failure standing. Every attempt keeps its
-   * command records, so its logs stay readable (check-log.mjs).
+   * command records, so its logs stay readable (check-log.mjs). No rerun when an
+   * earlier revision already failed the same way (sameFailureEarlier): `base` is
+   * what is known of the base now, and no base is driven just to decide this.
    */
-  async retryFailedCheck (first, { common, revision, fingerprint: fp, target }) {
+  async retryFailedCheck (first, { common, revision, fingerprint: fp, target, earlier, base }) {
     const attempts = []
     const limit = Number.isInteger(target.retryFailed) ? target.retryFailed : 1
+    if (first.result === 'failed' && limit > 0 && earlier.length && !this.controller.signal.aborted) {
+      const commands = sameFailureEarlier({ failures: await failureIdentities({ runDir: common.runDir, check: first }), earlier, base })
+      if (commands) {
+        const retrySkipped = { reason: 'failed-same-way', commands, baselineDir: base.dir ?? null }
+        await this.persist({ type: 'checks-retry-skipped', revision, ...retrySkipped })
+        return { ...first, retrySkipped }
+      }
+    }
     const record = attemptRecord
     let latest = first
     while (latest.result === 'failed' && attempts.length < limit && !this.controller.signal.aborted) {

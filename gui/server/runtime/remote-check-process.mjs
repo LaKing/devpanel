@@ -130,6 +130,11 @@ fi`
  * `$pid_props` goes before the command on the systemd-run line, `$pid_args`
  * to bubblewrap.
  */
+export const FENCE_NOTICES = Object.freeze({
+  managerPidNamespace: 'fence: private pid namespace created by the service manager (PrivatePIDs=); the unit user cannot mount /proc in one',
+  noPidNamespace: 'fence: no private pid namespace here (neither the unit user nor the service manager can provide one); running without it'
+})
+
 const pidNamespacePrelude = (user) => `pid_args=--unshare-pid
 pid_props=
 pid_test=(/usr/bin/bwrap --die-with-parent --unshare-pid --tmpfs / --ro-bind /usr /usr --symlink usr/lib64 /lib64 --symlink usr/bin /bin --proc /proc -- /bin/true)
@@ -138,9 +143,9 @@ if ! "\${pid_test[@]}" 2>/dev/null; then
   pid_args=
   if [[ "$(id -u)" == 0 ]] && systemd-run --quiet --wait --pipe --collect --property=PrivatePIDs=yes --property=User=${quote(user)} -- /bin/true 2>/dev/null; then
     pid_props=--property=PrivatePIDs=yes
-    echo 'fence: private pid namespace created by the service manager (PrivatePIDs=); the unit user cannot mount /proc in one' >&2
+    echo ${quote(FENCE_NOTICES.managerPidNamespace)} >&2
   else
-    echo 'fence: no private pid namespace here (neither the unit user nor the service manager can provide one); running without it' >&2
+    echo ${quote(FENCE_NOTICES.noPidNamespace)} >&2
   fi
 fi`
 

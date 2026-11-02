@@ -7,6 +7,7 @@ import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents } from '../server/runtime/store.mjs'
 import { readCheckLog } from '../server/runtime/check-log.mjs'
 import { plan } from '../server/runtime/engine.mjs'
+import { FENCE_NOTICES } from '../server/runtime/remote-check-process.mjs'
 
 export const name = 'check timing — a failed check is retried on the same revision; approved-only targets skip rejected revisions'
 
@@ -17,7 +18,7 @@ const revision = (p) => (p.match(/Current revision: (sha256:[a-f0-9]{64})/) ?? [
  * `reject` rounds get a blocking finding from every reviewer; `check` is the
  * local command. Returns what the reviewers saw and what the engine recorded.
  */
-async function scenario ({ check, target = '', reject = new Set(), requirement = 'required', auditor = 'gpt-6-astra', awaits = null, steady = false }) {
+async function scenario ({ check, command = '', target = '', reject = new Set(), requirement = 'required', auditor = 'gpt-6-astra', awaits = null, steady = false }) {
   const log = []
   const implementPrompts = []
   const coordinatorPrompts = []
@@ -54,7 +55,7 @@ async function scenario ({ check, target = '', reject = new Set(), requirement =
   }
   const f = await engineFixture({ playbook: 'implementation', script })
   await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
-    `\nchecks:\n  requirement: ${requirement}\n  target:\n    kind: local\n${target}    commands:\n      - id: probe\n        run: ${JSON.stringify(check)}\n`)
+    `\nchecks:\n  requirement: ${requirement}\n  target:\n    kind: local\n${target}    commands:\n      - id: probe\n        run: ${JSON.stringify(check)}\n${command}`)
   const runOptions = { participants: { 'auditor-1': auditor ? { model: auditor } : null } }
   const resolved = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, projectId: 'devpanel-project' })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
@@ -138,6 +139,107 @@ export default async function (t) {
     t.eq('one retry was attempted', events.filter((e) => e.type === 'checks-retry').length, 1)
     t.eq('another revision followed', engine.run.revisions.length, 2)
     t.eq('so the author got another round', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+    await releaseWorkspace(engine)
+  }
+
+  // Candidate drives counted outside the candidate: round-N.txt marks the revision, and the base has none.
+  // The first two revisions fail as `fail` says, the third passes.
+  // `onBase` is what the base does instead of passing.
+  const repeated = async (fail, { onBase = null } = {}) => {
+    const file = await counter()
+    const count = `echo x >> ${file}`
+    return { file, check: `if test -f round-2.txt; then ${count}; exit 0; fi; if test -f round-0.txt; then ${count}; ${fail}; fi${onBase ? `; ${onBase}` : ''}` }
+  }
+  const drives = async (file) => (await fs.readFile(file, 'utf8')).split('\n').length - 1
+  const SHORT = '        timeoutSeconds: 1\n'
+  const byType = (events, type) => events.filter((e) => e.type === type)
+  const retries = (events) => [byType(events, 'checks-retry').length, byType(events, 'checks-retry-skipped').length]
+
+  t.section('AC2, timeout: a silent timeout an earlier revision already had, the base passing, is not driven again')
+  {
+    const { file, check } = await repeated('sleep 30')
+    const { engine, events } = await scenario({ check, command: SHORT })
+    t.eq('three revisions, and the run completes', [engine.run.revisions.length, engine.run.status], [3, 'completed'], `${engine.run.blockedReason}`)
+    t.eq('first occurrence retried, repeat not, the pass once: four candidate drives', await drives(file), 4)
+    t.eq('only the first revision has a checks-retry', byType(events, 'checks-retry').map((e) => e.revision), [engine.run.revisions[0].fingerprint])
+    t.eq('the skip is on the journal for the second revision, naming the first', byType(events, 'checks-retry-skipped').map((e) => [e.revision, e.reason, e.commands[0].way, e.commands[0].revision]),
+      [[engine.run.revisions[1].fingerprint, 'failed-same-way', 'timeout-no-output', engine.run.revisions[0].fingerprint]])
+    const onDisk = JSON.parse(await fs.readFile(path.join(engine.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+    t.eq('the evidence is durable, so replay and resume read the same', onDisk.checkHistory.map((h) => h.retryEvidence.failures.map((f) => f.way)), [['timeout-no-output'], ['timeout-no-output'], []])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('AC2, crash signature: the same crash an earlier revision had, the base passing, is not driven again')
+  {
+    // The pid differs in every drive; six restarts print one distinct line.
+    const { file, check } = await repeated('for i in 1 2 3 4 5 6; do echo "thread admin crashed (pid $$, restart $i): namespace cycle"; done; exit 1')
+    const { engine, events } = await scenario({ check })
+    t.eq('three revisions, and the run completes', [engine.run.revisions.length, engine.run.status], [3, 'completed'], `${engine.run.blockedReason}`)
+    t.eq('four candidate drives', await drives(file), 4)
+    t.eq('one retry, one skip', retries(events), [1, 1])
+    t.eq('the skip names the crash line', byType(events, 'checks-retry-skipped')[0].commands[0].marker.startsWith('thread admin crashed'), true)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('AC3: a repeated timeout whose base hung too is retried on every revision')
+  {
+    const { file, check } = await repeated('sleep 30', { onBase: 'sleep 30' })
+    const { engine, events } = await scenario({ check, command: SHORT })
+    t.eq('the base timed out as well', engine.run.baselineChecks?.[0]?.commands?.[0]?.timedOut, true)
+    t.eq('both failing revisions got their retry, no skip', retries(events), [2, 0])
+    t.eq('five candidate drives', await drives(file), 5)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('AC3: a repeated crash whose base crashed too is retried on every revision')
+  {
+    // Not the base's own failure byte for byte: that would be inherited and pass the gate.
+    const { file, check } = await repeated('echo "thread admin crashed"; exit 1', { onBase: 'echo "base broke"; exit 1' })
+    const { engine, events } = await scenario({ check })
+    t.eq('both failing revisions got their retry, no skip', retries(events), [2, 0])
+    t.eq('five candidate drives', await drives(file), 5)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('AC2 and AC3: the launcher\'s fence notice is not output, and real output beside it is')
+  for (const [variant, notice] of Object.entries(FENCE_NOTICES)) {
+    const silent = await repeated(`echo "${notice}" >&2; sleep 30`)
+    const quiet = await scenario({ check: silent.check, command: SHORT })
+    const failedDir = byType(quiet.events, 'checks-retry')[0]?.failedDir
+    const log = await fs.readFile(path.join(quiet.engine.issuePath, 'runs', quiet.engine.runId, failedDir, 'probe.log'), 'utf8')
+    t.ok(`${variant}: the drive's log holds the notice`, log.includes(notice))
+    t.eq(`${variant} alone: the identity is kept`, quiet.engine.run.checkHistory[0].retryEvidence.failures.map((f) => f.way), ['timeout-no-output'])
+    t.eq(`${variant} alone: first occurrence retried, the later revision not`, [retries(quiet.events), await drives(silent.file)], [[1, 1], 4])
+    await releaseWorkspace(quiet.engine)
+    const printed = await repeated(`echo "${notice}" >&2; echo progress; sleep 30`)
+    const noisy = await scenario({ check: printed.check, command: SHORT })
+    t.eq(`${variant} with real output: both revisions get their retry`, [retries(noisy.events), await drives(printed.file)], [[2, 0], 5])
+    await releaseWorkspace(noisy.engine)
+  }
+
+  t.section('AC3: another crash, an ordinary failure and a timeout that printed something are retried')
+  {
+    const cases = {
+      'another crash signature': [await repeated('if test -f round-1.txt; then echo "thread worker crashed"; else echo "thread admin crashed"; fi; exit 1'), ''],
+      'an ordinary failure repeated': [await repeated('echo "expected 1 got 2"; exit 1'), ''],
+      'a timeout that printed something': [await repeated('echo progress; sleep 30'), SHORT]
+    }
+    for (const [label, [{ check }, command]] of Object.entries(cases)) {
+      const { engine, events } = await scenario({ check, command })
+      t.eq(label, retries(events), [2, 0])
+      await releaseWorkspace(engine)
+    }
+  }
+
+  t.section('AC3: a timeout a retry cleared on the earlier revision is instability, and is retried')
+  {
+    const file = await counter()
+    // Candidate drive 1 hangs, 2 passes (flaky); the next revision's drive 3 hangs and 4 passes. The base is known throughout.
+    const check = `if ! test -f round-0.txt; then exit 0; fi; n=$(cat ${file} 2>/dev/null || echo 0); echo $((n+1)) > ${file}; if [ "$n" = 0 ] || [ "$n" = 2 ]; then sleep 30; fi`
+    const { engine, events } = await scenario({ check, command: SHORT, target: '    compareBaseline: true\n', reject: new Set([0]) })
+    t.eq('two revisions, the run completes', [engine.run.revisions.length, engine.run.status], [2, 'completed'], `${engine.run.blockedReason}`)
+    t.eq('both timeouts got their retry', retries(events), [2, 0])
+    t.eq('the second passes as flaky', engine.run.checkResults.at(-1)?.flaky, true)
     await releaseWorkspace(engine)
   }
 
