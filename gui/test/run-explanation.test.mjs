@@ -56,6 +56,21 @@ export default async function (t) {
     explainRun({ status: 'blocked', blockedReason: 'closure-conditions-unmet', closure: { conditions: { ...conditions, checksSatisfied: false }, checks: { selftest: { verdict: 'new-failures', newFailures: [{ command: 'collect', test: 'socket — new-test' }], baselineKnown: [{ command: 'collect', test: 'socket — old-test' }] } } }, steps: [] }, { outputs }).detail,
     'New selftest failures: socket — new-test. 1 other selftest failure also occurs on the unchanged project and did not count.')
 
+  t.section('rounds exhausted: whether the full drive reached the last revision')
+  const exhausted = (extra) => explainRun({ status: 'blocked', blockedReason: 'rounds-exhausted', revisions: [{ fingerprint: 'r1' }, { fingerprint: 'r2' }], ...extra }).detail
+  const LIMIT = 'The review loop reached its round limit.'
+  const history = (...entries) => ({ checkHistory: [{ revision: 'r1', tier: 'full', result: 'failed' }, ...entries.map((e) => ({ revision: 'r2', ...e }))] })
+  t.eq('a full result', exhausted(history({ tier: 'smoke', result: 'passed' }, { tier: 'full', result: 'passed' })), `${LIMIT} The full drive ran on the last revision and passed; the next round's brief carries its result.`)
+  t.eq('the gate decides what the drive counted as', exhausted(history({ tier: 'full', result: 'failed', gating: 'passed' })), `${LIMIT} The full drive ran on the last revision and passed; the next round's brief carries its result.`)
+  t.eq('unavailable', exhausted(history({ result: 'unavailable' })), `${LIMIT} The full drive ran on the last revision and was unavailable; the next round's brief carries its result.`)
+  t.eq('a full result after a failed smoke', exhausted(history({ tier: 'smoke', result: 'failed' }, { tier: 'full', result: 'failed' })), `${LIMIT} The full drive ran on the last revision after its smoke failed and failed; the next round's brief carries its result.`)
+  t.eq('not-run in place', exhausted({ ...history({ result: 'not-run' }), workspace: { isolation: 'in-place' } }), `${LIMIT} No drive could run on the last revision: in-place work has no base plus patch to rebuild.`)
+  t.eq('not-run otherwise', exhausted(history({ result: 'not-run' })), `${LIMIT} No drive could run on the last revision.`)
+  t.eq('none configured', exhausted({ driveNotRun: { reason: 'no-drive-configured' } }), `${LIMIT} No drive could run on the last revision: this run has none configured.`)
+  t.eq('a failed smoke and no drive', exhausted(history({ tier: 'smoke', result: 'failed' })), `${LIMIT} The full drive never ran on the last revision: its smoke failed.`)
+  t.eq('a passed smoke and no drive', exhausted(history({ tier: 'smoke', result: 'passed' })), `${LIMIT} The full drive never ran on the last revision: its audit held blocking findings that do not wait for it.`)
+  t.eq('nothing recorded on the last revision adds nothing', exhausted(history()), LIMIT)
+
   t.section('interrupted work is not a plain failure')
   const cut = explainRun({ status: 'failed', blockedReason: 'CLI exited before recording the outcome', participants: { author: { state: 'recovery-required', pendingInvocation: { invocationId: 'x' } } } })
   t.eq('a step left in flight reads as interrupted', cut.headline, 'Interrupted — needs recovery')

@@ -233,7 +233,30 @@ decide the round. It happens once per (round, revision): the recorded re-review
 answers on replay, even when it again awaits the check. A failed drive gets no
 re-review: it makes the round `changes-needed` as above. A passed drive
 approves nothing by itself, so closure still needs an approval and a passing
-check on the same revision. Every seat's `checks.latest` carries `timing` saying the checks wait
+check on the same revision.
+
+The last allowed round is the one more exception, so that no run exhausts on
+revisions whose drive never ran. "Last" is read after the extension below, so it
+reflects Resume, Continue and an extra round. When that round's audit holds any
+`awaitsCheck` finding, with or without other blocking findings, and the revision
+has no full result, the planner returns `{kind: 'checks'}` before the loop is
+declared exhausted, even if the revision's smoke failed. With other findings beside it there
+is no re-review, since the author answers next: the result stays on the record,
+`checks.latest` carries it for the next brief and author (with `failedSmoke` when
+the smoke failed; a passed drive otherwise supersedes that failure, since the full
+tier contains the smoke commands), and the next audit gets it as
+`checks.latest.previousDrive`. That is evidence about an earlier revision: it
+settles no gate and no closure, and approving still drives the new revision. Resume
+still grants one round. Rounds still count: a round whose findings all await
+the drive and whose drive fails is a round the author answers.
+A run that cannot have a drive ends `rounds-exhausted` all the same, its
+explanation saying no drive could run: an in-place run with optional checks
+records `not-run` in `checkHistory`, and one with no drive configured records
+`run.driveNotRun`, which settles no gate and asks for no re-review. A worktree
+that no longer holds the revision when the drive starts (a writer outside any seat
+turn) also records `not-run`; no drive of those bytes is possible.
+
+Every seat's `checks.latest` carries `timing` saying the checks wait
 for approval, and a triage that writes the first brief (`firstHandoff`) is told
 the same, so either brief names the criteria only they can prove and the
 author does not hand over unchanged revisions to wait for them. Only a revision made inside a loop
@@ -249,7 +272,8 @@ does. `maybeRunChecks`/`startChecks` run one tier per call, idempotent per
 (revision, tier); `checkResults[]`, `checkHistory[]` and the `checks*` events
 carry `tier` (a record without one is a full drive). A failed smoke on the
 reviewed revision is the failed-check path: `changes-needed`, another author
-round, and no full drive for those bytes. The planner returns `{kind: 'checks'}`
+round, and no full drive for those bytes, except on the last allowed round with
+an `awaitsCheck` finding (above). Otherwise the planner returns `{kind: 'checks'}`
 only when the round approved, the revision has no full result and its smoke did
 not fail. Closure, the closure confirmation's check evidence, refresh-checks
 and a reconciled candidate's revalidation use the **full** drive only; with only
@@ -1629,7 +1653,8 @@ A run may stop for a human without ending. Three things ask:
   left fewer substantial findings (a failed check counts as one) than the round
   before it, and none of them is reopened, the loop gets exactly one more round,
   derived from the record so a replay grants the same (an extra round already on
-  the record stands); otherwise it ends as `rounds-exhausted`. A finding is
+  the record stands); otherwise it ends as `rounds-exhausted`, after the full
+  drive of the last revision when its audit holds an `awaitsCheck` finding. A finding is
   reopened when its exact id was closed in an earlier round of the loop: every
   seat that named it reviewed that round and none listed it as substantial. One
   that stays open from round to round is not reopened. `run.extensionDenied`

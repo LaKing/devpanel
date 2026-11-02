@@ -148,7 +148,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   concurrently, and a revision's checks run beside its reviews (a failed check vetoes the round via
   `run.checkHistory`), or only after approval for `timing: approved` targets (staging test drives by default);
   a target with `tiers.smoke` does both: the smoke tier on every revision beside the reviews (a failure returns the
-  author; no full drive for those bytes), the full drive once on the approved revision, and closure, the confirmation
+  author; no full drive for those bytes, unless the last allowed round's audit holds an `awaitsCheck` finding, which gets the drive before the loop exhausts), the full drive once on the approved revision, and closure, the confirmation
   and refresh-checks count only the full drive (records and events carry `tier`; none means full);
   a failed check is retried on the same revision (`retryFailed`, default 1; a later pass is `flaky`), unless an earlier revision already reproduced the failure (`retrySkipped`, `runtime/selftest-retry.mjs`); a triage `firstHandoff` is recorded as the round-0 brief without a second turn; all
   engine writes go through one queue. See "Reviews" and "Operator pause and resume" in execution-contract.md.

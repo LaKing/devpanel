@@ -114,7 +114,9 @@ and implementation review exhaust by rule (`extend-if-converging`, 2026-10-01):
 after five rounds a loop whose last round left fewer substantial findings than
 the one before, none of them reopened after an earlier round closed it, gets one
 more round without asking; otherwise the run ends unresolved, keeping the work so
-far, and its explanation names any reopened finding.
+far, and its explanation names any reopened finding and says whether the full drive
+reached the last revision. An audit on the last allowed round holding an
+`awaitsCheck` finding gets that drive before the loop ends.
 
 ## Autonomous runs
 

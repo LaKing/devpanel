@@ -21,6 +21,25 @@ import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 // It never decides anything. Actions a page may offer come from the run's
 // supportedActions; `next` names them in prose and a page shows the buttons.
 
+/** Whether the full drive reached the last revision of a run that ran out of rounds, from the record. */
+function driveWords (run) {
+  const revision = run.revisions?.at(-1)?.fingerprint
+  const entries = (run.checkHistory ?? []).filter((h) => h.revision === revision)
+  const full = entries.filter((h) => h.tier !== 'smoke').at(-1)
+  const smoke = entries.filter((h) => h.tier === 'smoke').at(-1)
+  const smokeFailed = (smoke?.gating ?? smoke?.result) === 'failed'
+  if (run.driveNotRun || full?.result === 'not-run') {
+    if (run.workspace?.isolation === 'in-place') return ' No drive could run on the last revision: in-place work has no base plus patch to rebuild.'
+    return run.driveNotRun?.reason === 'no-drive-configured' ? ' No drive could run on the last revision: this run has none configured.' : ' No drive could run on the last revision.'
+  }
+  if (full) {
+    const outcome = full.gating ?? full.result
+    return ` The full drive ran on the last revision${smokeFailed ? ' after its smoke failed' : ''} and ${outcome === 'unavailable' ? 'was unavailable' : outcome}; the next round's brief carries its result.`
+  }
+  if (smokeFailed) return ' The full drive never ran on the last revision: its smoke failed.'
+  return smoke ? ' The full drive never ran on the last revision: its audit held blocking findings that do not wait for it.' : ''
+}
+
 const ROLE = (role) => {
   if (!role) return 'an agent'
   if (role === 'coordinator') return 'the coordinator'
@@ -445,7 +464,7 @@ function blocked (run, outputs, kept) {
       }
       const denied = run.extensionDenied
       return { ...base, headline: "Stopped: the author and reviewers didn't agree in time",
-        detail: `The review loop reached its round limit.${denied ? ` Round ${denied.round + 1} reopened ${denied.reopened.join(', ')}, which an earlier round had closed, so the loop was not converging and got no extra round.` : ''}`,
+        detail: `The review loop reached its round limit.${denied ? ` Round ${denied.round + 1} reopened ${denied.reopened.join(', ')}, which an earlier round had closed, so the loop was not converging and got no extra round.` : ''}${driveWords(run)}`,
         next: 'Resume for one more round, or start a new run with clearer guidance.' }
     }
     case 'protocol-repair-exhausted': {

@@ -132,8 +132,9 @@ revision stages, installs, lints, boots and answers: for example
 refresh-npm-seed, prepare, lint, start, readiness and the log collectors.
 The smoke tier runs on **every** recorded revision beside
 its reviews; a failure (after `retryFailed`) sends the author another round
-through the ordinary failed-check path, and a revision whose smoke failed never
-gets a full drive. The **full** tier is the whole target: it runs once, on the
+through the ordinary failed-check path, and a revision whose smoke failed gets no
+full drive, unless it is the last allowed round's and its audit holds an
+`awaitsCheck` finding (execution-contract.md). The **full** tier is the whole target: it runs once, on the
 revision every reviewer approved, as `timing: approved` does, and it is the only
 result closure, the closure confirmation and refresh-checks count — a passing
 smoke never stands in for it. Every command a smoke command `needs` or `join`s

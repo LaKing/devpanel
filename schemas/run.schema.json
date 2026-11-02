@@ -109,6 +109,38 @@
       ],
       "description": "Set whenever status is blocked \u2014 protocol-repair-exhausted, recovery-required, workspace-unavailable, checks-unavailable-but-required, closure-not-authorised, cleanup-unproved (a turn's escaped descendants were not proved gone; see cleanup)."
     },
+    "driveNotRun": {
+      "type": "object",
+      "description": "On a run ended as rounds-exhausted whose last audit held awaitsCheck findings and that cannot have a drive of its last revision (no drive configured, or no result from one beside the reviews). Read by the run's explanation; decides nothing.",
+      "required": [
+        "phase",
+        "round",
+        "revision",
+        "result",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "type": "string"
+        },
+        "round": {
+          "type": "integer"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "result": {
+          "const": "not-run"
+        },
+        "reason": {
+          "enum": [
+            "no-drive-configured",
+            "no-result"
+          ]
+        }
+      }
+    },
     "extensionDenied": {
       "type": "object",
       "description": "On a run ended as rounds-exhausted under extend-if-converging: the deciding round (0-based) and the finding ids it reopened, so it got no extra round.",

@@ -8,6 +8,8 @@ import { readEvents } from '../server/runtime/store.mjs'
 import { readCheckLog } from '../server/runtime/check-log.mjs'
 import { plan } from '../server/runtime/engine.mjs'
 import { FENCE_NOTICES } from '../server/runtime/remote-check-process.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { checksOnlyBlock } from '../server/runtime/run-control.mjs'
 
 export const name = 'check timing — a failed check is retried on the same revision; approved-only targets skip rejected revisions'
 
@@ -18,10 +20,11 @@ const revision = (p) => (p.match(/Current revision: (sha256:[a-f0-9]{64})/) ?? [
  * `reject` rounds get a blocking finding from every reviewer; `check` is the
  * local command. Returns what the reviewers saw and what the engine recorded.
  */
-async function scenario ({ check, command = '', target = '', reject = new Set(), requirement = 'required', auditor = 'gpt-6-astra', awaits = null, steady = false }) {
+async function scenario ({ check, command = '', target = '', reject = new Set(), requirement = 'required', auditor = 'gpt-6-astra', awaits = null, steady = false, more = new Set(), cap = null, isolation = null }) {
   const log = []
   const implementPrompts = []
   const coordinatorPrompts = []
+  const confirmPrompts = []
   let engine = null
   const script = async (turn) => {
     const { stepId, role, round, prompt } = turn
@@ -44,19 +47,25 @@ async function scenario ({ check, command = '', target = '', reject = new Set(),
       return fence({ summary: 'Implemented', basedOnRevision: revision(prompt) })
     }
     if (stepId.startsWith('audit-')) {
-      log.push({ role, round, checksRunning: Boolean(engine.checksInFlight), recheck: prompt.includes('Re-review of revision'), gating: /"gating":"(\w+)"/.exec(prompt)?.[1] ?? null })
+      log.push({ role, round, checksRunning: Boolean(engine.checksInFlight), recheck: prompt.includes('Re-review of revision'), gating: /"gating":"(\w+)"/.exec(prompt)?.[1] ?? null, previousDrive: prompt.includes('"previousDrive"') })
       // `awaits(prompt)`: the auditor still needs evidence only the check produces.
-      if (awaits?.(prompt, round)) return fence({ verdict: 'changes-needed', artifactRevision: revision(prompt), findings: [{ ...blocking(`${role}-drive-${round}`), awaitsCheck: true }, ...(reject.has(round) ? [blocking(`${role}-${round}`)] : [])], priorFindings: [] })
+      if (awaits?.(prompt, round)) return fence({ verdict: 'changes-needed', artifactRevision: revision(prompt), findings: [{ ...blocking(`${role}-drive-${round}`), awaitsCheck: true }, ...(reject.has(round) ? [blocking(`${role}-${round}`)] : []), ...(more.has(round) ? [blocking(`${role}-more-${round}`)] : [])], priorFindings: [] })
       if (reject.has(round)) return fence({ verdict: 'changes-needed', artifactRevision: revision(prompt), findings: [blocking(`${role}-${round}`)], priorFindings: [] })
       return fence({ verdict: 'approved', artifactRevision: revision(prompt), findings: [], priorFindings: [] })
     }
-    if (stepId === 'confirm') return fence({ satisfied: true, criteria: [{ id: 'AC1', met: true }], revision: revision(prompt) })
+    if (stepId === 'confirm') {
+      confirmPrompts.push(prompt)
+      return fence({ satisfied: true, criteria: [{ id: 'AC1', met: true }], revision: revision(prompt) })
+    }
     return scriptFor()(turn)
   }
   const f = await engineFixture({ playbook: 'implementation', script })
-  await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
+  const playbookFile = path.join(f.configRoot, 'playbooks/implementation.yaml')
+  // No `check`: the playbook configures no drive at all.
+  if (check != null) await fs.appendFile(playbookFile,
     `\nchecks:\n  requirement: ${requirement}\n  target:\n    kind: local\n${target}    commands:\n      - id: probe\n        run: ${JSON.stringify(check)}\n${command}`)
-  const runOptions = { participants: { 'auditor-1': auditor ? { model: auditor } : null } }
+  if (cap != null) await fs.writeFile(playbookFile, (await fs.readFile(playbookFile, 'utf8')).replace('budgets:\n', `overrides:\n  implement-review.maxRounds: ${cap}\nbudgets:\n`))
+  const runOptions = { participants: { 'auditor-1': auditor ? { model: auditor } : null }, ...(isolation ? { isolation } : {}) }
   const resolved = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, projectId: 'devpanel-project' })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
   engine = await startRun({
@@ -66,7 +75,7 @@ async function scenario ({ check, command = '', target = '', reject = new Set(),
   })
   await engine.drive()
   const { events } = await readEvents(f.issuePath, engine.runId)
-  return { engine, log, events, implementPrompts, coordinatorPrompts }
+  return { engine, log, events, implementPrompts, coordinatorPrompts, confirmPrompts }
 }
 
 /*
@@ -340,5 +349,138 @@ export default async function (t) {
     t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
     t.eq('only the approved revision was checked', events.filter((e) => e.type === 'checks-started').map((e) => e.revision), [engine.run.revisions.at(-1).fingerprint])
     await releaseWorkspace(engine)
+  }
+
+  // The reported shape: a smoke beside every review, the full drive waiting.
+  const TIERS = '    tiers:\n      smoke: [probe]\n'
+  const TIERS_ONCE = `    retryFailed: 0\n${TIERS}`
+  const DEEP = '      - id: deep\n        run: "true"\n'
+  // Awaits until the drive's result is quoted in a re-review.
+  const untilRereview = (p) => !p.includes('Re-review of revision')
+  const fullDrives = async (engine) => (await readEvents(engine.issuePath, engine.runId)).events.filter((e) => e.type === 'checks-started' && e.tier === 'full').map((e) => e.revision)
+  const revisionsOf = (engine) => engine.run.revisions.map((r) => r.fingerprint)
+  const stopped = (engine) => `${engine.run.status}/${engine.run.blockedReason}`
+  const fullOf = (engine, rev) => engine.run.checkHistory.find((h) => h.revision === rev && h.tier === 'full')?.result
+  const FULL_LATEST = /"tier":\s*"full"/
+
+  t.section('one-round resumes: each round holds a new finding beside an awaited one, and the awaited finding still reaches the full drive')
+  {
+    const { engine, log, coordinatorPrompts, implementPrompts } = await scenario({ check: 'true', command: DEEP, target: TIERS, cap: 2, reject: new Set([0, 1, 2, 3]), awaits: untilRereview })
+    t.eq('the cap stops it', stopped(engine), 'blocked/rounds-exhausted')
+    const [, second] = revisionsOf(engine)
+    t.eq('only the last allowed round was driven, before the loop ended', await fullDrives(engine), [second])
+    t.eq('and its result is on the record for the next resume', fullOf(engine, second), 'passed')
+    t.ok('the explanation says the drive ran', explainRun(engine.run).detail.includes('The full drive ran on the last revision and passed'), explainRun(engine.run).detail)
+
+    const steps = engine.activeSteps()
+    t.eq('replay without the drive on record asks for it', [plan(engine.snapshot, steps, engine.outputs, { checkResults: [] }).kind, plan(engine.snapshot, steps, engine.outputs, { checkResults: [] }).revision], ['checks', second])
+    t.eq('replay with it ends the loop', [replay(engine).kind, replay(engine).reason], ['terminal', 'rounds-exhausted'])
+    const resumedOnce = structuredClone(engine.snapshot)
+    resumedOnce.phases.find((p) => p.id === 'implement-review').loop.maxRounds = 3
+    const onward = plan(resumedOnce, steps, engine.outputs, { checkResults: [] })
+    t.eq('a recorded round exhausted without a drive gets none on Resume: the next brief comes', [onward.kind, onward.step?.id, onward.round], ['turn', 'brief-implement', 2])
+
+    for (const round of [2, 3]) {
+      await engine.resumeExecution()
+      await engine.drive()
+      t.eq(`resume ${round - 1}: exactly one more round, stopped again`, [stopped(engine), engine.run.revisions.length], ['blocked/rounds-exhausted', round + 1])
+      t.eq(`resume ${round - 1}: one more drive, on that round's revision`, await fullDrives(engine), revisionsOf(engine).slice(1))
+      t.ok(`resume ${round - 1}: its brief carried the previous revision's drive`, FULL_LATEST.test(coordinatorPrompts.at(-1)))
+      t.ok(`resume ${round - 1}: and so did its author`, FULL_LATEST.test(implementPrompts.at(-1)))
+    }
+    await engine.resumeExecution()
+    await engine.drive()
+    t.eq('the last round holds only the awaited finding: it gets its drive and its re-review, and the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+    t.eq('the awaited finding reached a full-drive result on every revision from the first stop on', await fullDrives(engine), revisionsOf(engine).slice(1))
+    t.eq('every audit after a drive was told what that drive said', log.filter((a) => !a.recheck).map((a) => [a.round, a.previousDrive]), [[0, false], [1, false], [2, true], [3, true], [4, true]])
+    t.eq('a mixed round gets no re-review; the all-awaiting one does', log.filter((a) => a.recheck).map((a) => a.round), [4])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('the last allowed round: a failed smoke does not exempt an awaited finding from the drive')
+  {
+    const marker = await counter()
+    // The second revision's first drive fails: that is its smoke; the full drive of the same bytes passes.
+    const check = `test ! -f round-1.txt || test -f ${marker} || { touch ${marker}; false; }`
+    const { engine, coordinatorPrompts, implementPrompts } = await scenario({ check, command: DEEP, target: TIERS_ONCE, cap: 2, reject: new Set([0, 1]), awaits: (p, round) => round < 2 })
+    const [, second] = revisionsOf(engine)
+    t.eq('the cap stops it', stopped(engine), 'blocked/rounds-exhausted')
+    t.eq('the smoke failed on that revision', engine.run.checkHistory.find((h) => h.revision === second && h.tier === 'smoke')?.result, 'failed')
+    t.eq('the full drive ran on it, once, and passed', [await fullDrives(engine), fullOf(engine, second)], [[second], 'passed'])
+    t.ok('the explanation names both', explainRun(engine.run).detail.includes('ran on the last revision after its smoke failed and passed'), explainRun(engine.run).detail)
+    await engine.resumeExecution()
+    await engine.drive()
+    t.eq('the next round approved and the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+    t.ok('the next brief carried the drive and the failed smoke', FULL_LATEST.test(coordinatorPrompts.at(-1)) && coordinatorPrompts.at(-1).includes('"failedSmoke"'))
+    t.ok('and so did the author', FULL_LATEST.test(implementPrompts.at(-1)) && implementPrompts.at(-1).includes('"failedSmoke"'))
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await scenario({ check: 'test ! -f round-1.txt', command: DEEP, target: TIERS_ONCE, cap: 2, reject: new Set([0, 1]), awaits: () => true })
+    const [, second] = revisionsOf(engine)
+    t.eq('a drive that fails too ends the loop, one drive, no second try', [stopped(engine), await fullDrives(engine), fullOf(engine, second)], ['blocked/rounds-exhausted', [second], 'failed'])
+    t.ok('and the explanation says so', explainRun(engine.run).detail.includes('after its smoke failed and failed'), explainRun(engine.run).detail)
+    await releaseWorkspace(engine)
+  }
+  {
+    const marker = await counter()
+    const check = `test ! -f round-0.txt || test -f ${marker} || { touch ${marker}; false; }`
+    const { engine, log, confirmPrompts } = await scenario({ check, command: DEEP, target: TIERS_ONCE, cap: 1, awaits: untilRereview })
+    t.eq('all awaiting, the drive passes: its re-review decides, in the same round', [engine.run.status, log.map((a) => [a.round, a.recheck])], ['completed', [[0, false], [0, true]]], `${engine.run.blockedReason}`)
+    t.eq('closure saw the full drive', engine.run.closure?.conditions?.checksSatisfied, true)
+    t.ok('and the confirmation was shown the failed smoke', confirmPrompts.at(-1)?.includes('"failedSmoke"'))
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await scenario({ check: 'test ! -f round-0.txt || test -f round-1.txt', command: DEEP, target: TIERS_ONCE, cap: 2, reject: new Set([0]), awaits: (p, round) => round === 0 })
+    t.eq('any other round: a failed smoke with an awaited finding gets no drive', [engine.run.status, await fullDrives(engine)], ['completed', [revisionsOf(engine)[1]]], `${engine.run.blockedReason}`)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('the last allowed round: what ends it, and what does not get a drive')
+  {
+    const { engine } = await scenario({ check: 'true', command: '      - id: deep\n        run: "test ! -f round-1.txt"\n', target: TIERS_ONCE, cap: 2, reject: new Set([0, 1]), awaits: () => true })
+    const [, second] = revisionsOf(engine)
+    t.eq('a failed drive with a passed smoke ends the loop', [stopped(engine), await fullDrives(engine), fullOf(engine, second)], ['blocked/rounds-exhausted', [second], 'failed'])
+    t.eq('it is no checks-only stop: the reviewers did not approve', checksOnlyBlock(engine.run), false)
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await scenario({ check: 'true', command: DEEP, target: TIERS, cap: 2, reject: new Set([0, 1]) })
+    t.eq('only ordinary findings on the last round: no drive', [stopped(engine), await fullDrives(engine)], ['blocked/rounds-exhausted', []])
+    t.ok('and the explanation says it never ran', explainRun(engine.run).detail.includes('never ran on the last revision: its audit held blocking findings that do not wait for it'), explainRun(engine.run).detail)
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine, log } = await scenario({ check: 'true', command: DEEP, target: TIERS, cap: 2, reject: new Set([0, 1, 2]), more: new Set([0]), awaits: () => true })
+    t.eq('a converging mixed round is not the last: the drive waits for the extra round', [stopped(engine), log.length, await fullDrives(engine)], ['blocked/rounds-exhausted', 3, [revisionsOf(engine)[2]]])
+    await releaseWorkspace(engine)
+  }
+  {
+    // The note's rule (not adopted): a round whose only findings await the drive still counts.
+    const { engine } = await scenario({ check: 'test ! -f round-0.txt', target: '    timing: approved\n    retryFailed: 0\n', cap: 2, awaits: () => true })
+    t.eq('rounds whose findings all await a failing drive count, and stop at the cap', [stopped(engine), engine.run.revisions.length, engine.run.checkHistory.map((h) => h.result)], ['blocked/rounds-exhausted', 2, ['failed', 'failed']])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('a run that cannot have a drive says so (decision operator-request:009)')
+  {
+    const { engine } = await scenario({ check: 'true', target: '    timing: approved\n', requirement: 'optional', cap: 2, reject: new Set([0, 1]), awaits: () => true, isolation: 'in-place' })
+    t.eq('in place, optional checks: it ends at the cap', stopped(engine), 'blocked/rounds-exhausted')
+    t.eq('with not-run recorded once, on the last revision', engine.run.checkHistory.map((h) => [h.revision, h.result]), [[revisionsOf(engine)[1], 'not-run']])
+    t.ok('and the explanation says no drive could run', explainRun(engine.run).detail.includes('No drive could run on the last revision: in-place work'), explainRun(engine.run).detail)
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine, log } = await scenario({ check: null, cap: 2, awaits: (p, round) => round < 2 })
+    t.eq('no drive configured: it ends at the cap', stopped(engine), 'blocked/rounds-exhausted')
+    t.eq('the record says not-run', engine.run.driveNotRun, { phase: 'implement-review', round: 1, revision: revisionsOf(engine)[1], result: 'not-run', reason: 'no-drive-configured' })
+    t.eq('outside the check evidence', engine.run.checkHistory ?? [], [])
+    t.eq('so no re-review was spent on it', log.filter((a) => a.recheck), [])
+    t.ok('and the explanation says no drive could run', explainRun(engine.run).detail.includes('No drive could run on the last revision: this run has none configured'), explainRun(engine.run).detail)
+    await engine.resumeExecution()
+    await engine.drive()
+    t.eq('a later ending clears it', engine.run.driveNotRun, undefined)
+    await releaseWorkspace(engine).catch(() => {})
   }
 }

@@ -527,6 +527,8 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     // round's reopened ones while the loop has not gone past that round.
     const named = []
     let extensionDenied = null
+    // The deciding round's revision when its findings awaited a drive this run cannot have.
+    let driveNotRun = null
     // The previous round's revision when only its checks kept it from passing.
     let checksOnlyFailed = null
     // A round's reviews folded into its verdict, the revision they examined,
@@ -548,6 +550,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     }
     for (let round = 0; round < maxRounds && !satisfied; round++) {
       extensionDenied = null
+      driveNotRun = null
       let t = tally()
       for (const step of phase.loop.steps) {
         if (!snapshot.participants[step.role]) continue
@@ -594,10 +597,11 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       const verdictOfChecks = ofReviewed.at(-1)?.result
       // `timing: approved` targets run only on a revision every reviewer
       // approved: the round is not decided until its check has a result. With
-      // tiers that is the full drive, and a smoke that failed never gets one. A
-      // round whose every substantial finding awaits the check's evidence is
-      // checked too, or no revision could ever earn it. Once per revision: the
-      // recorded result (checkHistory) answers on replay.
+      // tiers that is the full drive, and a smoke that failed gets none here
+      // (the last allowed round, below, is the one exception). A round whose every
+      // substantial finding awaits the check's evidence is checked too, or no
+      // revision could ever earn it. Once per revision: the recorded result
+      // (checkHistory) answers on replay.
       const awaitsCheck = substantial > 0 && awaiting === substantial
       if ((review?.verdict === 'approved' || awaitsCheck) && reviewed && ofReviewed.filter(isFull).at(-1)?.result == null && verdictOfChecks !== 'failed' && checksAfterApproval(snapshot) && !continued.has(round)) {
         return { kind: 'checks', revision: reviewed, phase, round }
@@ -634,6 +638,18 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
         if (weight[round] < weight[round - 1] && (reopened.length === 0 || ranExtra)) maxRounds = base + 1
         if (reopened.length) extensionDenied = { phase: phase.id, round, reopened }
       }
+      // The loop ends here with a finding still awaiting the full drive: the drive
+      // runs on this revision first, whatever else the audit holds and even after a
+      // failed smoke, or a new finding each round would keep any revision from
+      // reaching it. Decided after the extension, so `maxRounds` is final. No
+      // re-review for a mixed round: the author answers next, and the brief, the
+      // author and the next audit (`previousDrive`) get the result. A run that
+      // cannot have a drive says so on the record instead (`driveNotRun`), outside
+      // the check evidence so it settles no gate and asks for no re-review.
+      if (!satisfied && round + 1 >= maxRounds && awaiting > 0 && reviewed && ofReviewed.filter(isFull).at(-1)?.result == null) {
+        if (!checksAfterApproval(snapshot)) driveNotRun = { phase: phase.id, round, revision: reviewed, result: 'not-run', reason: snapshot.checks?.target ? 'no-result' : 'no-drive-configured' }
+        else if (!continued.has(round)) return { kind: 'checks', revision: reviewed, phase, round }
+      }
     }
     if (!satisfied) {
       if (phase.loop.onExhausted === 'await-input') {
@@ -644,7 +660,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
           return pause(roundsKey, `Phase "${phase.title ?? phase.id}" used its ${maxRounds} round${maxRounds === 1 ? '' : 's'} without the review passing. Answer "continue" to grant exactly one more round, or "stop" to leave the issue unresolved.`, { options: ['continue', 'stop'], askedBy: { phase: phase.id, stepId: null, step: lastNumber }, kind: 'rounds-exhausted' })
         }
       }
-      return terminal('rounds-exhausted', 'unresolved', extensionDenied ? { extensionDenied } : {})
+      return terminal('rounds-exhausted', 'unresolved', { ...(extensionDenied ? { extensionDenied } : {}), ...(driveNotRun ? { driveNotRun } : {}) })
     }
   }
 
@@ -1623,7 +1639,7 @@ export class Engine {
     // checkResults holds only the current revision's evidence; the history is
     // what replay needs to know that an earlier round's revision failed.
     this.run.checkHistory ??= []
-    this.run.checkHistory.push({ revision: current, ...tierOf, result: result.result, gating: gatingResult(result, this.run), ...(inconclusiveBase(result, this.run) ? { inconclusive: true } : {}), at: this.clock.iso(), step: step?.number ?? null, afterApproval,
+    this.run.checkHistory.push({ revision: current, ...tierOf, result: result.result, gating: gatingResult(result, this.run), ...(inconclusiveBase(result, this.run) ? { inconclusive: true } : {}), at: this.clock.iso(), step: step?.number ?? null, afterApproval, dir: result.dir,
       // Each check run's own interval (the retried attempts too), so check time
       // stays measurable after a later revision drops this from checkResults.
       runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence })
@@ -1858,6 +1874,9 @@ export class Engine {
       const fullEvidence = path.join(store.runDir(this.issuePath, this.runId), 'evidence', 'checks', 'latest.json')
       await writeJson(fullEvidence, latestCheck)
       ctx.checks.latest = checkSummary(latestCheck, fullEvidence)
+      // A passed drive is the latest on a revision whose smoke failed (the last allowed round): the failure stays in sight.
+      const failedSmoke = isFull(latestCheck) ? this.run.checkResults.filter((c) => c.revision === latestCheck.revision && c.tier === 'smoke').at(-1) : null
+      if (failedSmoke && gatingResult(failedSmoke, this.run) === 'failed') ctx.checks.latest.failedSmoke = checkSummary(failedSmoke)
       if (this.run.checkRefresh) ctx.checks.refresh = { requestedAt: this.run.checkRefresh.requestedAt, completedAt: this.run.checkRefresh.completedAt, instruction: 'The operator installed and ran updated checks. Earlier decisions saying those checks cannot run are superseded by this evidence. Reassess every criterion honestly; do not turn a skipped test into a pass.' }
     }
     // Checks that wait for approval: every seat is told so, or a criterion only
@@ -1867,8 +1886,17 @@ export class Engine {
       const target = this.snapshot.checks.target
       ctx.checks.latest = { ...(ctx.checks.latest ?? { result: 'not-run-yet' }), timing: {
         timing: 'approved', kind: target.kind, commands: (target.commands ?? []).map((c) => c.id),
-        instruction: 'These checks (for example the staging test drive) run only on a revision every reviewer approved, or on a revision whose every substantial finding is marked `awaitsCheck` (once per revision); their result then gates the round and closure. Brief: name the acceptance criteria only these checks can prove, and those triage flagged with `outsideChecks` as beyond them. Author: finish the code for them and do not hand over an unchanged revision to wait for the checks. Auditor: when the only thing still blocking is evidence these checks produce and this revision has no result yet, keep that finding blocking with `awaitsCheck: true`; the engine runs them and asks you to review the same revision again in this round with their result.'
+        instruction: 'These checks (for example the staging test drive) run only on a revision every reviewer approved, on a revision whose every substantial finding is marked `awaitsCheck`, or on the revision of the last allowed round when any finding is so marked (once per revision); their result then gates the round and closure. Brief: name the acceptance criteria only these checks can prove, and those triage flagged with `outsideChecks` as beyond them. Author: finish the code for them and do not hand over an unchanged revision to wait for the checks. Auditor: when the only thing still blocking is evidence these checks produce and this revision has no result yet, keep that finding blocking with `awaitsCheck: true`; the engine runs them and asks you to review the same revision again in this round with their result. When other findings stand beside it and this is the last allowed round, they run with no re-review: the next round is told their result.'
       } }
+      // The revision's own drive has not run, and revision pruning dropped the last
+      // one from checkResults: the next audit still sees what it said.
+      const current = this.run.revisions.at(-1)?.fingerprint ?? null
+      const previous = this.run.checkResults.some((c) => c.revision === current && isFull(c)) ? null
+        : (this.run.checkHistory ?? []).filter((h) => isFull(h) && h.revision !== current && h.result !== 'not-run').at(-1)
+      if (previous) {
+        ctx.checks.latest.previousDrive = { revision: previous.revision, result: previous.result, gating: previous.gating ?? previous.result, at: previous.at, dir: previous.dir ?? null, failures: previous.retryEvidence?.failures ?? [],
+          instruction: 'The full drive of an earlier revision, not of this one. It may inform your judgement of a finding that awaited it, but it satisfies no gate and no closure: approving this revision still drives it.' }
+      }
     }
     if (coordinationOnly && ctx.window) {
       ctx.window = { ...ctx.window, instruction: 'Workers read the full captured report and evidence. Coordinate from this summary only.' }
@@ -3215,6 +3243,8 @@ export class Engine {
     // What the last ending said about the extra round; an earlier ending's goes with it.
     if (result.extensionDenied) this.run.extensionDenied = result.extensionDenied
     else delete this.run.extensionDenied
+    if (result.driveNotRun) this.run.driveNotRun = result.driveNotRun
+    else delete this.run.driveNotRun
     if (result.reason === 'complete') {
       // An automatic return reopened the review loop: the run goes on.
       if (await this.evaluateClosure({ mayReturn: true }) === 'returned') return 'returned'
