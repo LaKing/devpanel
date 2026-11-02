@@ -580,7 +580,7 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   and the issue page, Needs attention and summaries use it rather than showing reason codes. `issue.disposition` (resolved, partially-resolved, split,
   duplicate, declined, not-reproducible, superseded, not-resolved; `split`/`duplicate` name existing issues in
   `related`) is an explicit decision with evidence; `resolved` is refused while the named run left residual risks
-  unaccepted. Follow-up issues come from unaccepted risks and never absorb the original defect. The supervisor
+  unaccepted (stated up front as `unacceptedRisks` on the issue and the run explanation; `acceptRisks` on the disposition accepts them in the same write of `issue.json`, `runtime/residual-risks.mjs`). Follow-up issues come from unaccepted risks and never absorb the original defect. The supervisor
   needs a disposition before it may archive, and has `finish` to end an activation without cancelling runs.
   `reset` (New session) archives the chat, native session and any pending operation to `state.<ts>.json` and starts
   clean; it is refused while live and is the way out of `recovery-required`. It begins fresh session limits

@@ -199,9 +199,12 @@ in the run summary, tells the user, and does not restart that issue: the owner's
 answer on the issue page starts the next run itself.
 
 Two further actions: `set_disposition {project, issueId, value, evidence,
-runId?}` records the issue's state with evidence (`resolved` is refused while
-the named run left residual risks unaccepted; the supervisor then records
-`partially-resolved` and lists the risks in the evidence); `finish {}` ends the
+runId?, related?, acceptRisks?}` records the issue's state with evidence
+(`resolved` is refused while the named run left residual risks unaccepted;
+`get_issue` lists them under `issue.unacceptedRisks` beforehand, and the
+supervisor either accepts each in the same call with `acceptRisks: [{id | text,
+reason}]`, recorded with `by: supervisor`, or records `partially-resolved` and
+lists them in the evidence; it has no override); `finish {}` ends the
 activation gracefully. `create_followups` is refused to the supervisor: opening
 follow-ups on every closure grew issues faster than the work they tracked (51
 of 85 issues by 2026-10-24), so follow-up issues are the operator's, from the

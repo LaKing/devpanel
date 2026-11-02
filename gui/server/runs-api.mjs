@@ -10,6 +10,7 @@ import { supportedActions, LIVE_STATUSES } from './supervisor.mjs'
 import { triageSuggestion } from './runtime/triage-suggestion.mjs'
 import { runResult } from './runtime/run-result.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
+import { closureWithAcceptances, readAcceptedRisks } from './runtime/residual-risks.mjs'
 import { ownerLiveness } from './runtime/lock.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
 
@@ -40,6 +41,7 @@ export async function listRuns (issuePath) {
   }
 
   const runs = []
+  const acceptedRisks = await readAcceptedRisks(issuePath)
   for (const runId of names) {
     try {
       const run = await store.readRun(issuePath, runId)
@@ -52,7 +54,7 @@ export async function listRuns (issuePath) {
         outcome: run.outcome,
         ...runResult(run, outputs),
         blockedReason: run.blockedReason,
-        explanation: explainRun(run, { outputs }),
+        explanation: explainRun(run, { outputs, acceptedRisks }),
         startedAt: run.startedAt,
         endedAt: run.endedAt,
         steps: run.steps.length,
@@ -170,6 +172,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
       activity: p.pendingInvocation.activity ?? null
     }))
 
+  const acceptedRisks = await readAcceptedRisks(issuePath)
   const approvals = run.approvals.map((a) => ({ ...a, appliesToCurrentRevision: a.revision === currentRevision }))
   const actions = supportedActions(run, { active: isActive, refresh: refreshFacts(snapshot) })
   const checkResults = run.checkResults.map((c) => ({ ...c, appliesToCurrentRevision: c.revision === currentRevision }))
@@ -183,7 +186,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     outcome: run.outcome,
     ...runResult(run, outputs),
     blockedReason: run.blockedReason,
-    explanation: explainRun(run, { outputs, active, ownership }),
+    explanation: explainRun(run, { outputs, active, ownership, acceptedRisks }),
     // Only what the backend will actually accept. A button for anything else
     // would promise something the server refuses.
     actions,
@@ -250,7 +253,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     reconciliations: run.reconciliations ?? [],
     integration: run.integration ?? null,
     ownerInput: run.ownerInput ?? null,
-    closure: run.closure,
+    closure: closureWithAcceptances(run, acceptedRisks),
     checks: snapshot?.checks ?? null,
     autoClose: snapshot?.autoClose ?? null,
     completion: snapshot?.completion ?? null,

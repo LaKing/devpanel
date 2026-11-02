@@ -232,8 +232,8 @@ for (const action of ['archive', 'restore']) {
 // (which hides) and from any run's outcome (which is the run's).
 app.post('/api/projects/:project/issues/:id/disposition', route(async (req, res) => {
   const { project, id } = req.params
-  const { value, evidence, runId = null, override = null, related = null } = req.body ?? {}
-  const issue = await issues.setIssueDisposition(project, id, { value, evidence, runId, by: 'operator', override, related })
+  const { value, evidence, runId = null, override = null, related = null, acceptRisks = null } = req.body ?? {}
+  const issue = await issues.setIssueDisposition(project, id, { value, evidence, runId, by: 'operator', override, related, acceptRisks })
   io.emit('issues:changed', { reason: 'issue-disposition', project, id })
   res.json(issue)
 }))

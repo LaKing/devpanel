@@ -338,7 +338,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `GET /api/projects/:project/actions/operations/:operationId` | the operation record and its output, `?after=<seq>` to continue |
 | `POST /api/projects/:project/actions/operations/:operationId/stop` | terminate a running operation's process group and confirm it |
 | `GET /api/playbooks` | every playbook with its strategy, default `intent` and available `intents` |
-| `POST /api/projects/:project/issues/:id/disposition` | record the issue's state with evidence — `{ value, evidence, runId? }` |
+| `POST /api/projects/:project/issues/:id/disposition` | record the issue's state with evidence — `{ value, evidence, runId?, related?, override?, acceptRisks? }`. `acceptRisks: [{id \| text, reason}]` accepts residual risks listed under `unacceptedRisks` (on the issue and in a run's `explanation`) in the same atomic write; any refusal records nothing |
 | `POST /api/projects/:project/issues/:id/priority` | record where the issue sits in the execution order — `{ value, reason }`, value `urgent\|high\|normal\|low` |
 | `POST /api/projects/:project/issues/:id/dependencies` | record prerequisites — `{ dependsOn: [ids], reason }` (same project, or `project/id`; `[]` clears). The supervisor does not start the issue while one has no disposition and is not archived. A cycle of any length is refused. An accepted split chains its parts: each waits for the one before |
 | `POST /api/projects/:project/issues/:id/runs/:runId/finalize` | evaluate closure again for a run that stopped at delivery, from its retained worktree |

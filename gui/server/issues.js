@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 
 import { runResult } from './runtime/run-result.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
+import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
 import { withLock } from './runtime/lock.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { ARCHIVE_FILE, archiveState, requireUnarchived } from './issue-archive.mjs'
@@ -183,6 +184,11 @@ async function readIssue (project, dirName) {
     // a run can complete its negotiated work and still leave the reported
     // problem in place. Set with evidence, by an operator or the supervisor.
     disposition: meta.disposition ?? null,
+    // Stated before any disposition is attempted: what `resolved` would refuse on
+    // (the run it would rest on, its risks, the choices), or null. The acceptances
+    // on record, each with its reason and who gave it.
+    unacceptedRisks: meta.kind === 'inquiry' ? null : runs.find((r) => r.closed)?.explanation?.unacceptedRisks ?? null,
+    acceptedRisks: Array.isArray(meta.acceptedRisks) ? meta.acceptedRisks : [],
     // Execution ORDER, decided by a person or the supervisor — not severity, not
     // urgency inferred from the text. Absent means nobody has decided yet, and
     // that is reported as unset rather than defaulted, so a backlog that predates
@@ -208,7 +214,8 @@ const LIVE_RUN = ['pending', 'preflighting', 'running', 'stopping', 'paused']
  * unchanged. Every list and overview request used to parse every run.json of
  * every issue (up to megabytes each); a summary depends only on run.json and on
  * the last step's output, which is written once before the step is recorded, so
- * an unchanged run.json means an unchanged summary.
+ * an unchanged run.json means an unchanged summary, unless the acceptances of its
+ * risks changed: those are in issue.json and are part of the key.
  */
 const summaryCache = new Map()
 const SUMMARY_CACHE_LIMIT = 5000
@@ -225,12 +232,14 @@ async function runSummaries (dir) {
       .map((e) => e.name)
   } catch { return [] }
   const out = []
+  const acceptedRisks = await readAcceptedRisks(dir)
   for (const runId of names) {
     const file = path.join(dir, 'runs', runId, 'run.json')
     let stat
     try { stat = await fs.stat(file) } catch { continue }
+    const accepted = JSON.stringify(acceptedRisks.filter((a) => a.runId === runId))
     const cached = summaryCache.get(file)
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) { out.push(cached.summary); continue }
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.accepted === accepted) { out.push(cached.summary); continue }
     let run
     try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch { continue }
     // The disposition the run detail shows, derived the same way: a triage that
@@ -265,10 +274,11 @@ async function runSummaries (dir) {
       recoveryReason: run.recovery?.required ? (run.recovery.reason ?? null) : null,
       // Only the last output is read here, which is where a closing
       // confirmation sits; the run page reads them all.
-      explanation: explainRun(run, { outputs })
+      explanation: explainRun(run, { outputs, acceptedRisks }),
+      closed: Boolean(run.closure)
     }
     if (summaryCache.size >= SUMMARY_CACHE_LIMIT) summaryCache.delete(summaryCache.keys().next().value)
-    summaryCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, summary })
+    summaryCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, accepted, summary })
     out.push(summary)
   }
   return out.sort((a, b) => ((a.startedAt ?? '') < (b.startedAt ?? '') ? 1 : -1))
@@ -673,13 +683,18 @@ export const DEFAULT_PRIORITY = 'normal'
  * Record what the issue's state IS, with evidence, separately from what any
  * run did. `runId` ties the decision to the run whose closure it rests on;
  * that run's unaccepted residual risks are copied as `openRisks`, so a
- * "resolved" that leaves risks open is visibly contradictory.
+ * "resolved" that leaves risks open is visibly contradictory. `acceptRisks`
+ * accepts risks in the same call: every refusal comes before the one write of
+ * issue.json, which holds both the acceptances and the disposition, so a refused
+ * call leaves neither.
  */
-export async function setIssueDisposition (project, id, { value, evidence, runId = null, by = 'operator', override = null, related = null } = {}) {
+export async function setIssueDisposition (project, id, { value, evidence, runId = null, by = 'operator', override = null, related = null, acceptRisks = null } = {}) {
   if ((await readIssue(project, id).catch(() => null))?.kind === 'inquiry') throw new IssueError('an inquiry has no disposition; close or acknowledge it', 409)
   if (!DISPOSITIONS.includes(value)) throw new IssueError(`disposition must be one of ${DISPOSITIONS.join(', ')}`)
   if (typeof evidence !== 'string' || !evidence.trim()) throw new IssueError('a disposition needs evidence: say what was checked')
   if (!['operator', 'supervisor'].includes(by)) throw new IssueError('by must be operator or supervisor')
+  const entriesError = acceptRisksError(acceptRisks)
+  if (entriesError) throw new IssueError(entriesError)
   const dir = await issueDir(project, id)
   const links = await relatedIssues(project, id, value, related)
 
@@ -694,21 +709,42 @@ export async function setIssueDisposition (project, id, { value, evidence, runId
       try { const r = JSON.parse(await fs.readFile(path.join(dir, 'runs', s.runId, 'run.json'), 'utf8')); if (r.closure) { runRecord = r; runId = s.runId; break } } catch { /* skip */ }
     }
   }
-  const openRisks = (runRecord?.closure?.residualRisks ?? []).filter((r) => r.accepted === false).map((r) => ({ description: r.description, relatesTo: r.relatesTo ?? null }))
+  const accepted = await readAcceptedRisks(dir)
+  const at = new Date().toISOString()
+  const newlyAccepted = riskAcceptances(unacceptedRisks(runRecord, accepted), acceptRisks ?? [], { runId, by, at })
+  const remaining = unacceptedRisks(runRecord, [...accepted, ...newlyAccepted])
+  const openRisks = remaining.map((r) => ({ description: r.description, relatesTo: r.relatesTo ?? null }))
   let overrideRecord = null
   if (value === 'resolved' && openRisks.length) {
     // Only an operator may override, and only by saying why, on the record.
     if (by !== 'operator' || typeof override !== 'string' || !override.trim()) {
-      throw new IssueError(`run ${runId} left ${openRisks.length} residual risk(s) unaccepted; "resolved" contradicts them — choose partially-resolved, accept them on the record first, or (operator only) override with a stated reason`, 409)
+      throw new IssueError(`run ${runId} left ${openRisks.length} residual risk(s) unaccepted; "resolved" contradicts them — choose partially-resolved, accept each with a reason in acceptRisks [{id or text, reason}] (${[...new Set(remaining.map((r) => riskId(r.description)))].join(', ')}), or (operator only) override with a stated reason`, 409)
     }
     overrideRecord = { reason: override.trim(), openRisksAtOverride: openRisks.length }
   }
   const file = path.join(dir, META_FILE)
   let meta = {}
   try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-  meta.disposition = { value, evidence: evidence.trim(), runId: runId ?? null, by, at: new Date().toISOString(), openRisks, override: overrideRecord, related: links }
+  if (newlyAccepted.length) meta.acceptedRisks = [...(Array.isArray(meta.acceptedRisks) ? meta.acceptedRisks : []), ...newlyAccepted]
+  meta.disposition = { value, evidence: evidence.trim(), runId: runId ?? null, by, at, openRisks, override: overrideRecord, related: links }
   await writeJson(file, meta)
   return getIssue(project, id)
+}
+
+/** The acceptance records `acceptRisks` asks for; an entry that names no unaccepted risk refuses the whole call. */
+function riskAcceptances (open, entries, { runId, by, at }) {
+  const records = new Map()
+  for (const entry of entries) {
+    const matched = open.filter((r) => (entry.id === undefined || riskId(r.description) === entry.id.trim()) && (entry.text === undefined || r.description.trim() === entry.text.trim()))
+    if (!matched.length) throw new IssueError(`acceptRisks: ${entry.id ?? JSON.stringify(entry.text)} names no unaccepted residual risk of ${runId ? `run ${runId}` : 'a run on this issue'}${open.length ? `; unaccepted: ${[...new Set(open.map((r) => riskId(r.description)))].join(', ')}` : ''}`, 409)
+    const reason = entry.reason.trim()
+    for (const risk of matched) {
+      const earlier = records.get(risk.description)
+      if (earlier && earlier.reason !== reason) throw new IssueError(`acceptRisks names ${earlier.id} twice with different reasons`)
+      records.set(risk.description, { runId, id: riskId(risk.description), text: risk.description, relatesTo: risk.relatesTo ?? null, reason, by, at })
+    }
+  }
+  return [...records.values()]
 }
 
 /**
@@ -775,8 +811,7 @@ function currentPriority (history) {
 }
 
 /**
- * One follow-up issue per residual risk the closing coordinator did not
- * accept, linked back to the run, deduplicated by the risk's position in the
+ * One follow-up issue per residual risk still unaccepted, linked back to the run, deduplicated by the risk's position in the
  * closure record. The original issue keeps its own disposition: a follow-up
  * tracks work that remains, it never absorbs the defect that was reported.
  */
@@ -788,10 +823,11 @@ export async function createFollowUps (project, id, runId, { by = null } = {}) {
   const risks = run.closure?.residualRisks ?? []
   if (!run.closure) throw new IssueError('the run has no closure record yet', 409)
   const existing = run.closure.followUps ?? []
+  const open = unacceptedRisks(run, await readAcceptedRisks(dir))
   const created = []
   for (let index = 0; index < risks.length; index++) {
     const risk = risks[index]
-    if (risk.accepted !== false) continue
+    if (!open.includes(risk)) continue
     const already = existing.find((f) => f.riskIndex === index)
     if (already) { created.push({ ...already, existing: true }); continue }
     const title = `Follow-up: ${risk.description.replace(/\s+/g, ' ').trim().slice(0, 70)}`

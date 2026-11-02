@@ -773,10 +773,24 @@ named, its unaccepted residual risks are copied as `openRisks`, and
 work while leaving the reported exposure in place is `partially-resolved`,
 not `resolved`. Omitting the run is not a way around this — the newest run
 with a closure is used — and only an operator may override, by stating a
-reason that is kept on the disposition. Archiving without a disposition is
+reason that is kept on the disposition. The risks are stated before anyone
+asks: a run's `explanation.unacceptedRisks` and the issue's `unacceptedRisks`
+(the run a disposition without `runId` rests on) are `{runId, risks: [{id, text,
+relatesTo}], choices}`, the same set `resolved` refuses on. `acceptRisks: [{id |
+text, reason}]` on the disposition accepts risks in that call, by operator or
+supervisor: `id` is derived from the risk's text (closure risks carry none), so
+one copied from another run matches nothing, and an entry naming no unaccepted
+risk, or lacking a reason, refuses the call. Acceptances are kept as
+`acceptedRisks` in `issue.json` (run, text, reason, who, when), the file the
+disposition is in, so the one atomic write records both, a refused call leaves
+neither, and a later disposition keeps them. An accepted risk leaves `openRisks`,
+the listings and follow-ups; `run.json` still holds what the coordinator said,
+and the run detail's `closure` reads it as accepted with its `acceptance`.
+Archiving without a disposition is
 always possible from the panel and is recorded as an override
 (`archiveOverride`, with the reason when one was given); the supervisor must
-set a disposition first and has no override. Archive hides; disposition states. Neither is inferred from
+set a disposition first and has no override (accepting a risk with a reason is
+not an override: it names each risk). Archive hides; disposition states. Neither is inferred from
 `run.outcome`.
 
 Unaccepted residual risks can become **follow-up issues** — one per risk,

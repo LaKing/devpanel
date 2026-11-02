@@ -162,7 +162,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    closeInquiry:a=>mutate(()=>supervisor.closeInquiry(a)),
    reopenInquiry:a=>mutate(()=>supervisor.reopenInquiry(a)),
    archive:a=>mutate(()=>issues.setIssueArchived(a.project,a.issueId,true)),
-   setDisposition:a=>mutate(()=>issues.setIssueDisposition(a.project,a.issueId,{value:a.value,evidence:a.evidence,runId:a.runId??null,related:a.related??null,by:'supervisor'})),
+   setDisposition:a=>mutate(()=>issues.setIssueDisposition(a.project,a.issueId,{value:a.value,evidence:a.evidence,runId:a.runId??null,related:a.related??null,acceptRisks:a.acceptRisks??null,by:'supervisor'})),
    createFollowUps:a=>mutate(()=>issues.createFollowUps(a.project,a.issueId,a.runId,{by:{user:'supervisor'}})),
    markLanded:a=>mutate(()=>supervisor.markLanded(a))
   }}) } catch(e) { await lock.release();throw e }

@@ -1,3 +1,4 @@
+import { riskId } from './runtime/residual-risks.mjs'
 import crypto from 'node:crypto'
 import { checkSummary } from './runtime/check-summary.mjs'
 import { concurrentStarts } from './supervisor-starts.mjs'
@@ -99,7 +100,7 @@ export function summariseRun (detail) {
         verificationLevel: detail.closure.verificationLevel,
         authorised: detail.closure.authorised,
         conditions: detail.closure.conditions,
-        residualRisks: (detail.closure.residualRisks ?? []).map((r) => ({ accepted: r.accepted ?? null, relatesTo: r.relatesTo ?? null, description: clip(r.description, 300) }))
+        residualRisks: (detail.closure.residualRisks ?? []).map((r) => ({ id: riskId(r.description), accepted: r.accepted ?? null, ...(r.acceptance ? { acceptance: r.acceptance } : {}), relatesTo: r.relatesTo ?? null, description: clip(r.description, 300) }))
       }
     : null
   return {
@@ -220,6 +221,8 @@ export function summariseIssue ({ issue, reports, runs }) {
     issue: {
       id: issue.id, name: issue.name, project: issue.project, status: issue.status, archived: issue.archived,
       openedOn: issue.openedOn, openedBy: issue.openedBy ?? null, report: issue.report ?? null, path: issue.path, disposition: issue.disposition ?? null,
+      // Never clipped: a risk's text, like its id, names it in acceptRisks.
+      unacceptedRisks: issue.unacceptedRisks ?? null, acceptedRisks: issue.acceptedRisks ?? [],
       steps: (issue.steps ?? []).map((s) => ({ number: s.number, slug: s.slug, files: (s.files ?? []).map((f) => f.name) }))
     },
     reports: (reports ?? []).map((r) => ({ step: r.step, name: r.name, text: clip(r.text, 6000), truncated: typeof r.text === 'string' && r.text.length > 6000 })),

@@ -1,6 +1,7 @@
 import { checksOnlyBlock } from './run-control.mjs'
 import { runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
+import { riskStatement } from './residual-risks.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -17,6 +18,8 @@ import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 //   next      what a person can do about it
 //   unmet     the specific things that were not satisfied, each with evidence
 //   tone      progress | waiting | success | warning | error | neutral
+//   unacceptedRisks  what a `resolved` disposition would refuse on, each risk with
+//             what names it in acceptRisks, and the choices; absent when nothing is
 //
 // It never decides anything. Actions a page may offer come from the run's
 // supportedActions; `next` names them in prose and a page shows the buttons.
@@ -302,9 +305,18 @@ const DELIVERY = {
 }
 
 /** Where a run stands, for a person. See the header for the fields. */
-export function explainRun (run, { outputs = {}, active = [], ownership = null } = {}) {
+export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [] } = {}) {
   if (!run) return null
-  if (run.landed) return landed(run, explainRun({ ...run, landed: undefined }, { outputs, active }))
+  const standing = explainStanding(run, { outputs, active, ownership })
+  const unaccepted = riskStatement(run, acceptedRisks)
+  if (!unaccepted) return standing
+  const n = unaccepted.risks.length
+  const choice = `${plural(n, 'residual risk')} ${n === 1 ? 'is' : 'are'} unaccepted: to record resolved, accept ${n === 1 ? 'it' : 'each'} with a reason; otherwise record partially-resolved.`
+  return { ...standing, next: [standing.next, choice].filter(Boolean).join(' '), unacceptedRisks: unaccepted }
+}
+
+function explainStanding (run, { outputs, active, ownership }) {
+  if (run.landed) return landed(run, explainStanding({ ...run, landed: undefined }, { outputs, active }))
   const kept = run.workspace?.state === 'retained' ? 'Its workspace and logs are kept.' : 'Its logs are kept.'
 
   // The run lock names an owner whose liveness cannot be proved (lock.mjs):

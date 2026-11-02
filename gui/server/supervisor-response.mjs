@@ -1,3 +1,5 @@
+import { acceptRisksError } from './runtime/residual-risks.mjs'
+
 const fields = {
   get_check_log: ['project','issueId','runId','check','command'],
   refresh_checks_run: ['project','issueId','runId'],
@@ -40,6 +42,7 @@ function validate (value) {
     for (const field of fields[action.type]) if (typeof action[field]!=='string' || !action[field].trim()) throw Error(`Action ${action.type} requires ${field}`)
     if(action.type==='set_disposition'&&action.runId!==undefined&&(typeof action.runId!=='string'||!action.runId.trim()))throw Error('runId must be a string')
     if(action.type==='set_disposition'&&action.related!==undefined&&(!Array.isArray(action.related)||action.related.some(r=>typeof r!=='string'||!r.trim())))throw Error('related must be a list of issue ids')
+    if(action.type==='set_disposition'&&action.acceptRisks!==undefined){const bad=action.acceptRisks===null?'acceptRisks must be a list of {id or text, reason}':acceptRisksError(action.acceptRisks);if(bad)throw Error(bad)}
     if(action.type==='set_dependencies'&&(!Array.isArray(action.dependsOn)||action.dependsOn.some(r=>typeof r!=='string'||!r.trim())))throw Error('dependsOn must be a list of issue ids')
     if(action.type==='inquire'&&action.relatedIssue!==undefined&&(typeof action.relatedIssue!=='string'||!action.relatedIssue.trim()))throw Error('relatedIssue must be an issue id')
     if(action.type==='create_issue'&&action.fromInquiry!==undefined&&(!action.fromInquiry||typeof action.fromInquiry!=='object'||Array.isArray(action.fromInquiry)||['inquiryId','runId','key'].some(k=>typeof action.fromInquiry[k]!=='string'||!action.fromInquiry[k].trim())||Object.keys(action.fromInquiry).some(k=>!['inquiryId','runId','key'].includes(k))))throw Error('fromInquiry must be {inquiryId, runId, key}')
@@ -52,7 +55,7 @@ function validate (value) {
       if(action.issueId!==undefined&&action.project===undefined)throw Error('issueId needs its project')
       if(action.options!==undefined&&(!Array.isArray(action.options)||!action.options.length||action.options.length>6||action.options.some(o=>typeof o!=='string'||!o.trim()||o.length>200)))throw Error('options must be 1 to 6 short strings')
     }
-    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
+    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
     if(Object.keys(action).some(k=>!allowed.includes(k)))throw Error('Unexpected action argument')
     for(const k of ['offset','limit'])if(action[k]!==undefined&&(!Number.isSafeInteger(action[k])||action[k]<0))throw Error(`${k} must be a non-negative integer`)
     if(action.stats!==undefined&&action.stats!==true&&action.stats!==false&&(!Array.isArray(action.stats)||action.stats.some(x=>!['byPlaybook','bySeat'].includes(x))))throw Error('stats must be true, false or a list of byPlaybook, bySeat')
