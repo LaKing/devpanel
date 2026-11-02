@@ -50,7 +50,10 @@ not a new one. The only automatic conflict resolution is the project's declared
 appended); any other conflict, a changed reviewed delta or failed checks leave
 the run blocked with the paths in `run.reconciliations`, and a new run of the
 issue still starts from the approved patch (execution-contract.md "Reconciling
-a delivery with drifted source").
+a delivery with drifted source"). A run reading `reconcilePending: true` has an
+automatic reconcile undecided: monitoring holds its wake until the decision
+arrives as an ordinary `run-changed`, and a run record that cannot be read is
+a monitoring fault that is retried (`getRun` answers 503, not 404).
 This authority does not include committing, running arbitrary scripts, or deploying.
 
 Shared staging is a separate action. Where a project's infrastructure enables

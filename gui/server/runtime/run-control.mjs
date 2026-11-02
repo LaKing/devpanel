@@ -1,5 +1,35 @@
 import { gatingResult } from './baseline-failures.mjs'
 
+/*
+ * An automatic reconcile applies and is undecided (auto-reconcile.mjs): the marker
+ * is written with the block itself and cleared by whatever decides it. The status
+ * is read too, so a run that failed, was abandoned or moved on never reads pending
+ * from a leftover field. While this holds, no one is told the run settled.
+ */
+export const reconcilePending = (run) => run?.autoReconcile?.state === 'pending' && run.status === 'blocked' && run.blockedReason === 'source-delivery-blocked'
+
+export const RECONCILABLE_BLOCKS = Object.freeze(['source-delivery-blocked', 'delivery-unverifiable'])
+
+/** The approved patch's own paths a refused source application found changed. */
+export function ownPathDrift (run) {
+  const a = run.delivery?.application
+  if (a?.state !== 'source-drift') return []
+  if (a.drifted?.length) return a.drifted
+  // Refused before `drifted` was recorded: the message names them.
+  const m = /The approved patch's own paths changed: (.+?)\. /.exec(a.error ?? '')
+  return m ? m[1].split(', ').filter((p) => p !== '…') : []
+}
+
+/** Why `reconcile-delivery` cannot run on this record, or null. */
+export function reconcileUnavailable (run) {
+  if (run.status !== 'blocked' || !RECONCILABLE_BLOCKS.includes(run.blockedReason)) return `this run is not blocked at source delivery (status ${run.status}, ${run.blockedReason ?? 'no block'})`
+  if (run.delivery?.action !== 'apply-to-source') return 'only an apply-to-source delivery is reconciled with its source'
+  if (!run.workspace?.path || run.workspace.state === 'removed') return 'the worktree is gone; nothing is left to reconcile'
+  if (['quarantined', 'abandoned'].includes(run.integrity?.status) || run.recovery?.required) return 'the run needs its integrity or recovery resolved first'
+  if (!ownPathDrift(run).length) return "delivery was not refused for drift on the approved patch's own paths; finalize once the cause is fixed"
+  return null
+}
+
 /** Resume is an explicit operator action; uncertain mutations still need recovery. */
 export function resumeUnavailable (run) {
   if (run.abandonment || run.integrity?.status === 'abandoned') return 'This run was abandoned.'

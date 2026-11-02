@@ -6,6 +6,7 @@
 // refuses a configuration the preview marks blocking. `answer` also starts a run: the server restarts the
 // same playbook after an owner answer.
 import fs from 'node:fs';
+import http from 'node:http';
 import https from 'node:https';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -102,7 +103,9 @@ function api(method, url, body) {
     const bearer = token();
     const headers = { ...(bearer && { Authorization: `Bearer ${bearer}` }), ...(payload && { 'Content-Type': 'application/json' }) };
     return new Promise((resolve, reject) => {
-        const req = https.request({ host: SERVER.hostname.replace(/^\[|\]$/g, ''), port: SERVER.port || 443, path: url, method, headers, rejectUnauthorized: false }, (res) => {
+        // A panel with DEVPANEL_TLS=0 serves plain HTTP.
+        const [transport, port] = SERVER.protocol === 'http:' ? [http, SERVER.port || 80] : [https, SERVER.port || 443];
+        const req = transport.request({ host: SERVER.hostname.replace(/^\[|\]$/g, ''), port, path: url, method, headers, rejectUnauthorized: false }, (res) => {
             let text = '';
             res.setEncoding('utf8');
             res.on('data', (d) => (text += d));
@@ -203,6 +206,7 @@ const commands = {
         const issue = await api('GET', `${base(project)}/issues/${id}`);
         console.log(`${issue.name}\n${project}/${id} — ${issue.status}, ${issue.runCount} run(s), ${link(issue.path, 'folder')}`);
         if (issue.disposition) console.log(`disposition: ${issue.disposition.value} — ${issue.disposition.evidence ?? ''}`);
+        for (const runId of issue.unreadableNewerRuns ?? []) console.log(`run ${runId} cannot be read; the latest run below is older`);
         console.log(describeRun(issue.latestRun).join('\n'));
         const asked = issue.latestRun?.ownerInput;
         if (!asked || asked.answered) return;
@@ -264,18 +268,48 @@ const commands = {
         const wanted = flags.find((f) => !f.startsWith('--'));
         const id = wanted ? await resolveId(project, wanted) : null;
         if (untilSettled && !id) fail('--until-settled needs the issue whose run to wait for');
+        // A record that cannot be read may be the newest run: latestRun then names an older one, which says nothing about it.
+        // So may a reading that failed. Either way the record has to be asked again: no event may ever come.
+        let unsure = false;
+        const noted = new Set();
         const settledRun = async () => {
-            const run = (await api('GET', `${base(project)}/issues/${id}`)).latestRun;
-            return run && (!run.live || run.status === 'paused') ? run : null;
+            const issue = await api('GET', `${base(project)}/issues/${id}`);
+            const unread = issue.unreadableNewerRuns ?? [];
+            unsure = unread.length > 0;
+            if (unsure) {
+                for (const runId of unread) {
+                    if (!noted.has(runId)) { noted.add(runId); console.log(`cannot read run ${runId}; waiting for it`); }
+                }
+                return null;
+            }
+            const run = issue.latestRun;
+            // Blocked is not settled while an automatic reconcile of it is undecided.
+            return run && (!run.live || run.status === 'paused') && !run.reconcilePending ? run : null;
         };
-        if (untilSettled) {
-            const run = await settledRun();
-            if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); return; }
-        }
+        // Every path that can end the wait asks the record here; a reading that fails is not an answer.
+        let done = false;
+        let socket = null;
+        let recheck = null;
+        const settle = async () => {
+            const run = await settledRun().catch(() => { unsure = true; return null; });
+            if (!run || done) return false;
+            done = true;
+            console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`);
+            clearInterval(recheck);
+            socket?.close();
+            return true;
+        };
+        if (untilSettled && await settle()) return;
         const { io } = createRequire(path.join(ROOT, 'gui', 'package.json'))('socket.io-client');
-        const socket = io(SERVER.origin, { auth: { token: token() }, rejectUnauthorized: false, transports: ['websocket'] });
+        socket = io(SERVER.origin, { auth: { token: token() }, rejectUnauthorized: false, transports: ['websocket'] });
+        // Only while unsure is the record asked on a timer; otherwise events and reconnects say when to ask.
+        if (untilSettled) recheck = setInterval(() => { if (unsure) settle(); }, Number(process.env.DEVPANEL_WATCH_RECHECK_MS) || 5000);
         const time = () => new Date().toTimeString().slice(0, 8);
-        socket.on('connect', () => console.log(`${time()} watching ${project}${id ? `/${id}` : ''}`));
+        socket.on('connect', () => {
+            console.log(`${time()} watching ${project}${id ? `/${id}` : ''}`);
+            // What happened while not connected produced no event here.
+            if (untilSettled) settle();
+        });
         socket.on('connect_error', (e) => console.log(`${time()} cannot connect: ${e.data?.reason ?? e.message}`));
         socket.on('disconnect', (reason) => console.log(`${time()} disconnected: ${reason}`));
         socket.on('run:event', async (e) => {
@@ -283,10 +317,7 @@ const commands = {
             const detail = [e.role, e.stepId, e.status ?? e.outcome ?? e.reason].filter(Boolean).join(' ');
             console.log(`${time()} ${id ? '' : `${e.issueId} `}${e.runId ?? ''} ${e.type}${detail ? ` ${detail}` : ''}`);
             // The run record, not the event, says whether it settled: a pause or an end is persisted before it is emitted.
-            if (untilSettled && SETTLING.has(e.type)) {
-                const run = await settledRun().catch(() => null);
-                if (run) { console.log(`settled ${run.runId} ${run.status}${run.result ? ` / ${run.result}` : ''}`); socket.close(); }
-            }
+            if (untilSettled && SETTLING.has(e.type)) await settle();
         });
     },
 };

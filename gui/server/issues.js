@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 
 import { runResult } from './runtime/run-result.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
+import { reconcilePending } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
 import { withLock } from './runtime/lock.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
@@ -152,7 +153,8 @@ async function readIssue (project, dirName) {
     stepCount = entries.filter((entry) => entry.isDirectory() && STEP_PATTERN.test(entry.name)).length
   } catch { /* unreadable */ }
 
-  const runs = await runSummaries(dir)
+  const unreadable = []
+  const runs = await runSummaries(dir, unreadable)
 
   return {
     id: dirName,
@@ -203,7 +205,11 @@ async function readIssue (project, dirName) {
     runCount: runs.length,
     // The newest run, reduced to what a list can tag an issue with. Read from
     // persisted state, so a run driven by another process is described too.
-    latestRun: runs[0] ?? null
+    latestRun: runs[0] ?? null,
+    // Records that exist and cannot be read, started after latestRun: the newest
+    // run may be one of these, so latestRun alone cannot say the issue's run settled.
+    // A run id starts with its time, so string order is start order.
+    unreadableNewerRuns: unreadable.filter((id) => !runs[0] || id > runs[0].runId)
   }
 }
 
@@ -224,7 +230,7 @@ const SUMMARY_CACHE_LIMIT = 5000
  * Every run under an issue, newest first, as list-sized summaries.
  * A half-written run directory is not a run and is skipped.
  */
-async function runSummaries (dir) {
+async function runSummaries (dir, unreadable = []) {
   let names = []
   try {
     names = (await fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }))
@@ -236,12 +242,19 @@ async function runSummaries (dir) {
   for (const runId of names) {
     const file = path.join(dir, 'runs', runId, 'run.json')
     let stat
-    try { stat = await fs.stat(file) } catch { continue }
+    try { stat = await fs.stat(file) } catch (error) {
+      // No record at all is a half-written directory, not a run.
+      if (error.code !== 'ENOENT') unreadable.push(runId)
+      continue
+    }
     const accepted = JSON.stringify(acceptedRisks.filter((a) => a.runId === runId))
     const cached = summaryCache.get(file)
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.accepted === accepted) { out.push(cached.summary); continue }
     let run
-    try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch { continue }
+    try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch (error) {
+      if (error.code !== 'ENOENT') unreadable.push(runId)
+      continue
+    }
     // The disposition the run detail shows, derived the same way: a triage that
     // judged the playbook unfit is "rejected", not merely unresolved.
     const last = run.steps?.at?.(-1)
@@ -261,6 +274,7 @@ async function runSummaries (dir) {
       playbook: run.playbook?.id ?? null,
       intent: run.playbook?.intent ?? null,
       live: LIVE_RUN.includes(run.status),
+      reconcilePending: reconcilePending(run),
       recoveryRequired: run.blockedReason === 'recovery-required' || run.recovery?.required === true,
       workspaceRetained: run.workspace?.state === 'retained',
       delivered: Boolean(run.delivery?.completedAt),
@@ -938,6 +952,7 @@ async function markArchived (project, id, archived, { overrideReason = null } = 
             throw new IssueError('Run state could not be checked. Resolve it before archiving.', 409)
           }
           if (['pending', 'preflighting', 'running', 'stopping', 'paused'].includes(run.status) ||
+              reconcilePending(run) ||
               run.recovery?.required || run.blockedReason === 'recovery-required' ||
               Object.values(run.participants ?? {}).some((p) => p.pendingInvocation || p.state === 'recovery-required')) {
             throw new IssueError('Stop the active run and resolve any pending recovery before archiving this issue.', 409)

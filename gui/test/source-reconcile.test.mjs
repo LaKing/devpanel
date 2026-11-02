@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { startRun, worktreeDiffDelivery, releaseOwnership, gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { applyToSource } from '../server/runtime/source-delivery.mjs'
@@ -15,6 +16,9 @@ import { autoReconcileRefusal } from '../server/runtime/auto-reconcile.mjs'
 import { readCheckLog } from '../server/runtime/check-log.mjs'
 import { getRun } from '../server/runs-api.mjs'
 import { summariseRun } from '../server/supervisor-summary.mjs'
+import { acquire } from '../server/runtime/lock.mjs'
+import { reconcilePending } from '../server/runtime/run-control.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 
 const exec = promisify(execFile)
@@ -61,8 +65,49 @@ const read = (f, file) => fs.readFile(path.join(f.projectPath, file), 'utf8')
 const getRunView = async (f, engine) => summariseRun(await getRun(f.issuePath, engine.runId, { issues: f.issues, project: 'devpanel-project', issueId: f.issue.id }))
 const checkNumber = (dir) => dir.split('/')[1]
 
+const PROJECT = 'devpanel-project'
+const RETRY_MS = 20
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const periods = () => sleep(RETRY_MS * 10)
+const until = async (test, label) => {
+  const end = Date.now() + 60000
+  while (!(await test())) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${label}`)
+    await sleep(10)
+  }
+}
+const CHANGELOG_ONLY = { worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'candidate: fixed line 9\nv1 released\n' }, source: { 'changelog.txt': 'other: landed first\nv1 released\n' } }
+const CODE_CONFLICT = { worktree: { 'server.mjs': lines(10, { 5: 'line 5 by the candidate' }) }, source: { 'server.mjs': lines(10, { 5: 'line 5 by someone else' }) } }
+const DECLARED = "'**/changelog.txt': prepend"
+const types = (events) => events.map((e) => e.type)
+const finishes = (events, runId = null) => events.filter((e) => e.type === 'run-finished' && (!runId || e.runId === runId)).length
+const shows = (run, text) => JSON.stringify(explainRun(run)).includes(text)
+const DO_NOT_LAND = 'automatic reconcile running; do not land by hand'
+
 export default async function (t) {
   const temps = []
+  const runFile = (f, runId) => path.join(f.issuePath, 'runs', runId, 'run.json')
+  const record = async (f, runId) => JSON.parse(await fs.readFile(runFile(f, runId), 'utf8'))
+
+  /* A run blocked at delivery, its project declaring `policy`, and a supervisor whose events are kept. */
+  async function supervisedRun (scenario, { policy = DECLARED, wrap = (issues) => issues, onEvent = null } = {}) {
+    const { f, engine } = await blockedRun(scenario)
+    await fs.mkdir(path.join(f.configRoot, 'projects'), { recursive: true })
+    await fs.writeFile(path.join(f.configRoot, 'projects', `${PROJECT}.yaml`), `id: ${PROJECT}\nworkspace:\n  reconcile:\n    ${policy}\n`)
+    await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    const projectsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reconcile-projects-'))
+    temps.push(projectsDir)
+    await fs.symlink(f.projectPath, path.join(projectsDir, PROJECT))
+    const open = (over = {}) => {
+      const events = []
+      const handler = over.onEvent ?? onEvent
+      const supervisor = createSupervisor({ issues: (over.wrap ?? wrap)(f.issues), emit: (e) => { events.push(e); handler?.(e) }, harnessDir: path.join(f.configRoot, 'harness'), projectsDir, configRoot: f.configRoot, reconcileRetryMs: RETRY_MS })
+      return { supervisor, events }
+    }
+    const runId = engine.runId
+    return { f, engine, runId, open, ids: { project: PROJECT, issueId: f.issue.id, runId } }
+  }
+
   try {
     t.section('1. clean merge: the source changed another line of the patched file')
     {
@@ -145,6 +190,376 @@ export default async function (t) {
       t.eq('the attempt is the engine\'s', run.reconciliations?.[0]?.by, 'engine')
       t.eq("the candidate's entry is above the source's", await read(f, 'changelog.txt'), 'candidate: fixed line 9\nother: landed first\nv1 released\n')
       await supervisor.shutdown?.()
+    }
+
+    t.section('2d. accepted: the end is announced once, after the automatic reconcile is decided')
+    {
+      let seen = null
+      const s = await supervisedRun(CHANGELOG_ONLY, { onEvent: (e) => {
+        if (e.type === 'finished' && e.reason === 'finalize') seen ??= JSON.parse(readFileSync(runFile(s.f, s.runId), 'utf8'))
+      } })
+      const { supervisor, events } = s.open()
+      await supervisor.finalize(s.ids)
+      t.eq('the block is on the record with its marker before the engine\'s end event', [seen?.status, reconcilePending(seen), seen?.reconciliations?.length ?? 0], ['blocked', true, 0])
+      t.ok('and already says so before reconcile-started', shows(seen, DO_NOT_LAND), JSON.stringify(explainRun(seen)))
+      await until(() => finishes(events) > 0, 'the end announcement')
+      const order = types(events)
+      t.ok('run-finished comes after the reconcile is decided', order.indexOf('reconciled') >= 0 && order.indexOf('run-finished') > order.indexOf('reconciled'), order.join(' '))
+      await periods()
+      t.eq('exactly once', finishes(events), 1)
+      const run = await record(s.f, s.runId)
+      t.eq('it reports the actual end state, marker gone', [run.status, run.outcome, run.autoReconcile ?? null], ['completed', 'resolved', null])
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2e. refused: the end is announced once, after the refusal, and the run stays blocked')
+    {
+      const s = await supervisedRun(CODE_CONFLICT, { policy: "'server.mjs': append" })
+      const { supervisor, events } = s.open()
+      await supervisor.finalize(s.ids)
+      await until(() => finishes(events) > 0, 'the end announcement')
+      const order = types(events)
+      t.ok('run-finished comes after the refusal', order.indexOf('reconcile-refused') >= 0 && order.indexOf('run-finished') > order.indexOf('reconcile-refused'), order.join(' '))
+      await periods()
+      t.eq('exactly once', finishes(events), 1)
+      const run = await record(s.f, s.runId)
+      t.eq('blocked as before, one attempt on the record, marker gone', [run.status, run.blockedReason, run.reconciliations.length, run.autoReconcile ?? null], ['blocked', 'source-delivery-blocked', 1, null])
+      t.ok('the attempt ended refused', run.reconciliations[0].state !== 'accepted' && Boolean(run.reconciliations[0].endedAt), run.reconciliations[0].state)
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2f. never ran, the project busy: recorded, announced once, Reconcile still offered')
+    {
+      // Another issue's live run, as the admission reads it; only once the operator's own finalize has passed admission.
+      let busy = null
+      const wrap = (issues) => ({ ...issues, listIssues: async (project, options) => [...await issues.listIssues(project, options), ...(busy ? [busy] : [])] })
+      let lock = null
+      const s = await supervisedRun(CHANGELOG_ONLY, { wrap, onEvent: (e) => {
+        if (e.type === 'finished' && e.reason === 'finalize') busy = { id: 'another-issue', path: other.path, latestRun: { live: true, runId: 'held-run' } }
+      } })
+      const other = await s.f.issues.getIssue(PROJECT, (await s.f.issues.createIssue(PROJECT, { name: 'Holds the project' })).id)
+      lock = await acquire(path.join(other.path, '.run.lock'), { purpose: 'test', runId: 'held-run' })
+      const { supervisor, events } = s.open()
+      await supervisor.finalize(s.ids)
+      await until(() => finishes(events) > 0, 'the end announcement')
+      await lock.release()
+      await periods()
+      t.eq('exactly once', finishes(events), 1)
+      const run = await record(s.f, s.runId)
+      t.eq('no attempt, marker recorded as not run', [run.reconciliations?.length ?? 0, run.autoReconcile?.state, reconcilePending(run)], [0, 'not-run', false])
+      t.ok('the reason names the busy project', /already active on this project/.test(run.autoReconcile.reason), run.autoReconcile.reason)
+      t.ok('the journal comes first', types(events).indexOf('reconcile-not-run') >= 0 && types(events).indexOf('reconcile-not-run') < types(events).indexOf('run-finished'), types(events).join(' '))
+      t.ok('the explanation says it did not run and offers Reconcile', shows(run, 'The automatic reconcile did not run') && shows(run, 'Reconcile delivery'), JSON.stringify(explainRun(run)))
+      t.ok('and Reconcile is still an action', supportedActions(run).includes('reconcile-delivery'))
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2g. an automatic reconcile does not apply: announced at once, as before')
+    {
+      const s = await supervisedRun(CODE_CONFLICT)
+      const { supervisor, events } = s.open()
+      await supervisor.finalize(s.ids)
+      t.eq('announced by the time finalize returns', finishes(events), 1)
+      const run = await record(s.f, s.runId)
+      t.eq('no marker and no attempt', [run.autoReconcile ?? null, run.reconciliations?.length ?? 0, reconcilePending(run)], [null, 0, false])
+      t.ok('the explanation does not say it is running', !shows(run, DO_NOT_LAND), JSON.stringify(explainRun(run)))
+      await periods()
+      t.eq('still once', finishes(events), 1)
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2h. the lock is held when the attempt starts: it never ran, and the release waits for the lock')
+    {
+      let grab = false
+      let lock = null
+      const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+        if (grab) { grab = false; lock = await acquire(path.join(s.f.issuePath, '.run.lock'), { purpose: 'test', runId: s.runId }) }
+        return issues.getIssue(...args)
+      } })
+      const s = await supervisedRun(CHANGELOG_ONLY, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') grab = true } })
+      const { supervisor, events } = s.open()
+      // The attempt reads the project's configuration first: the lock is held until the attempt has really met it.
+      const warned = []
+      const warn = console.warn
+      console.warn = (...args) => { warned.push(args.join(' ')); warn(...args) }
+      try {
+        await supervisor.finalize(s.ids)
+        await until(() => warned.some((w) => /did not run: another run already holds this issue/.test(w)), 'the attempt to meet the held lock')
+        await periods()
+        t.eq('nothing is announced while it is held', finishes(events), 0)
+        t.ok('and the marker stands', reconcilePending(await record(s.f, s.runId)))
+        await lock.release()
+        await until(() => finishes(events) > 0, 'the end announcement')
+      } finally {
+        console.warn = warn
+      }
+      await periods()
+      t.eq('once released, exactly one announcement', finishes(events), 1)
+      const run = await record(s.f, s.runId)
+      t.eq('and no attempt, recorded as not run', [run.reconciliations?.length ?? 0, run.autoReconcile?.state], [0, 'not-run'])
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2k. a marker this server wrote is its own end path\'s: a sweep leaves it alone')
+    {
+      // The run has ended and its marker is on the record; its announcement is held at the gate.
+      let closed = false
+      let open = null
+      let reached = false
+      const gate = new Promise((resolve) => { open = resolve })
+      const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+        if (closed) { reached = true; await gate }
+        return issues.getIssue(...args)
+      } })
+      const s = await supervisedRun(CHANGELOG_ONLY, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') closed = true } })
+      const { supervisor, events } = s.open()
+      const finalized = supervisor.finalize(s.ids)
+      await until(() => reached, 'the end path to reach the gate')
+      const held = await record(s.f, s.runId)
+      t.ok('the marker names this server', reconcilePending(held) && typeof held.autoReconcile.owner === 'string', JSON.stringify(held.autoReconcile))
+      await supervisor.reconcile()
+      await periods()
+      const after = await record(s.f, s.runId)
+      t.eq('the sweep leaves it as it was', after.autoReconcile, held.autoReconcile)
+      t.eq('and announces nothing', [finishes(events), types(events).includes('reconcile-not-run')], [0, false])
+      closed = false
+      open()
+      await finalized
+      await until(() => finishes(events) > 0, 'the end announcement')
+      await periods()
+      const run = await record(s.f, s.runId)
+      t.eq('its own end path decides it, announced once', [run.status, run.autoReconcile ?? null, finishes(events), types(events).includes('reconcile-not-run')], ['completed', null, 1, false])
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2i. a read fails when the run ends: nothing is announced until the record reads')
+    {
+      for (const [label, scenario, failFor, expected] of [
+        ['transient, reconcile applies', CHANGELOG_ONLY, 1, 'completed'],
+        ['many periods, reconcile applies', CHANGELOG_ONLY, 10, 'completed'],
+        ['many periods, reconcile does not apply', CODE_CONFLICT, 10, 'blocked']
+      ]) {
+        let failing = false
+        const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+          if (failing) throw new Error('disk fault')
+          return issues.getIssue(...args)
+        } })
+        const s = await supervisedRun(scenario, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') failing = true } })
+        const { supervisor, events } = s.open()
+        await supervisor.finalize(s.ids)
+        await sleep(RETRY_MS * failFor)
+        t.eq(`${label}: nothing announced while it fails`, finishes(events), 0)
+        const applies = scenario === CHANGELOG_ONLY
+        t.eq(`${label}: the marker as it should be`, reconcilePending(await record(s.f, s.runId)), applies)
+        failing = false
+        await until(() => finishes(events) > 0, 'the end announcement')
+        await periods()
+        t.eq(`${label}: once healed, exactly one announcement`, finishes(events), 1)
+        const run = await record(s.f, s.runId)
+        t.eq(`${label}: the end state, marker gone`, [run.status, run.autoReconcile ?? null], [expected, null])
+        if (applies) t.ok(`${label}: after the decision`, types(events).indexOf('run-finished') > types(events).indexOf('reconciled'), types(events).join(' '))
+        await supervisor.shutdown?.()
+      }
+      // A record that is gone cannot hold anything: it is announced and not retried.
+      let gone = false
+      const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+        if (gone) throw Object.assign(new Error('no such issue'), { status: 404 })
+        return issues.getIssue(...args)
+      } })
+      const s = await supervisedRun(CHANGELOG_ONLY, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') gone = true } })
+      const { supervisor, events } = s.open()
+      await supervisor.finalize(s.ids)
+      t.eq('gone: announced', finishes(events), 1)
+      await periods()
+      t.eq('gone: and not again', finishes(events), 1)
+      await supervisor.shutdown?.()
+    }
+
+    t.section('2j. a marker left by an earlier server: released at startup, whatever stood in the way')
+    {
+      const s = await supervisedRun(CHANGELOG_ONLY)
+      const base = await record(s.f, s.runId)
+      const write = (run) => fs.writeFile(runFile(s.f, s.runId), JSON.stringify(run))
+      const marker = { state: 'pending', at: '2026-11-02T10:00:00.000Z', owner: 'an earlier server' }
+      const pending = { ...base, autoReconcile: marker }
+      const lockFile = path.join(s.f.issuePath, '.run.lock')
+
+      // The explanation, on a real record.
+      t.eq('the fixture is the blocked record', [base.blockedReason, base.delivery.application.drifted], ['source-delivery-blocked', ['changelog.txt']])
+      t.ok('pending, before reconcile-started', shows(pending, DO_NOT_LAND))
+      t.ok('pending, during the attempt', shows({ ...pending, reconciliations: [{ n: 1, state: 'merging' }] }, DO_NOT_LAND))
+      t.ok('decided: it no longer says so', !shows(base, DO_NOT_LAND))
+      const next = (run) => explainRun(run).next
+      t.ok('recorded drift: Reconcile delivery before landing by hand', next(base).indexOf('Reconcile delivery') === 0 && next(base).indexOf('by hand') > 0, next(base))
+      const olderRecord = { ...base, delivery: { ...base.delivery, application: { state: 'source-drift', error: "The approved patch's own paths changed: changelog.txt. Merge them." } } }
+      t.ok('drift only in an older record\'s message: the same', next(olderRecord).indexOf('Reconcile delivery') === 0 && next(olderRecord).indexOf('by hand') > 0, next(olderRecord))
+      t.ok('with the worktree gone it is not offered', !next({ ...base, workspace: { ...base.workspace, state: 'removed' } }).includes('Reconcile delivery'))
+
+      // Refused like a live run while it holds.
+      await write(pending)
+      {
+        const { supervisor } = s.open()
+        const removed = await supervisor.deleteRun(s.ids).then(() => null, (e) => e)
+        t.eq('deleting the run is refused', removed?.status, 409)
+        const archived = await s.f.issues.setIssueArchived(PROJECT, s.f.issue.id, true).then(() => null, (e) => e)
+        t.ok('archiving the issue is refused', /Stop the active run/.test(archived?.message ?? ''), archived?.message)
+        await supervisor.shutdown?.()
+      }
+
+      // Restart: the record reads.
+      await write(pending)
+      {
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        t.eq('restart: announced once', finishes(events), 1)
+        t.ok('restart: journaled first', types(events).indexOf('reconcile-not-run') >= 0 && types(events).indexOf('reconcile-not-run') < types(events).indexOf('run-finished'), types(events).join(' '))
+        const run = await record(s.f, s.runId)
+        t.eq('restart: recorded as not run', [run.autoReconcile.state, reconcilePending(run)], ['not-run', false])
+        t.ok('restart: naming the restart', /restarted/.test(run.autoReconcile.reason), run.autoReconcile.reason)
+        await supervisor.shutdown?.()
+      }
+
+      // The lock is held at startup: the release keeps trying, and depends only on what the holder left.
+      await write(pending)
+      {
+        const lock = await acquire(lockFile, { purpose: 'test', runId: s.runId })
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        await periods()
+        t.eq('held lock: nothing announced', finishes(events), 0)
+        t.ok('held lock: the marker stands', reconcilePending(await record(s.f, s.runId)))
+        await lock.release()
+        await until(() => finishes(events) > 0, 'the end announcement')
+        await periods()
+        t.eq('released: exactly one announcement', finishes(events), 1)
+        t.eq('released: recorded as not run', (await record(s.f, s.runId)).autoReconcile.state, 'not-run')
+        await supervisor.shutdown?.()
+      }
+      // A real landing holds the lock, leaves the marker and announces only itself.
+      await write(pending)
+      {
+        const { supervisor, events } = s.open()
+        await supervisor.markLanded({ ...s.ids, by: 'a person', applied: 'the patch', handChanges: 'none', checkout: '/somewhere' })
+        t.eq('a landing announces itself, not the end', [types(events).includes('run-landed'), finishes(events)], [true, 0])
+        const landed = await record(s.f, s.runId)
+        t.ok('a landing leaves the marker', Boolean(landed.landed) && reconcilePending(landed))
+        await supervisor.reconcile()
+        t.eq('the release after it announces once', finishes(events), 1)
+        t.eq('and records it as not run', (await record(s.f, s.runId)).autoReconcile.state, 'not-run')
+        await supervisor.shutdown?.()
+      }
+      {
+        await write(pending)
+        const lock = await acquire(lockFile, { purpose: 'test', runId: s.runId })
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        const { autoReconcile: _gone, ...decided } = pending
+        await write({ ...decided, status: 'completed', outcome: 'resolved', blockedReason: null })
+        await lock.release()
+        await periods()
+        t.eq('the holder decided it: the release announces nothing', finishes(events), 0)
+        t.eq('and writes nothing', (await record(s.f, s.runId)).autoReconcile ?? null, null)
+        await supervisor.shutdown?.()
+      }
+      {
+        await write(pending)
+        const lock = await acquire(lockFile, { purpose: 'test', runId: s.runId })
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        const remarked = { ...marker, at: '2026-11-02T11:00:00.000Z' }
+        await write({ ...pending, autoReconcile: remarked })
+        await lock.release()
+        await periods()
+        t.eq('the holder re-marked it: the release announces nothing', finishes(events), 0)
+        t.eq('and leaves the new marker', (await record(s.f, s.runId)).autoReconcile, remarked)
+        await supervisor.shutdown?.()
+      }
+
+      // The record cannot be read at startup; one server start, no operator.
+      await fs.writeFile(runFile(s.f, s.runId), '{ not json')
+      {
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        await periods()
+        t.eq('unreadable at startup: nothing announced', finishes(events), 0)
+        t.eq('unreadable at startup: nothing written', await fs.readFile(runFile(s.f, s.runId), 'utf8'), '{ not json')
+        await write(pending)
+        await until(() => finishes(events) > 0, 'the end announcement')
+        await periods()
+        t.eq('healed: exactly one announcement', finishes(events), 1)
+        t.ok('healed: journaled first', types(events).indexOf('reconcile-not-run') >= 0 && types(events).indexOf('reconcile-not-run') < types(events).indexOf('run-finished'), types(events).join(' '))
+        const run = await record(s.f, s.runId)
+        t.eq('healed: recorded as not run', [run.autoReconcile.state, reconcilePending(run)], ['not-run', false])
+        t.ok('healed: naming the restart', /restarted/.test(run.autoReconcile.reason), run.autoReconcile.reason)
+        await supervisor.shutdown?.()
+      }
+      for (const [label, healedTo] of [['a settled run', { ...base, status: 'completed', outcome: 'resolved', blockedReason: null }], ['a blocked run with no marker', base]]) {
+        await fs.writeFile(runFile(s.f, s.runId), '{ not json')
+        const { supervisor, events } = s.open()
+        await supervisor.reconcile()
+        const bytes = JSON.stringify(healedTo)
+        await fs.writeFile(runFile(s.f, s.runId), bytes)
+        await periods()
+        t.eq(`unreadable at startup, healed as ${label}: nothing announced`, finishes(events), 0)
+        t.eq(`unreadable at startup, healed as ${label}: not written`, await fs.readFile(runFile(s.f, s.runId), 'utf8'), bytes)
+        await supervisor.shutdown?.()
+      }
+
+      // Something above the record cannot be read; the retry stops once it can.
+      for (const method of ['listIssues', 'listProjects']) {
+        await write(pending)
+        let failing = true
+        let calls = 0
+        const wrap = (issues) => ({ ...issues, [method]: async (...args) => {
+          calls++
+          if (failing) throw new Error('disk fault')
+          return issues[method](...args)
+        } })
+        const { supervisor, events } = s.open({ wrap })
+        await supervisor.reconcile()
+        await periods()
+        t.eq(`${method} fails at startup: nothing announced`, finishes(events), 0)
+        failing = false
+        await until(() => finishes(events) > 0, 'the end announcement')
+        await periods()
+        const seen = calls
+        await periods()
+        t.eq(`${method} heals: exactly one announcement`, finishes(events), 1)
+        t.eq(`${method} heals: the retry has stopped`, calls, seen)
+        await supervisor.shutdown?.()
+      }
+
+      // Other records of the same sweep are handled as usual, before it returns.
+      await write(pending)
+      {
+        const copyRun = async (name, run) => {
+          const issue = await s.f.issues.getIssue(PROJECT, (await s.f.issues.createIssue(PROJECT, { name })).id)
+          await fs.cp(path.dirname(runFile(s.f, s.runId)), path.join(issue.path, 'runs', s.runId), { recursive: true })
+          await fs.writeFile(path.join(issue.path, 'runs', s.runId, 'run.json'), JSON.stringify(run))
+          return issue
+        }
+        const readable = await copyRun('A readable pending run', pending)
+        const live = await copyRun('A live run nobody owns', { ...base, status: 'running', outcome: null, blockedReason: null })
+        await fs.writeFile(runFile(s.f, s.runId), '{ not json')
+        const { supervisor, events } = s.open()
+        const recovered = await supervisor.reconcile()
+        const ofIssue = (issue) => events.filter((e) => e.type === 'run-finished' && e.issueId === issue.id).length
+        t.eq('another pending record is released before the sweep returns', ofIssue(readable), 1)
+        t.ok('a live record nobody owns is recovered as usual', recovered.some((r) => r.issueId === live.id), JSON.stringify(recovered))
+        t.eq('the unreadable one announces nothing yet', ofIssue(s.f.issue), 0)
+        await write(pending)
+        await until(() => ofIssue(s.f.issue) > 0, 'the end announcement')
+        await periods()
+        t.eq('healed: one more announcement, for that record only', [ofIssue(s.f.issue), ofIssue(readable), finishes(events)], [1, 1, 2])
+        await supervisor.shutdown?.()
+      }
+
+      // A read fault is not a missing run: monitoring keeps following it (runs-api.mjs).
+      const read = (runId) => getRun(s.f.issuePath, runId, { issues: s.f.issues, project: PROJECT, issueId: s.f.issue.id }).then(() => null, (e) => e)
+      await fs.writeFile(runFile(s.f, s.runId), '{ not json')
+      t.eq('an unreadable record answers 503', (await read(s.runId))?.status, 503)
+      await write(base)
+      t.eq('a missing record answers 404', (await read('2026-01-01T00-00-00-000Z-00000000'))?.status, 404)
     }
 
     t.section('3. conflicting code path: nothing is delivered, the carry-forward stays')

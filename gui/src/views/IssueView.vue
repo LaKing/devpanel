@@ -136,6 +136,7 @@ const nextAction = computed(() => {
       : `This run failed: ${run.value.blockedReason ?? 'no reason was recorded'}`
   }
   if (run.value.status !== 'blocked') return null
+  if (run.value.reconcilePending) return 'Approved; automatic reconcile running; do not land by hand. The panel is merging the change onto the project, rechecking it and delivering it.'
   return {
     'recovery-required': canRecover.value
       ? 'The server restarted while this run was live. Recover run reconciles what was in flight from the runtimes\' own records and continues if nothing is uncertain; Abandon keeps its work and logs and allows a fresh run.'
@@ -151,7 +152,7 @@ const nextAction = computed(() => {
     'delivery-unavailable': 'No delivery provider was configured, so nothing could be delivered. Fix the configuration, then press Finalize run.',
     'delivery-unverifiable': 'A patch was written, but rebuilding the candidate from it did not reproduce the approved revision. The worktree is kept; the patch is not a faithful copy. Fix the cause, then press Finalize run to evaluate closure again from the retained worktree.',
     'delivery-failed': 'The delivery action itself failed. The worktree is kept. Fix the cause, then press Finalize run.',
-    'source-delivery-blocked': 'Source delivery did not verify. The patch and worktree are retained. If source drifted, apply manually or rerun against the current checkout. Finalize can recognize an exact manual application; it never overrides drift.',
+    'source-delivery-blocked': 'Source delivery did not verify. The patch and worktree are retained. If source drifted, use Reconcile with source when it is offered; otherwise apply manually or rerun against the current checkout. Finalize can recognize an exact manual application; it never overrides drift.',
     'source-delivery-interrupted': 'Source delivery was interrupted. Finalize checks the destination: approved revision means done, base means not applied, anything else requires recovery. The patch and worktree are retained.'
   }[run.value.blockedReason] ?? 'This run stopped and needs a human.'
 })

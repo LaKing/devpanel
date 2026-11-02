@@ -115,6 +115,7 @@ export function summariseRun (detail) {
     artifactApplication: detail.artifactApplication ?? null,
     landed: detail.landed ?? null,
     reconciliation: decidedReconciliation(detail.reconciliations),
+    reconcilePending: detail.reconcilePending === true,
     blockedReason: detail.blockedReason ?? null,
     pause: detail.pause ?? null,
     ownerInput: detail.ownerInput ?? null,

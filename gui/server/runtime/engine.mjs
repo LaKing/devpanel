@@ -28,6 +28,7 @@ import { baselineCacheFor, tierTarget } from './baseline-cache.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
+import { autoReconcileRefusal } from './auto-reconcile.mjs'
 import { infrastructureBrief } from '../infrastructure.mjs'
 import { classifyFailure, backoffMs } from './failure.mjs'
 
@@ -3354,6 +3355,8 @@ export class Engine {
       policy, ref: `refs/devpanel/reconciled/${this.runId}-${n}`, runDir, clock: this.clock })
     const refuse = async (state, error = null) => {
       Object.assign(entry, { state, endedAt: this.clock.iso(), ...(error ? { error } : {}) })
+      // Decided: the attempt is the record now (supervisor.mjs announceEnd releases who waits).
+      delete this.run.autoReconcile
       await this.persist({ type: 'reconcile-refused', n, state, conflicts: entry.conflicts })
       return this.run
     }
@@ -3392,6 +3395,7 @@ export class Engine {
       this.run.status = 'running'
       this.run.blockedReason = null
       this.run.endedAt = null
+      delete this.run.autoReconcile
       await this.persist({ type: 'reconciled', n, from: approved.revision, revision, merged: entry.merged, appended: entry.appended })
     } catch (error) {
       // Before acceptance nothing of the run changed: the attempt is the record.
@@ -3709,6 +3713,9 @@ export class Engine {
       this.run.delivery = record
     }
 
+    // Read before the status changes, so nothing waits between the block and its marker below.
+    const reconcilePolicy = blockedReason === 'source-delivery-blocked' ? await Promise.resolve(this.reconcilePolicy?.()).catch(() => null) : null
+
     if (conditions.deliveryCompleted) {
       this.run.status = 'completed'
       this.run.outcome = 'resolved'
@@ -3741,5 +3748,10 @@ export class Engine {
       ...(workerResult ? { workerCompleted: workerResult.completed === true, blockers: workerResult.blockers ?? [], unverified: workerResult.unverified ?? [] } : {}),
       at: this.clock.iso()
     }
+
+    // An automatic reconcile comes next: on the record in the same write as the
+    // block (every caller's `finished` persist), so no reader sees the block without it.
+    if (reconcilePolicy && !autoReconcileRefusal(this.run, reconcilePolicy)) this.run.autoReconcile = { state: 'pending', at: this.clock.iso(), owner: this.reconcileOwner ?? null }
+    else if (this.run.autoReconcile?.state === 'pending') delete this.run.autoReconcile
   }
 }

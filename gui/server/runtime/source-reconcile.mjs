@@ -8,6 +8,9 @@ import { destinationFingerprint } from './source-delivery.mjs'
 import { reconstructInto, discardReconstruction, runEpoch, worktreeDiffDelivery } from './launch.mjs'
 import { writeJson } from './persistence.mjs'
 import { repositoryGitArgs, engineGitEnv, HARDENED, LOCAL_TRANSPORT } from './engine-git.mjs'
+import { ownPathDrift, reconcileUnavailable, RECONCILABLE_BLOCKS } from './run-control.mjs'
+
+export { ownPathDrift, reconcileUnavailable, RECONCILABLE_BLOCKS }
 
 /*
  * Reconcile an approved patch onto drifted source (`reconcile-delivery`).
@@ -37,7 +40,6 @@ import { repositoryGitArgs, engineGitEnv, HARDENED, LOCAL_TRANSPORT } from './en
 
 const NL = String.fromCharCode(10)
 const NUL = String.fromCharCode(0)
-export const RECONCILABLE_BLOCKS = Object.freeze(['source-delivery-blocked', 'delivery-unverifiable'])
 
 const sha = (bytes) => 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex')
 
@@ -51,26 +53,6 @@ const must = async (pending) => {
   const r = await pending
   if (r.code !== 0) throw new Error(r.stderr.trim().split(NL)[0] || `git exited ${r.code}`)
   return r
-}
-
-/** The approved patch's own paths a refused source application found changed. */
-export function ownPathDrift (run) {
-  const a = run.delivery?.application
-  if (a?.state !== 'source-drift') return []
-  if (a.drifted?.length) return a.drifted
-  // Refused before `drifted` was recorded: the message names them.
-  const m = /The approved patch's own paths changed: (.+?)\. /.exec(a.error ?? '')
-  return m ? m[1].split(', ').filter((p) => p !== '…') : []
-}
-
-/** Why `reconcile-delivery` cannot run on this record, or null. */
-export function reconcileUnavailable (run) {
-  if (run.status !== 'blocked' || !RECONCILABLE_BLOCKS.includes(run.blockedReason)) return `this run is not blocked at source delivery (status ${run.status}, ${run.blockedReason ?? 'no block'})`
-  if (run.delivery?.action !== 'apply-to-source') return 'only an apply-to-source delivery is reconciled with its source'
-  if (!run.workspace?.path || run.workspace.state === 'removed') return 'the worktree is gone; nothing is left to reconcile'
-  if (['quarantined', 'abandoned'].includes(run.integrity?.status) || run.recovery?.required) return 'the run needs its integrity or recovery resolved first'
-  if (!ownPathDrift(run).length) return "delivery was not refused for drift on the approved patch's own paths; finalize once the cause is fixed"
-  return null
 }
 
 /** The project's reconcile rule for this path (`append` | `prepend`), or null. */

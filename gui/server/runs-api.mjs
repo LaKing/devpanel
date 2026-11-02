@@ -1,4 +1,4 @@
-import { refreshFacts, resumeUnavailable } from './runtime/run-control.mjs'
+import { reconcilePending, refreshFacts, resumeUnavailable } from './runtime/run-control.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -78,8 +78,10 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
   let run
   try {
     run = await store.readRun(issuePath, runId)
-  } catch {
-    throw err(404, 'no such run')
+  } catch (error) {
+    // Only a missing record is gone: monitoring stops following a run on a 404, and one that cannot be read today may read tomorrow.
+    if (error.code === 'ENOENT') throw err(404, 'no such run')
+    throw err(503, `this run's record cannot be read: ${error.message}`)
   }
   // A live-looking run this process is not driving, whose lock owner cannot be
   // proved alive or dead: the explanation says so and names the lock.
@@ -186,6 +188,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     outcome: run.outcome,
     ...runResult(run, outputs),
     blockedReason: run.blockedReason,
+    reconcilePending: reconcilePending(run),
     explanation: explainRun(run, { outputs, active, ownership, acceptedRisks }),
     // Only what the backend will actually accept. A button for anything else
     // would promise something the server refuses.

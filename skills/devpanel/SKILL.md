@@ -67,7 +67,7 @@ Playbooks: `analysis`, `triage`, `implementation`, `plan-and-implement`, `stagin
 
 ## Following up
 
-`watch <id> --until-settled` prints one line per run event over the panel's socket and exits when the issue's run finishes, pauses or stops (immediately if it already has), so a long run can be waited for without polling; without an id it follows every run of the project.
+`watch <id> --until-settled` prints one line per run event over the panel's socket and exits when the issue's run finishes, pauses or stops (immediately if it already has), so a long run can be waited for without polling; without an id it follows every run of the project. A run blocked at delivery whose automatic reconcile is undecided has not settled: the watch waits for the decision and reports the end state, so do not land it by hand meanwhile. While the issue's newest run record cannot be read it prints `cannot read run <id>; waiting for it` and keeps waiting, because an older run says nothing about that one. As an accepted exception, a record that can never be read again (disk damage or a hand edit) holds the watch, reconcile or not, and it never claims `settled` for it: interrupt it to get out.
 
 `status` shows the latest run's own explanation (`headline`, `detail`, `unmet` goals, `next`). Relay it, don't re-judge it: an unmet goal is the coordinator's evidence, quoted. `result` prints `result.md`; a delivered patch has already been applied to the development checkout, uncommitted (general §007), so `git diff` in that project shows it. Committing is the operator's checkpoint (general §009).
 

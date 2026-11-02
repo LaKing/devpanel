@@ -31,7 +31,10 @@ async function owning ({ decisions = null, dir = null, adopt = false, record: gi
   const tools = { projects: async () => [{ id: 'p' }], playbooks: async () => [], infrastructure: async () => ({}), seatModels: async () => [],
     listIssues: async () => [{ id: 'a' }], getIssue: async () => ({ name: 'x' }), preview: async () => ({ ok: true, configHash: 'h' }),
     start: async () => ({ runId: 'r1', status: h.record.status }),
-    getRun: async () => h.packed ? summarisePackedRun({ runId: 'r1', project: 'p', issueId: 'a', record: structuredClone(h.record) }) : summariseRun(structuredClone(h.record)),
+    getRun: async () => {
+      if (h.readFault) throw h.readFault
+      return h.packed ? summarisePackedRun({ runId: 'r1', project: 'p', issueId: 'a', record: structuredClone(h.record) }) : summariseRun(structuredClone(h.record))
+    },
     stop: async () => { h.record.status = 'cancelled' }, archive: async () => {}, createIssue: async () => ({ id: 'c' }), addNote: async () => ({ number: '000' }),
     reconcileDelivery: async (a) => { calls.push(a); return h.onReconcile?.() ?? {} }, markLanded: async (a) => { calls.push(a); return h.onLand?.() ?? {} } }
   h.agent = await createTopSupervisor({ dir, models: async () => [{ id: 'm', title: 'M', model: 'wire', defaultEffort: 'high', verification: { status: 'verified' } }], adapter, tools, pollMs: 20, decisions })
@@ -51,6 +54,32 @@ export default async function (t) {
     const h = await owning()
     await polls()
     t.eq('nothing woke the supervisor about the run', h.wakes().length, 0)
+    await h.close()
+    await fs.rm(h.dir, { recursive: true, force: true })
+  }
+
+  t.section('an undecided automatic reconcile: the block wakes nobody, the decision wakes once')
+  {
+    const h = await owning()
+    h.record.status = 'blocked'; h.record.outcome = 'unresolved'; h.record.blockedReason = 'source-delivery-blocked'
+    h.record.reconcilePending = true
+    await polls()
+    t.eq('the block does not wake the supervisor while it is undecided', h.wakes().length, 0)
+    h.record.reconciliations = [{ n: 1, by: 'engine', state: 'merging' }]
+    await polls()
+    t.eq('nor does the attempt starting', h.wakes().length, 0)
+    h.readFault = Object.assign(new Error("this run's record cannot be read"), { status: 503 })
+    await polls()
+    t.ok('a record that cannot be read stays monitored', Boolean(h.owned()))
+    t.eq('and wakes nobody', h.wakes().length, 0)
+    h.readFault = null
+    h.record.reconcilePending = false
+    h.record.status = 'completed'; h.record.outcome = 'resolved'; h.record.blockedReason = null
+    h.record.reconciliations = [{ n: 1, by: 'engine', state: 'accepted', endedAt: '2026-11-02T10:00:00.000Z' }]
+    await wait(() => h.wakes().length === 1 && h.idle())
+    t.eq('the decision wakes it, saying what moved', h.wakes()[0].changed, ['status', 'reconcile'])
+    await polls()
+    t.eq('once', h.wakes().length, 1)
     await h.close()
     await fs.rm(h.dir, { recursive: true, force: true })
   }

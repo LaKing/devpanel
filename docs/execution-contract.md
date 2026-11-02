@@ -945,6 +945,39 @@ the run ends (`runtime/auto-reconcile.mjs`, actor `engine`), once per run: a run
 that already has a reconciliation, a drift on any undeclared path, or a project
 that is busy at that moment leaves the run blocked with the button offered.
 
+A run an automatic reconcile applies to is not announced as settled until it is
+decided. The engine writes `run.autoReconcile: {state: 'pending', at, owner}` in
+the same write as the block, so no reader sees the block without it; `owner`
+names the server instance. While it reads pending (`reconcilePending`,
+`run-control.mjs`; `reconcilePending` on the issue's run summaries and the run
+detail) no `run-finished` is emitted, the top-level supervisor is not woken,
+`devpanel.mjs watch --until-settled` keeps waiting, and the explanation says
+"automatic reconcile running; do not land by hand". The engine's own `finished`
+journal event still fires; readers ask the record. The decision releases them:
+an accepted or refused attempt clears the marker in its own write and is announced
+as any end. An attempt that never ran (the project busy, finalize refused, the
+policy changed, the lock held) is written `{state: 'not-run', reason, at}` under
+the issue's lock and then announced. That write re-reads the record, so it leaves
+alone a marker someone else decided or re-marked, and it retries on a held lock
+rather than trusting the holder to decide: a landing, for one, leaves the marker
+as it is. A failed read when a run ends is retried too and never treated as
+permission to announce. At startup a marker left by an earlier server is released
+as not run, with Reconcile offered, and the attempt is not retried; anything the
+startup sweep could not read is read again until it reads, and only then released
+if it holds such a marker. Deleting the run and archiving the issue are refused
+while it reads pending. These retries have no limit, because a limit would announce
+an undecided run: while a record stays unreadable, or a lock owner stays unknown,
+the hold stands and the log says so. The issue's `unreadableNewerRuns` lists
+records that exist, cannot be read and are newer than `latestRun`, and the watch
+does not settle on an older run while one is listed. It re-reads on a timer then,
+and after any reading that failed, since no further event may come.
+
+One accepted exception: a newer run record that can never be read again (disk
+damage or a hand edit) holds that watch, whether or not a reconcile applied,
+because the record alone could say. The watch never claims `settled` for it: it
+prints `cannot read run <id>; waiting for it` and keeps waiting until the operator
+interrupts it. Waiters are released in every case where the record can be read.
+
 1. The retained patch must still rebuild the approved revision on its base B.
    Paths under materialized links are merged like any other (B holds their
    materialized copies, the destination is read through the links); owner

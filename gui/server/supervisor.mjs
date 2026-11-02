@@ -1,8 +1,9 @@
-import { continueUnavailable, integrateUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
+import { continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
 import { projectPath as projectDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -90,6 +91,8 @@ export function createSupervisor ({
   projectsDir = PROJECTS_DIR,
   maxProbeInvocations = MAX_PROBE_INVOCATIONS,
   shutdownGraceMs = SHUTDOWN_GRACE_MS,
+  // How soon an automatic reconcile's undecided state is tried again after a failed read or a held lock.
+  reconcileRetryMs = 2000,
   configRoot = process.env.DEVPANEL_CONFIG_ROOT,
   // Advisory decisions (docs/decisions.md), both absent unless the server wires
   // them: the Triage pre-gate (decisions/pregate.mjs) and the reclassifier of
@@ -108,6 +111,10 @@ export function createSupervisor ({
   /** Reservations in flight, so a double-click cannot become two runs. */
   const starting = new Set()
   let shuttingDown = false
+  /** Names this process on the markers its runs write: any other owner's marker was left by an earlier server. */
+  const instanceId = crypto.randomUUID()
+  /** Automatic reconcile markers already attempted: one attempt per marker, whatever a failed write left on disk. */
+  const attemptedReconciles = new Set()
 
   const key = (project, issueId) => `${project}/${issueId}`
 
@@ -438,6 +445,7 @@ export function createSupervisor ({
   /** The agent phase proper, shared by a fresh start and a resume after a decision. */
   async function driveEngine (record, engine) {
     if (failureAdvisor) engine.failureAdvisor = failureAdvisor
+    armAutoReconcile(engine, record.project)
     engine.quotaFallback = createQuotaFallback({ loadModels: async () => [...(await loadConfig({ root: configRoot })).roster.values()], availability, probeFor, root: configRoot })
     record.engine = engine
     record.phase = 'run'
@@ -494,6 +502,7 @@ export function createSupervisor ({
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })
       })
+      armAutoReconcile(engine, project)
       if (integrity) {
         // Pinned to the state the operator inspected; the engine refuses a
         // disposition for a workspace that changed since, or one that is not
@@ -612,37 +621,162 @@ export function createSupervisor ({
    * (run-result-step.mjs), then say so. The account is for people; failing to
    * write it is logged and changes nothing about the run.
    */
+  const reconcilePolicyOf = async (project) => (await loadConfig({ root: configRoot })).projects.get(project)?.workspace?.reconcile ?? {}
+  const armAutoReconcile = (engine, project) => {
+    engine.reconcilePolicy = () => reconcilePolicyOf(project)
+    engine.reconcileOwner = instanceId
+  }
+  // No record is left to hold a decision, so nothing is left to wait on.
+  const recordGone = (error) => error.status === 404 || error.code === 'ENOENT'
+  const announceFinished = (project, issueId, runId) => emit?.({ type: 'run-finished', project, issueId, runId })
+
+  /*
+   * Try until `attempt` stops throwing: whether a run may be announced can only
+   * be read from its record, and a guess in either direction is wrong (told
+   * settled while a reconcile is coming, or waiting for ever). No limit: a retry
+   * is one read and one lock attempt. The first try is awaited, so a readable
+   * record keeps its order; a restart picks up what a shutdown drops (reconcile()).
+   */
+  async function retryUntilEstablished (what, attempt, tries = 0) {
+    if (tries > 0 && shuttingDown) return
+    try {
+      await attempt()
+    } catch (error) {
+      if (tries % 30 === 0) console.warn(`[devpanel] ${what} could not be established, trying again: ${error.message}`)
+      setTimeout(() => retryUntilEstablished(what, attempt, tries + 1), reconcileRetryMs).unref()
+    }
+  }
+
   /*
    * A run blocked at delivery only by drift on paths the project declares
    * reconcilable (its changelog) is reconciled at once (auto-reconcile.mjs), not
-   * left for a person. Not awaited: the run has ended and its account is
-   * written. A refusal from finalize (the project became busy, the record moved
-   * on) leaves the run blocked exactly as it was, with Reconcile still offered.
+   * left for a person. Not awaited: the run has ended and its account is written.
+   * Only a marked run comes here (engine.evaluateClosure), and it is not announced
+   * until the attempt decides it. An attempt that cannot run (the project became
+   * busy, the record moved on) is recorded and announced by the release, leaving
+   * the run blocked as it was, with Reconcile still offered.
    */
-  function autoReconcile (project, issueId, runId) {
+  function autoReconcile (project, issueId, runId, at) {
     ;(async () => {
+      const mark = `${runId}:${at}`
+      if (attemptedReconciles.has(mark)) throw new Error('the attempt ended without deciding it')
       const issue = await issues.getIssue(project, issueId)
-      if (issue.packed) return
-      const run = await store.readRun(issue.path, runId)
-      if (run.blockedReason !== 'source-delivery-blocked') return
-      const policy = (await loadConfig({ root: configRoot })).projects.get(project)?.workspace?.reconcile ?? {}
-      const refusal = autoReconcileRefusal(run, policy)
-      if (refusal) return
+      if (issue.packed) throw new Error('the issue was archived')
+      const refusal = autoReconcileRefusal(await store.readRun(issue.path, runId), await reconcilePolicyOf(project))
+      if (refusal) throw new Error(refusal)
+      attemptedReconciles.add(mark)
       await finalize({ project, issueId, runId, reconcile: true, actor: 'engine' })
-    })().catch((error) => console.warn(`[devpanel] automatic reconcile of ${project}/${issueId} run ${runId} did not run: ${error.message}`))
+    })().catch((error) => {
+      console.warn(`[devpanel] automatic reconcile of ${project}/${issueId} run ${runId} did not run: ${error.message}`)
+      return releaseAutoReconcile(project, issueId, runId, at, error.message)
+    })
+  }
+
+  /*
+   * An attempt that never ran is an ending too. Written under the issue's lock, on
+   * the record as it reads then, so the outcome depends only on what a holder left:
+   * a marker already decided or re-marked has its own announcement and gets none
+   * here. A held lock is tried again; no holder is trusted to decide (markLanded
+   * holds it and leaves the marker). A dead owner's lock is taken over (the default):
+   * after a crash mid-attempt nothing else would ever free it.
+   */
+  function releaseAutoReconcile (project, issueId, runId, at, reason) {
+    return retryUntilEstablished(`the automatic reconcile of ${project}/${issueId} run ${runId}`, async () => {
+      let released = true
+      try {
+        const issue = await issues.getIssue(project, issueId)
+        if (!issue.packed) {
+          released = await withLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-reconcile-release', runId }, async () => {
+            const run = await store.readRun(issue.path, runId)
+            if (!reconcilePending(run) || run.autoReconcile.at !== at) return false
+            run.autoReconcile = { state: 'not-run', reason, at: new Date().toISOString() }
+            await store.writeRun(issue.path, runId, run)
+            // The record is the decision; an incomplete journal must not hold it (store.mjs requireCompleteEvents).
+            await store.appendEvent(issue.path, runId, { type: 'reconcile-not-run', reason }, { emit: (event) => emit?.({ ...event, project, issueId, runId }) })
+              .catch((error) => console.warn(`[devpanel] could not journal the automatic reconcile of ${project}/${issueId} run ${runId}: ${error.message}`))
+            return true
+          })
+        }
+      } catch (error) {
+        if (!recordGone(error)) throw error
+      }
+      if (!released) return
+      await writeResult(project, issueId, runId)
+      announceFinished(project, issueId, runId)
+    })
+  }
+
+  /* A marker left by an earlier server: nothing is coming for it, so it ends here. */
+  function releaseIfLeftBehind (project, issueId, run) {
+    if (!reconcilePending(run) || run.autoReconcile.owner === instanceId) return null
+    return releaseAutoReconcile(project, issueId, run.runId, run.autoReconcile.at, 'the server restarted before it was decided')
+  }
+
+  /** The run folders of an issue, as the issue's own listing reads them. */
+  const runNames = async (issue) => (await fs.readdir(store.runsDir(issue.path), { withFileTypes: true }))
+    .filter((e) => e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-'))
+    .map((e) => e.name)
+
+  /*
+   * What the startup sweep could not read may hold a marker, and a marker nobody
+   * reads waits for ever: the scopes it skipped are read again, and only those,
+   * until they read. This only looks for markers. The startup handling a record
+   * missed is not repeated, and a record that is not pending announces nothing.
+   */
+  function recoverHeldReconciles (scopes) {
+    let left = scopes
+    return retryUntilEstablished('a read the startup sweep could not make', async () => {
+      const queue = left
+      const failed = []
+      let failure = null
+      left = failed
+      while (queue.length) {
+        const scope = queue.pop()
+        try {
+          if (!scope.project) queue.push(...(await issues.listProjects()).map((p) => ({ project: p.id ?? p.name ?? p })))
+          else if (!scope.issue) queue.push(...(await issues.listIssues(scope.project)).map((issue) => ({ ...scope, issue })))
+          else if (!scope.runId) queue.push(...(await runNames(scope.issue)).map((runId) => ({ ...scope, runId })))
+          else await releaseIfLeftBehind(scope.project, scope.issue.id, await store.readRun(scope.issue.path, scope.runId))
+        } catch (error) {
+          if (error.code === 'ENOENT') continue
+          failed.push(scope)
+          failure = error
+        }
+      }
+      if (failure) throw failure
+    })
+  }
+
+  /** The run's account in the issue folder, for people. Failing to write it is logged and changes nothing about the run. */
+  async function writeResult (project, issueId, runId) {
+    try {
+      const issue = await issues.getIssue(project, issueId)
+      await writeRunResultStep({ issuePath: issue.path, runId, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
+      return { written: true, inquiry: issue.kind === 'inquiry' }
+    } catch (error) {
+      console.warn(`[devpanel] could not write the result of ${project}/${issueId} run ${runId}: ${error.message}`)
+      return { written: false, inquiry: false }
+    }
   }
 
   async function announceEnd (project, issueId, runId, type = 'run-finished') {
-    let inquiry = false
-    try {
-      const issue = await issues.getIssue(project, issueId)
-      inquiry = issue.kind === 'inquiry'
-      await writeRunResultStep({ issuePath: issue.path, runId, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
-    } catch (error) {
-      console.warn(`[devpanel] could not write the result of ${project}/${issueId} run ${runId}: ${error.message}`)
+    let { written, inquiry } = await writeResult(project, issueId, runId)
+    if (type !== 'run-finished') emit?.({ type, project, issueId, runId })
+    // The record says whether it may be said: a failed read is not permission to.
+    else {
+      await retryUntilEstablished(`the end of ${project}/${issueId} run ${runId}`, async () => {
+        let run = null
+        try {
+          const issue = await issues.getIssue(project, issueId)
+          if (!issue.packed) run = await store.readRun(issue.path, runId)
+        } catch (error) {
+          if (!recordGone(error)) throw error
+        }
+        if (!written) ({ written } = await writeResult(project, issueId, runId))
+        if (reconcilePending(run)) autoReconcile(project, issueId, runId, run.autoReconcile.at)
+        else announceFinished(project, issueId, runId)
+      })
     }
-    emit?.({ type, project, issueId, runId })
-    if (type === 'run-finished') autoReconcile(project, issueId, runId)
     // An answered inquiry (row 4) packs itself once its run is settled; every
     // other ending waits for a close or an acknowledgement.
     if (inquiry) {
@@ -1007,9 +1141,10 @@ export function createSupervisor ({
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })
       })
+      armAutoReconcile(engine, project)
       if (!supportedActions(engine.run).includes(action)) throw err(409, reconcile ? `This run cannot be reconciled: ${reconcileUnavailable(engine.run) ?? 'it is not waiting at delivery'}.` : 'This run is not waiting at delivery; there is nothing to finalize.')
       // The policy is the project's as configured now, like a check refresh's target; it is recorded on the attempt.
-      const policy = reconcile ? (await loadConfig({ root: configRoot })).projects.get(project)?.workspace?.reconcile ?? {} : null
+      const policy = reconcile ? await reconcilePolicyOf(project) : null
       if (engine.run.workspace?.state === 'retained') {
         engine.run.workspace.state = 'active'
         engine.run.workspace.retainedReason = null
@@ -1097,6 +1232,7 @@ export function createSupervisor ({
       return await withLock(path.join(issue.path, '.run.lock'), { purpose: 'run-delete', takeOverDead: false }, async () => {
         const run = await store.readRun(issue.path, runId)
         if (LIVE_STATUSES.includes(run.status) || run.status === 'paused') throw err(409, `The run is ${run.status}. Stop or abandon it before deleting.`)
+        if (reconcilePending(run)) throw err(409, 'An automatic reconcile of this run is undecided; wait for it before deleting.')
         // Its record may be the only durable copy of an unproved cleanup (the barrier file refused it).
         if ((await unrecordedCleanup(path.dirname(issue.path), run)).length) throw err(409, unrecordedRefusal(run, 'deleting the run'), { code: 'CLEANUP_UNRECORDED' })
         await removeRunWorkspace(run, await resolveProjectPath(project, { projectsDir }).catch(() => null))
@@ -1260,10 +1396,13 @@ export function createSupervisor ({
    */
   async function reconcile () {
     const recovered = []
+    // What this sweep could not read; a marker in there is released once it reads.
+    const unread = []
     let projects = []
     try {
       projects = await issues.listProjects()
     } catch {
+      recoverHeldReconciles([{}])
       return recovered
     }
 
@@ -1274,18 +1413,22 @@ export function createSupervisor ({
       // other, so loosening either one without the other leaves a run persisted
       // as live that nothing will ever reconcile.
       let list = []
-      try { list = await issues.listIssues(projectId) } catch { continue }
+      try { list = await issues.listIssues(projectId) } catch { unread.push({ project: projectId }); continue }
 
       for (const issue of list) {
         let names = []
         try {
-          names = (await fs.readdir(store.runsDir(issue.path), { withFileTypes: true }))
-            .filter((e) => e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-'))
-            .map((e) => e.name)
-        } catch { continue }
+          names = await runNames(issue)
+        } catch (error) {
+          if (error.code !== 'ENOENT') unread.push({ project: projectId, issue })
+          continue
+        }
 
         for (const runId of names) {
-          const run = await store.readRun(issue.path, runId).catch(() => null)
+          const run = await store.readRun(issue.path, runId).catch((error) => {
+            if (error.code !== 'ENOENT') unread.push({ project: projectId, issue, runId })
+            return null
+          })
           if (!run) continue
           // A publication the previous process did not finish: settle it from
           // its record before anything else is offered on the run.
@@ -1296,6 +1439,7 @@ export function createSupervisor ({
           // The barrier as the run records say: open entries a failed write
           // left off it are put back (or held here), settled ones lifted.
           await keepOnBarrier(path.dirname(issue.path), run)
+          await releaseIfLeftBehind(projectId, issue.id, run)
           if (!LIVE_STATUSES.includes(run.status)) continue
 
           const owner = await lockOwner(issue.path, runId)
@@ -1311,6 +1455,7 @@ export function createSupervisor ({
         }
       }
     }
+    if (unread.length) recoverHeldReconciles(unread)
     return recovered
   }
 

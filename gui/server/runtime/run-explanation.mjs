@@ -1,4 +1,4 @@
-import { checksOnlyBlock } from './run-control.mjs'
+import { checksOnlyBlock, reconcilePending, reconcileUnavailable } from './run-control.mjs'
 import { runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
@@ -461,6 +461,11 @@ function completed (run, outputs) {
 function blocked (run, outputs, kept) {
   const reason = run.blockedReason
   const base = { tone: 'warning', kept }
+  if (reconcilePending(run)) {
+    return { ...base, tone: 'progress', headline: 'Approved; automatic reconcile running; do not land by hand',
+      detail: 'The panel is merging the approved change onto the project, rechecking it and delivering it.',
+      next: 'Wait: it delivers the change or says why not.' }
+  }
   switch (reason) {
     case 'recovery-required':
     case 'owner-lost':
@@ -549,8 +554,9 @@ function blocked (run, outputs, kept) {
     // Refused for drift on the patch's own paths: say what reconciling did or can do.
     const attempt = run.reconciliations?.at(-1)
     const refused = attempt && attempt.state !== 'accepted' ? ` Reconciling with the project was refused (${attempt.state})${attempt.conflicts?.length ? ` at ${attempt.conflicts.slice(0, 5).join(', ')}` : ''}.` : ''
-    const next = run.delivery?.application?.drifted?.length ? `Reconcile with source to merge it onto the project and recheck it; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
-    return { ...base, headline: d.headline, detail: (d.detail ?? '') + refused || null, cause: firstLine(run.delivery?.error, 400) || null, next }
+    const notRun = run.autoReconcile?.state === 'not-run' ? ` The automatic reconcile did not run: ${String(run.autoReconcile.reason).replace(/\.$/, '')}.` : ''
+    const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
+    return { ...base, headline: d.headline, detail: (d.detail ?? '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
   }
   if (typeof reason === 'string' && reason.startsWith('release-')) {
     return { ...base, headline: `Stopped: the release ${reason.slice(8).replace(/-/g, ' ')}`, next: 'Check the release commands in the technical details.' }
