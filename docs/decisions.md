@@ -237,7 +237,8 @@ Nothing is dropped. Records go to `issues/.supervisor/decisions/wake-filter-<key
 
 Never asked, always woken: user messages, action results, format repairs, model substitutions, runs that failed,
 blocked, paused or were cancelled, runs with a failure, pause or pause request, runs completed with any outcome
-other than `resolved`, and any event type the filter does not know.
+other than `resolved`, a `run-changed` whose `changed` names more than `status` (a delivery decided: reconcile,
+landing, application), and any event type the filter does not know. A held event's summary keeps `changed`.
 
 ## Failure second opinion (`gui/server/decisions/failure-advisor.mjs`, `runtime/engine.mjs`)
 

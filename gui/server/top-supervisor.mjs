@@ -6,7 +6,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSupervisorResponse } from './supervisor-response.mjs'
-import { remainingBudget } from './supervisor-summary.mjs'
+import { deliveryReading, remainingBudget } from './supervisor-summary.mjs'
 import { createLedger } from './runtime/ledger.mjs'
 import { admits, describeRefusal, loadPolicy } from './runtime/spending-policy.mjs'
 import { createWakeFilter, DEFAULT_MAX_DEFER_MS } from './decisions/wake-filter.mjs'
@@ -67,6 +67,7 @@ A run blocked with protocol-repair-exhausted carries a diagnostics.protocol list
 There is no activation time limit; owned runs end on their own budgets or when you stop them.
 A Triage start may be refused with code PREGATE_HOLD: the decision provider confidently judged the issue closable or lacking information. Its "pregate.proposals" say what an operator could confirm on the issue page. You cannot confirm them or start past the hold; tell the user, or choose other work.
 Routine monitoring events may be held rather than wake you. Held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Failures, pauses, cancellations, unresolved endings, user messages and your own action results always wake you.
+A run-changed event's "changed" lists what moved since the last observation: status, reconcile (run.reconciliation is the latest reconcile that ended), landing (run.landed), delivery (run.delivery, its application or merge). Anything but status always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead.
 Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. Actual provider quota failures trigger compatible-model substitution for coordinators and workers, preserving their run and completed work. Inspect run failures and modelSubstitutions; a failed substitution needs an available compatible model, not a budget increase. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. The run engine refuses a second live run on the same project regardless, so concurrency only ever means different projects.`
 
 const SETTLE_INTERVAL_MS = 60_000
@@ -296,7 +297,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       }
       case 'reconcile_delivery_run': {
         if (!state.ownedRuns.some(r => r.runId === a.runId && r.project === a.project && r.issueId === a.issueId)) throw fail('Supervisor can reconcile only runs it owns')
-        return tools.reconcileDelivery({ project: a.project, issueId: a.issueId, runId: a.runId, actor: 'supervisor' })
+        const result = await tools.reconcileDelivery({ project: a.project, issueId: a.issueId, runId: a.runId, actor: 'supervisor' })
+        await absorbDelivery(a, 'reconcile')
+        return result
       }
       case 'continue_run': {
         const owned = state.ownedRuns.find(r => r.runId === a.runId && r.project === a.project && r.issueId === a.issueId)
@@ -357,7 +360,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       case 'create_followups': throw fail('Follow-up issues are opened by the operator; record the residual risks in the disposition evidence, and ask_operator for one that is a correctness or security defect')
       case 'mark_landed': {
         if (!tools.markLanded) throw fail('Recording a landing is not available in this service')
-        return absorb(a.project, tools.markLanded({ project: a.project, issueId: a.issueId, runId: a.runId, applied: a.applied, handChanges: a.handChanges, commit: a.commit ?? null, checkout: a.checkout ?? null, landedAt: a.landedAt ?? null, by: 'supervisor' }))
+        const result = await absorb(a.project, tools.markLanded({ project: a.project, issueId: a.issueId, runId: a.runId, applied: a.applied, handChanges: a.handChanges, commit: a.commit ?? null, checkout: a.checkout ?? null, landedAt: a.landedAt ?? null, by: 'supervisor' }))
+        await absorbDelivery(a, 'landing')
+        return result
       }
       case 'ask_operator': {
         state.questions ??= []
@@ -387,6 +392,13 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       state.observedIssues[project] = JSON.stringify(issues.map(i=>({id:i.id,status:i.status,name:i.name})))
     } catch { /* the next poll will report it as a change; only noise, never loss */ }
     return result
+  }
+  // The same for a delivery decision the supervisor made itself: its action result says so, so only that
+  // key is taken as seen and a change by anyone else still wakes it. A failed read only risks one more wake.
+  async function absorbDelivery (a, key) {
+    const owned = state.ownedRuns.find((r) => r.runId === a.runId && r.project === a.project && r.issueId === a.issueId)
+    if (!owned?.observedDelivery) return
+    try { owned.observedDelivery[key] = deliveryReading(await tools.getRun(a.project, a.issueId, a.runId))[key] } catch { /* the next poll reports it */ }
   }
   async function drive () {
     try {
@@ -694,11 +706,17 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           r.observedSubstitutions = substitutions
           state.queue.push({ type: 'model-substituted', run: current })
         }
-        if (current.status !== (r.observedStatus ?? r.status)) {
+        // Without a stored reading (a run not yet observed, or owned before this was recorded) the present
+        // delivery is the baseline, not news.
+        const delivery = deliveryReading(current)
+        const moved = r.observedDelivery ? Object.keys(delivery).filter((k) => delivery[k] !== r.observedDelivery[k]) : []
+        const changed = [...(current.status !== (r.observedStatus ?? r.status) ? ['status'] : []), ...moved]
+        if (changed.length) {
           r.status = current.status
-          await enqueue({ type: 'run-changed', run: current })
+          await enqueue({ type: 'run-changed', changed, run: current })
         }
         r.observedStatus = current.status
+        r.observedDelivery = delivery
       }
       // A start gate that cannot read one launch keeps that slot occupied; it must not stop issue observation.
       try { await startGate.refresh(); monitoringFaults.delete('start-gate') } catch (e) { monitoringFault('start-gate', e.message) }

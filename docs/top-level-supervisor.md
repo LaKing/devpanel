@@ -163,6 +163,14 @@ issue's runs are read from its bundle, so packing between two polls is an
 ordinary ending (status and cost). A run whose record is gone (deleted) leaves
 monitoring; if it was last seen live, a `run-unreadable` event wakes the
 supervisor to read the issue instead.
+The poll compares a delivery reading as well as the status (`deliveryReading`:
+the latest reconcile that ended, the landing, the delivery's application or
+merge), and `run-changed` says in `changed` which of `status`, `reconcile`,
+`landing` and `delivery` moved. So a refused reconcile or a landing wakes the
+supervisor although the run's status stays the same, and the wake filter never
+holds it. A reconcile still `merging` is not a change: one decision, one wake. A
+run with no stored reading takes its present one as the baseline without waking,
+and a packed run's reading carries the same fields.
 Stopping aborts the supervisor and its owned issue runs, waits for termination,
 and retains conversation history. A normal Start with the same model continues the same session. Changing models
 while stopped creates a new native session seeded with the recent conversation;
@@ -334,7 +342,8 @@ so the model never infers a budget from run history, and `replyFormat`
 restating the envelope. A change the supervisor itself makes (a note, an
 issue, an archive) is absorbed into the poller's last-observed state, so it
 does not come back as an `issues-changed` wake-up; a change made by anyone
-else still does.
+else still does. Its own reconcile or landing is absorbed the same way, its
+action result having said so, and no `run-changed` follows for that alone.
 
 Each playbook the supervisor is shown lists its `intents` and its default
 `intent`. It chooses the playbook by shape and cost, and passes

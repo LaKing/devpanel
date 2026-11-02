@@ -243,6 +243,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     artifactApplication: run.artifactApplication ?? null,
     // A person's record that they landed the work by hand (supervisor.markLanded).
     landed: run.landed ?? null,
+    reconciliations: run.reconciliations ?? [],
     integration: run.integration ?? null,
     ownerInput: run.ownerInput ?? null,
     closure: run.closure,

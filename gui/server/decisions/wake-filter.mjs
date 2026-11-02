@@ -14,8 +14,9 @@ import { confidentAnswer } from './index.mjs'
  * Never filtered, whatever the provider would say: the operator's messages, the
  * results of the supervisor's own actions and its format repairs, runs that
  * failed, blocked, paused (an operator request or question) or were cancelled,
- * a run that ended unresolved (budgets, disagreement), and model substitutions
- * after a quota failure.
+ * a run that ended unresolved (budgets, disagreement), a run whose delivery was
+ * decided (`changed` names more than its status), and model substitutions after
+ * a quota failure.
  */
 
 export const WAKE_PURPOSE = 'wake-filter'
@@ -30,6 +31,7 @@ export function alwaysWakes (event) {
   if (ALWAYS.includes(event?.type)) return true
   if (event?.type === 'run-changed') {
     const run = event.run ?? {}
+    if (event.changed?.some((c) => c !== 'status')) return true
     if (ATTENTION_STATUSES.includes(run.status)) return true
     if (run.pause || run.failure || run.pauseRequested) return true
     if (run.status === 'completed' && run.outcome !== 'resolved') return true
@@ -46,6 +48,7 @@ export function summariseEvent (event) {
     const r = event.run ?? {}
     return {
       type: 'run-changed',
+      changed: event.changed ?? ['status'],
       run: {
         runId: r.runId ?? null,
         project: r.issue?.project ?? null,

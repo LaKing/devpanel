@@ -23,6 +23,36 @@ const gist = (text, n = 200) => {
   return line ? clip(line, n) : null
 }
 
+/** The latest reconciliation that ended: an entry persisted as `merging` has decided nothing yet. */
+function decidedReconciliation (entries) {
+  const entry = (entries ?? []).findLast((e) => e.endedAt)
+  return entry ? { n: entry.n, state: entry.state, by: entry.by ?? null, endedAt: entry.endedAt, revision: entry.revision ?? null, conflicts: entry.conflicts ?? [], error: clip(entry.error, 500) } : null
+}
+
+/**
+ * What monitoring compares, beside the status, to learn that a run's delivery was decided
+ * (top-supervisor.mjs poll). Each key is a name `run-changed` reports in `changed`. It reads
+ * only fields summariseRun and summarisePackedRun both carry, so packing changes nothing here.
+ */
+export function deliveryReading (run) {
+  const { reconciliation: r, landed, delivery, artifactApplication, integration } = run
+  return {
+    reconcile: r ? `${r.n}:${r.state}:${r.endedAt}` : null,
+    landing: landed?.recordedAt ?? null,
+    delivery: JSON.stringify([delivery?.action ?? null, delivery?.completedAt ?? null, delivery?.application?.state ?? null, artifactApplication?.state ?? null, integration?.mergeCommit ?? null])
+  }
+}
+
+/** A run of a packed issue, read from its bundle's record (`record` is run.json): no steps, its ending and its delivery. */
+export function summarisePackedRun ({ runId, project, issueId, record }) {
+  return { runId, project, issueId, packed: true, status: record.status, outcome: record.outcome ?? null, blockedReason: record.blockedReason ?? null,
+    budgets: record.budgets ?? null, modelSubstitutions: record.modelSubstitutions ?? [],
+    landed: record.landed ?? null, reconciliation: decidedReconciliation(record.reconciliations), artifactApplication: record.artifactApplication ?? null,
+    delivery: record.delivery ? { action: record.delivery.action, completedAt: record.delivery.completedAt, application: record.delivery.application ?? null } : null,
+    integration: record.integration ? { mergeCommit: record.integration.mergeCommit ?? null } : null,
+    note: 'The issue is archived and packed; its steps are in the bundle (restore the issue to read them).' }
+}
+
 /** A run, as the supervisor needs it. `detail` is the panel's full run view. */
 export function summariseRun (detail) {
   if (!detail || typeof detail !== 'object') return detail
@@ -61,6 +91,7 @@ export function summariseRun (detail) {
     resultReason: detail.resultReason ?? null,
     artifactApplication: detail.artifactApplication ?? null,
     landed: detail.landed ?? null,
+    reconciliation: decidedReconciliation(detail.reconciliations),
     blockedReason: detail.blockedReason ?? null,
     pause: detail.pause ?? null,
     ownerInput: detail.ownerInput ?? null,
