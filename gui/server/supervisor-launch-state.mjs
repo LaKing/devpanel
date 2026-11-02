@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import { inspectSourceRepository } from './runtime/source-repository.mjs'
@@ -9,6 +9,22 @@ import { classifyUntracked, describeBlocking, snapshotPathspec } from './runtime
 
 const exec = promisify(execFile)
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
+
+// The working-tree diff only feeds the key, so it is hashed as it streams: read
+// whole it exceeded any buffer on a checkout whose materialized collections show
+// as thousands of deletions (d250, 2026-10-31: "stdout maxBuffer length exceeded"
+// refused a start).
+function streamedHash (args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    const digest = crypto.createHash('sha256')
+    let stderr = ''
+    child.stdout.on('data', (chunk) => digest.update(chunk))
+    child.stderr.on('data', (chunk) => { if (stderr.length < 4096) stderr += chunk })
+    child.on('error', reject)
+    child.on('close', (code) => code === 0 ? resolve(digest.digest('hex')) : reject(Object.assign(new Error(`git ${args.join(' ')} exited ${code}`), { stderr })))
+  })
+}
 
 // Re-read engine-owned launch inputs; a new preview ID or a model's assertion
 // that something changed is not evidence that a persistent failure was fixed.
@@ -37,7 +53,7 @@ export async function inspectLaunchState ({ projectPath, workspace = {}, configH
     }
     const ref = typeof base === 'object' ? (await git(['rev-parse', '--verify', `${base.commit}^{commit}`])).trim() : head
     const excludes = workspace.excludes ?? []
-    const diff = base === 'working-tree' ? await git(['diff', '--binary', 'HEAD', '--', ...snapshotPathspec(excludes)]) : null
+    const diff = base === 'working-tree' ? await streamedHash(['-C', projectPath, 'diff', '--binary', 'HEAD', '--', ...snapshotPathspec(excludes)]) : null
     const untracked = []
     if (base === 'working-tree') {
       // One classification, shared with the snapshot the launch would build, so a
