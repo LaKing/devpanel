@@ -6,7 +6,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSupervisorResponse } from './supervisor-response.mjs'
-import { deliveryReading, remainingBudget } from './supervisor-summary.mjs'
+import { deliveryReading, remainingBudget, runReading } from './supervisor-summary.mjs'
 import { createLedger } from './runtime/ledger.mjs'
 import { admits, describeRefusal, loadPolicy } from './runtime/spending-policy.mjs'
 import { createWakeFilter, DEFAULT_MAX_DEFER_MS } from './decisions/wake-filter.mjs'
@@ -60,6 +60,7 @@ When the user names a model, match what they said against ids and titles before 
 "projects" is every project on this panel and all of them are yours to see, create issues in, and start runs against. "focus" is what the operator asked you to attend to first — an ordering, never a fence, and an empty focus means the whole panel. When a name is not among your issues, check it against projects before anything else: it is usually a PROJECT, not a missing issue. Never report work as non-existent because you were looking in one project, and never offer a different issue in place of the one that was asked for.
 Each playbook lists its intents (kinds of work: bugfix, feature, refactor, research, spec…). Choose the playbook by tactics: analysis investigates code/logs and creates issues; triage evaluates incoming reports and creates/links issues or records a polite response; implementation has one writer and up to four auditors; plan-and-implement adds unanimous plan review; staging deploys a source snapshot with checkpoint and tests; deployment promotes the exact successfully staged archive. Optional seats can be assigned in runOptions.participants or cleared with null. The coordinator owns the current-state window, and the engine waits for every occupied seat. Choose the playbook deliberately, then pass runOptions:{"intent":"<id>"} to preview so participants are briefed for that kind of work; omit it to use the playbook's default.
 An action result causes your next turn. action:null waits for a user message or a watched run's status change.
+Runs you own are watched by the panel, so you do not watch them yourself: their changes arrive as events, and the panel observes them only once your turn has ended, so a chain of reads delays the very news it is waiting for. Once you have read a run and have nothing else to do, end your turn with action:null (or finish, when your work is done) and wait. Never re-read a run to see whether it has moved. A repeated get_run on a run whose state has not changed within one wake is answered with a short "unchanged since <time>; you will be woken on change" instead of the full record; what you read before still stands.
 The model-call counter is not an engine-action counter. A tool-result event is authoritative evidence that its action executed.
 Your session persists across issues and activations. Current scope and limits always override prior permissions.
 Archive is allowed only when the current activation permits it. Archiving is not a claim that a fix was implemented.
@@ -259,7 +260,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       case 'list_issues': return issuesPage(await tools.listIssues(a.project), { project: a.project, offset: a.offset, limit: a.limit })
       case 'get_result': return readResult({ dir, resultId: a.resultId, offset: a.offset })
       case 'get_issue': return tools.getIssue(a.project, a.issueId)
-      case 'get_run': return tools.getRun(a.project, a.issueId, a.runId)
+      case 'get_run': return readRun(a)
       case 'get_check_log': return tools.getCheckLog(a)
       case 'get_step': return tools.getStep(a)
       case 'get_file': return tools.getFile(a)
@@ -378,6 +379,28 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       }
       default: throw fail(`Unknown supervisor action: ${a.type}`)
     }
+  }
+  /*
+   * The model's get_run, and only that: monitoring and the start gate call tools.getRun directly. A session
+   * once re-read the same run 92 times in a wake, each call at 280-500k input tokens, because every record entered
+   * the session and stayed. The last read is kept on the wake, so it closes with the wake and survives a restart
+   * with it, and only the session that was given a record is told it still stands: a substitute model's new
+   * session in the same wake reads in full. An action between two reads changes nothing here, since it cannot
+   * make an unchanged run news; a read of another run does, and the next read of this one is full again.
+   */
+  async function readRun (a) {
+    const run = await tools.getRun(a.project, a.issueId, a.runId)
+    if (!state.wake) return run
+    const key = `${a.project}/${a.issueId}/${a.runId}`, reading = runReading(run), session = state.session?.id ?? null
+    const last = state.wake.lastRead
+    if (last?.key !== key || last.reading !== reading || last.session !== session) {
+      state.wake.lastRead = { key, reading, session, at: new Date().toISOString() }
+      return run
+    }
+    // Only an owned run is monitored: of any other, the promise of a wake would be false.
+    const owned = state.ownedRuns.some((r) => r.runId === a.runId && r.project === a.project && r.issueId === a.issueId)
+    return { unchanged: true, project: a.project, issueId: a.issueId, runId: a.runId, status: run.status, since: last.at,
+      detail: owned ? `unchanged since ${last.at}; you will be woken on change` : `unchanged since ${last.at}; you do not own this run, so no event will announce a change: read it later, not now` }
   }
   /**
    * A change the supervisor itself just made is not news. The poller compares

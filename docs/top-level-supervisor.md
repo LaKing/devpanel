@@ -359,6 +359,19 @@ the engine's, and neither is fixed by a cheaper model or a smaller round cap. In
 the first live session it spent its last run start retrying a run that had been
 blocked by a parser defect.
 
+`get_run` does not always return the record. Runs the supervisor owns are watched by
+the panel and their changes arrive as events, and the charter tells it to end its turn
+rather than re-read one. Should it read the same run again within one wake with nothing
+changed, the answer is `{ unchanged: true, status, since, detail }`, whose `detail` says
+`unchanged since <time>; you will be woken on change` (a run it does not own gets no
+such promise, because nothing monitors it). Unchanged compares the whole run summary
+except `active[].activity` (liveness) and `metrics.time` (derived from the clock), so a
+new step, verdict, revision, check, delivery or reconcile always returns the full
+record; so do the first read of a run in a wake, a read of another run (the next read
+of the first is full again), a later wake, and a new native session within the wake.
+An action between two reads does not reset it. Only this action is guarded: monitoring
+and the start gate read full records through `tools.getRun`.
+
 Automated tests use injected adapters or a scratch-server shim. They never start a
 paid supervisor session.
 

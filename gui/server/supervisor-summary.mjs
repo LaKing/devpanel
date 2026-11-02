@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import { checkSummary } from './runtime/check-summary.mjs'
 import { concurrentStarts } from './supervisor-starts.mjs'
 
@@ -49,6 +50,19 @@ export function deliveryReading (run) {
     landing: landed?.recordedAt ?? null,
     delivery: JSON.stringify([delivery?.action ?? null, delivery?.completedAt ?? null, delivery?.application?.state ?? null, artifactApplication?.state ?? null, integration?.mergeCommit ?? null])
   }
+}
+
+/**
+ * What get_run compares to say a run has nothing new (top-supervisor.mjs readRun): the whole summary, minus
+ * the two things that move while a run is simply working. `active[].activity` is liveness, re-persisted every
+ * few seconds, and `metrics.time` is derived from the clock at read time. Everything else counts, a field added
+ * later included, so what this gets wrong costs one more full record and never hides a change.
+ */
+export function runReading (run) {
+  const { metrics, active, ...rest } = run
+  const { time: _time, ...measured } = metrics ?? {}
+  const steady = { ...rest, metrics: measured, active: (active ?? []).map(({ activity: _activity, ...turn }) => turn) }
+  return crypto.createHash('sha256').update(JSON.stringify(steady)).digest('hex')
 }
 
 /** A run of a packed issue, read from its bundle's record (`record` is run.json): no steps, its ending and its delivery. */
