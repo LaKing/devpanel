@@ -246,7 +246,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - `runtime/working-tree.mjs` — what `git add -A` would make of the untracked tree, used by BOTH the launch
   condition and the `working-tree` snapshot so a reading cannot be more permissive than the build: a nested
   repository is `gitlink:<HEAD>`, an unreadable file or special file BLOCKS (`UNREADABLE_WORKTREE`), a
-  vanished path is re-read once then reported as `MOVING_WORKTREE`.
+  vanished path is re-read once then reported as `MOVING_WORKTREE`. It also holds how the launch path reads git: an
+  output only counted or hashed is streamed (`streamGit`, `statusCounts`), a listing that must be held is bounded
+  (`gitRead`, `GIT_OUTPUT_LIMIT`, 256 MiB, gate and provisioning alike) and over the limit refuses `GIT_OUTPUT_LIMIT`.
 - `runtime/fingerprint.mjs` — revision identity: sha256 over the full content set including explicit deletions;
   file mode is the executable bit only (what a Git patch can rebuild), and the `rule` is recorded on the revision.
   Approvals, checks and closure all bind to a fingerprint; any change invalidates them. A rule change is not a

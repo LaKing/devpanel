@@ -25,14 +25,14 @@ import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
 import * as store from './store.mjs'
-import { classifyUntracked, describeBlocking, includeNested, nestedRepositories, snapshotPathspec } from './working-tree.mjs'
+import { GIT_OUTPUT_LIMIT, classifyUntracked, describeBlocking, gitRead, includeNested, nestedRepositories, snapshotPathspec, statusCounts } from './working-tree.mjs'
 import { runProcess } from './process.mjs'
 import { applyToSource, sourceTarget, bindSourceOwners } from './source-delivery.mjs'
 import { carryForward } from './carry-forward.mjs'
 import { publishCandidate } from './publication.mjs'
 
-const run = promisify(execFile)
-const BIG = { maxBuffer: 256 * 1024 * 1024 }
+const run = gitRead
+const BIG = { maxBuffer: GIT_OUTPUT_LIMIT }
 
 /**
  * Writes a patch of the candidate into the run's artifacts, and proves it.
@@ -323,9 +323,7 @@ export const gitWorktreeProvider = {
     const objectEnv = gitStore ? { GIT_OBJECT_DIRECTORY: gitStore.objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: gitStore.sourceObjects } : {}
     const repo = gitStore ? (args, opts = {}) => run('git', ['--git-dir', gitStore.dir, ...args], { ...BIG, ...opts }) : git
     const headCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim()
-    const status = (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.split(String.fromCharCode(10)).filter(Boolean)
-    const dirtyPaths = status.filter((l) => !l.startsWith('??')).length
-    const untrackedPaths = status.filter((l) => l.startsWith('??')).length
+    const { dirtyPaths, untrackedPaths } = await statusCounts(projectPath)
 
     const base = policy.base ?? 'head'
     const kind = typeof base === 'object' ? 'commit' : base
@@ -1155,9 +1153,7 @@ export const inPlaceProvider = {
     let headCommit = null, dirtyPaths = null, untrackedPaths = null
     try {
       headCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim()
-      const status = (await git(['status', '--porcelain', '--untracked-files=all'])).stdout.split(String.fromCharCode(10)).filter(Boolean)
-      dirtyPaths = status.filter((l) => !l.startsWith('??')).length
-      untrackedPaths = status.length - dirtyPaths
+      ;({ dirtyPaths, untrackedPaths } = await statusCounts(projectPath))
     } catch { /* not a git repository: still workable in place */ }
     const escaping = await escapingLinks(projectPath)
     return {

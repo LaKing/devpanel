@@ -3,6 +3,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { startRun, worktreeDiffDelivery, releaseOwnership } from '../server/runtime/launch.mjs'
+import { carryForward, carryForwardBrief } from '../server/runtime/carry-forward.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
 
@@ -71,6 +72,29 @@ export default async function (t) {
     t.eq('the three-way merge conflicted', two.run.workspace.seed?.state, 'conflicts', JSON.stringify(two.run.workspace.seed))
     t.eq('the conflicted path is listed', two.run.workspace.seed?.conflicts, ['server.mjs'])
     t.ok('the file holds both sides', (await fs.readFile(path.join(two.run.workspace.path, 'server.mjs'), 'utf8')).includes('<<<<<<<'))
+    await releaseOwnership(two, { reason: 'test' }).catch(() => {})
+  }
+
+  t.section('git stopped at the output limit: the seed says so, with the limit, and the run still has the patch')
+  {
+    const { f, one, start } = await setup()
+    const two = await start()
+    // The worktree as provisioning hands it to carryForward: the snapshot, before any merge.
+    const file = path.join(two.run.workspace.path, 'server.mjs')
+    const snapshot = 'console.log("Hello Other world")'
+    await fs.writeFile(file, snapshot)
+    const carry = (extra) => carryForward({ issuePath: f.issuePath, runId: two.runId, workspace: two.run.workspace, sourceRepository: two.run.workspace.repository?.source, ...extra })
+
+    const seed = await carry({ outputLimit: 16 })
+    t.eq('the seed stays context-only and is not fatal', [seed?.fromRun, seed?.state], [one.runId, 'context-only'])
+    t.ok('the error names the git call and the limit', /git apply printed more than the 16 bytes/.test(seed?.error ?? ''), seed?.error)
+    t.eq('nothing is read from the cut-short output', seed?.conflicts, [])
+    t.eq('the worktree is as it was', await fs.readFile(file, 'utf8'), snapshot)
+    t.ok('the patch is still handed over', (await fs.stat(seed?.patch)).size > 0, seed?.patch)
+    t.ok('and every turn is told the limit', carryForwardBrief(seed).includes('16 bytes'), carryForwardBrief(seed))
+
+    const unlimited = await carry({})
+    t.eq('under the stated limit the same tree merges as before', [unlimited?.state, unlimited?.error], ['conflicts', null])
     await releaseOwnership(two, { reason: 'test' }).catch(() => {})
   }
 }

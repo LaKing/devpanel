@@ -2,15 +2,15 @@ import { writeAtomic } from './persistence.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { fingerprint, workspaceProjection } from './fingerprint.mjs'
 import { worktreeGitArgs, engineGitEnv } from './engine-git.mjs'
+import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
 
-const exec = promisify(execFile)
 const hash = (value) => 'sha256:' + crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
-const git = async (dir, args, gitDir = null) => (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], {
-  env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer: 32 * 1024 * 1024
+// The limit snapshot and gate read under: a lower one here would let a tree be
+// admitted and cut, then fail this first capture after preflight was paid.
+const git = async (dir, args, gitDir = null) => (await gitRead('git', [...worktreeGitArgs(dir, gitDir), ...args], {
+  env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer: GIT_OUTPUT_LIMIT
 })).stdout
 
 const statCache = new Map()

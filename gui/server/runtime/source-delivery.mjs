@@ -7,7 +7,7 @@ import { fingerprint } from './fingerprint.mjs'
 import { acquire } from './lock.mjs'
 import { writeJson } from './persistence.mjs'
 import { systemClock } from './clock.mjs'
-import { compositionPaths, nestedFiles } from './working-tree.mjs'
+import { compositionPaths, nestedFiles, streamGit } from './working-tree.mjs'
 import { applyToOwners } from './owner-delivery.mjs'
 import { selectionState } from './selection.mjs'
 export { bindSourceOwners } from './owner-delivery.mjs'
@@ -19,6 +19,12 @@ const git = async (dir, args, options = {}) => (await exec('git', ['-C', dir, ..
 const digest = value => 'sha256:' + crypto.createHash('sha256').update(value).digest('hex')
 const remedy = 'The verified patch remains available: apply manually or rerun against the current source.'
 
+const streamedIndexDigest = async (dir) => {
+  const hash = crypto.createHash('sha256')
+  await streamGit(['-C', dir, 'ls-files', '--stage', '-v', '-z'], (chunk) => hash.update(chunk))
+  return 'sha256:' + hash.digest('hex')
+}
+
 // Bind only an engine-supplied checkout. No model or delivery response chooses it.
 export async function sourceTarget (projectPath) {
   const dir = await fs.realpath(projectPath)
@@ -27,7 +33,7 @@ export async function sourceTarget (projectPath) {
     repository: await fs.realpath((await git(dir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).trim()),
     head: (await git(dir, ['rev-parse', 'HEAD'])).trim(),
     branch: (await git(dir, ['symbolic-ref', '-q', 'HEAD']).catch(() => '')).trim(),
-    index: digest(await git(dir, ['ls-files', '--stage', '-v', '-z']))
+    index: await streamedIndexDigest(dir)
   }
 }
 

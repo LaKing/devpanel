@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { readRun, runsDir, runDir } from './store.mjs'
+import { gitOutputLimit } from './working-tree.mjs'
 
 const NL = String.fromCharCode(10)
 
@@ -20,9 +21,13 @@ const NL = String.fromCharCode(10)
  * still handed to the agents as a file (`state: context-only`).
  */
 
-const run = (args, { cwd, env = {}, input = null } = {}) => new Promise((resolve) => {
-  const child = execFile('git', args, { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...env }, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) =>
-    resolve({ ok: !error, stdout: String(stdout), stderr: String(stderr) }))
+const OUTPUT_LIMIT = 64 * 1024 * 1024
+
+// `overflow` says so when git was stopped at the limit: its output is then cut
+// short, so nothing (the conflicted paths above all) may be read from it.
+const run = (args, { cwd, env = {}, input = null, limit = OUTPUT_LIMIT } = {}) => new Promise((resolve) => {
+  const child = execFile('git', args, { cwd, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', ...env }, maxBuffer: limit }, (error, stdout, stderr) =>
+    resolve({ ok: !error, stdout: String(stdout), stderr: String(stderr), overflow: error?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ? gitOutputLimit(args, limit).message : null }))
   child.stdin.on('error', () => {})
   child.stdin.end(input ?? '')
 })
@@ -58,7 +63,7 @@ const conflictedPaths = (stderr) => [...stderr.matchAll(/Applied patch to '([^']
  * base snapshot is there), with a throwaway index so neither repository's
  * index changes. Conflicts are left as markers for the author to resolve.
  */
-export async function carryForward ({ issuePath, runId, workspace, sourceRepository }) {
+export async function carryForward ({ issuePath, runId, workspace, sourceRepository, outputLimit: limit = OUTPUT_LIMIT }) {
   const source = await undeliveredApproval(issuePath, runId)
   if (!source) return null
   const patch = await fs.readFile(source.patch).catch(() => null)
@@ -66,18 +71,21 @@ export async function carryForward ({ issuePath, runId, workspace, sourceReposit
   const seed = { fromRun: source.runId, revision: source.revision, reason: source.reason, patch: copy, state: 'context-only', conflicts: [], error: null }
   if (!patch?.length) return { ...seed, error: 'the approved patch could not be read' }
   await fs.writeFile(copy, patch)
-  const clean = await run(['apply', '--binary', '--whitespace=nowarn', '-'], { cwd: workspace.path, input: patch })
+  const clean = await run(['apply', '--binary', '--whitespace=nowarn', '-'], { cwd: workspace.path, input: patch, limit })
+  if (clean.overflow) return { ...seed, error: clean.overflow }
   if (clean.ok) return { ...seed, state: 'applied' }
   if (!sourceRepository || !workspace.baseCommit) return { ...seed, error: clean.stderr.trim() }
   const index = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-carry-')), 'index')
   try {
     const env = { GIT_DIR: sourceRepository, GIT_WORK_TREE: workspace.path, GIT_INDEX_FILE: index }
-    const read = await run(['read-tree', workspace.baseCommit], { cwd: workspace.path, env })
-    if (!read.ok) return { ...seed, error: read.stderr.trim() }
+    const read = await run(['read-tree', workspace.baseCommit], { cwd: workspace.path, env, limit })
+    if (!read.ok) return { ...seed, error: read.overflow ?? read.stderr.trim() }
     // read-tree leaves no stat data, and apply --3way refuses any path whose
     // index entry it cannot match to the file; a refresh records them.
-    await run(['update-index', '-q', '--refresh'], { cwd: workspace.path, env })
-    const merged = await run(['apply', '--3way', '--binary', '--whitespace=nowarn', '-'], { cwd: workspace.path, env, input: patch })
+    const refreshed = await run(['update-index', '-q', '--refresh'], { cwd: workspace.path, env, limit })
+    if (refreshed.overflow) return { ...seed, error: refreshed.overflow }
+    const merged = await run(['apply', '--3way', '--binary', '--whitespace=nowarn', '-'], { cwd: workspace.path, env, input: patch, limit })
+    if (merged.overflow) return { ...seed, error: merged.overflow }
     const conflicts = conflictedPaths(merged.stderr)
     if (merged.ok) return { ...seed, state: 'merged' }
     if (conflicts.length) return { ...seed, state: 'conflicts', conflicts }

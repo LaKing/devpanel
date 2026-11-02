@@ -2,12 +2,11 @@ import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { issuesRoot, listProjectDirs, projectsRoot } from '../project-path.mjs'
 import { hostSettings } from '../config/host-settings.mjs'
 import { hostPlatform } from './platform.mjs'
 import { privateHomeHit } from './private-paths.mjs'
+import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
 
 /*
  * Snapshot selection, v1 (fence.selection: 1; the seat-access fence's
@@ -37,9 +36,8 @@ import { privateHomeHit } from './private-paths.mjs'
 
 export const SELECTION_RULE = 'owner-ls-files/v1'
 
-const exec = promisify(execFile)
-const git = async (dir, args) => (await exec('git', ['-C', dir, ...args], {
-  maxBuffer: 256 * 1024 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
+const git = async (dir, args) => (await gitRead('git', ['-C', dir, ...args], {
+  maxBuffer: GIT_OUTPUT_LIMIT, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
 })).stdout
 const sha = (bytes) => 'sha256:' + crypto.createHash('sha256').update(bytes).digest('hex')
 const inside = (root, file) => file === root || file.startsWith(root + path.sep)

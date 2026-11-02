@@ -1,9 +1,8 @@
-import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { promisify } from 'node:util'
 
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from './selection.mjs'
+import { gitRead } from './working-tree.mjs'
 import { certDir, issuesRoot, logDir, tokenFile } from '../project-path.mjs'
 
 /*
@@ -19,7 +18,6 @@ import { certDir, issuesRoot, logDir, tokenFile } from '../project-path.mjs'
  *                    the worktree without ever following a link out of it
  */
 
-const exec = promisify(execFile)
 const within = (root, p) => p === root || p.startsWith(root + path.sep)
 
 /** What is wrong with the declared targets, if anything (no filesystem access). */
@@ -81,7 +79,7 @@ async function sourceErrors (real, source, { projectPath }) {
     // A listing that fails proves nothing: it is a refusal, never an empty selection (auditor-1-008).
     let listed
     try {
-      listed = (await exec('git', ['-C', host, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', path.relative(host, real)], { maxBuffer: 64 * 1024 * 1024 })).stdout.split('\0').filter(Boolean)
+      listed = (await gitRead('git', ['-C', host, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', path.relative(host, real)], { maxBuffer: 64 * 1024 * 1024 })).stdout.split('\0').filter(Boolean)
     } catch (error) {
       return [`tooling.mounts: ${source} could not be checked against the snapshot selection of ${host} (git ls-files failed: ${(error.stderr || error.message).toString().trim().split('\n')[0]})`]
     }

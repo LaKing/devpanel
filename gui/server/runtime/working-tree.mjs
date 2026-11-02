@@ -2,6 +2,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
 
 /*
  * What `git add -A` would make of the untracked working tree.
@@ -31,6 +33,69 @@ import os from 'node:os'
  */
 
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+
+/*
+ * Reading git on the launch path. An output only counted or hashed is streamed:
+ * it has no limit. A listing every path of which is then used has to be held, so
+ * it has a stated limit (the same for the gate and for provisioning, or the gate
+ * refuses a tree the build accepts) and going over it says so.
+ */
+export const GIT_OUTPUT_LIMIT = 256 * 1024 * 1024
+const execFileAsync = promisify(execFile)
+const NODE_DEFAULT_LIMIT = 1024 * 1024
+
+export function gitOutputLimit (args, limit) {
+  const verb = args.find((a) => !a.startsWith('-') && !/[/=]/.test(a)) ?? ''
+  const size = limit >= 1024 * 1024 ? `${limit / (1024 * 1024)} MiB` : `${limit} bytes`
+  return Object.assign(new Error(`git ${verb} printed more than the ${size} the panel reads from it, so nothing was decided from a partial output. Ignore, exclude (the project's workspace.excludes) or commit what it lists, then try again.`), { code: 'GIT_OUTPUT_LIMIT', limit })
+}
+
+/** execFile's promise, with an output over the limit reported as what it is. */
+export async function gitRead (command, args, options = {}) {
+  try {
+    return await execFileAsync(command, args, options)
+  } catch (error) {
+    if (error.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw error
+    throw gitOutputLimit(args, options.maxBuffer ?? NODE_DEFAULT_LIMIT)
+  }
+}
+
+/** Hand git's stdout to `onChunk` as it arrives; nothing is kept. */
+export function streamGit (args, onChunk) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let stderr = ''
+    child.stdout.on('data', onChunk)
+    child.stderr.on('data', (chunk) => { if (stderr.length < 4096) stderr += chunk })
+    child.on('error', reject)
+    child.on('close', (code) => code === 0 ? resolve() : reject(Object.assign(new Error(`git ${args.join(' ')} exited ${code}`), { stderr })))
+  })
+}
+
+/** The checkout's status as counts, for any number of changed paths. `??` lines are the untracked ones. */
+export async function statusCounts (projectPath, { untracked = 'all' } = {}) {
+  const NEWLINE = 10
+  const QUESTION = 63
+  let dirtyPaths = 0
+  let untrackedPaths = 0
+  let column = 0
+  let marks = 0
+  await streamGit(['-C', projectPath, 'status', '--porcelain', `--untracked-files=${untracked}`], (chunk) => {
+    for (let i = 0; i < chunk.length; i++) {
+      const byte = chunk[i]
+      if (byte === NEWLINE) {
+        if (marks === 2) untrackedPaths++
+        else if (column) dirtyPaths++
+        column = 0
+        marks = 0
+      } else {
+        if (column < 2 && byte === QUESTION) marks++
+        column++
+      }
+    }
+  })
+  return { dirtyPaths, untrackedPaths }
+}
 
 // Git owns ignore and pathspec semantics. Share this selection with snapshot
 // admission and destination verification; never discover ignored file contents
@@ -213,7 +278,13 @@ const nestedBlocking = (files) => files.flatMap((f) => f.special
  */
 export async function includeNested ({ projectPath, nested, excludes, git, exec, env }) {
   const record = []
-  const plain = (args) => exec({ command: 'git', args, env: process.env }).then((r) => { if (r.code !== 0) throw new Error(r.stderr.trim()); return r.stdout })
+  // runProcess keeps the TAIL of an output over its limit, which would read here
+  // as a repository with fewer files.
+  const plain = (args) => exec({ command: 'git', args, env: process.env, maxBuffer: GIT_OUTPUT_LIMIT }).then((r) => {
+    if (r.code !== 0) throw new Error(r.stderr.trim())
+    if (r.truncated) throw gitOutputLimit(args, GIT_OUTPUT_LIMIT)
+    return r.stdout
+  })
   for (const root of nested) {
     const head = (await plain(['-C', path.join(projectPath, root), 'rev-parse', '-q', '--verify', 'HEAD']).catch(() => '')).trim() || null
     const files = await nestedFiles({ projectPath, root, excludes, run: plain })
