@@ -118,6 +118,39 @@ far, and its explanation names any reopened finding and says whether the full dr
 reached the last revision. An audit on the last allowed round holding an
 `awaitsCheck` finding gets that drive before the loop ends.
 
+### What a brief asks for
+
+Every `brief.md` that receives `findings.outstanding` (Implementation, Plan and
+implement, Staging, Deployment, Analysis) asks the coordinator to reference open
+findings by ID and quote only what the worker lacks, within the handoff prompt's
+2400-character limit. The Triage brief receives only the issue and the window.
+
+The briefs that follow candidate revisions (Implementation and Plan and implement)
+also say that the same timeout or crash signature on two consecutive revisions
+gets a diagnostic step before another change, stated as such in the handoff. A
+brief turn has no check history in its context: `checks.latest` is the latest drive,
+`retrySkipped` (`failed-same-way`) and `previousDrive` appear only in some drives,
+and a fresh session lacks the earlier turns. So the wording never claims a repeat
+it cannot see. It sends the worker, who can read every drive under the run's
+`checks/`, to compare first and treat a match as the repeat. Whether a coordinator
+follows this can only be seen on a run; the templates do not enforce it.
+
+A recorded example of such a handoff, written by hand under this wording after a
+real run in which 900-second timeouts recurred over several revisions before a
+person's note turned the work to diagnosis (the names and IDs are made up; it is not
+a live model's output). The findings are in the worker's context, so they are only
+cited; the operator's chat instruction reaches the coordinator's turn alone, so
+it is the one thing quoted:
+
+```json
+{
+  "targetRole": "implementer",
+  "prompt": "Objective: the migration suite finishes on the candidate.\n\nDiagnostic step before another change. `migration-suite` timed out at 900 s with no output on this revision, as on the previous one (checks.latest.retrySkipped, failed-same-way). Identify the process that blocks it and measure where the 900 s go. Report what you ran and measured, then change only what the measurement supports, in this turn. Do not raise the timeout or add retries as a guess.\n\nOpen findings: auditor-1-rpc-call-unbounded and auditor-1-lock-order. Address both by ID.\n\nNot in your context, from the operator: \"the staging database is shared, do not drop it between drives\".\n\nEvidence needed next: the measurement, and the check you ran for migrations-complete.",
+  "rationale": "Second identical timeout on consecutive revisions: another guess would repeat the last round.",
+  "windowDecision": "keep"
+}
+```
+
 ## Autonomous runs
 
 A run finishes without a person, or does not start
