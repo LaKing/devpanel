@@ -623,6 +623,8 @@ async function start (override = false) {
 .setting small { opacity: 0.6; font-size: 0.6875rem; }
 .check-row { display: flex; align-items: center; gap: 8px; font-size: 0.95rem; }
 .check-row input { width: 16px; height: 16px; margin: 0; }
+/* A finger needs the box itself at 44px; flex: none keeps a long label from squeezing it. */
+@media (pointer: coarse) { .check-row input { flex: none; width: 44px; height: 44px; } }
 .setting--inactive { opacity: 0.55; }
 
 .settings-actions { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin: 16px 0 0; }
