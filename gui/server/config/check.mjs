@@ -100,6 +100,12 @@ for (const id of ids) {
   for (const m of p.workspace.tooling.mounts ?? []) {
     if (m.missing) console.log(`  ${mark('warn')} tooling mount ${m.target}: ${m.source} does not exist${m.provisional ? ' (provisional)' : ''}; this project's seat turns are refused until it does`)
   }
+  // What the checkout provides under host settings tooling.nodeModules: no file states it, so it is listed.
+  if (p.workspace.tooling.auto) {
+    for (const m of p.workspace.tooling.mounts ?? []) console.log(`    ${c.dim}tooling${c.off}    mount ${m.target} ← ${m.sourceReal ?? m.source} (read-only${m.masks?.length ? `; masked: ${m.masks.join(', ')}` : ''})`)
+    for (const x of p.workspace.tooling.commands ?? []) console.log(`    ${c.dim}tooling${c.off}    command ${x.id}: ${x.cwd ? `${x.cwd}: ` : ''}${x.run}`)
+    for (const s of p.workspace.tooling.autoSkipped ?? []) console.log(`  ${mark('warn')} tooling ${s.target} left out: ${s.reason}`)
+  }
 
   if (target) {
     for (const [role, q] of Object.entries(p.participants)) {

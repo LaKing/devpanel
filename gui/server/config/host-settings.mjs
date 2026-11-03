@@ -62,7 +62,7 @@ const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2
 
 /**
  * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, projectDiscovery, proxyLogin, projectActions,
- * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
+ * testDrive, selection, harnesses, fence, tooling, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
 export function hostSettings ({ root = DEFAULT_CONFIG_ROOT, env = process.env, hostDir = hostConfigDir({ root, env }) } = {}) {
@@ -102,6 +102,7 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     selection: { forbiddenPrefixes: data.selection?.forbiddenPrefixes ?? DEFAULT_FORBIDDEN_PREFIXES, allowedHomePaths: (data.selection?.allowedHomePaths ?? []).map(expandHome) },
     harnesses: { disabled: data.harnesses?.disabled ?? [] },
     fence: { readOnly: (data.fence?.readOnly ?? []).map(expandHome) },
+    tooling: { nodeModules: data.tooling?.nodeModules === true },
     skill: { linkBaseVariable: data.skill?.linkBaseVariable ?? null },
     reporter: { panelUrl: data.reporter?.panelUrl ?? null },
     seatGuidance: { projects: data.seatGuidance?.projects ?? [] }

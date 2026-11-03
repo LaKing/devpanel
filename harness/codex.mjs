@@ -324,6 +324,9 @@ async function invokeOnce ({
   // fenceable. The policy is stated in the prompt and recorded; this is what
   // the runtime can enforce of it.
   const enforcement = tooling && !supervisorOnly && !readSeat ? { writes: 'workspace-write', reads: 'not-fenceable', bash: 'not-fenceable' } : null
+  // Masked caches of a tooling mount (tooling.nodeModules): empty writable directories
+  // outside the worktree in the fence, which the workspace-write sandbox must also let a tool write.
+  const mountMasks = enforcement ? tooling.mountMasks ?? [] : []
   // `exec resume` has no --sandbox option; the config override is supported
   // by both fresh and resumed invocations and preserves the same write fence.
   if (enforcement) args.push('-c', 'sandbox_mode="workspace-write"')
@@ -331,16 +334,17 @@ async function invokeOnce ({
     // workspace-write implicitly includes cwd. Make that root scratch, including
     // resumed sessions, and remove any extra writable roots from user config.
     args.push('-c', `cwd=${JSON.stringify(scratchDir)}`, '-c', 'approval_policy="never"',
-      '-c', 'sandbox_workspace_write.writable_roots=[]', '-c', 'sandbox_workspace_write.exclude_slash_tmp=true')
+      '-c', `sandbox_workspace_write.writable_roots=${JSON.stringify(mountMasks)}`, '-c', 'sandbox_workspace_write.exclude_slash_tmp=true')
     enforcement.writes = 'scratch-only'
     enforcement.source = 'read-only'
   }
   if (enforcement && tooling.networkAccess) args.push('-c', 'sandbox_workspace_write.network_access=true')
   // The writer's own Git directory (0d private repositories) lies outside its
   // working directory; `git add/commit` must be able to write there.
-  if (enforcement && !readOnlySource && tooling.writesCode === true && tooling.gitWorker) {
-    args.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify([tooling.gitWorker])}`)
-    enforcement.gitWorker = 'writable'
+  const gitWorker = enforcement && !readOnlySource && tooling.writesCode === true && tooling.gitWorker ? tooling.gitWorker : null
+  if (enforcement && !readOnlySource && (gitWorker || mountMasks.length)) {
+    args.push('-c', `sandbox_workspace_write.writable_roots=${JSON.stringify([...(gitWorker ? [gitWorker] : []), ...mountMasks])}`)
+    if (gitWorker) enforcement.gitWorker = 'writable'
   }
 
   const body = [

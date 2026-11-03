@@ -55,6 +55,7 @@ import { candidateDiff } from './diff.mjs'
 import { COORDINATOR_INSTRUCTIONS, TRIAGE_READ_INSTRUCTIONS, coordinationInput } from './coordination.mjs'
 import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
 import { ensureMountPoint } from './tooling-mounts.mjs'
+import { maskDir } from '../../../harness/fence.mjs'
 import { toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
 
@@ -1541,8 +1542,11 @@ export class Engine {
     const mounts = []
     for (const m of t.mounts ?? []) {
       const real = m.sourceReal ? await fs.realpath(m.sourceReal).catch(() => null) : null
-      if (!real) throw refuse(`tooling mount source ${m.source} does not exist (workspace.tooling.mounts in projects/${this.run.issue.project}.yaml): this project's seat turns are refused until it does`)
-      try { mounts.push({ source: real, target: await ensureMountPoint(ws.path, m.target) }) } catch (error) { throw refuse(error.message) }
+      if (!real) throw refuse(`tooling mount source ${m.source} does not exist (${m.auto ? 'found in the checkout under host settings tooling.nodeModules' : `workspace.tooling.mounts in projects/${this.run.issue.project}.yaml`}): this project's seat turns are refused until it does`)
+      // Found in the checkout, so the checkout may have changed it since resolution: it is
+      // bound only while it is still a real directory at the real path recorded then.
+      if (m.auto && (real !== m.sourceReal || !(await fs.lstat(m.sourceReal)).isDirectory())) throw refuse(`tooling mount source ${m.source} is no longer the real directory ${m.sourceReal} recorded when this run was resolved (host settings tooling.nodeModules): this run's seat turns are refused`)
+      try { mounts.push({ source: real, target: await ensureMountPoint(ws.path, m.target), ...(m.masks ? { masks: m.masks } : {}) }) } catch (error) { throw refuse(error.message) }
     }
     const panelRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
     return { mounts, toolingBin: path.join(panelRoot, 'harness', 'tooling') }
@@ -1601,6 +1605,13 @@ export class Engine {
       gitDirectories: this.run.integrity?.gitDirectories ?? [],
       // Tooling mount targets: read-only inside the worktree (toolingMounts).
       ...(t.mounts?.length && this.run.workspace?.path && this.run.workspace.isolation !== 'in-place' ? { mountTargets: t.mounts.map((m) => path.join(this.run.workspace.path, m.target)) } : {}),
+      // Their masked caches (tooling.nodeModules): the fence makes each an empty writable directory, and
+      // the CLI's own sandbox must leave it writable too, or the tools still fail writing there (EROFS).
+      // The caches are linked from the mount to directories outside the worktree (harness/fence.mjs maskDir).
+      ...(t.mounts?.some((m) => m.masks?.length) && this.run.workspace?.path && this.run.workspace.isolation !== 'in-place' ? {
+        mountMasks: t.mounts.flatMap((m, index) => (m.masks ?? []).map((name) => maskDir(index, name))),
+        maskedMountTargets: t.mounts.filter((m) => m.masks?.length).map((m) => path.join(this.run.workspace.path, m.target))
+      } : {}),
       // The writer's own Git directory (0d): its CLI sandbox must let `git
       // add/commit` write there. Adapters grant it only to a writing seat.
       ...(this.run.workspace?.repository?.kind === 'private' ? { gitWorker: this.run.workspace.repository.worker } : {}),

@@ -55,6 +55,9 @@ export function runlessFence ({ cwd, writable = [] }) {
 
 /** Where the panel's harness/tooling (offline wrapper, launchers) appears inside the fence. */
 export const TOOLING_BIN = '/run/devpanel/tooling'
+/** Where a masked mount's caches live in the fence: outside the worktree, linked from the mount (maskedMountArgs). */
+export const MASK_ROOT = '/run/devpanel/caches'
+export const maskDir = (index, name) => path.posix.join(MASK_ROOT, String(index), name)
 
 const BWRAP = () => process.env.DEVPANEL_BWRAP_BIN ?? 'bwrap'
 const SETPRIV = () => process.env.DEVPANEL_SETPRIV_BIN ?? 'setpriv'
@@ -111,9 +114,10 @@ export async function fenceArgs (spec) {
   }
   // Tooling mounts, after the worktree they sit in. Never skipped: a seat told
   // it may run the project's tooling must not find an empty directory.
-  for (const mount of spec.mounts ?? []) {
+  for (const [index, mount] of (spec.mounts ?? []).entries()) {
     if (!await exists(mount.source)) throw new Error(`tooling mount source ${mount.source} does not exist`)
-    args.push('--ro-bind', await canonical(mount.source), mount.target)
+    if (!mount.masks) { args.push('--ro-bind', await canonical(mount.source), mount.target); continue }
+    args.push(...await maskedMountArgs(await canonical(mount.source), mount.target, mount.masks, index))
   }
   if (spec.toolingBin) args.push('--ro-bind', await canonical(spec.toolingBin), TOOLING_BIN)
   for (const file of spec.entries ?? []) {
@@ -130,6 +134,31 @@ export async function fenceArgs (spec) {
     args.push(bind.writable ? '--bind' : '--ro-bind', await canonical(bind.source), bind.target)
   }
   args.push('--chdir', await canonical(spec.cwd))
+  return args
+}
+
+/**
+ * A mount with masked entries (tooling.nodeModules): a tmpfs at the target with
+ * each entry of the source bound read-only into it, except the masked ones (build
+ * caches), and each mask a link to an empty writable directory outside the
+ * worktree (maskDir). Not a read-only bind with a tmpfs over each cache: a CLI
+ * sandbox inside the fence (Claude's) mounts read-only again, last, whatever it
+ * does not let the seat write, and for a seat that may not write its source that
+ * is the whole worktree, so any cache inside it ends up read-only. Through the
+ * link a tool writes outside the worktree, where the adapters let it (mountMasks),
+ * and it may create a cache the checkout lacks (vite's .vite-temp before the tests
+ * ever ran on this host). An entry that is a symlink is recreated as the same
+ * link, never followed: its target is visible only if the fence grants it.
+ */
+async function maskedMountArgs (source, target, masks, index) {
+  const args = ['--tmpfs', target]
+  for (const entry of (await fs.readdir(source, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+    if (masks.includes(entry.name)) continue
+    const from = path.join(source, entry.name), to = path.join(target, entry.name)
+    if (entry.isSymbolicLink()) args.push('--symlink', await fs.readlink(from), to)
+    else if (entry.isDirectory() || entry.isFile()) args.push('--ro-bind', from, to)
+  }
+  for (const name of masks) args.push('--dir', maskDir(index, name), '--symlink', maskDir(index, name), path.join(target, name))
   return args
 }
 
@@ -156,9 +185,20 @@ export async function proveFence ({ fence, spec, canaries = [], command = null, 
   // Each mount must be a directory the seat cannot write, showing the source's
   // content (a sentinel entry), not the empty mount point beneath it.
   const mounts = []
+  const masks = []
   for (const mount of spec.mounts ?? []) {
-    const names = (await fs.readdir(mount.source).catch(() => [])).sort()
-    mounts.push(`${mount.target}|${names[0] ?? ''}`)
+    if (!mount.masks) {
+      const names = (await fs.readdir(mount.source).catch(() => [])).sort()
+      mounts.push(`${mount.target}|${names[0] ?? ''}`)
+      continue
+    }
+    // A masked mount is a writable tmpfs of read-only entries (maskedMountArgs): its
+    // first directory entry is proved instead, read-only and showing the source's content.
+    const dirs = (await fs.readdir(mount.source, { withFileTypes: true }).catch(() => []))
+      .filter((e) => e.isDirectory() && !mount.masks.includes(e.name)).map((e) => e.name).sort()
+    if (dirs.length) mounts.push(`${path.join(mount.target, dirs[0])}|${(await fs.readdir(path.join(mount.source, dirs[0])).catch(() => [])).sort()[0] ?? ''}`)
+    // Each mask must be an empty directory the seat can write, not the cache of the source.
+    for (const name of mount.masks) masks.push(path.join(mount.target, name))
   }
   const script = [
     'status=0',
@@ -168,11 +208,12 @@ export async function proveFence ({ fence, spec, canaries = [], command = null, 
     // The CLI itself must be runnable inside, or the turn would fail at launch.
     'if [ -n "$COMMAND" ] && ! [ -x "$COMMAND" ]; then echo "CLI-NOT-VISIBLE $COMMAND"; status=1; fi',
     'if [ -n "$MOUNTS" ] && ! printf "%s\\n" "$MOUNTS" | { fail=0; while IFS="|" read -r t s; do f="$t/.devpanel-fence-probe-$$"; if ! [ -d "$t" ]; then echo "MOUNT-MISSING $t"; fail=1; elif ( : > "$f" ) 2>/dev/null; then rm -f "$f"; echo "MOUNT-WRITABLE $t"; fail=1; elif [ -n "$s" ] && ! [ -e "$t/$s" ] && ! [ -L "$t/$s" ]; then echo "MOUNT-NOT-BOUND $t"; fail=1; fi; done; exit $fail; }; then status=1; fi',
+    'if [ -n "$MASKS" ] && ! printf "%s\\n" "$MASKS" | { fail=0; while IFS= read -r m; do f="$m/.devpanel-fence-probe-$$"; if ! [ -d "$m" ] || [ -n "$(ls -A "$m" 2>/dev/null)" ]; then echo "MASK-NOT-EMPTY $m"; fail=1; elif ( : > "$f" ) 2>/dev/null; then rm -f "$f"; else echo "MASK-NOT-WRITABLE $m"; fail=1; fi; done; exit $fail; }; then status=1; fi',
     'if [ -n "$TOOLING" ] && ! [ -x "$TOOLING/offline" ]; then echo "TOOLING-NOT-VISIBLE $TOOLING"; status=1; fi',
     'exit $status'
   ].join(NL)
   const wrapped = fencedCommand({ command: '/bin/sh', args: ['-c', script], fence })
-  const probeEnv = { PATH: '/usr/bin:/bin', WRITABLE: writable.join(' '), READONLY: readOnly.join(' '), CANARIES: canaries.join(' '), COMMAND: command ?? '', MOUNTS: mounts.join(NL), TOOLING: spec.toolingBin ? TOOLING_BIN : '', ...env }
+  const probeEnv = { PATH: '/usr/bin:/bin', WRITABLE: writable.join(' '), READONLY: readOnly.join(' '), CANARIES: canaries.join(' '), COMMAND: command ?? '', MOUNTS: mounts.join(NL), MASKS: masks.join(NL), TOOLING: spec.toolingBin ? TOOLING_BIN : '', ...env }
   let result
   try {
     result = await runProcess({ command: wrapped.command, args: wrapped.args, env: probeEnv, signal, stdin: '', maxBuffer: 1024 * 1024 })
@@ -184,7 +225,7 @@ export async function proveFence ({ fence, spec, canaries = [], command = null, 
     const findings = result.stdout.split(NL).filter(Boolean)
     return { proved: false, reason: (findings.length ? findings.slice(0, 5).join('; ') : result.stderr.trim().slice(0, 400)) || `probe exited ${result.code}` }
   }
-  return { proved: true, reason: null, checked: { writable: writable.length, readOnly: readOnly.length, canaries: canaries.length, ...(mounts.length ? { mounts: mounts.length } : {}) } }
+  return { proved: true, reason: null, checked: { writable: writable.length, readOnly: readOnly.length, canaries: canaries.length, ...(mounts.length ? { mounts: mounts.length } : {}), ...(masks.length ? { masks: masks.length } : {}) } }
 }
 
 /**
@@ -330,7 +371,7 @@ export async function applyFence ({ spec, manifest = {}, command = null, signal 
     return {
       applied: true, reason: null, proof: proof.checked,
       mounts: { writable: full.writable.length, readOnly: full.readOnly.length, home: full.homeBinds.map((b) => `${b.writable ? 'rw' : 'ro'}:${b.path}`),
-        ...(full.mounts.length ? { tooling: full.mounts.map((m) => ({ target: m.target, source: m.source })) } : {}) },
+        ...(full.mounts.length ? { tooling: full.mounts.map((m) => ({ target: m.target, source: m.source, ...(m.masks?.length ? { masks: m.masks } : {}) })) } : {}) },
       wrap: (command, args) => fencedCommand({ command, args, fence })
     }
   } catch (error) {

@@ -372,6 +372,70 @@ isolation was available in that runtime and of which kind (`isolationMode`:
 `namespace` or `inherited`), and `seatNetwork`, the same 127.0.0.1 probe run in
 the seat's own shell without the wrapper).
 
+### Tooling found in the checkout
+
+A host with many npm projects can opt in once instead of writing a project file
+for each: `"tooling": { "nodeModules": true }` in the host settings
+(`runtime/node-modules-tooling.mjs`). For a project whose `projects/<id>.yaml`
+declares no `tooling.mounts` or `tooling.commands` (one that does keeps exactly
+what it declares), resolution walks the checkout (the root and up to three levels
+below, skipping dot directories and `node_modules`, never through a link) and, for
+each `package.json` with a `node_modules` beside it:
+
+- mounts that `node_modules` read-only at the same worktree-relative path;
+- masks its build caches (`.cache`, `.vite`, `.vite-temp`, `.vitest`,
+  `.vitest-cache`): each is an empty writable directory in the fence;
+- declares its `test` and `lint` scripts as commands,
+  `npm run <script> -- <args>` (from that directory, offline like every declared
+  command).
+
+The snapshot records them (`workspace.tooling.auto: nodeModules`, each mount
+`auto: true` with its `masks`, anything left out under `autoSkipped`), they are
+part of the configuration hash, and `config:check -- <playbook> --project <id>`
+lists them. The brief tells seats the tooling was found in the checkout.
+
+What it does not open, and why:
+
+- **No link is followed.** A `node_modules` is taken only as a real directory
+  whose real path is its place in the checkout, and the walk does not descend
+  into linked directories. Otherwise the project tree would decide what a seat
+  reads: a `node_modules` link to `~/.ssh`, created by anyone who can write the
+  checkout (a delivered patch included), would be mounted in the next run. A
+  link is left out and reported. Before each turn the engine checks again that
+  the source is still the real directory resolved; if not, the run's seat turns
+  are refused (`environment-error`, nothing started).
+- **The declared-mount checks still apply.** Each one passes `resolveMounts`
+  (forbidden roots, the panel's data, a repository root, source the snapshot
+  selects: a `node_modules` that is not ignored is source, not tooling); a
+  failure leaves it out rather than failing resolution.
+- **Caches are not shown.** Build caches hold derived data that may embed values
+  from the project's git-ignored configuration; the tmpfs hides them, and gives
+  tools the writable place they need (vite bundles its config into
+  `.vite-temp`, so without it `vitest` fails with `EROFS` in a read-only
+  worktree). In the fence the mount is a tmpfs holding each package entry
+  bound read-only (a link among them recreated as the same link, never
+  followed), and each cache a link to an empty writable directory outside the
+  worktree (`/run/devpanel/caches/<mount>/<name>`), also for a cache the
+  checkout lacks (`.vite-temp` before the tests ever ran here). Not a
+  read-only bind with a tmpfs over each cache: Claude's own Bash sandbox
+  mounts read-only, last, whatever a seat may not write (and every path an
+  Edit-tool denial names), and for an auditor that is the whole worktree, so a
+  cache inside it would be read-only again. Those directories are passed to
+  the CLI sandboxes as writable (Claude `allowWrite`, Codex `writable_roots`),
+  and a masked mount gets no Claude denyWrite or Edit denial of its own. The
+  fence proof checks each cache is empty and writable and a package directory
+  read-only.
+- **Nothing is written to the host.** The mount is read-only, so a seat cannot
+  change code the developer's own processes run outside the fence; nothing is
+  installed, so no install script runs. The scripts run the project's own
+  dependencies inside the fence without network, as the developer runs them.
+  A seat can edit `package.json` in its worktree, but a declared command grants
+  nothing a seat's shell does not already have.
+- **The whole `node_modules`, not just the tools.** A test imports the
+  application, which imports its dependencies; a mount of only the tool
+  packages would not run it. The packages themselves are public code; the risk
+  is in links and caches, handled above.
+
 ## Project actions: checkpoint.sh
 
 Git state matters to every run: the base policy reads the checkout, delivery

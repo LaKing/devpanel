@@ -136,6 +136,16 @@
         }
       }
     },
+    "tooling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodeModules": {
+          "type": "boolean",
+          "description": "Seat tooling for every project that declares none in projects/<id>.yaml: each node_modules directory beside a package.json in the project's checkout (the root and up to three levels below) is mounted read-only at the same place in the worktree, with its build caches masked (each an empty writable directory in the fence), and the package.json `test` and `lint` scripts become declared commands (`npm run <script>`, offline). A node_modules that is a symlink, lies outside the checkout or fails the declared-mount checks is left out and reported. Resolved into each run's snapshot (runtime/node-modules-tooling.mjs)."
+        }
+      }
+    },
     "skill": {
       "type": "object",
       "additionalProperties": false,

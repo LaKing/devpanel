@@ -404,7 +404,18 @@ async function invokeOnce ({
     // Tooling mounts (workspace.tooling.mounts) sit inside the worktree and are
     // read-only there: the mount refuses a write, these rules say why.
     const mountTargets = tooling.mountTargets ?? []
-    await denyTools(mountTargets, editTools)
+    // A masked mount (tooling.nodeModules) links its caches to empty writable
+    // directories outside the worktree (harness/fence.mjs maskedMountArgs). The
+    // CLI's sandbox mounts read-only, last, whatever it does not let the seat
+    // write, including every path an Edit-tool denial names: it allows each cache
+    // directory, and a masked mount is named neither in its denyWrite nor in an
+    // edit denial (the fence's read-only binds of the packages, proved before
+    // launch, refuse those writes). The caches exist only inside the fence, so
+    // they are passed as spelled, never resolved on the host.
+    const mountMasks = tooling.mountMasks ?? []
+    const masked = tooling.maskedMountTargets ?? []
+    const sandboxDenied = mountTargets.filter((target) => !masked.includes(target))
+    await denyTools(sandboxDenied, editTools)
     // Hygiene replaces the operator's inherited `auto` mode: what it used to let
     // through without a per-call classifier is allowed explicitly here. Reads and
     // web access keep today's reach (decision 5); denials above still win, and
@@ -412,7 +423,7 @@ async function invokeOnce ({
     const settings = { permissions: { deny, ...(workerHygiene ? { allow: [...(readSeat ? READ_ALLOW : WORKER_ALLOW), ...(broker && !readSeat ? BROKER_TOOLS : [])] } : {}) } }
     if (readOnlyRoots.length && !supervisorOnly) {
       settings.sandbox = { enabled: true, failIfUnavailable: true, allowUnsandboxedCommands: false,
-        filesystem: { disabled: false, allowWrite: [cwd, ...(scratchDir ? [scratchDir] : []), ...(tooling.writesCode === true && tooling.gitWorker ? [tooling.gitWorker] : [])], denyWrite: [...readOnlyRoots, ...mountTargets] } }
+        filesystem: { disabled: false, allowWrite: [cwd, ...(scratchDir ? [scratchDir] : []), ...(tooling.writesCode === true && tooling.gitWorker ? [tooling.gitWorker] : [])], denyWrite: [...readOnlyRoots, ...sandboxDenied] } }
       enforcement.bash = 'sandbox-required'
     }
     if (tooling.writesCode === false && !supervisorOnly) {
@@ -434,6 +445,7 @@ async function invokeOnce ({
       ;[filesystem.allowWrite, filesystem.denyWrite] = await Promise.all([
         canonicalRoots(filesystem.allowWrite), canonicalRoots(filesystem.denyWrite)
       ])
+      filesystem.allowWrite.push(...mountMasks)
     }
     settings.permissions.deny = [...new Set(deny)]
     if (deny.length || settings.sandbox || workerHygiene) flagSettings = settings

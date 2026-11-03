@@ -27,6 +27,10 @@ export function renderToolingCommand (command, worktree, { offline = true } = {}
   return `cd ${quote(dir)} && ${offline ? `${OFFLINE} ` : ''}sh -c ${quote(command.run)}`
 }
 
+const heading = (auto) => auto
+  ? 'Project tooling (found in the project checkout: host settings tooling.nodeModules).'
+  : 'Project tooling (projects/<id>.yaml workspace.tooling).'
+
 const NO_SHELL = 'Your runtime has no shell in this turn, so you cannot run these: record each one you would need under not run, saying so.'
 
 /**
@@ -39,9 +43,9 @@ export function toolingBrief ({ tooling, worktree, shell = true, confinement = n
   const mounts = tooling?.mounts ?? []
   const commands = tooling?.commands ?? []
   if (!mounts.length && !commands.length) return null
-  if (confinement) return unfencedBrief({ mounts, commands, worktree, shell, confinement })
-  const lines = ['Project tooling (projects/<id>.yaml workspace.tooling).']
-  if (mounts.length) lines.push(`Mounted read-only in the worktree: ${mounts.map((m) => `${m.target} (from ${m.source}${m.provisional ? ', provisional' : ''})`).join('; ')}. Never install anything: these are read-only, and the commands below have no network.`)
+  if (confinement) return unfencedBrief({ mounts, commands, worktree, shell, confinement, auto: tooling.auto })
+  const lines = [heading(tooling.auto)]
+  if (mounts.length) lines.push(`Mounted read-only in the worktree: ${mounts.map((m) => `${m.target} (from ${m.source}${m.provisional ? ', provisional' : ''}${m.masks?.length ? `; ${m.masks.join(', ')} inside it empty and writable` : ''})`).join('; ')}. Never install anything: these are read-only, and the commands below have no network.`)
   if (commands.length) {
     lines.push('Declared commands, each to be run exactly in the form shown (fill in <placeholders>):')
     for (const c of commands) lines.push(`- ${c.id}${c.provisional ? ' (provisional)' : ''}${c.description ? `: ${c.description}` : ''}${'\n'}  ${renderToolingCommand(c, worktree)}`)
@@ -53,8 +57,8 @@ export function toolingBrief ({ tooling, worktree, shell = true, confinement = n
 }
 
 /** The same declarations for a turn without the fence: nothing is called mounted, isolated or offline. */
-function unfencedBrief ({ mounts, commands, worktree, shell, confinement }) {
-  const lines = ['Project tooling (projects/<id>.yaml workspace.tooling).']
+function unfencedBrief ({ mounts, commands, worktree, shell, confinement, auto }) {
+  const lines = [heading(auto)]
   if (mounts.length) lines.push(`Declared mounts NOT bound in this turn (${confinement.reason}): ${mounts.map((m) => `${m.target} (from ${m.source})`).join('; ')}. Nothing is mounted at these paths for you; never install anything there.`)
   if (!commands.length) return lines.join('\n')
   if (confinement.mode === 'refused') {

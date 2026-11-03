@@ -9,6 +9,7 @@ import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-option
 import { infrastructureErrors, localChecksErrors, localTarget, stagingTarget, tierErrors } from '../infrastructure.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
+import { nodeModulesTooling } from '../runtime/node-modules-tooling.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
 import { DEFAULT_CONFIG_ROOT, hostConfigDir, discover } from './host-config.mjs'
 import { hostSettings } from './host-settings.mjs'
@@ -571,6 +572,14 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     for (const e of resolvedMounts.errors) err(errors, e.message, project.file, `/workspace/tooling/mounts/${e.index}/source`)
     toolingMounts = resolvedMounts.mounts
   }
+  // A project that declares no tooling gets what its checkout provides, when the
+  // host opted in (host settings tooling.nodeModules; runtime/node-modules-tooling.mjs).
+  let autoTooling = null
+  if (projectId && !project?.workspace?.tooling?.mounts?.length && !project?.workspace?.tooling?.commands?.length && hostSettings({ root, hostDir: cfg.hostDir }).tooling.nodeModules) {
+    const projectPath = await resolveProjectPath(projectId).catch(() => null)
+    if (projectPath) autoTooling = await nodeModulesTooling(projectPath)
+    if (autoTooling) toolingMounts = autoTooling.mounts
+  }
 
   // Delivery validation must finish before deciding whether resolution succeeded.
   if (errors.length) return { ok: false, errors }
@@ -587,6 +596,8 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   // The seat-access policy a run executes under is part of what it is, so a
   // policy step starts a new configuration group (harness/README.md "Seat hygiene").
   contributing.push(sha256(`fence:${JSON.stringify(FENCE_POLICY)}`))
+  // Tooling found in the checkout is configuration no file states: a change in it starts a new group too.
+  if (autoTooling) contributing.push(sha256(`tooling:${JSON.stringify({ mounts: autoTooling.mounts.map((m) => ({ target: m.target, masks: m.masks })), commands: autoTooling.commands, skipped: autoTooling.skipped })}`))
 
   const resolved = {
     // Frozen per run: the adapters read it from the snapshot, so a run resolved
@@ -630,7 +641,9 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
       ...(project?.workspace ?? {}),
       tooling: { allowLiveCheckout: false, allowedRoots: [], ...(strategy.workspace?.tooling ?? {}), ...(project?.workspace?.tooling ?? {}), ...(playbook.workspace?.tooling ?? {}),
         // Project-only (refused elsewhere at load): mounts as resolved on this host.
-        ...(toolingMounts.length ? { mounts: toolingMounts } : {}), ...(project?.workspace?.tooling?.commands?.length ? { commands: project.workspace.tooling.commands } : {}) },
+        ...(toolingMounts.length ? { mounts: toolingMounts } : {}), ...(project?.workspace?.tooling?.commands?.length ? { commands: project.workspace.tooling.commands } : {}),
+        ...(autoTooling?.commands.length ? { commands: autoTooling.commands } : {}),
+        ...(autoTooling && (autoTooling.mounts.length || autoTooling.skipped.length) ? { auto: 'nodeModules', ...(autoTooling.skipped.length ? { autoSkipped: autoTooling.skipped } : {}) } : {}) },
       ...(playbook.workspace?.base !== undefined ? { base: playbook.workspace.base, baseSource: runOptions.base !== undefined ? 'run' : 'playbook' } : { baseSource: project?.workspace?.base !== undefined ? 'project' : 'strategy' }),
       ...(playbook.workspace?.symlinks !== undefined ? { symlinks: playbook.workspace.symlinks } : {}),
       ...(playbook.workspace?.isolation !== undefined ? { isolation: playbook.workspace.isolation, isolationSource: runOptions.isolation !== undefined ? 'run' : 'playbook' } : {}),

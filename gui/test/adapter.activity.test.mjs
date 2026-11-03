@@ -190,6 +190,36 @@ export default async function (t) {
     }
   }
 
+  t.section('masked caches of a tooling mount stay writable in the CLI sandboxes (tooling.nodeModules)')
+  for (const shape of ['claude', 'codex']) {
+    const record = path.join(await temp(), 'calls')
+    process.env[shape === 'claude' ? 'DEVPANEL_CLAUDE_BIN' : 'DEVPANEL_CODEX_BIN'] = await shim({ shape, record })
+    const adapter = await import(`../../harness/${shape}.mjs?masks=1`)
+    for (const writesCode of [true, false]) {
+      const cwd = await fs.realpath(await temp())
+      const scratchDir = await fs.realpath(await temp())
+      const evidence = await fs.realpath(await temp())
+      const target = path.join(cwd, 'node_modules')
+      await fs.mkdir(target)
+      // As in a real turn: the cache directory exists only inside the fence, linked from the mount.
+      const mask = '/run/devpanel/caches/0/.vite-temp'
+      const tooling = { writesCode, worktree: cwd, allowedRoots: [evidence], mountTargets: [target], mountMasks: [mask], maskedMountTargets: [target] }
+      await adapter.invoke({ model: 'm', cwd, scratchDir, tooling, prompt: 'Run the declared test command.' })
+      const call = (await readRecord(record)).at(-1).received
+      const seat = writesCode ? 'writer' : 'reader'
+      if (shape === 'claude') {
+        const fsys = JSON.parse(call.argv[call.argv.indexOf('--settings') + 1]).sandbox.filesystem
+        t.ok(`claude ${seat}: the mask is writable in its sandbox`, fsys.allowWrite.includes(mask), JSON.stringify(fsys))
+        t.ok(`claude ${seat}: the masked mount is not re-mounted read-only over it`, !fsys.denyWrite.includes(target), JSON.stringify(fsys))
+        const deny = JSON.parse(call.argv[call.argv.indexOf('--settings') + 1]).permissions.deny
+        t.ok(`claude ${seat}: nor named by an edit denial, which the CLI also mounts read-only`, !deny.some((rule) => rule.includes(`${target}/**`)), JSON.stringify(deny))
+      } else {
+        const roots = call.argv.find((a) => a.startsWith('sandbox_workspace_write.writable_roots='))
+        t.ok(`codex ${seat}: the mask is a writable root`, JSON.parse(roots.split('=').slice(1).join('=')).includes(mask), roots)
+      }
+    }
+  }
+
   t.section('symlink spellings are denied; only canonical paths reach bubblewrap')
   for (const writesCode of [false, true]) {
     const root = await temp()
