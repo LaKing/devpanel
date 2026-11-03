@@ -56,6 +56,8 @@ for (const id of ['releases', 'live-reports']) {
 }
 console.log(`${c.dim}host-config${c.off} ${config.hostDir} (${hostPresent ? 'present' : 'absent'})   ${Object.entries(counts).map(([id, n]) => `${c.dim}${id}${c.off} ${n.tree + n.host} (tree ${n.tree}, host ${n.host})`).join('   ')}`)
 for (const s of config.shadowed) console.log(`  ${mark('warn')} ${s.category}/${s.name}: host-config shadows the in-tree ${s.tree}`)
+for (const p of config.unmatchedPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} prices "${p.id}", which is not in the roster`)
+for (const p of config.invalidPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} is not usable, so that model stays unpriced: ${p.message}`)
 // The host settings (docs/host-config.md "Host settings"): an invalid file is an error here as at server start.
 try {
   const settings = hostSettings({ root: config.root, hostDir: config.hostDir })

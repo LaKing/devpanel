@@ -26,7 +26,7 @@ import { hostPlatform } from '../runtime/platform.mjs'
 export const CONFIG_ROOT = DEFAULT_CONFIG_ROOT
 
 const SCHEMA_NAMES = [
-  'harness-capabilities', 'roster-model', 'strategy-template', 'intent',
+  'harness-capabilities', 'roster-model', 'roster-pricing', 'strategy-template', 'intent',
   'playbook', 'agent-outputs', 'revision-fingerprint', 'run', 'lock', 'project'
 ]
 
@@ -184,6 +184,23 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     if (roster.has(data.id)) { err(errors, `duplicate roster id "${data.id}"`, file, '/id'); continue }
     roster.set(data.id, { ...data, file, hash })
   }
+  // Beside the entry, never in it: `hash` above is the entry's bytes, and a price is
+  // no reason to start a new configuration group (docs/host-config.md). Nor is a bad
+  // one a reason to stop a run: it only feeds estimates, so it is reported, and the
+  // model's calls stay unknown.
+  const unmatchedPricing = [], invalidPricing = []
+  for (const { file } of await hostFiles('roster-pricing')) {
+    let data
+    try { ({ data } = await readYaml(file)) } catch (error) { invalidPricing.push({ file, message: error.message }); continue }
+    const problems = []
+    if (!validate(await validator(), 'roster-pricing', data, file, problems)) {
+      invalidPricing.push({ file, message: problems.map((e) => `${e.field ?? ''} ${e.message}`.trim()).join('; ') })
+      continue
+    }
+    const entry = roster.get(data.id)
+    if (entry) entry.pricing = data
+    else if (!disabledModels.has(data.id)) unmatchedPricing.push({ id: data.id, file })
+  }
 
   for (const dir of (await fs.readdir(path.join(root, 'strategy-templates'), { withFileTypes: true }).catch(() => []))
     .filter((e) => e.isDirectory()).map((e) => e.name).sort()) {
@@ -245,7 +262,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     projects.set(data.id, { ...data, file, hash })
   }
 
-  return { root, hostDir, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, disabledModels }
+  return { root, hostDir, unmatchedPricing, invalidPricing, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, disabledModels }
 }
 
 /** A project's source repository and integration branch, declared or defaulted. */

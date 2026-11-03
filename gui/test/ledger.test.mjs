@@ -89,6 +89,34 @@ export default async function (t) {
     t.eq('a call counts against the call allowance, never the run one', [calls.day.unpricedCalls, calls.day.unpricedRuns], [1, 1])
   }
 
+  t.section('4a. an estimate is counted in the window, and said apart; old lines read as they always did')
+  {
+    const file = await temp()
+    const l = createLedger({ file })
+    await l.load()
+    const when = at('2026-09-15T10:00:00Z')
+    for (const id of ['estimated', 'reported', 'unknown']) await l.reserve({ id, subject: 'model-call', at: when })
+    const line = await l.settle({ id: 'estimated', estimate: { usd: 0.25, tokens: { input: 5 }, source: 's' }, at: when })
+    t.eq('an estimate is no known cost', [line.costKnown, line.costUsdMicros, line.overageUsdMicros], [false, null, 0])
+    t.eq('and is marked, with how it was reached', [line.estimated, line.estimatedUsdMicros, line.estimate], [true, 250_000, { tokens: { input: 5 }, source: 's' }])
+    await l.settle({ id: 'reported', costUsd: 1, at: when })
+    await l.settle({ id: 'unknown', at: when })
+    let refused = null
+    await l.reserve({ id: 'both', subject: 'model-call', at: when })
+    try { await l.settle({ id: 'both', costUsd: 1, estimate: { usd: 1 }, at: when }) } catch (e) { refused = e.message }
+    t.ok('a known cost and an estimate cannot both settle', /both a known cost and an estimate/.test(refused ?? ''))
+    await l.settle({ id: 'both', at: when })
+    const day = l.usage(when).day
+    t.eq('the window holds it', [day.settledUsdMicros, day.committedUsd], [1_250_000, 1.25])
+    t.eq('and says how much of that is estimated', [day.estimatedUsdMicros, day.estimatedUsd, day.estimatedCalls], [250_000, 0.25, 1])
+    t.eq('unknown calls are counted, as no money', day.unknownCalls, 2)
+    t.eq('the unpriced-call allowance counts every call, as before', day.unpricedCalls, 4)
+    await fs.appendFile(file, JSON.stringify({ kind: 'reserve', id: 'old', subject: 'model-call', at: new Date(when).toISOString(), day: '2026-09-15', month: '2026-09', reservedUsdMicros: 0, unpriced: true, meta: {} }) + '\n' +
+      JSON.stringify({ kind: 'settle', id: 'old', at: new Date(when).toISOString(), costUsdMicros: null, costKnown: false, overageUsdMicros: 0, meta: {} }) + '\n')
+    const again = await reopen(file)
+    t.eq('a line from before estimates replays as unknown', [again.usage(when).day.unknownCalls, again.usage(when).day.estimatedCalls, again.usage(when).day.settledUsdMicros], [3, 1, 1_250_000])
+  }
+
   t.section('4b. money is integers: a sum no float can hold exactly still lands exactly')
   {
     const file = await temp()

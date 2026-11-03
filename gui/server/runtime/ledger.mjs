@@ -22,7 +22,10 @@ import path from 'node:path'
  *    not get a guess from historical means — it consumes one of an explicit
  *    allowance of unpriced runs, which is a different resource with its own
  *    limit. A mean is a statement about runs that already happened; admission is
- *    a statement about one that has not.
+ *    a statement about one that has not. An ESTIMATE is not that: it is one call's
+ *    own tokens times a sourced price, kept apart from reported cost on its line
+ *    (`estimated`, `estimatedUsdMicros`) and counted in the windows, because
+ *    leaving known token spending out would keep them blind to it.
  *  - **Overage is recorded, not absorbed.** When the settled cost exceeds what
  *    was reserved, the difference is written down as an overage. The window then
  *    holds what was actually spent, which may be more than its limit — and the
@@ -67,7 +70,10 @@ const emptyWindow = () => ({
   // Unpriced work is counted BY SUBJECT. A call whose price nobody knows must not
   // consume a run's allowance: the two are bounded separately, or one silently
   // exhausts the other while remaining unbounded itself.
-  unpricedRuns: 0, unpricedCalls: 0, outstanding: 0
+  unpricedRuns: 0, unpricedCalls: 0, outstanding: 0,
+  // Of the model calls settled: estimated (their money is inside settledUsdMicros,
+  // said apart here) and unknown (no money anywhere, which is not zero).
+  estimatedUsdMicros: 0, estimatedCalls: 0, unknownCalls: 0
 })
 
 /**
@@ -196,14 +202,20 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
       })
     },
 
-    /** What it actually cost. An unknown settled cost stays unknown. */
-    async settle ({ id, costUsd = null, at = clock.now(), meta = {} }) {
+    /**
+     * What it actually cost. An unknown settled cost stays unknown. An estimate
+     * ({usd, ...how it was reached}, runtime/call-cost.mjs) is not a known cost:
+     * `costUsdMicros` stays null, so nothing summing reported cost can mistake it.
+     */
+    async settle ({ id, costUsd = null, estimate = null, at = clock.now(), meta = {} }) {
       assertLoaded()
       const held = reservations.get(id)
       if (!held) throw new Error(`no reservation ${id} to settle`)
       if (held.settled) throw new Error(`reservation ${id} is already settled`)
       if (held.released) throw new Error(`reservation ${id} was released; it cannot also be settled`)
       const known = costUsd != null && Number.isFinite(costUsd)
+      if (known && estimate) throw new Error(`reservation ${id} cannot settle both a known cost and an estimate`)
+      const estimated = estimate && Number.isFinite(estimate.usd) ? estimate : null
       const costUsdMicros = known ? toMicros(costUsd) : null
       // An overage is spending BEYOND a reservation, which only exists where a
       // reservation held money. An unpriced subject — a model call, whose price
@@ -213,7 +225,9 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
       const overageUsdMicros = known && !held.unpriced ? Math.max(0, costUsdMicros - held.reservedUsdMicros) : 0
       return append({
         kind: 'settle', id, at: new Date(at).toISOString(),
-        costUsdMicros, costKnown: known, overageUsdMicros, meta
+        costUsdMicros, costKnown: known, overageUsdMicros,
+        ...(estimated ? (({ usd, ...detail }) => ({ estimated: true, estimatedUsdMicros: toMicros(usd), estimate: detail }))(estimated) : {}),
+        meta
       })
     },
 
@@ -238,7 +252,8 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
      * What each window holds right now.
      *
      * A settled reservation contributes what it cost; an outstanding one
-     * contributes what it reserved. Nothing contributes an estimate.
+     * contributes what it reserved. A call settled at an estimate contributes that
+     * estimate, also said apart as `estimatedUsdMicros`; a reservation never does.
      */
     usage (at = clock.now()) {
       assertLoaded()
@@ -259,6 +274,11 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
           const unpricedInto = held.subject === 'model-call' ? 'unpricedCalls' : 'unpricedRuns'
           if (held.settled) {
             if (held.settled.costKnown) into.settledUsdMicros += held.settled.costUsdMicros
+            else if (held.settled.estimated) {
+              into.settledUsdMicros += held.settled.estimatedUsdMicros
+              into.estimatedUsdMicros += held.settled.estimatedUsdMicros
+              if (held.subject === 'model-call') into.estimatedCalls++
+            } else if (held.subject === 'model-call') into.unknownCalls++
             if (held.unpriced) into[unpricedInto]++
             into.overageUsdMicros += held.settled.overageUsdMicros ?? 0
           } else {
@@ -275,6 +295,7 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
         w.reservedUsd = toUsd(w.reservedUsdMicros)
         w.overageUsd = toUsd(w.overageUsdMicros)
         w.committedUsd = toUsd(w.committedUsdMicros)
+        w.estimatedUsd = toUsd(w.estimatedUsdMicros)
       }
       return { at: new Date(at).toISOString(), timezone, windows: here, day, month }
     },

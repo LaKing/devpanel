@@ -20,6 +20,8 @@ export default async function(t){
  const created=await stage.request('/api/projects/'+stage.project+'/issues',{method:'POST',body:JSON.stringify({input:'# Supervisor integration\n\nRead this audit evidence.'})})
  const result=await stage.request('/api/supervisor/start',{method:'POST',body:JSON.stringify({model:'supervisor-test',projects:[stage.project],message:'Handle this issue',limits:{maxCalls:12,maxRuns:1,maxConcurrent:1}})})
  t.eq('top-level activation accepted',result.status,201)
+ const scoped=await stage.request('/api/supervisor/campaign',{method:'POST',body:JSON.stringify({campaign:{leaveReporters:['reporter-a']}})})
+ t.eq('the campaign route sets the scope while it runs',[scoped.status,scoped.body.campaign?.leaveReporters],[200,['reporter-a']])
  let state
  const end=Date.now()+20000
  do{state=(await stage.request('/api/supervisor')).body;if(state.ownedRuns[0]?.status==='completed'&&state.status==='active'&&state.messages.some(m=>m.prompt?.includes('run-changed')))break;await new Promise(r=>setTimeout(r,50))}while(Date.now()<end)

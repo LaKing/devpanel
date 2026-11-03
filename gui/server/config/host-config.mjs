@@ -55,6 +55,7 @@ export function hostConfigDir ({ root = DEFAULT_CONFIG_ROOT, env = process.env }
 export const CATEGORIES = [
   { id: 'projects', tree: 'projects', host: 'projects', match: (name) => name.endsWith('.yaml'), moves: () => true },
   { id: 'roster', tree: 'roster', host: 'roster', match: (name) => name.endsWith('.yaml'), moves: (name, text) => /^account\s*:/m.test(text) },
+  { id: 'roster-pricing', tree: 'roster-pricing', host: 'roster-pricing', match: (name) => name.endsWith('.yaml'), moves: () => false },
   { id: 'playbooks', tree: 'playbooks', host: 'playbooks', match: (name) => name.endsWith('.yaml'), moves: () => false },
   { id: 'releases', tree: 'tools/releases', host: 'releases', match: (name) => name.endsWith('-targets.json'), moves: () => true },
   { id: 'live-reports', tree: 'gui/live/reports', host: 'live-reports', match: () => true, moves: () => true }

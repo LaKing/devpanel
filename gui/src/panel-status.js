@@ -37,7 +37,7 @@ async function supervisorStatus () {
   const s = await api.supervisor()
   const last = (s.messages ?? []).findLast((m) => m.role === 'assistant')
   return { status: s.status, finishing: Boolean(s.finishing), reason: s.reason ?? null, model: s.model?.title ?? s.model?.id ?? null, pending: s.pending?.kind ?? null,
-    calls: s.calls ?? 0, starts: s.starts ?? 0, limits: s.limits ?? {}, costUsd: s.costUsd ?? 0, ownedRuns: (s.ownedRuns ?? []).length, last: last ? { text: String(last.text ?? '').slice(0, 280), at: last.at } : null }
+    calls: s.calls ?? 0, starts: s.starts ?? 0, limits: s.limits ?? {}, costUsd: s.costUsd ?? 0, cost: s.cost ?? null, ownedRuns: (s.ownedRuns ?? []).length, last: last ? { text: String(last.text ?? '').slice(0, 280), at: last.at } : null }
 }
 
 async function load () {

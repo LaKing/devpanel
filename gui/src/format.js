@@ -85,3 +85,15 @@ export function supervisorUsage (messages = []) {
     untimed: u.untimed + (Number.isFinite(m.durationMs) ? 0 : 1)
   }), { tokens: 0, durationMs: 0, untimed: 0 })
 }
+
+/** A supervisor session's spending, each kind said apart: reported, estimated (~), and calls nobody can price. */
+export function supervisorCost (cost) {
+  if (!cost) return []
+  const usd = (n) => `$${Number(n).toFixed(n > 0 && n < 0.01 ? 4 : 2)}`
+  const calls = (n) => `${n} call${n === 1 ? '' : 's'}`
+  return [
+    ...(cost.reportedUsd > 0 ? [`${usd(cost.reportedUsd)} reported`] : []),
+    ...(cost.estimatedCalls > 0 ? [`~${usd(cost.estimatedUsd)} estimated (${calls(cost.estimatedCalls)})`] : []),
+    ...(cost.unknownCalls > 0 ? [`${calls(cost.unknownCalls)} unknown cost`] : [])
+  ]
+}

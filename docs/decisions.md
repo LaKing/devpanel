@@ -235,6 +235,28 @@ A confident `defer` holds the event in `state.deferred`. Held events are attache
 event that wakes the supervisor, or delivered as a `deferred-events` event once the oldest has waited 15 minutes.
 Nothing is dropped. Records go to `issues/.supervisor/decisions/wake-filter-<key16>.json`.
 
+An `issues-changed` event outside the supervisor's campaign has no such limit: waking it only to pass the change on is
+the call the filter exists to save. Two things establish that it is outside, and nothing else does:
+
+- **The declared scope**, `state.campaign` (`{projects, leaveReporters}`), set by an operator on the Supervisor page or
+  with `POST /api/supervisor/campaign`. `splitByCampaign` applies it before the provider and with or without one: a row
+  is outside when its project is not among a non-empty `projects`, or its `report.reporter` is among `leaveReporters`.
+  A row with an open run the supervisor owns never is; a removed id has no report, so only the project test places it.
+  What is not established as outside continues as a normal event, so a mixed change wakes for its other rows.
+- **A confident `outside`** from the provider, the third answer to the wake question, given the mission and the operator's
+  latest instructions verbatim (never a side question or an answer to one), the focus, and each row's `report`. On a
+  `run-changed` it counts as `defer`.
+
+Focus is an ordering and holds nothing, and no code parses the mission. A filter that cannot establish membership wakes:
+a campaign that exists only as chat text, with the provider absent, skipped, failing or unsure, wakes the supervisor until
+its scope is declared. Such a wrong wake costs one call, and a wrong hold has no timer.
+
+These events are held with `outside: true` and start no timer (`deferred-events` never fires for them alone). They
+are merged per project (`holdOutside`): the newest row per issue wins, at most 40 rows and 40 removed ids, the rest counted
+in `omitted` with a `list_issues` pointer. They arrive in `event.deferred` with the next wake of any kind, and a New
+session keeps them. Any held event leaves `state.deferred` only once a call has returned with it, so a call that never
+started, failed or was stopped leaves it held for the next one. The panel says what is held under Status details.
+
 Never asked, always woken: user messages, action results, format repairs, model substitutions, runs that failed,
 blocked, paused or were cancelled, runs with a failure, pause or pause request, runs completed with any outcome
 other than `resolved`, a `run-changed` whose `changed` names more than `status` (a delivery decided: reconcile,

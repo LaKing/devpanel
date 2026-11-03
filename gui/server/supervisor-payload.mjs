@@ -29,6 +29,7 @@ export function issueRow (i) {
         id: i.id, name: i.name, status: i.status ?? null,
         ...(i.kind ? { kind: i.kind } : {}), ...(i.archived ? { archived: true } : {}),
         priority: i.priority?.value ?? i.priority ?? null, disposition: i.disposition?.value ?? i.disposition ?? null,
+        ...(i.report ? { report: { kind: i.report.kind ?? null, trust: i.report.trust ?? null, reporter: i.report.reporter ?? null } } : {}),
         ...(i.dependsOn?.length ? { dependsOn: i.dependsOn.map((d) => d.id ?? d) } : {}),
         openedOn: i.openedOn ?? null,
         latestRun: i.latestRun ? { runId: i.latestRun.runId, status: i.latestRun.status, outcome: i.latestRun.outcome ?? null, blockedReason: i.latestRun.blockedReason ?? null } : null

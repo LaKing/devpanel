@@ -39,6 +39,7 @@ runs: they were never part of a run's snapshot.
 host-config/
   projects/<id>.yaml
   roster/<id>.yaml
+  roster-pricing/<id>.yaml
   playbooks/<id>.yaml
   decisions/active.yaml
   decisions/<id>.yaml
@@ -52,7 +53,7 @@ host-config/
 
 ## Precedence
 
-Each category (projects, roster, playbooks, releases, live reports) is the union of the in-tree
+Each category (projects, roster, roster pricing, playbooks, releases, live reports) is the union of the in-tree
 directory and the host-config one, by file name. When both hold a file of the same
 name, **the host-config file is used** and the in-tree one is shadowed: `config:check`
 lists it as a warning, not an error. Two different file names declaring the same id
@@ -64,6 +65,16 @@ A roster entry is hashed by its bytes, so an installation that keeps its own cop
 catalogue entry (its dated verification evidence, say) keeps that entry's hash, and
 every configuration group built on it, whatever the tracked catalogue says. To adopt
 a newer tracked entry, delete the host copy; that starts a new configuration group.
+
+A model's price is therefore not in its entry: `roster-pricing/<id>.yaml` (schema
+`roster-pricing.schema.json`: `id`, `inputUsdPerMillionTokens`,
+`outputUsdPerMillionTokens`, `cachedInputUsdPerMillionTokens`, `source`, `asOf`, optional
+`cacheWriteUsdPerMillionTokens`) moves no hash and no configHash. It prices supervisor
+calls whose runtime reports no cost (docs/top-level-supervisor.md), and takes effect at the
+next Start or model substitution. The tracked tree ships none: enter a price you can
+source, with where you read it. A price naming no roster id, or a file that does not
+validate, is a `config:check` warning and blocks nothing: that model stays unpriced, so
+its calls stay unknown.
 
 Live checks write their reports to `host-config/live-reports/` once the host-config
 directory exists, and to `gui/live/reports/` before that.

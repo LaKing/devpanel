@@ -71,6 +71,15 @@ overview and nothing else; an empty focus means the whole panel. If per-tenant o
 per-repository access control is ever needed, that belongs in an organisation-level
 authorisation policy, not in an activation setting.
 
+`campaign` (`{projects, leaveReporters}`) is what decides wakes, and only those: an
+issue-list change it places outside waits for the next wake, without a provider
+(docs/decisions.md "Wake filter"). It takes nothing out of sight: the supervisor still
+sees every project and can act on any issue. An operator sets it on the Supervisor page
+at any time, since Stop would also stop owned runs; it is sent in every prompt and
+survives Start and New session, and the model has no action to change it. A campaign
+given only as chat text is not declared: those changes wake unless the provider
+confidently judges them outside.
+
 Open **Supervisor** in the application navigation. Select a verified Claude- or Codex-backed
 model, optionally a focus, set limits, and give it an objective.
 The model picker includes unverified roster entries with an explicit label and
@@ -326,6 +335,7 @@ The API and socket use the existing authenticated channel:
 - `GET /api/supervisor` and `/api/supervisor/models`
 - `POST /api/supervisor/start` — model, message, limits (`maxCalls`, `maxStartsPerIssue`, `maxRuns`, `maxConcurrent`), `allowArchive`, and an optional `focus` (project ids to attend to first; `projects` is still accepted as its old name)
 - `POST /api/supervisor/messages` — text
+- `POST /api/supervisor/campaign` — `campaign` (`{projects, leaveReporters}`, or null to clear), `actor`; any status
 - `POST /api/supervisor/stop`
 - `POST /api/supervisor/finish` and `POST /api/supervisor/reset`
 - `supervisor:changed` socket event triggers rereading durable state.
@@ -825,6 +835,26 @@ Calls are bounded by `perWakeCalls` and by `unpricedCalls`; runs by `starts`,
 
 Spending against no reservation is not an overage either: a subject that
 deliberately reserves nothing would otherwise close a window it never exceeded.
+
+A call whose runtime reports no cost, on a model with a price in `roster-pricing/`
+(docs/host-config.md), settles at an **estimate**: that call's own tokens times the
+price. Its ledger line keeps `costKnown: false, costUsdMicros: null` and adds
+`estimated: true, estimatedUsdMicros, estimate` (tokens, rates, source, date), so
+nothing summing reported cost can mistake it. Estimates count in the USD windows, said
+apart as `estimatedUsd` and `estimatedCalls`, because leaving known token spending out
+would keep the windows blind to it; under `enforceAllowances: true` one can close a
+window. The unpriced-call allowance is unchanged: it counts every model call. `costUsd`
+stays what was reported, and `cost` on the view and on `/api/supervisor/status` gives
+`{reportedUsd, estimatedUsd, estimatedCalls, unknownCalls}`.
+
+Codex reports the thread's running total and the adapter subtracts the totals on the
+session, so a delta is one call's usage only when the previous turn left those totals
+current. `state.ownUsageSession` records that a turn proved it: all three counters
+reported, no counter reset, the same session, no fork running. Otherwise the next call
+stays unknown, as does any call after a failure or a cancel, and a Codex fork always.
+A call that cannot be estimated (no price, no usage, zero tokens) is counted in
+`unknownCostCalls` and `unknownCalls`. Unknown is not zero. Old ledger lines are not
+rewritten: one without `estimated` reads as reported or unknown from its `costKnown`.
 
 **Money is integer micro-USD** wherever it is stored, compared or summed. Dollars
 exist only at the edges — an operator writes them in the policy, a reader sees

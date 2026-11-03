@@ -418,6 +418,7 @@ app.get('/api/supervisor', route(async (_req, res) => res.json(topSupervisor.get
 app.get('/api/supervisor/status', route(async (_req, res) => res.json(topSupervisor.status())))
 app.get('/api/supervisor/models', route(async (_req, res) => res.json(await topSupervisor.models())))
 app.post('/api/supervisor/start', route(async (req, res) => res.status(201).json(await topSupervisor.start(req.body ?? {}))))
+app.post('/api/supervisor/campaign', route(async (req, res) => res.json(await topSupervisor.setCampaign({ campaign: req.body?.campaign, actor: req.body?.actor }))))
 app.post('/api/supervisor/launches/reconcile', route(async (req, res) => res.json(await topSupervisor.reconcileLaunch(req.body ?? {}))))
 app.post('/api/supervisor/launches/retry', route(async (req, res) => res.json(await topSupervisor.retryLaunch(req.body ?? {}))))
 // A side question, answered in a fork of the supervisor's session (202; the

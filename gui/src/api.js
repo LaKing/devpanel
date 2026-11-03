@@ -44,6 +44,7 @@ export const api = {
   supervisorLive: (invocationId, after = 0) => request(`/api/supervisor/live/${enc(invocationId)}?after=${after}`),
   supervisorQuestions: () => request('/api/supervisor/questions'),
   answerSupervisorQuestion: (id, answer, actor) => request(`/api/supervisor/questions/${enc(id)}/answer`, { method: 'POST', body: JSON.stringify({ answer, actor }) }),
+  setSupervisorCampaign: (campaign, actor) => request('/api/supervisor/campaign', { method: 'POST', body: JSON.stringify({ campaign, actor }) }),
   chatSupervisor: (text) => request('/api/supervisor/messages', { method: 'POST', body: JSON.stringify({ text }) }),
   stopSupervisor: () => request('/api/supervisor/stop', { method: 'POST' }),
   /** Every <projects-root>/*-project, each with its issue count. */

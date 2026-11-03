@@ -7,9 +7,10 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSupervisorResponse } from './supervisor-response.mjs'
 import { deliveryReading, remainingBudget, runReading } from './supervisor-summary.mjs'
-import { createLedger } from './runtime/ledger.mjs'
+import { createLedger, toMicros, toUsd } from './runtime/ledger.mjs'
+import { estimateCallCost, leavesCleanBaseline } from './runtime/call-cost.mjs'
 import { admits, describeRefusal, loadPolicy } from './runtime/spending-policy.mjs'
-import { createWakeFilter, DEFAULT_MAX_DEFER_MS } from './decisions/wake-filter.mjs'
+import { createWakeFilter, DEFAULT_MAX_DEFER_MS, holdOutside, normaliseCampaign, splitByCampaign, summariseEvent } from './decisions/wake-filter.mjs'
 import { createStartGate, migrateStartLimits, accumulateHistory, emptyHistory } from './supervisor-starts.mjs'
 import { runlessFence } from '../../harness/fence.mjs'
 import { appendLiveFile, readLiveFile } from './runtime/store.mjs'
@@ -72,7 +73,7 @@ Archive is allowed only when the current activation permits it. Archiving is not
 A run blocked with protocol-repair-exhausted carries a diagnostics.protocol list: each failed attempt's classification (no-structured-output, contract-violation, ambiguous-output) and exact error. Read it before deciding. A contract violation is the agent's; a failure to find output the agent did produce is the engine's, and neither is fixed by a cheaper model or a smaller round cap. Do not spend a run start on a retry that changes nothing the diagnostics point at.
 There is no activation time limit; owned runs end on their own budgets or when you stop them.
 A Triage start may be refused with code PREGATE_HOLD: the decision provider confidently judged the issue closable or lacking information. Its "pregate.proposals" say what an operator could confirm on the issue page. You cannot confirm them or start past the hold; tell the user, or choose other work.
-Routine monitoring events may be held rather than wake you. Held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Failures, pauses, cancellations, unresolved endings, user messages and your own action results always wake you.
+Routine monitoring events may be held rather than wake you. Held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, user messages and your own action results always wake you.
 A run-changed event's "changed" lists what moved since the last observation: status, reconcile (run.reconciliation is the latest reconcile that ended; its checks name the gate's reason and the directory get_check_log reads), landing (run.landed), delivery (run.delivery, its application or merge). Anything but status always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead. A run read with reconcilePending true has an automatic reconcile undecided: it is not settled and you are not woken for it; do not land or reconcile it, the decision arrives as a run-changed event.
 Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. Actual provider quota failures trigger compatible-model substitution for coordinators and workers, preserving their run and completed work. Inspect run failures and modelSubstitutions; a failed substitution needs an available compatible model, not a budget increase. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. The run engine refuses a second live run on the same project regardless, so concurrency only ever means different projects.`
 
@@ -90,6 +91,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     state = { status: 'stopped', session: null, model: null, messages: [], queue: [], ownedRuns: [], previews: {}, calls: 0, starts: 0, costUsd: 0, unknownCostCalls: 0, history: emptyHistory() }
   }
   let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null
+  // Moved at each fork's start and end: a main call it overlapped cannot claim its own token delta.
+  let forkMarks = 0
   const serial = (fn) => { const p = chain.then(fn); chain = p.catch(() => {}); return p }
   // Beside the state, never inside it: a New session rewrites state.json and must
   // not be able to touch what was reserved or spent. Read here, before anything
@@ -105,8 +108,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
    * file existed, and nothing reported the difference. Derived rather than
    * stored, so a New session cannot make it stale either.
    */
+  const costReading = () => ({ reportedUsd: state.costUsd ?? 0, estimatedUsd: toUsd(state.estimatedCostUsdMicros ?? 0), estimatedCalls: state.estimatedCostCalls ?? 0, unknownCalls: state.unknownCostCalls ?? 0 })
   const view = () => ({
     ...structuredClone(state),
+    cost: costReading(),
     asking: asking ? { ...asking } : null,
     spending: {
       active: spending.active,
@@ -133,6 +138,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       starts: state.starts ?? 0,
       limits: { maxCalls: state.limits?.maxCalls ?? null, maxRuns: state.limits?.maxRuns ?? null },
       costUsd: state.costUsd ?? 0,
+      cost: costReading(),
       // What this session's model calls cost, as the panel reports cost: tokens
       // and time. Replies recorded before durations were kept add tokens only,
       // and are counted so the time is not mistaken for complete.
@@ -152,6 +158,21 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     const write = writes.then(async () => { await writeAtomic(file, bytes); emit(event) })
     writes = write.catch(() => {})
     await write
+  }
+  /*
+   * One call's cost into this session's accounting: reported, else estimated from
+   * its own tokens, else counted as unknown. What it returns is what its ledger
+   * settlement records, and `cost` is what its chat message says.
+   */
+  function accountCall ({ reported = null, usage = null, model = null, resumed = false, ownUsage = false, fork = false }) {
+    const costUsd = typeof reported === 'number' ? reported : typeof usage?.costUsd === 'number' ? usage.costUsd : null
+    const estimate = costUsd === null ? estimateCallCost(usage, model?.pricing, { resumed, ownUsage, fork }) : null
+    if (costUsd !== null) state.costUsd = (state.costUsd ?? 0) + costUsd
+    else if (estimate) {
+      state.estimatedCostUsdMicros = (state.estimatedCostUsdMicros ?? 0) + toMicros(estimate.usd)
+      state.estimatedCostCalls = (state.estimatedCostCalls ?? 0) + 1
+    } else state.unknownCostCalls = (state.unknownCostCalls ?? 0) + 1
+    return { costUsd, estimate, cost: { usd: costUsd ?? estimate?.usd ?? null, basis: costUsd !== null ? 'reported' : estimate ? 'estimated' : 'unknown' } }
   }
   function message (role, text, extra = {}) { state.messages.push({ id: crypto.randomUUID(), at: new Date().toISOString(), role, text, ...extra }) }
   /*
@@ -462,15 +483,19 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // empty queue as idle (including the bounded format-repair turn).
         state.status = 'working'
         const event = state.queue.shift()
-        // Events the wake filter held ride with the first one that wakes.
-        if (state.deferred?.length) event.deferred = state.deferred.splice(0)
+        // Events the wake filter held ride with the first one that wakes. They stay
+        // held until a call has returned with them: every way out before that (a call
+        // that never started, a failure, a stop, a crash) must not lose them, and being
+        // told twice costs less than never being told.
+        const carried = state.deferred?.length ? [...state.deferred] : []
+        if (carried.length) event.deferred = carried
         const invocationId = crypto.randomUUID()
         const prompt = JSON.stringify({
           history: state.session ? undefined : state.messages.filter((m) => !m.side).slice(-30).map(({role,text,action})=>({role,text,action})),
           event,
           replyFormat: 'exactly one JSON object {"message": string, "action": object|null}; prose outside it is allowed, a reply without it is rejected and repaired once',
           projects: await tools.projects(),
-          focus: state.focus ?? [], limits: state.limits,
+          focus: state.focus ?? [], campaign: state.campaign ?? null, limits: state.limits,
           remaining: remainingBudget(state, { policy: spending, usage: spending.active ? ledger.usage() : null, wakeCalls: state.wake ? ledger.wakeCalls(state.wake.id) : 0 }),
           allowArchive: state.allowArchive, playbooks: await tools.playbooks(), ownedRuns: state.ownedRuns,
           ...(tools.seatModels ? { seatModels: await tools.seatModels() } : {}),
@@ -493,11 +518,18 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           }
         }
         state.status = 'working'; state.calls++
+        // Taken down before the call and put back only by a turn that proves it:
+        // a failure, a cancel or a crash leaves the next call's delta unproved.
+        const priorSessionId = state.session?.id ?? null
+        const baselineClean = priorSessionId !== null && state.ownUsageSession === priorSessionId
+        const forkFree = !asking, marksAtStart = forkMarks
+        state.ownUsageSession = null
         state.pending = { kind: 'model', invocationId, prompt, at: new Date().toISOString() }; await save()
         if (controller.signal.aborted) {
           // Stop may arrive while the reservation or pending marker is saved.
           // No adapter call happened, so retire the reservation at zero cost.
           state.pending = null; state.calls--
+          if (baselineClean) state.ownUsageSession = priorSessionId
           if (state.wake) await ledger.settle({ id: invocationId, costUsd: 0 })
           break
         }
@@ -516,13 +548,17 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             cwd: path.join(dir, 'workspace'), ledgerDir: path.join(dir, 'adapters'), instructions: INSTRUCTIONS,
             prompt, marker: `supervisor:${invocationId}`, meta: { invocationId }, signal: turnAbort.signal, supervisorOnly: true, hygiene: true, fence: runlessFence({ cwd: path.join(dir, 'workspace') }),
             observe: turnLive.observe })
+          if (carried.length) state.deferred = state.deferred.filter((d) => !carried.includes(d))
         } catch (e) {
           const classified = classifyFailure(e)
+          // A call that never started cost nothing. Any other reports a cost or is
+          // unknown: a failed call hands back no usage to estimate from.
+          const spent = e.kind === 'spawn-error' && e.started === false ? null : accountCall({ reported: e.payload?.total_cost_usd })
           if (classified.class === 'quota' && !controller.signal.aborted) {
             await tools.recordExhausted?.({ modelId: state.model.id, harness: state.model.harness, reason: classified.evidence, retryAfterMs: classified.retryAfterMs, role: 'supervisor' })
             state.quotaFailures ??= []
             state.quotaFailures.push({ at: new Date().toISOString(), model: state.model.id, wakeId: state.wake?.id, evidence: classified.evidence })
-            await ledger.settle({ id: invocationId, costUsd: typeof e.payload?.total_cost_usd === 'number' ? e.payload.total_cost_usd : null })
+            await ledger.settle({ id: invocationId, costUsd: spent?.costUsd ?? null })
             state.pending = null
             const alternatives = await fallbackCandidates({ models: await models(), current: state.model,
               excluded: state.quotaFailures.filter(f => f.wakeId === state.wake?.id).map(f => f.model), availability: tools.availability, coordinator: true })
@@ -548,7 +584,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             const notStarted = e.kind === 'spawn-error' && e.started === false
             await (notStarted
               ? ledger.release({ id: invocationId, reason: `the supervisor runtime did not start: ${e.message}` })
-              : ledger.settle({ id: invocationId, costUsd: typeof e.payload?.total_cost_usd === 'number' ? e.payload.total_cost_usd : null })
+              : ledger.settle({ id: invocationId, costUsd: spent?.costUsd ?? null })
             ).catch(() => { /* already settled; the ledger refuses a second settlement */ })
           }
           if (e.kind === 'spawn-error' && e.started === false) {
@@ -556,26 +592,28 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             state.failureHistory ??= []
             state.failureHistory.push({ ...state.pending, error: e.message, code: e.code, started: false })
             state.pending = null
-          } else state.unknownCostCalls++
+          }
           if (e.name === 'AbortError' && e.termination) state.pending = null
           // A failed/cancelled call may have changed session history. Retain the
           // invocation marker, rather than pretending it can safely be replayed.
           throw e
         } finally { controller.signal.removeEventListener('abort', abort); await turnLive.flush() }
         state.session = response.session
-        if (typeof response.usage?.costUsd === 'number') state.costUsd += response.usage.costUsd
-        else state.unknownCostCalls++
+        const sessionId = response.session?.id ?? null
+        const spent = accountCall({ usage: response.usage, model: state.model, resumed: priorSessionId !== null,
+          ownUsage: baselineClean && sessionId === priorSessionId && forkFree && !asking && forkMarks === marksAtStart })
+        state.ownUsageSession = !asking && leavesCleanBaseline(response.usage, { priorSessionId, sessionId }) ? sessionId : null
         // The call has already happened; a settlement that fails cannot un-spend
         // it. The reservation stays outstanding, which is the safe direction —
         // it keeps consuming its allowance — and the failure is said out loud
         // rather than swallowed.
         try {
-          await ledger.settle({ id: invocationId, costUsd: typeof response.usage?.costUsd === 'number' ? response.usage.costUsd : null })
+          await ledger.settle({ id: invocationId, costUsd: spent.costUsd, estimate: spent.estimate })
         } catch (error) {
           message('system', `This call's cost could not be recorded (${error.message}); its reservation stays outstanding and keeps counting against the window.`)
         }
         // How long the call took, beside its tokens: what the panel reports a call cost.
-        message('assistant', response.response, { usage: response.usage, durationMs: Date.now() - callStarted, invocationId, prompt, rawResponse: response.response })
+        message('assistant', response.response, { usage: response.usage, cost: spent.cost, durationMs: Date.now() - callStarted, invocationId, prompt, rawResponse: response.response })
         const assistantMessage = state.messages.at(-1)
         state.pending = null; await save()
         if (controller.signal.aborted) break
@@ -694,14 +732,25 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
    * A filter that errs wakes, never drops.
    */
   async function enqueue (event) {
+    const ownedIssues = state.ownedRuns.filter((r) => { const s = r.observedStatus ?? r.status; return !s || OPEN_RUN.includes(s) }).map((r) => `${r.project}/${r.issueId}`)
+    const { outside, rest } = splitByCampaign(event, { campaign: state.campaign, ownedIssues })
+    state.deferred ??= []
+    if (outside) holdOutside(state.deferred, { at: new Date().toISOString(), summary: summariseEvent(outside), reason: 'outside the declared campaign' })
+    if (!rest) return
     let verdict = { wake: true }
     if (wakeFilter) {
-      const mission = [...state.messages].reverse().find((m) => m.role === 'user')?.text ?? null
-      try { verdict = await wakeFilter.route(event, { mission }) } catch (error) { verdict = { wake: true, reason: error.message } }
+      try { verdict = await wakeFilter.route(rest, { mission: missionText(), focus: state.focus ?? [] }) } catch (error) { verdict = { wake: true, reason: error.message } }
     }
-    if (verdict.wake) { state.queue.push(event); return }
-    state.deferred ??= []
+    if (verdict.wake) { state.queue.push(rest); return }
+    if (verdict.outside) { holdOutside(state.deferred, { at: new Date().toISOString(), summary: verdict.summary, decision: verdict.key, reason: verdict.reason }); return }
     state.deferred.push({ at: new Date().toISOString(), event: verdict.summary, decision: verdict.key, reason: verdict.reason })
+  }
+  // What the operator asked for, verbatim, for the provider to read: the mission and
+  // the latest instructions, never a side question or the answer to one.
+  function missionText () {
+    const said = state.messages.filter((m) => m.role === 'user' && !m.side && !m.questionId).slice(-3).map((m) => m.text)
+    const parts = [...new Set([state.mission, ...said].filter(Boolean))].map((text) => String(text).slice(0, 2000))
+    return parts.length ? parts.join('\n\n') : null
   }
   // The last monitoring failure said, by key, so a fault that persists across polls is one chat message, not
   // one every pollMs (a stuck run once filled the chat with thousands of copies).
@@ -764,8 +813,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           await enqueue(issuesChanged(project, previous, issues))
         }
       }
-      // Nothing is held for ever: past the limit, what was deferred wakes on its own.
-      if (state.deferred?.length && !state.queue.some((e) => e.type === 'deferred-events') && Date.now() - Date.parse(state.deferred[0].at) >= maxDeferMs) {
+      // Nothing routine is held for ever: past the limit, what was deferred wakes on
+      // its own. What is outside the campaign starts no timer; it rides with the next wake.
+      const timed = state.deferred?.find((d) => !d.outside)
+      if (timed && !state.queue.some((e) => e.type === 'deferred-events') && Date.now() - Date.parse(timed.at) >= maxDeferMs) {
         state.queue.push({ type: 'deferred-events', reason: `held for ${Math.round(maxDeferMs / 60000)} minutes without a waking event` })
       }
       monitoringFaults.delete('poll')
@@ -784,6 +835,26 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       launchReady:m.verification?.status === 'verified',
       blockedReason:m.verification?.status === 'verified' ? null : 'Runtime access has not been verified. Verify this roster entry before starting.'
     })),
+    /*
+     * The campaign's scope, declared by an operator: what makes an issue-list change
+     * outside it without any provider. Taken in any status, because Stop also stops
+     * owned runs and a campaign assigned mid-activation must not cost them. The model
+     * has no action for this: it would be silencing its own wakes.
+     */
+    setCampaign: ({ campaign, actor } = {}) => serial(async () => {
+      const scope = normaliseCampaign(campaign)
+      if (scope?.projects.length) {
+        const onPanel = (await tools.projects()).map((p) => p.id ?? p.name)
+        if (scope.projects.some((p) => !onPanel.includes(p))) throw fail('Unknown project in campaign')
+      }
+      const by = typeof actor === 'string' && actor.trim() ? actor.trim().slice(0, 120) : 'operator'
+      state.campaign = scope ? { ...scope, by, at: new Date().toISOString() } : null
+      message('system', scope
+        ? `Campaign scope set by ${by}: ${scope.projects.length ? `projects ${scope.projects.join(', ')}` : 'all projects'}${scope.leaveReporters.length ? `; reports from ${scope.leaveReporters.join(', ')} left to others` : ''}.`
+        : `Campaign scope cleared by ${by}.`)
+      await save()
+      return view()
+    }),
     start: (options) => serial(async () => {
       if (closing) throw fail('Supervisor service is shutting down', 409)
       if (!['stopped'].includes(state.status)) throw fail(`Supervisor is ${state.status}`, 409)
@@ -854,11 +925,12 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       message('user', text.trim(), { side: 'question', invocationId })
       const question = state.messages.at(-1)
       asking = { questionId: question.id, invocationId }
+      forkMarks++; state.ownUsageSession = null
       await save()
       const live = liveRecorder(invocationId)
       const started = Date.now()
       ;(async () => {
-        let result = null, failure = null
+        let result = null, failure = null, reported = null, notStarted = false
         try {
           result = await adapter.invoke({ harness: model.harness, session, fork: true, model: model.model, effort: model.defaultEffort,
             profile: model.profile ?? 'default', endpointRef: model.endpointRef, credentialRef: model.credentialRef, account: model.account ?? null,
@@ -867,16 +939,24 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
               note: 'A side question from the operator, answered in a copy of your session. Answer in prose; no action will be executed from this reply and you will not remember it in your next turn. If the operator should instruct you, say what to send.' },
               status: state.status, ownedRuns: state.ownedRuns, openQuestions: (state.questions ?? []).filter((q) => !q.answer) }),
             meta: { invocationId }, supervisorOnly: true, hygiene: true, fence: runlessFence({ cwd: path.join(dir, 'workspace') }), observe: live.observe })
-        } catch (error) { failure = classifyFailure(error) }
+        } catch (error) {
+          failure = classifyFailure(error)
+          reported = error.payload?.total_cost_usd ?? null
+          notStarted = error.kind === 'spawn-error' && error.started === false
+        }
         await live.flush()
-        const cost = typeof result?.usage?.costUsd === 'number' ? result.usage.costUsd : null
-        await ledger.settle({ id: invocationId, costUsd: cost }).catch(() => {})
-        if (cost !== null) state.costUsd += cost
+        forkMarks++; state.ownUsageSession = null
+        // As for a main call: one that never started cost nothing, and a failure may still report what it cost.
+        const spent = notStarted ? null : accountCall({ reported, usage: result?.usage, model, resumed: true, fork: true })
+        await (notStarted
+          ? ledger.release({ id: invocationId, reason: `the side question's runtime did not start: ${failure.message}` })
+          : ledger.settle({ id: invocationId, costUsd: spent.costUsd, estimate: spent.estimate })
+        ).catch(() => {})
         let answerText = result ? String(result.response ?? '') : null
         // A fork may still reply in the supervisor's JSON shape; show its message.
         if (answerText) { try { const parsed = parseSupervisorResponse(answerText); if (parsed.message) answerText = parsed.message } catch { /* prose */ } }
         message('assistant', failure ? `No answer: ${failure.class}: ${failure.message}` : answerText.trim() || '(empty answer)',
-          { side: 'answer', replyTo: question.id, invocationId, usage: result?.usage ?? null, durationMs: Date.now() - started, ...(failure ? { failed: true } : {}) })
+          { side: 'answer', replyTo: question.id, invocationId, usage: result?.usage ?? null, cost: spent?.cost ?? null, durationMs: Date.now() - started, ...(failure ? { failed: true } : {}) })
         asking = null
         await save()
       })().catch((error) => { asking = null; console.error('supervisor side question failed', error) })
@@ -943,9 +1023,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       clearInterval(timer)
       const archivedAt = new Date().toISOString()
       const archive = path.join(dir, `state.${archivedAt.replace(/[:.]/g, '-')}.json`)
-      const previous = { session: state.session, messages: state.messages.length, pending: state.pending ?? null, ownedRuns: state.ownedRuns.length, costUsd: state.costUsd }
+      const previous = { session: state.session, messages: state.messages.length, pending: state.pending ?? null, ownedRuns: state.ownedRuns.length, costUsd: state.costUsd, cost: costReading() }
       await writeAtomic(archive, JSON.stringify(state, null, 2))
-      const { model, focus, limits, allowArchive, mission, launches: allLaunches, ownedRuns: allOwned, startBudgetVersion, startLimitMigration } = state
+      const { model, focus, campaign, deferred, limits, allowArchive, mission, launches: allLaunches, ownedRuns: allOwned, startBudgetVersion, startLimitMigration } = state
       // Session allowances end with the session. What was used is added to the
       // history, which is accounting: it is shown, never enforced.
       const history = accumulateHistory(state.history, state)
@@ -954,7 +1034,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       const ownedRuns = allOwned.filter((r) => OPEN_RUN.includes(r.status) || !r.status)
       const launches = allLaunches.filter((a) => a.status !== 'finished')
       const retired = { runs: allOwned.length - ownedRuns.length, launches: allLaunches.length - launches.length }
-      state = { status: 'stopped', session: null, model, focus, limits, allowArchive, mission, messages: [], queue: [], ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
+      state = { status: 'stopped', session: null, model, focus, campaign, deferred, limits, allowArchive, mission, messages: [], queue: [], ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
         reset: { at: archivedAt, archive: path.basename(archive), previous, retired } }
       message('system', `Fresh session. The previous conversation (${previous.messages} messages${previous.pending ? ', one unreconciled operation' : ''}) is archived as ${path.basename(archive)}.` +
         (retired.runs ? ` ${retired.runs} settled run${retired.runs === 1 ? '' : 's'} moved into that archive; ${ownedRuns.length === 0 ? 'nothing is still open' : `${ownedRuns.length} still open`}.` : '') +

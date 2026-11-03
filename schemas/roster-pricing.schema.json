@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devpanel/schemas/roster-pricing.schema.json",
+  "title": "Roster model pricing",
+  "description": "What one roster model's tokens cost, for estimating supervisor calls whose runtime reports no cost. Kept beside the roster entry, not in it: an entry is hashed by its bytes, so a price there would start a new configuration group.",
+  "type": "object",
+  "required": ["id", "inputUsdPerMillionTokens", "outputUsdPerMillionTokens", "cachedInputUsdPerMillionTokens", "source", "asOf"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*$", "description": "The roster id this price belongs to." },
+    "inputUsdPerMillionTokens": { "type": "number", "minimum": 0 },
+    "outputUsdPerMillionTokens": { "type": "number", "minimum": 0 },
+    "cachedInputUsdPerMillionTokens": { "type": "number", "minimum": 0, "description": "Required: supervisor prompts are mostly cached input, so a missing rate would badly overstate an estimate. State the input rate when the provider gives no discount." },
+    "cacheWriteUsdPerMillionTokens": { "type": "number", "minimum": 0, "description": "Absent: the input rate." },
+    "source": { "type": "string", "minLength": 1, "description": "Where the price was read: a provider's price page, a contract." },
+    "asOf": { "type": "string", "minLength": 1, "description": "The date it was read." }
+  }
+}

@@ -251,10 +251,13 @@ function windowAllowance (limits, held, rolls) {
     usd: {
       committed: held.committedUsd, limit: limits.usd,
       remaining: Math.max(0, Math.round((limits.usd * 1e6 - held.committedUsdMicros)) / 1e6),
+      // Part of `committed`: this share is tokens times a price, not a reported cost.
+      ...(held.estimatedUsdMicros ? { estimated: held.estimatedUsd } : {}),
       ...(spent ? { exhausted: true, consequence: `nothing further is admitted until ${rolls}, priced or not` } : {})
     },
     unpricedRuns: allowance(held.unpricedRuns, limits.unpricedRuns, `no further run without a configured maxCostUsd until ${rolls}`),
-    unpricedCalls: allowance(held.unpricedCalls, limits.unpricedCalls, `no further model call whose price the provider does not report, until ${rolls}`)
+    unpricedCalls: allowance(held.unpricedCalls, limits.unpricedCalls, `no further model call whose price the provider does not report, until ${rolls}`),
+    ...(held.unknownCalls ? { unknownCalls: held.unknownCalls } : {})
   }
 }
 

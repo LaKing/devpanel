@@ -1,5 +1,5 @@
 <script setup>
-import { formatHms, formatMTokens, supervisorUsage } from '@/format'
+import { formatHms, formatMTokens, supervisorCost, supervisorUsage } from '@/format'
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { api } from '@/api'
 import { socket, connection } from '@/socket'
@@ -7,6 +7,7 @@ import MarkdownText from '@/components/MarkdownText.vue'
 import StructuredBody from '@/components/StructuredBody.vue'
 import LiveOutput from '@/components/LiveOutput.vue'
 import SupervisorQuestion from '@/components/SupervisorQuestion.vue'
+import SupervisorCampaign from '@/components/SupervisorCampaign.vue'
 const state=ref(null), models=ref([]), projects=ref([]), error=ref(''), refreshError=ref(''), busy=ref(false), text=ref('')
 // Technical details are drawn when opened: a tree per message, built up front,
 // would cost every long conversation for detail nobody looked at.
@@ -60,6 +61,8 @@ onMounted(async()=>{await run(async()=>{[models.value,projects.value]=await Prom
 onUnmounted(()=>{clearInterval(timer);socket.off('supervisor:changed',refresh);socket.off('connect',refresh)})
 // The session's model calls, as cost is reported: time and tokens.
 const callUsage=computed(()=>supervisorUsage(state.value?.messages??[]))
+const callCost=computed(()=>supervisorCost(state.value?.cost))
+const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
 </script>
 <template>
  <section class="supervisor">
@@ -71,13 +74,15 @@ const callUsage=computed(()=>supervisorUsage(state.value?.messages??[]))
     <span v-else-if="active && state.finishing" class="status-label" role="status">finishing</span>
     <v-btn v-if="active" size="small" :disabled="busy || state.status==='stopping'" color="warning" @click="run(()=>api.stopSupervisor())">{{state.status==='stopping'?'Stopping…':'Stop supervisor'}}</v-btn>
    </div>
-   <div v-if="state" class="status-meta">{{state.model?.id??'No model selected'}} · {{state.calls}} model-call attempts this session · {{state.starts}} run-start attempts this session<span v-if="state.history?.sessions"> · {{state.history.starts}} in {{state.history.sessions}} earlier session{{state.history.sessions===1?'':'s'}}</span> · {{formatHms(callUsage.durationMs)}} · {{formatMTokens(callUsage.tokens)}}<span v-if="callUsage.untimed"> · {{callUsage.untimed}} earlier calls untimed</span></div>
+   <div v-if="state" class="status-meta">{{state.model?.id??'No model selected'}} · {{state.calls}} model-call attempts this session · {{state.starts}} run-start attempts this session<span v-if="state.history?.sessions"> · {{state.history.starts}} in {{state.history.sessions}} earlier session{{state.history.sessions===1?'':'s'}}</span> · {{formatHms(callUsage.durationMs)}} · {{formatMTokens(callUsage.tokens)}}<span v-if="callUsage.untimed"> · {{callUsage.untimed}} earlier calls untimed</span><span v-for="part in callCost" :key="part"> · {{part}}</span></div>
    <details v-if="state" class="status-details"><summary>Status details<span v-if="state.reason"> · {{state.reason}}</span></summary>
     <p>Issue-run costs appear in their run details.</p><p v-if="state.spawnFailures">{{state.spawnFailures}} launch attempts failed before a process started; no model cost.</p>
     <p>Start and a server restart resume this session's allowances. New session begins fresh ones and keeps ownership of open runs and unresolved launch reservations.<span v-if="state.spending?.active"> Spending totals continue across sessions and are reporting only by default.</span></p>
     <p v-for="(used, issue) in state.startsByIssue ?? {}" :key="issue">{{issue}}: {{used}} / {{state.limits?.maxStartsPerIssue}} start attempts this session</p>
     <p v-for="a in (state.launches ?? []).filter(a => ['reserved','uncertain'].includes(a.status))" :key="a.id">Unresolved launch {{a.id}} for {{a.project}}/{{a.issueId}} occupies a concurrent slot and requires reconciliation.</p>
-    <p v-if="state.deferred?.length">{{state.deferred.length}} routine event(s) held by the wake filter since {{state.deferred[0].at}}; they reach the supervisor with its next wake.</p>
+    <p v-if="state.deferred?.some(d=>!d.outside)">{{state.deferred.filter(d=>!d.outside).length}} routine event(s) held by the wake filter since {{state.deferred.find(d=>!d.outside).at}}; they reach the supervisor with its next wake.</p>
+    <p v-if="state.deferred?.some(d=>d.outside)">Issue changes outside the campaign held for {{state.deferred.filter(d=>d.outside).map(d=>d.event.project).join(', ')}}; they wake nothing and reach the supervisor with its next wake.</p>
+    <SupervisorCampaign v-if="state.status!=='stopped'" :campaign="state.campaign" :projects="projects" :busy="busy" @save="saveCampaign" />
     <p v-if="state.reason">{{state.reason}}</p><p v-if="state.session">Session: <code>{{state.session.id}}</code></p>
    </details>
    <v-alert v-if="error || refreshError" type="error" variant="tonal" density="compact">{{error || refreshError}}</v-alert>
@@ -101,6 +106,7 @@ const callUsage=computed(()=>supervisorUsage(state.value?.messages??[]))
                hint="Prioritize these projects. All projects remain visible."
                persistent-hint multiple chips clearable />
     </div>
+    <SupervisorCampaign :campaign="state.campaign" :projects="projects" :busy="busy" @save="saveCampaign" />
     <section class="activation-limits" aria-labelledby="supervisor-limits-title">
      <div class="limits-heading"><v-icon icon="$clock" size="18" /><h3 id="supervisor-limits-title">Session limits</h3><span>You set the pace</span></div>
      <div class="settings limits-grid">
