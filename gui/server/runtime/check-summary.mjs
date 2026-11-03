@@ -8,6 +8,8 @@ export function checkSummary (check, fullEvidence = null) {
     // A smoke result answers whether the revision boots; only the full drive counts for closure.
     ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.' : 'Full drive: the result closure counts.' } : {}),
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
+    // Not a drive of this revision: the approved revision's result, carried over inert drift (engine.reconcileDelivery).
+    ...(check.carriedFrom ? { carriedFrom: check.carriedFrom, carriedBecause: check.carriedBecause ?? null } : {}),
     materialization: m ? { method: m.method, verified: m.verified, detail: clip(m.detail), archiveSha256: m.archiveSha256,
       remoteSha256: m.remoteSha256, remoteEntryCount: m.remoteEntryCount ?? m.remoteEntries?.length ?? null,
       beforeCommands: m.beforeCommands, afterCommands: m.afterCommands,

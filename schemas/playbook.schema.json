@@ -266,9 +266,22 @@
         },
         "reconcile": {
           "type": "object",
-          "description": "Project setting only (projects/<id>.yaml; refused in a playbook). Per-path policy for `reconcile-delivery`, which merges an approved patch three-way onto source that drifted on the patch's own paths (docs/execution-contract.md \"Reconciling a delivery with drifted source\"). Keys are worktree-relative paths or globs; `append` resolves a merge conflict on such a path by keeping the source's content and appending the lines the candidate added there (only when the candidate's change to it is pure addition). Every other conflict, and any change to the reviewed delta outside these paths, refuses the reconciliation.",
+          "description": "Project setting only (projects/<id>.yaml; refused in a playbook). Per-path policy for `reconcile-delivery`, which merges an approved patch three-way onto source that drifted on the patch's own paths (docs/execution-contract.md \"Reconciling a delivery with drifted source\"). Keys are worktree-relative paths or globs; `append` resolves a merge conflict on such a path by keeping the source's content and appending the lines the candidate added there (only when the candidate's change to it is pure addition), `prepend` the same before it. Every other conflict, and any change to the reviewed delta outside these paths, refuses the reconciliation. The object form `{ rule, inert: true }` also declares the path inert: when all the drift is on inert paths and every other path is byte-identical to the approved revision, the approved revision's check result carries and no check runs. The first entry naming a path decides both. Declaring a path inert makes it the project's responsibility that no check depends on that file (docs/project-infrastructure.md \"Reconcile policy: inert paths\").",
           "propertyNames": { "minLength": 1 },
-          "additionalProperties": { "enum": ["append", "prepend"] }
+          "additionalProperties": {
+            "anyOf": [
+              { "enum": ["append", "prepend"] },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["rule"],
+                "properties": {
+                  "rule": { "enum": ["append", "prepend"] },
+                  "inert": { "type": "boolean" }
+                }
+              }
+            ]
+          }
         },
         "related": {
           "type": "array",

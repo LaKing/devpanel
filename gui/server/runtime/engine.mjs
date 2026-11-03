@@ -3333,8 +3333,11 @@ export class Engine {
    * delivery reads it; a merge that carries the reviewed delta unaltered
    * outside the project's declared append paths is revalidated by the
    * configured checks, takes the approvals (`reconciledFrom`) and is delivered
-   * by closure like any candidate. Anything else is journaled in
-   * `run.reconciliations` and the run stays blocked exactly as it was.
+   * by closure like any candidate. When all the drift is on paths declared
+   * inert and every other path is byte-identical to the approved revision, no
+   * check runs: the approved revision's passing result is carried (`carriedFrom`,
+   * `entry.noDrive`). Anything else is journaled in `run.reconciliations` and
+   * the run stays blocked exactly as it was.
    */
   async reconcileDelivery ({ policy = {}, actor = 'operator' } = {}) {
     await this.assertJournal()
@@ -3370,25 +3373,41 @@ export class Engine {
       entry.patch = kept.patch
       if (kept.reconstruction?.verified !== true) return await refuse('unverifiable', `the merged candidate's patch does not rebuild it: ${kept.reconstruction?.detail ?? 'unverified'}`)
 
-      // Revalidation: the configured checks on the merged candidate, judged as closure judges them.
-      const configured = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
-      const target = configured?.tiers ? tierTarget(configured, 'full') : configured
-      const requirement = this.snapshot.checks.requirement
-      const runs = Boolean(target) && (target.kind === 'local' || requirement === 'required')
-      const check = runs ? await this.checkCandidate({ target, revision, fingerprint: candidate.fingerprint, baseCommit: candidate.baseCommit, baseline: candidate.baseline, workspacePath: candidate.path }) : null
-      const gateRun = { ...this.run, workspace: { ...this.run.workspace, baseCommit: candidate.baseCommit } }
-      const gating = check ? gatingResult(check, gateRun) : 'unavailable'
-      // The whole record: a refused check never joins checkResults (closure reads those), so its commands stay readable from here (check-log.mjs).
-      entry.checks = check ? { ...check, gating, reason: gateReason(check, gateRun), error: check.error ?? null }
-        : { result: 'not-run', gating, reason: target ? 'the staging drive runs on a reconciled candidate only when checks are required' : 'no check target' }
-      const satisfied = requirement === 'none' ? true : requirement === 'optional' ? gating !== 'failed' : gating === 'passed'
-      // The raw result alone misleads: a drive can pass while a selftest new against the baseline still gates it.
-      if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
+      // Only inert paths drifted, by proof: the approved revision's passing full drive stands, gated on the base it ran on.
+      if (merge.inert) entry.inert = merge.inert
+      const passing = merge.inert?.proved ? this.run.checkResults.filter((c) => c.revision === approved.revision && isFull(c)).at(-1) : null
+      const carried = passing && gatingResult(passing, this.run) === 'passed' ? passing : null
+      if (merge.inert?.proved && !carried) entry.inert.notCarried = 'the approved revision has no full check result that passes the gate'
+
+      let check = null
+      let configured = null
+      if (carried) {
+        const detail = `Every drifted path is declared inert (${merge.inert.paths.slice(0, 5).join(', ')}${merge.inert.paths.length > 5 ? ', …' : ''}) and the ${merge.inert.compared} other paths are byte-identical to the approved revision, so its check result carries and no check ran.`
+        entry.noDrive = { reason: 'inert-drift-only', detail, paths: merge.inert.paths, compared: merge.inert.compared, check: { revision: carried.revision, result: carried.result, at: carried.at, dir: carried.dir ?? null } }
+        entry.checks = { result: 'not-run', gating: 'passed', carriedFrom: approved.revision, reason: detail }
+      } else {
+        // Revalidation: the configured checks on the merged candidate, judged as closure judges them.
+        configured = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
+        const target = configured?.tiers ? tierTarget(configured, 'full') : configured
+        const requirement = this.snapshot.checks.requirement
+        const runs = Boolean(target) && (target.kind === 'local' || requirement === 'required')
+        check = runs ? await this.checkCandidate({ target, revision, fingerprint: candidate.fingerprint, baseCommit: candidate.baseCommit, baseline: candidate.baseline, workspacePath: candidate.path }) : null
+        const gateRun = { ...this.run, workspace: { ...this.run.workspace, baseCommit: candidate.baseCommit } }
+        const gating = check ? gatingResult(check, gateRun) : 'unavailable'
+        // The whole record: a refused check never joins checkResults (closure reads those), so its commands stay readable from here (check-log.mjs).
+        entry.checks = check ? { ...check, gating, reason: gateReason(check, gateRun), error: check.error ?? null }
+          : { result: 'not-run', gating, reason: target ? 'the staging drive runs on a reconciled candidate only when checks are required' : 'no check target' }
+        const satisfied = requirement === 'none' ? true : requirement === 'optional' ? gating !== 'failed' : gating === 'passed'
+        // The raw result alone misleads: a drive can pass while a selftest new against the baseline still gates it.
+        if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
+      }
 
       // Accepted: the merged candidate is the run's revision, with the approvals carried.
       const original = this.run.approvals.filter((a) => a.revision === approved.revision && !a.reconciledFrom)
       this.run.approvals = [...original, ...original.map((a) => ({ ...a, revision, reconciledFrom: approved.revision }))]
-      this.run.checkResults = [...this.run.checkResults.filter((c) => c.revision === approved.revision), ...(check ? [{ ...check, ...(configured?.tiers ? { tier: 'full' } : {}), reconciledFrom: approved.revision, step: null }] : [])]
+      const driven = check ? [{ ...check, ...(configured?.tiers ? { tier: 'full' } : {}), reconciledFrom: approved.revision, step: null }] : []
+      const result = carried ? [{ ...carried, revision, reconciledFrom: approved.revision, carriedFrom: approved.revision, carriedBecause: 'inert-drift-only', carriedAt: this.clock.iso(), step: null }] : driven
+      this.run.checkResults = [...this.run.checkResults.filter((c) => c.revision === approved.revision), ...result]
       this.run.revisions.push({ fingerprint: revision, byStep: this.run.revisions.find((r) => r.fingerprint === approved.revision)?.byStep ?? null, at: this.clock.iso(),
         rule: candidate.fingerprint.rule, reconciledFrom: approved.revision, baseCommit: candidate.baseCommit })
       Object.assign(entry, { state: 'accepted', endedAt: this.clock.iso() })
@@ -3396,7 +3415,7 @@ export class Engine {
       this.run.blockedReason = null
       this.run.endedAt = null
       delete this.run.autoReconcile
-      await this.persist({ type: 'reconciled', n, from: approved.revision, revision, merged: entry.merged, appended: entry.appended })
+      await this.persist({ type: 'reconciled', n, from: approved.revision, revision, merged: entry.merged, appended: entry.appended, ...(carried ? { noDrive: true } : {}) })
     } catch (error) {
       // Before acceptance nothing of the run changed: the attempt is the record.
       if (entry.state !== 'accepted') return await refuse('failed', error.message)
@@ -3547,7 +3566,8 @@ export class Engine {
     const requirement = this.snapshot.checks.requirement
     // Failures the unchanged base of the same source revision has too do not
     // block (baseline-known); a new one, or a comparison not made, does.
-    const gating = gatingResult(check, candidate ? { ...this.run, workspace: ws } : this.run)
+    // A carried result is judged on the base it was driven on, the run's, not B′.
+    const gating = gatingResult(check, candidate && !check.carriedFrom ? { ...this.run, workspace: ws } : this.run)
     const inherited = check.baselineComparison?.failures ?? null
 
     const checksSatisfied =
@@ -3681,7 +3701,7 @@ export class Engine {
         reconstruction,
         ...(action === 'apply-to-source' ? { application: receipt?.application ?? null } : {}),
         // What a reconciliation merged: the approved revision, its base, the source it was merged onto.
-        ...(candidate ? { reconciliation: (({ n, from, mergeBase, sourceBase, merged, appended }) => ({ n, from, mergeBase, sourceBase, merged, appended }))(candidate.reconciliation) } : {}),
+        ...(candidate ? { reconciliation: (({ n, from, mergeBase, sourceBase, merged, appended, noDrive }) => ({ n, from, mergeBase, sourceBase, merged, appended, ...(noDrive ? { noDrive } : {}) }))(candidate.reconciliation) } : {}),
         repository: receipt?.repository ?? null,
         branch: receipt?.branch ?? null,
         commit: receipt?.commit ?? null,
@@ -3741,7 +3761,7 @@ export class Engine {
       // Why an unmet confirmation was not returned to the author.
       ...(notReturned ? { notReturned } : {}),
       // The checks as closure counted them, with the inherited-failure comparison.
-      ...(check.revision ? { checks: { result: check.result, gating,
+      ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
         ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
         ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown }) => ({ verdict, reason, newFailures, baselineKnown }))(check.baselineComparison.selftest) } : {}) } } : {}),
       // What the seat said stopped it, kept where closure explains itself.

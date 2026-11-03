@@ -300,7 +300,8 @@ function regressionsAfterApproval (run) {
   let count = flagged.filter((h) => h.afterApproval && failed(h.result, h.gating)).length
   const covered = new Set(flagged.map((h) => h.revision))
   const endOf = (number) => ms((run.steps ?? []).find((s) => s.number === number)?.endedAt)
-  const older = (run.checkResults ?? []).filter((c) => !covered.has(c.revision))
+  // A carried result (reconcile of inert drift) is no drive: its own revision counted it already.
+  const older = (run.checkResults ?? []).filter((c) => !covered.has(c.revision) && !c.carriedFrom)
   for (const c of older) {
     const approved = (run.approvals ?? []).filter((a) => a.revision === c.revision).map((a) => endOf(a.step)).filter((t) => t != null)
     if (approved.length && ms(c.at) != null && ms(c.at) >= Math.min(...approved) && failed(c.result, gatingResult(c, run))) count++

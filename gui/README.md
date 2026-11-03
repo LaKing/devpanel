@@ -342,7 +342,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `POST /api/projects/:project/issues/:id/priority` | record where the issue sits in the execution order — `{ value, reason }`, value `urgent\|high\|normal\|low` |
 | `POST /api/projects/:project/issues/:id/dependencies` | record prerequisites — `{ dependsOn: [ids], reason }` (same project, or `project/id`; `[]` clears). The supervisor does not start the issue while one has no disposition and is not archived. A cycle of any length is refused. An accepted split chains its parts: each waits for the one before |
 | `POST /api/projects/:project/issues/:id/runs/:runId/finalize` | evaluate closure again for a run that stopped at delivery, from its retained worktree |
-| `POST /api/projects/:project/issues/:id/runs/:runId/reconcile-delivery` | merge the approved patch onto source that drifted on its own paths, revalidate with the configured checks, carry the approvals and deliver; a refusal lists the paths in `run.reconciliations` |
+| `POST /api/projects/:project/issues/:id/runs/:runId/reconcile-delivery` | merge the approved patch onto source that drifted on its own paths, revalidate with the configured checks (or, for drift only on inert paths, carry the approved result with no drive), carry the approvals and deliver; a refusal lists the paths in `run.reconciliations` |
 | `GET /api/projects/:project/issues/:id/runs/:runId/patch` | download the retained patch. A settled run with an approved revision and no delivery attempt gets that revision's check artifact, once base + patch rebuilds its fingerprint (409 otherwise), named `<hash>.approved-check-artifact.patch` and labelled by the headers `X-Devpanel-Patch-Kind: approved-revision-check-artifact` and `X-Devpanel-Patch-Revision`; `patch-check` and `apply-artifact` do not take it |
 | `GET /api/projects/:project/issues/:id/runs/:runId/patch-check` | read-only: would the patch apply to the checkout NOW — `{state: applies \| applied \| conflicts \| unavailable, owners: [{path, files, state, conflicts?}], checkedAt}`; each file is checked in the git checkout that owns it, through symlinked collections (`server/runtime/patch-check.mjs`). The issue page asks it every time it shows the run. Textual only: not a test of the code, and not the stricter as-reviewed rule of source delivery |
 | `POST /api/projects/:project/issues/:id/runs/:runId/apply-artifact` | explicit operator application of a completed retained patch; body names `expectedRevision`; source drift refuses it |
@@ -582,7 +582,10 @@ worktree; a conflict is resolved only on a path the project declares
 content kept, the candidate's added lines after it, or before it for a
 newest-first changelog); the merged candidate must carry the
 reviewed change unaltered elsewhere and pass the run's configured checks
-(local always, the staging drive only under a `required` requirement). Then the
+(local always, the staging drive only under a `required` requirement), unless all
+the drift is on paths declared `{ rule, inert: true }` and everything else is
+byte-identical to the approved revision: then its passing result carries and no
+check runs (`noDrive` on the attempt). Then the
 approvals carry with `reconciledFrom` and it is delivered, the delivery naming
 the merge base and the merged and appended paths. Otherwise nothing is
 delivered, the run stays blocked and the attempt lists the paths

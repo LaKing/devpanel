@@ -276,7 +276,8 @@ round, and no full drive for those bytes, except on the last allowed round with
 an `awaitsCheck` finding (above). Otherwise the planner returns `{kind: 'checks'}`
 only when the round approved, the revision has no full result and its smoke did
 not fail. Closure, the closure confirmation's check evidence, refresh-checks
-and a reconciled candidate's revalidation use the **full** drive only; with only
+and a reconciled candidate's revalidation (or the result it carries over inert
+drift) use the **full** drive only; with only
 a smoke result the check is `unavailable`, which blocks under `required`. A
 smoke never stands in for the full drive. `checksOnlyBlock` reads the newest
 check of either tier, so a smoke failure on an approved revision is a
@@ -996,7 +997,9 @@ interrupts it. Waiters are released in every case where the record can be read.
    recorded on the attempt) is resolved by keeping the source's content (stage 2)
    and adding the lines the candidate added there after it (`append`) or before
    it (`prepend`, a newest-first changelog) — only when its change to that path
-   is pure addition. Every other conflict refuses (`conflicts`).
+   is pure addition. Every other conflict refuses (`conflicts`). A value may be
+   `{rule, inert: true}`: the same rule, and the path declared inert (step 5); the
+   first entry naming a path decides both.
 4. Outside the append/prepend paths the merged change must be the reviewed one: a path
    the source did not touch must have the approved bytes and mode, and a
    drifted path must carry the same removed and added lines in the same order
@@ -1008,6 +1011,22 @@ interrupts it. Waiters are released in every case where the record can be read.
    check runner and base comparison — a local target always, a staging drive
    only when the requirement is `required` — and judged by closure's rule.
    A failure refuses (`revalidation-failed`).
+
+   The exception is a drift entirely on inert paths. When every path of the whole
+   drift (step 2, not only the patch's own paths) is declared inert and every
+   other path of the merged tree has the content and mode of the rebuilt approved
+   tree (`entry.inert.proved`), and the approved revision has a full result that
+   passes the gate, no check runs on the candidate or a base. The result is carried
+   to the merged revision (`carriedFrom`, `carriedBecause: inert-drift-only`, its
+   `dir` and `at` still the drive's) and is gated against the base it was driven
+   on, not B′. The attempt records `noDrive` (why, the paths, the check it kept) and
+   `checks: {result: 'not-run', carriedFrom}`; `delivery.reconciliation.noDrive` and
+   `closure.checks.carriedFrom` repeat it, and a reconcile that drove has
+   `checks.dir` and none of these. Without such a result the checks run as above
+   (`inert.notCarried`), and so they do for any non-inert drift (`inert.nonInertDrift`,
+   `inert.differing`). A check that depends on an inert file is not re-run: that is
+   the project's responsibility (project-infrastructure.md "Reconcile policy: inert
+   paths").
 6. Accepted: the revision is recorded with `reconciledFrom: <approved>` and
    `baseCommit: B′`, every approval of the approved revision is carried with
    `reconciledFrom`, and closure runs on the rebuilt candidate (a confirmation

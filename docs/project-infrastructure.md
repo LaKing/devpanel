@@ -25,6 +25,7 @@ is an example. A project file declares infrastructure only: it does not authoriz
 | Field | Meaning |
 | --- | --- |
 | `infrastructure.kind` | `boilerplate` |
+| `workspace.reconcile` | `{<path or glob>: append \| prepend \| {rule, inert}}`: how a delivery refused for drift merges onto the source. See "Reconcile policy: inert paths" below. |
 | `orientation` | Source ownership, application/framework composition, documentation entry points, access instructions and operating conventions. No credentials. |
 | `staging` | Environment used by automatic candidate checks. |
 | `deployments` | One or more environments available for inspection, never selected by the automatic test-drive runner. |
@@ -203,6 +204,38 @@ Validate a project's effective policy without making model calls or connecting:
 cd gui
 npm run config:check -- implementation --project <project-id>
 ```
+
+## Reconcile policy: inert paths
+
+`workspace.reconcile` in `projects/<id>.yaml` (project-only) says how a delivery
+refused for drift on its own paths is merged onto the source
+(execution-contract.md "Reconciling a delivery with drifted source"). A path's
+value is its rule, or the rule with `inert`:
+
+```yaml
+workspace:
+  reconcile:
+    'docs/notes.txt': append                     # merged by the rule, then the checks run
+    '**/changelog.txt': { rule: prepend, inert: true }
+```
+
+The merge is the same either way: `inert` does not change how a path composes,
+and a conflict the rule cannot resolve still refuses. What it changes is the
+revalidation. When every path the source drifted on is inert, inside or outside
+the approved patch, and every other path of the merged candidate is byte-identical
+to the approved revision, no check runs, on the candidate or on a base. The approved
+revision's passing full check result carries to the merged revision
+(`carriedFrom`), and the attempt records why (`noDrive`). Any other drift gets the
+configured checks as without the declaration, as does a revision with no passing
+result to carry (`inert.notCarried`).
+
+**Declaring a path inert makes it the project's responsibility that no check
+depends on that file, because no drive will re-check it.** A selftest that reads
+it, a build that embeds it, or a startup that parses it can break on the composed
+bytes and nothing will notice before delivery. Declare only files nothing executes
+or tests, such as a changelog, and never a broad glob: `'**'` would skip the drive
+for real code. A path is inert only when its own entry says `inert: true`, and the
+first entry naming a path decides both its rule and its inertness.
 
 ## Local checks: a project without staging
 

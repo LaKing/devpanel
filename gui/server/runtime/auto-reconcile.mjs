@@ -14,7 +14,9 @@ import { additionRule, ownPathDrift, reconcileUnavailable } from './source-recon
  * is also what stops announceEnd from re-entering after the attempt itself.
  * The attempt changes nothing it would not change when pressed: the merge must
  * carry the reviewed delta unaltered, and the configured checks run on the
- * merged candidate before it is delivered (engine.reconcileDelivery).
+ * merged candidate before it is delivered, unless all the drift is on paths
+ * declared inert (engine.reconcileDelivery, which judges that on the whole
+ * drift, not only these own paths).
  */
 export function autoReconcileRefusal (run, policy) {
   const unavailable = reconcileUnavailable(run)

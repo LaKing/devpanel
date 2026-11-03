@@ -35,7 +35,10 @@ export { ownPathDrift, reconcileUnavailable, RECONCILABLE_BLOCKS }
  * adding the candidate's lines after them (`append`) or before them (`prepend`,
  * a newest-first changelog); every other path must carry exactly the reviewed
  * delta (the same removed and added lines, the same mode change), or nothing
- * is delivered.
+ * is delivered. A path may also be declared `inert`: when all the drift is on
+ * such paths and every other path is byte-identical to the approved revision
+ * (`inertProof`), the engine keeps the approved check result instead of driving
+ * the merged candidate again.
  */
 
 const NL = String.fromCharCode(10)
@@ -55,8 +58,39 @@ const must = async (pending) => {
   return r
 }
 
+/** The first policy entry naming this path, as `{ rule, inert? }`: one entry decides both, so no second glob adds inertness to another's rule. */
+const reconcileEntry = (policy, p) => Object.entries(policy ?? {})
+  .map(([pattern, value]) => [pattern, typeof value === 'string' ? { rule: value } : value])
+  .find(([pattern, entry]) => (entry?.rule === 'append' || entry?.rule === 'prepend') && (pattern === p || path.matchesGlob(p, pattern)))?.[1] ?? null
+
 /** The project's reconcile rule for this path (`append` | `prepend`), or null. */
-export const additionRule = (policy, p) => Object.entries(policy ?? {}).find(([pattern, rule]) => (rule === 'append' || rule === 'prepend') && (pattern === p || path.matchesGlob(p, pattern)))?.[1] ?? null
+export const additionRule = (policy, p) => reconcileEntry(policy, p)?.rule ?? null
+
+/** Whether the project declares this path `inert: true`: no check depends on it, by the project's word. */
+export const isInert = (policy, p) => reconcileEntry(policy, p)?.inert === true
+
+/** The paths whose content or mode differ between two fingerprints of whole trees (a deleted path is absent). */
+export function differingPaths (a, b) {
+  const read = (fp) => new Map(fp.entries.filter((e) => e.status !== 'deleted').map((e) => [e.path, `${e.contentHash} ${e.mode}`]))
+  const [left, right] = [read(a), read(b)]
+  return [...new Set([...left.keys(), ...right.keys()])].filter((p) => left.get(p) !== right.get(p)).sort()
+}
+
+/**
+ * Whether this merge may keep the approved revision's check result: every path
+ * the destination drifted on is declared inert (all of the drift, since all of
+ * it is in B′, not only the patch's own paths), and every other path of the
+ * merged tree is byte-identical to the approved one. Null when no drifted path
+ * is inert: the policy did not come into it.
+ */
+export function inertProof (policy, drift, approved, merged) {
+  const paths = drift.map((e) => e.path).filter((p) => isInert(policy, p))
+  if (!paths.length) return null
+  const nonInertDrift = drift.map((e) => e.path).filter((p) => !isInert(policy, p))
+  const differing = differingPaths(approved, merged).filter((p) => !isInert(policy, p))
+  const compared = new Set([...approved.entries, ...merged.entries].filter((e) => e.status !== 'deleted' && !isInert(policy, e.path)).map((e) => e.path)).size
+  return { proved: !nonInertDrift.length && !differing.length, paths, nonInertDrift: nonInertDrift.slice(0, 20), nonInertDriftCount: nonInertDrift.length, differing: differing.slice(0, 20), compared }
+}
 
 /** The lines a change adds, or null when it also removes or rewrites some (not an append). */
 async function additions (scratch, before, afterFile) {
@@ -236,7 +270,7 @@ export async function mergeOntoSource ({ workspace, baseline, revision, patchFil
 
     result.merged = own.filter((p) => !result.appended.includes(p))
     keep = true
-    return { ...result, state: 'merged', candidate: { path: mergedDir, baseCommit: result.sourceBase, baseline: next, fingerprint: merged }, release }
+    return { ...result, state: 'merged', inert: inertProof(policy, drift, approved, merged), candidate: { path: mergedDir, baseCommit: result.sourceBase, baseline: next, fingerprint: merged }, release }
   } catch (error) {
     return refuse('failed', error.message)
   } finally {

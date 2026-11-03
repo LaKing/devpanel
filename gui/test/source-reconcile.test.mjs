@@ -6,7 +6,9 @@ import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { startRun, worktreeDiffDelivery, releaseOwnership, gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { applyToSource } from '../server/runtime/source-delivery.mjs'
-import { mergeOntoSource, reconcileUnavailable } from '../server/runtime/source-reconcile.mjs'
+import { differingPaths, inertProof, isInert, mergeOntoSource, reconcileUnavailable } from '../server/runtime/source-reconcile.mjs'
+import { runMetrics } from '../server/runtime/run-metrics.mjs'
+import { loadConfig } from '../server/config/load.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents } from '../server/runtime/store.mjs'
@@ -37,7 +39,7 @@ const lines = (n, edit = {}) => Array.from({ length: n }, (_, i) => edit[i + 1] 
  * on a merge of the two.
  */
 const COMPATIBLE = '      - id: compatible\n        run: "! (grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs)"\n'
-async function blockedRun ({ worktree, source, commands = COMPATIBLE }) {
+async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '' }) {
   let engine
   const script = scriptFor()
   const f = await engineFixture({ playbook: 'implementation', delivery: 'apply-to-source', script: async (turn) => {
@@ -52,7 +54,7 @@ async function blockedRun ({ worktree, source, commands = COMPATIBLE }) {
   await git(f.projectPath, 'add', '-A')
   await git(f.projectPath, 'commit', '-qm', 'source')
   await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
-    `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n${commands}`)
+    `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n${target}    commands:\n${commands}`)
   const options = { base: 'working-tree', participants: { 'auditor-1': { model: 'opus-5' } } }
   const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
@@ -626,6 +628,225 @@ export default async function (t) {
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
     }
 
+    // A check that also counts every drive, candidate or base, outside anything a run owns.
+    const counted = async (more = '') => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'reconcile-drives-'))
+      temps.push(dir)
+      const file = path.join(dir, 'drives')
+      return { commands: `      - id: count\n        run: "echo drive >> ${file}"\n${more}`, target: '    compareBaseline: true\n',
+        drives: async () => (await fs.readFile(file, 'utf8').catch(() => '')).split('\n').filter(Boolean).length }
+    }
+    const INERT = { '**/changelog.txt': { rule: 'prepend', inert: true } }
+    const INERT_YAML = "'**/changelog.txt': { rule: prepend, inert: true }"
+    const FOREIGN = { worktree: CHANGELOG_ONLY.worktree, source: { ...CHANGELOG_ONLY.source, 'source.txt': 'changed by someone else\n' } }
+    const OWN_CODE = { worktree: CHANGELOG_ONLY.worktree, source: { ...CHANGELOG_ONLY.source, 'server.mjs': lines(10, { 1: 'line 1 elsewhere' }) } }
+    const checkDirs = (f, engine) => fs.readdir(path.join(f.issuePath, 'runs', engine.runId, 'checks')).then((d) => d.sort())
+
+    t.section('8. inert: the policy loads, opt-in per path')
+    {
+      const f = await engineFixture({ playbook: 'implementation' })
+      const file = path.join(f.configRoot, 'projects', `${PROJECT}.yaml`)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      const load = async (value) => {
+        await fs.writeFile(file, `id: ${PROJECT}\nworkspace:\n  reconcile:\n    'changelog.txt': ${value}\n`)
+        const cfg = await loadConfig({ root: f.configRoot })
+        return { errors: cfg.errors.filter((e) => e.file?.endsWith(`projects/${PROJECT}.yaml`)).length, policy: cfg.projects.get(PROJECT)?.workspace?.reconcile }
+      }
+      for (const value of ['append', 'prepend', '{ rule: prepend }', '{ rule: append, inert: true }', '{ rule: prepend, inert: false }']) t.eq(`${value} loads`, (await load(value)).errors, 0)
+      for (const value of ['{ inert: true }', "{ rule: prepend, inert: 'yes' }", '{ rule: prepend, inert: true, other: 1 }', '{ rule: rewrite, inert: true }', 'inert']) t.ok(`${value} is refused`, (await load(value)).errors > 0)
+      t.ok('declared inert', isInert({ 'a.txt': { rule: 'append', inert: true } }, 'a.txt'))
+      for (const policy of [{}, { 'a.txt': 'append' }, { 'a.txt': { rule: 'append' } }, { 'a.txt': { rule: 'append', inert: false } }, { 'b.txt': { rule: 'append', inert: true } }]) t.ok(`not inert under ${JSON.stringify(policy)}`, !isInert(policy, 'a.txt'))
+      t.ok('the first entry naming a path decides: a later glob adds no inertness', !isInert({ 'a.txt': 'append', '*.txt': { rule: 'append', inert: true } }, 'a.txt'))
+    }
+
+    t.section('8a. the proof: all of the drift inert, and nothing else differs')
+    {
+      const fp = (entries) => ({ entries: entries.map(([p, contentHash, mode = '000644', status = 'unchanged']) => ({ path: p, contentHash, mode, status })) })
+      t.eq('same content and mode: nothing differs', differingPaths(fp([['a', 'x']]), fp([['a', 'x', '000644', 'modified']])), [])
+      t.eq('content', differingPaths(fp([['a', 'x']]), fp([['a', 'y']])), ['a'])
+      t.eq('a mode-only change', differingPaths(fp([['a', 'x']]), fp([['a', 'x', '000755']])), ['a'])
+      t.eq('a deletion', differingPaths(fp([['a', 'x']]), fp([['a', null, undefined, 'deleted']])), ['a'])
+      t.eq('an added path', differingPaths(fp([]), fp([['a', 'x']])), ['a'])
+      const approved = fp([['changelog.txt', 'mine'], ['server.mjs', 'code']])
+      const composed = fp([['changelog.txt', 'both'], ['server.mjs', 'code']])
+      const drift = (...paths) => paths.map((p) => ({ path: p }))
+      t.eq('inert drift, the rest identical: proved', inertProof(INERT, drift('changelog.txt'), approved, composed), { proved: true, paths: ['changelog.txt'], nonInertDrift: [], nonInertDriftCount: 0, differing: [], compared: 1 })
+      t.eq('a non-inert path drifted to the approved bytes: not proved, though nothing differs', [inertProof(INERT, drift('changelog.txt', 'server.mjs'), approved, composed).proved, inertProof(INERT, drift('changelog.txt', 'server.mjs'), approved, composed).nonInertDrift], [false, ['server.mjs']])
+      const moved = inertProof(INERT, drift('changelog.txt'), approved, fp([['changelog.txt', 'both'], ['server.mjs', 'other']]))
+      t.eq('a non-inert path differs: not proved, though all the drift is inert', [moved.proved, moved.differing], [false, ['server.mjs']])
+      t.eq('no drifted path is inert: the policy did not come into it', inertProof(INERT, drift('server.mjs'), approved, composed), null)
+    }
+
+    t.section('8b. inert-only drift: composed, proved, carried and delivered with no drive')
+    {
+      const c = await counted()
+      const { f, engine } = await blockedRun({ ...CHANGELOG_ONLY, ...c })
+      const approved = engine.run.closure.revision
+      const before = { drives: await c.drives(), dirs: await checkDirs(f, engine), baselines: engine.run.baselineChecks.length }
+      t.ok('the approved revision and its base were driven', before.drives >= 2 && before.baselines >= 1, JSON.stringify(before))
+      const driven = engine.run.checkResults.at(-1)
+      let calls = 0
+      const real = engine.checkCandidate
+      engine.checkCandidate = (...args) => { calls++; return real.apply(engine, args) }
+      await engine.reconcileDelivery({ policy: INERT })
+      const attempt = engine.run.reconciliations.at(-1)
+      t.eq('delivered', `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${JSON.stringify(attempt)}`)
+      t.eq('no check command ran, on the candidate or a base', await c.drives(), before.drives)
+      t.eq('the check runner was never asked', calls, 0)
+      t.eq('no check directory appeared', await checkDirs(f, engine), before.dirs)
+      t.eq('no baseline was added', engine.run.baselineChecks.length, before.baselines)
+      t.eq("the source holds the composition: the source's entry kept, the candidate's added", await read(f, 'changelog.txt'), 'candidate: fixed line 9\nother: landed first\nv1 released\n')
+      t.eq('and the reviewed code', await read(f, 'server.mjs'), lines(10, { 9: 'line 9 fixed' }))
+      const revision = engine.run.revisions.at(-1).fingerprint
+      t.ok('the delivered revision is the composed one', revision !== approved && engine.run.delivery.revision === revision)
+      t.eq('the proof is recorded', [attempt.inert.proved, attempt.inert.paths, attempt.inert.differing, attempt.inert.compared > 0], [true, ['changelog.txt'], [], true])
+      t.ok('every approval carried', engine.run.approvals.filter((a) => a.revision === approved).length > 0 && engine.run.approvals.filter((a) => a.revision === approved).length === engine.run.approvals.filter((a) => a.revision === revision && a.reconciledFrom === approved).length)
+      const carried = engine.run.checkResults.at(-1)
+      t.eq("the approved revision's result is carried, its drive named", [carried.revision, carried.result, carried.dir, carried.at, carried.carriedFrom, carried.carriedBecause], [revision, 'passed', driven.dir, driven.at, approved, 'inert-drift-only'])
+      t.eq('the attempt says why no drive ran', [attempt.noDrive.reason, attempt.noDrive.paths, attempt.noDrive.check.revision, attempt.noDrive.check.dir], ['inert-drift-only', ['changelog.txt'], approved, driven.dir])
+      t.ok('in words', /declared inert/.test(attempt.noDrive.detail) && /no check ran/.test(attempt.noDrive.detail), attempt.noDrive.detail)
+      t.eq('the attempt has no check of its own', [attempt.checks.result, attempt.checks.dir ?? null, attempt.checks.carriedFrom], ['not-run', null, approved])
+      t.eq('closure counted it, and says it was carried', [engine.run.closure.checks.gating, engine.run.closure.checks.carriedFrom, engine.run.closure.verificationLevel], ['passed', approved, 'verified'])
+      t.eq('the delivery names it', engine.run.delivery.reconciliation.noDrive.reason, 'inert-drift-only')
+      const view = await getRunView(f, engine)
+      t.eq('get_run shows it', [view.reconciliation.noDrive.reason, view.reconciliation.checks.reason, view.checkResults.at(-1).carriedFrom, view.checkResults.at(-1).carriedBecause], ['inert-drift-only', attempt.noDrive.detail, approved, 'inert-drift-only'])
+      const log = await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(driven.dir), command: 'count' })
+      t.eq('its log still reads as the revision that was driven', log.revision, approved)
+      t.ok('journaled as no drive', (await readEvents(f.issuePath, engine.runId)).events.some((e) => e.type === 'reconciled' && e.noDrive === true))
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('8c. mixed drift, or a path not declared inert: the drive runs, and a reader can tell')
+    {
+      for (const [label, scenario, nonInert] of [['drift on another own path', OWN_CODE, ['server.mjs']], ['drift outside the approved patch', FOREIGN, ['source.txt']]]) {
+        const c = await counted()
+        const { f, engine } = await blockedRun({ ...scenario, ...c })
+        const before = await c.drives()
+        const undeclared = autoReconcileRefusal(engine.run, INERT)
+        t.eq(`${label}: as today, the automatic attempt ${scenario === FOREIGN ? 'applies' : 'does not apply'}`, undeclared === null, scenario === FOREIGN, undeclared)
+        await engine.reconcileDelivery({ policy: INERT })
+        const attempt = engine.run.reconciliations.at(-1)
+        t.eq(`${label}: delivered`, `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${JSON.stringify(attempt)}`)
+        t.ok(`${label}: the configured checks ran, on the candidate and its base`, (await c.drives()) >= before + 2, `${before} -> ${await c.drives()}`)
+        t.eq(`${label}: the attempt says why`, [attempt.inert.proved, attempt.inert.paths, attempt.inert.nonInertDrift], [false, ['changelog.txt'], nonInert])
+        t.ok(`${label}: and holds the drive's own record, not a carried one`, Boolean(attempt.checks.dir) && attempt.checks.result === 'passed' && !attempt.noDrive && !attempt.checks.carriedFrom)
+        const check = engine.run.checkResults.at(-1)
+        t.eq(`${label}: the result is the drive's`, [check.revision, check.dir, check.carriedFrom ?? null], [engine.run.revisions.at(-1).fingerprint, attempt.checks.dir, null])
+        t.eq(`${label}: closure and the delivery say no carry`, [engine.run.closure.checks.carriedFrom ?? null, engine.run.delivery.reconciliation.noDrive ?? null], [null, null])
+        await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+      }
+      for (const policy of [{ '**/changelog.txt': 'prepend' }, { '**/changelog.txt': { rule: 'prepend' } }, { '**/changelog.txt': { rule: 'prepend', inert: false } }]) {
+        const c = await counted()
+        const { engine } = await blockedRun({ ...CHANGELOG_ONLY, ...c })
+        const before = await c.drives()
+        await engine.reconcileDelivery({ policy })
+        const attempt = engine.run.reconciliations.at(-1)
+        t.ok(`${JSON.stringify(policy)}: the drive runs and nothing about inertness is recorded`, (await c.drives()) > before && attempt.state === 'accepted' && Boolean(attempt.checks.dir) && !attempt.inert && !attempt.noDrive, JSON.stringify(attempt))
+        await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+      }
+    }
+
+    t.section('8d. mixed drift keeps the refusals')
+    {
+      const failing = await blockedRun({ worktree: CHANGELOG_ONLY.worktree, source: { ...CHANGELOG_ONLY.source, 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) } })
+      await failing.engine.reconcileDelivery({ policy: INERT })
+      t.eq('a failing drive refuses, nothing delivered', [failing.engine.run.reconciliations.at(-1).state, failing.engine.run.status, failing.engine.run.approvals.some((a) => a.reconciledFrom)], ['revalidation-failed', 'blocked', false])
+      await releaseOwnership(failing.engine, { reason: 'test' }).catch(() => {})
+      const c = await counted()
+      const rewritten = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'rewritten by the candidate\n' }, source: CHANGELOG_ONLY.source, ...c })
+      const before = await c.drives()
+      await rewritten.engine.reconcileDelivery({ policy: INERT })
+      const attempt = rewritten.engine.run.reconciliations.at(-1)
+      t.eq('inert does not widen the merge: a rewrite of the inert path still conflicts', [attempt.state, attempt.conflicts, await c.drives()], ['conflicts', ['changelog.txt'], before])
+      await releaseOwnership(rewritten.engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('8e. a selftest reads the inert file: declared inert, it is not re-run; that is the project\'s responsibility')
+    {
+      // Fails only on the composition: the approved candidate has no entry of the source's, the source alone none of the candidate's.
+      const collect = '      - id: collect\n        report: selftest\n        run: |\n          if grep -q other changelog.txt && grep -q candidate changelog.txt; then t=\',{"test":"core/changelog","error":"two entries"}\'; fi\n          echo "== runtime/selftest.report"\n          printf \'{\\n  "total": 1,\\n  "tests": [{"test":"core/a"}%s]\\n}\\n\' "$t"\n'
+      const c = await counted(collect)
+      const inert = await blockedRun({ ...CHANGELOG_ONLY, ...c })
+      t.eq('the approved candidate passed it', inert.engine.run.blockedReason, 'source-delivery-blocked', JSON.stringify(inert.engine.run.checkResults.at(-1)?.baselineComparison))
+      const before = await c.drives()
+      await inert.engine.reconcileDelivery({ policy: INERT })
+      t.eq('declared inert: delivered with no drive', [inert.engine.run.status, await c.drives(), inert.engine.run.reconciliations.at(-1).noDrive?.reason], ['completed', before, 'inert-drift-only'])
+      t.ok('with the bytes that selftest would have refused', /candidate/.test(await read(inert.f, 'changelog.txt')) && /other/.test(await read(inert.f, 'changelog.txt')))
+      await releaseOwnership(inert.engine, { reason: 'test' }).catch(() => {})
+      const driven = await blockedRun({ ...CHANGELOG_ONLY, ...(await counted(collect)) })
+      await driven.engine.reconcileDelivery({ policy: { '**/changelog.txt': 'prepend' } })
+      const attempt = driven.engine.run.reconciliations.at(-1)
+      t.eq('not declared: the same drift is driven and the selftest refuses it', [attempt.state, attempt.checks.reason], ['revalidation-failed', 'selftest verdict new-failures: collect: core/changelog'], JSON.stringify(attempt))
+      await releaseOwnership(driven.engine, { reason: 'test' }).catch(() => {})
+      const doc = readFileSync(new URL('../../docs/project-infrastructure.md', import.meta.url), 'utf8')
+      t.ok("the project documentation says it is the project's responsibility", doc.includes("Declaring a path inert makes it the project's responsibility that no check\ndepends on that file, because no drive will re-check it."))
+    }
+
+    t.section('8f. an approved result that passed only on inherited failures carries through closure')
+    {
+      const { f, engine } = await blockedRun({ ...CHANGELOG_ONLY, commands: '      - id: inherited\n        run: "false"\n' })
+      const driven = engine.run.checkResults.at(-1)
+      t.eq('it failed as run and passes the gate, known on the base', [engine.run.blockedReason, driven.result, driven.baselineComparison?.failures?.verdict], ['source-delivery-blocked', 'failed', 'baseline-known'], JSON.stringify(driven.baselineComparison))
+      const metrics = runMetrics(engine.run)
+      await engine.reconcileDelivery({ policy: INERT })
+      t.eq('delivered: closure judges it on the base it was driven on, not B′', [engine.run.status, engine.run.closure.checks.result, engine.run.closure.checks.gating, engine.run.closure.checks.carriedFrom], ['completed', 'failed', 'passed', engine.run.reconciliations.at(-1).from], `${engine.run.blockedReason} ${JSON.stringify(engine.run.closure?.conditions)}`)
+      const after = runMetrics(engine.run)
+      t.eq('the carried copy is no second regression, and leaves the basis alone', [after.regressionsAfterApproval, after.regressionsBasis], [metrics.regressionsAfterApproval, metrics.regressionsBasis])
+      t.eq('the same base drive, and its log', (await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(driven.dir), command: 'inherited' })).revision, engine.run.reconciliations.at(-1).from)
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('8g. Finalize after a failed delivery: the carried result still counts, and still no drive')
+    {
+      const c = await counted()
+      const { f, engine } = await blockedRun({ ...CHANGELOG_ONLY, ...c })
+      const provider = engine.deliveryProvider
+      let thrown = false
+      engine.deliveryProvider = { deliver: async (args) => { if (!thrown) { thrown = true; throw new Error('disk full') } return provider.deliver(args) } }
+      const before = await c.drives()
+      await engine.reconcileDelivery({ policy: INERT })
+      t.eq('accepted, delivery failed', [engine.run.reconciliations.at(-1).state, engine.run.status, engine.run.blockedReason], ['accepted', 'blocked', 'delivery-failed'])
+      t.eq('finalize is offered', supportedActions(engine.run).includes('finalize'), true)
+      await engine.finalize()
+      t.eq('Finalize delivers the composed candidate', [engine.run.status, engine.run.delivery.revision, engine.run.delivery.reconciliation.noDrive?.reason], ['completed', engine.run.revisions.at(-1).fingerprint, 'inert-drift-only'], `${engine.run.blockedReason} ${engine.run.delivery?.error}`)
+      t.eq('no drive there either', await c.drives(), before)
+      t.ok('and the source has it', /other/.test(await read(f, 'changelog.txt')) && /candidate/.test(await read(f, 'changelog.txt')))
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('8h. nothing passing to carry: the proof holds, and the drive runs')
+    {
+      for (const [label, spoil] of [['the only result is a smoke', (r) => ({ ...r, tier: 'smoke' })], ['the result does not pass the gate', (r) => ({ ...r, result: 'failed', baselineComparison: null })]]) {
+        const c = await counted()
+        const { engine } = await blockedRun({ ...CHANGELOG_ONLY, ...c })
+        engine.run.checkResults = engine.run.checkResults.map(spoil)
+        const before = await c.drives()
+        await engine.reconcileDelivery({ policy: INERT })
+        const attempt = engine.run.reconciliations.at(-1)
+        t.eq(`${label}: not carried, and says so`, [attempt.inert.proved, /no full check result/.test(attempt.inert.notCarried), attempt.noDrive ?? null], [true, true, null])
+        t.ok(`${label}: the drive ran and delivered`, (await c.drives()) > before && Boolean(attempt.checks.dir) && engine.run.status === 'completed', `${engine.run.status} ${JSON.stringify(attempt)}`)
+        await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+      }
+    }
+
+    t.section('8i. the panel does it by itself: the automatic reconcile shares all of it')
+    {
+      for (const [label, scenario, noDrive] of [['inert-only', CHANGELOG_ONLY, true], ['with foreign drift', FOREIGN, false]]) {
+        const c = await counted()
+        const s = await supervisedRun({ ...scenario, ...c }, { policy: INERT_YAML })
+        const { supervisor, events } = s.open()
+        const before = await c.drives()
+        await supervisor.finalize(s.ids)
+        await until(() => finishes(events) > 0, 'the end announcement')
+        await periods()
+        t.eq(`${label}: announced once`, finishes(events), 1)
+        const run = await record(s.f, s.runId)
+        t.eq(`${label}: delivered, the engine's attempt`, [run.status, run.reconciliations[0].by], ['completed', 'engine'], JSON.stringify(run.reconciliations[0]))
+        t.eq(`${label}: ${noDrive ? 'no drive' : 'the drive ran'}`, [Boolean(run.reconciliations[0].noDrive), (await c.drives()) === before], [noDrive, noDrive])
+        await supervisor.shutdown?.()
+      }
+    }
+
     t.section('5. what is offered')
     {
       const blocked = (application, extra = {}) => ({ status: 'blocked', blockedReason: 'source-delivery-blocked', participants: {}, workspace: { path: '/w', state: 'retained' }, integrity: { status: 'clear' }, delivery: { action: 'apply-to-source', application }, ...extra })
@@ -713,6 +934,44 @@ export default async function (t) {
       } finally {
         await merge.release?.()
         await a.release()
+      }
+    }
+
+    t.section('7b. an inert changelog under a materialized link: the proof reads through the link, and sees the owner\'s other drift')
+    {
+      const policy = { '**/changelog.txt': { rule: 'prepend', inert: true } }
+      const scenario = async () => {
+        const owner = await repository({ 'modules/shared.txt': lines(10), 'modules/changelog.txt': 'v1 released\n' })
+        const app = await repository({ 'source.txt': 'original\n' })
+        await fs.symlink(path.join(owner, 'modules'), path.join(app, 'shared'))
+        const a = await approve(app, { symlinks: 'materialize' }, async (dir) => {
+          await fs.writeFile(path.join(dir, 'shared/shared.txt'), lines(10, { 9: 'line 9 fixed' }))
+          await fs.writeFile(path.join(dir, 'shared/changelog.txt'), 'candidate: fixed\nv1 released\n')
+        })
+        await fs.writeFile(path.join(owner, 'modules/changelog.txt'), 'other: landed first\nv1 released\n')
+        return { owner, a }
+      }
+      const merge = (a) => mergeOntoSource({ workspace: a.ws, baseline: a.baseline, revision: a.fp.fingerprint, patchFile: path.join(a.runDir, a.receipt.artifactRef), policy, ref: `refs/devpanel/reconciled/${a.runId}-1`, runDir: a.runDir })
+      {
+        const { a } = await scenario()
+        const m = await merge(a)
+        try {
+          t.eq('proved, on the path as the worktree names it', [m.state, m.inert?.proved, m.inert?.paths, m.inert?.differing, m.appended], ['merged', true, ['shared/changelog.txt'], [], ['shared/changelog.txt']], m.error)
+        } finally {
+          await m.release?.()
+          await a.release()
+        }
+      }
+      {
+        const { owner, a } = await scenario()
+        await fs.writeFile(path.join(owner, 'modules/shared.txt'), lines(10, { 1: 'line 1 by the owner' }))
+        const m = await merge(a)
+        try {
+          t.eq('code drift at the owner: not proved', [m.state, m.inert?.proved, m.inert?.nonInertDrift], ['merged', false, ['shared/shared.txt']], m.error)
+        } finally {
+          await m.release?.()
+          await a.release()
+        }
       }
     }
   } finally {

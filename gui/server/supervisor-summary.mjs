@@ -35,7 +35,7 @@ function decidedReconciliation (entries) {
 }
 
 function reconciliationSummary (entry) {
-  return { n: entry.n, state: entry.state, by: entry.by ?? null, endedAt: entry.endedAt, revision: entry.revision ?? null, conflicts: entry.conflicts ?? [], error: clip(entry.error, 500),
+  return { n: entry.n, state: entry.state, by: entry.by ?? null, endedAt: entry.endedAt, revision: entry.revision ?? null, conflicts: entry.conflicts ?? [], error: clip(entry.error, 500), ...(entry.noDrive ? { noDrive: entry.noDrive } : {}),
     ...(entry.checks ? { checks: { ...checkSummary(entry.checks), gating: entry.checks.gating ?? null, reason: entry.checks.reason ?? null } } : {}) }
 }
 

@@ -463,7 +463,7 @@ function blocked (run, outputs, kept) {
   const base = { tone: 'warning', kept }
   if (reconcilePending(run)) {
     return { ...base, tone: 'progress', headline: 'Approved; automatic reconcile running; do not land by hand',
-      detail: 'The panel is merging the approved change onto the project, rechecking it and delivering it.',
+      detail: 'The panel is merging the approved change onto the project, rechecking it unless only declared inert paths drifted, and delivering it.',
       next: 'Wait: it delivers the change or says why not.' }
   }
   switch (reason) {
@@ -555,7 +555,7 @@ function blocked (run, outputs, kept) {
     const attempt = run.reconciliations?.at(-1)
     const refused = attempt && attempt.state !== 'accepted' ? ` Reconciling with the project was refused (${attempt.state})${attempt.conflicts?.length ? ` at ${attempt.conflicts.slice(0, 5).join(', ')}` : ''}.` : ''
     const notRun = run.autoReconcile?.state === 'not-run' ? ` The automatic reconcile did not run: ${String(run.autoReconcile.reason).replace(/\.$/, '')}.` : ''
-    const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
+    const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it, unless only declared inert paths drifted; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
     return { ...base, headline: d.headline, detail: (d.detail ?? '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
   }
   if (typeof reason === 'string' && reason.startsWith('release-')) {

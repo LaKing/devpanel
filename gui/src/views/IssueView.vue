@@ -136,7 +136,7 @@ const nextAction = computed(() => {
       : `This run failed: ${run.value.blockedReason ?? 'no reason was recorded'}`
   }
   if (run.value.status !== 'blocked') return null
-  if (run.value.reconcilePending) return 'Approved; automatic reconcile running; do not land by hand. The panel is merging the change onto the project, rechecking it and delivering it.'
+  if (run.value.reconcilePending) return 'Approved; automatic reconcile running; do not land by hand. The panel is merging the change onto the project, rechecking it unless only declared inert paths drifted, and delivering it.'
   return {
     'recovery-required': canRecover.value
       ? 'The server restarted while this run was live. Recover run reconciles what was in flight from the runtimes\' own records and continues if nothing is uncertain; Abandon keeps its work and logs and allows a fresh run.'
@@ -1387,8 +1387,8 @@ watch(() => route.query.run, (runId) => {
 
                 <h3 class="block__sub">Checks</h3>
                 <p class="muted">requirement {{ run.checks?.requirement ?? '—' }} · target {{ run.checks?.target?.kind ?? 'none' }}</p>
-                <div v-for="c in run.checkResults" :key="c.at" class="check">
-                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
+                <div v-for="c in run.checkResults" :key="`${c.revision}:${c.at}`" class="check">
+                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="c.carriedFrom"> · carried from <code>{{ short(c.carriedFrom) }}</code>, no drive</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
                   <p v-if="c.error" class="muted">{{ c.error }}</p>
                   <p v-for="cmd in c.commands ?? []" :key="cmd.id" class="kv kv--indent">
                     <v-icon :icon="cmd.passed ? '$checkCircle' : '$alertCircle'" size="14" :color="cmd.passed ? 'success' : cmd.required ? 'error' : 'warning'" />
