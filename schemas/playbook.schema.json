@@ -450,6 +450,11 @@
                 },
                 "description": "Earlier commands this one depends on (a join implies its service). After a required command fails, a command runs only if it declares needs (an empty list: independent) and every need passed; without needs it is skipped, and a skipped required command leaves the run's outcome unknown. Not allowed on finallyCommands, which always run."
               },
+              "reportsUnavailable": {
+                "type": "boolean",
+                "default": false,
+                "description": "Required commands only: this command may say the drive cannot be made (a pinned snapshot it cannot obtain) by exiting non-zero with a line `devpanel-unavailable: <reason>`. The check result is then unavailable, not failed, with the reason in its error, unless another required command failed. Without the line a non-zero exit is an ordinary failure. Declare it only on a command that runs no candidate code: candidate code could otherwise block the check instead of failing it. See docs/project-infrastructure.md \"One application snapshot per run\"."
+              },
               "report": {
                 "type": "string",
                 "pattern": "^([a-z0-9][a-z0-9.]*-)?selftest$",

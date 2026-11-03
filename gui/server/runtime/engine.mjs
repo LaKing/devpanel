@@ -1783,7 +1783,8 @@ export class Engine {
       runDir: store.runDir(this.issuePath, this.runId),
       clock: this.clock,
       signal: this.controller.signal,
-      platform: this.platform
+      platform: this.platform,
+      runId: this.runId
     }
     // The baseline: the same target (of a tier: the same tier) on the base
     // commit (the source revision), once per run and target, reused by later

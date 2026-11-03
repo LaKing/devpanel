@@ -181,7 +181,7 @@ export default async function (t) {
       const commands = [
         { id: 'prepare', kind: 'candidate', network: true, run: `set -e; test "$(cat value.txt)" = 2; mkdir -p build; echo built > build/out; test ! -e ${canaryDir}/secret; test "$HOME" = ${home}; test -z "$(ls -A "$HOME")"` },
         { id: 'start', kind: 'candidate', service: true, run: 'exec /bin/sh app.sh' },
-        { id: 'ready', kind: 'candidate', join: 'start', run: 'for i in $(seq 50); do test -s run/state && break; sleep 0.1; done; test "$(cat run/state)" = up; test -n "$DEVPANEL_UNIT_START"' },
+        { id: 'ready', kind: 'candidate', join: 'start', run: 'for i in $(seq 50); do test -s run/state && break; sleep 0.1; done; test "$(cat run/state)" = up; test -n "$DEVPANEL_UNIT_START"; test "$DEVPANEL_RUN_ID" = rc-run' },
         { id: 'host-view', kind: 'privileged', run: 'test -z "$(ls -A "$DEVPANEL_CANDIDATE_DIR")"; test "$(pwd)" = /; echo "unit $DEVPANEL_UNIT_START"' }
       ]
       const finallyCommands = [
@@ -190,7 +190,7 @@ export default async function (t) {
         { id: 'own-pids', kind: 'candidate', run: `test "$(cat /proc/1/comm)" = bwrap; ! kill -0 ${process.pid} 2>/dev/null` },
         { id: 'logs', kind: 'privileged', required: false, run: 'echo "would read journal of $DEVPANEL_UNIT_START"' }
       ]
-      const result = await check({ kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, commands, finallyCommands, confinement: { user, home } }, runDir)
+      const result = await check({ kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, commands, finallyCommands, confinement: { user, home } }, runDir, { runId: 'rc-run' })
       t.eq('the checks pass', result.result, 'passed', result.error ?? JSON.stringify(result.commands.filter((c) => !c.passed)))
       if (result.result !== 'passed') for (const f of await fs.readdir(path.join(runDir, result.dir))) if (f.endsWith('.log')) console.log(f, await fs.readFile(path.join(runDir, result.dir, f), 'utf8'))
       t.eq('labelled remote-enforced', result.confinement?.level, 'remote-enforced', JSON.stringify(result.confinement))

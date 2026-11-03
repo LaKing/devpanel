@@ -94,7 +94,8 @@ not by the command text (step 0e of the seat-access fence):
 
 systemd expands `$` in a unit's command line; the engine escapes the run text,
 so it reaches `/bin/sh` exactly as written (`$$` is the shell's pid).
-Every command gets `DEVPANEL_CANDIDATE_DIR` and `DEVPANEL_UNIT_<ID>` for each
+Every command gets `DEVPANEL_CANDIDATE_DIR`, `DEVPANEL_RUN_ID` (the run; see
+"One application snapshot per run") and `DEVPANEL_UNIT_<ID>` for each
 candidate command's unit (e.g. `journalctl -u "$DEVPANEL_UNIT_START"`). When the
 SSH account is root, the verified candidate is handed to the unit user after
 its arrival listing. The engine's launch bookkeeping lives in
@@ -250,6 +251,56 @@ store. A hit saves the base drive, which runs beside the candidate's: it
 lightens staging, and shortens wall time only where the candidate was waiting
 for the base.
 
+### One application snapshot per run
+
+`DEVPANEL_RUN_ID` is the run's id. Every check command receives it: local and
+SSH, `kind: candidate`, `kind: privileged` or none, services and joining commands,
+finalizers, in every drive of the run (candidate and base, smoke and full, a
+retry, refresh-checks, a reconciled candidate's revalidation). It is the same for
+all of them and differs in another run. The `baselineCache.environment` command
+receives it too. It is not part of the target definition, so it changes neither
+the `targetKey` nor the baseline key.
+
+It lets a command that stages shared application content pin that content by run:
+the first drive to arrive pins what staging holds, later drives and their bases
+reuse the pin, and a stage deploy during the run does not change what is under
+test. The candidate and base of one revision can be the first drives together,
+so creating the pin must be atomic. The pin must outlive anything that can drive
+the run again, and the staging host cannot see which runs are live or retained:
+pruning belongs to something that can (a project action on the panel's host), or
+it must fail closed as below.
+
+A drive that cannot obtain the run's pin must not stage something newer. A required
+command declaring `reportsUnavailable: true` says so by exiting non-zero with a line
+`devpanel-unavailable: <reason>` on stderr or stdout:
+
+```yaml
+- id: stage-content
+  kind: privileged
+  reportsUnavailable: true
+  run: /usr/local/sbin/stage-pinned "$DEVPANEL_RUN_ID" || exit 1
+```
+
+The check result is then `unavailable`, not `failed`, and `result.error` names the
+command and the reason (`commands[].unavailable` holds the reason). Commands after it are
+skipped as after any required failure and finalizers still run; a required finalizer
+that then fails does not change the result, and retains the remote candidate as
+it always does. If another required command had already failed, the result stays
+`failed`. An `unavailable` result is not retried and returns no author round; under
+`required` it blocks closure, and refresh-checks can run it again. A base drive that
+reports is not kept or cached, and its comparison says why there is none. A smoke
+that reports keeps no instance. Without the line, or without the declaration, or
+when the engine ended the command, a non-zero exit is an ordinary failure. Declare
+it only on a command that runs no candidate code: candidate code could otherwise
+block the check instead of failing it. An optional command or a finalizer declaring it is refused.
+
+A pin needs one more step with a baseline cache: its key reads staging as it is now,
+so after a stage deploy a run's pinned base drive would be stored under the newer
+content's key, and a hit could stand for other content than the pin. The
+`baselineCache.environment` command must print what `DEVPANEL_RUN_ID` pinned
+(creating the pin the same way when it is first to arrive) and exit non-zero when
+it cannot: two runs with the same pinned content then share an entry and no others do.
+
 ### The npm seed: a per-host cache, read-only to candidates
 
 `refresh-npm-seed` (`kind: privileged`, so the candidate is masked, not
@@ -335,7 +386,8 @@ from base plus patch on this host, fingerprinted, and the commands run in it, wi
 every command's log under `runs/<id>/checks/<n>/`. Timing defaults to every
 revision, beside the reviews, and a failed required check sends the author another
 round; `timing`, `retryFailed`, `compareBaseline`, `tiers` and `finallyCommands`
-mean what they mean for a test drive. `requirement` strengthens the playbook's,
+mean what they mean for a test drive, as do `DEVPANEL_RUN_ID` and `reportsUnavailable`
+("One application snapshot per run"). `requirement` strengthens the playbook's,
 never weakens it. Commands take no `kind` and none of the SSH confinement options:
 they run through the local check fence, labelled `local-enforced` (Linux, fence
 proved), `local-unconfined` (`DEVPANEL_FENCE=off`, or macOS under the install's

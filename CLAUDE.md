@@ -204,7 +204,8 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - `runtime/checks.mjs` — the check runner: rebuilds the candidate from base + patch into a temp worktree,
   requires its fingerprint to equal the revision, runs the target's commands (`local`, or `ssh` with an archive
   whose hash is verified on arrival) with per-command logs under `runs/<id>/checks/<n>/`. The engine calls it once
-  per revision after a `recordsRevision` step. A command marked `report: selftest` (an older spelling with a site
+  per revision after a `recordsRevision` step. Every command of every drive of a run gets `DEVPANEL_RUN_ID`, and a required command declaring
+  `reportsUnavailable` ends the drive `unavailable` with the reason of its `devpanel-unavailable: <reason>` line (docs/project-infrastructure.md "One application snapshot per run"). A command marked `report: selftest` (an older spelling with a site
   prefix, `<site>-selftest`, is read the same) has its selftest report read by `baseline-failures.mjs`: a failed test whose name the
   base's report lacks, or a report that cannot be compared while failures are listed, makes `gatingResult` `failed`
   (`baselineComparison.selftest`); inherited failures never block, and the byte rules for failed commands are unchanged.

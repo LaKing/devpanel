@@ -17,6 +17,7 @@ export function infrastructureErrors (infra) {
     for (const id of c.needs ?? []) if (!infra.testDrive.commands.slice(0, i).some(e => e.id === id)) errors.push(`${c.id}: needs must name an earlier command (${id})`)
   })
   for (const c of infra.testDrive.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
+  errors.push(...reportingErrors(infra.testDrive))
   errors.push(...tierErrors(infra.testDrive))
   for (const name of infra.testDrive.baselineCache?.stagingFiles ?? []) if (!infra.staging.files?.[name]) errors.push(`testDrive.baselineCache.stagingFiles: ${name} is not in infrastructure.staging.files`)
   const deployment = [...(infra.stagingDeployment?.commands ?? []), ...(infra.stagingDeployment?.diagnostics ?? [])]
@@ -27,6 +28,14 @@ export function infrastructureErrors (infra) {
   }
   for (const id of Object.keys(infra.release?.targets ?? {})) if (!environments.some(e => e.id === id)) errors.push(`release target ${id} is not a declared environment`)
   return errors
+}
+
+/** `reportsUnavailable` decides a drive's result, so it means nothing on a command that decides none. */
+function reportingErrors (target) {
+  return [
+    ...target.commands.filter((c) => c.reportsUnavailable && c.required === false).map((c) => `${c.id}: reportsUnavailable applies to a required command`),
+    ...(target.finallyCommands ?? []).filter((c) => c.reportsUnavailable).map((c) => `${c.id}: reportsUnavailable does not apply to finallyCommands`)
+  ]
 }
 
 /**
@@ -118,6 +127,7 @@ export function localChecksErrors (project) {
     for (const id of c.needs ?? []) if (!checks.commands.slice(0, i).some(e => e.id === id)) errors.push(`${c.id}: needs must name an earlier command (${id})`)
   })
   for (const c of checks.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
+  errors.push(...reportingErrors(checks))
   for (const c of all) {
     const options = ['kind', 'network', 'service', 'join', 'unprivilegedPorts', 'lifetimeSeconds', 'startedMarker', 'startedTimeoutSeconds'].filter(k => c[k] !== undefined)
     if (options.length) errors.push(`${c.id}: ${options.join(', ')} belong to an SSH test drive; local checks run through the local check fence`)

@@ -514,7 +514,12 @@ one revision and nothing else:
    ids; an empty list means independent; a `join` implies its service) and
    every need passed. Any other command is skipped and listed in
    `result.skipped` with the reason. A timeout terminates the command and fails
-   it. Cancellation is `unavailable`.
+   it. Cancellation is `unavailable`. So is a required command declaring
+   `reportsUnavailable` that exits non-zero with a line
+   `devpanel-unavailable: <reason>`: the reason is in `result.error`, unless
+   another required command failed, which leaves the result `failed`. Every
+   command of every drive of a run gets the run's id as `DEVPANEL_RUN_ID`
+   (project-infrastructure.md "One application snapshot per run").
 
 Absence of a target is still `unavailable` at closure, never a pass, and a
 result never rewrites the requirement. Scratch selftests an author or auditor
@@ -564,7 +569,8 @@ whose key is exactly: the base commit, the sha256 of the tier target's
 definition (the `targetKey` above), the content hash of every
 `baselineCache.files` path on the target, and the hash of the
 `baselineCache.environment` command's output there (run as the SSH account,
-never inside a candidate). No component is approximated; one that cannot be
+never inside a candidate, with `DEVPANEL_RUN_ID` set; only its output enters the
+key). No component is approximated; one that cannot be
 computed means no lookup and no store, recorded on `baselineChecks[].cache`. A
 hit is copied byte for byte into the run's `checks/base-<key>/`, checked against
 the entry's manifest (otherwise it is a miss), and recorded as

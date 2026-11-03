@@ -27,8 +27,9 @@ import { childEnvironment } from '../../../harness/shared.mjs'
  * Results follow the contract's vocabulary and never rewrite the requirement:
  *   passed       every required command exited 0
  *   failed       a required command did not
- *   unavailable  the candidate could not be materialised or reached, or the
- *                run was cancelled — nothing was proven either way
+ *   unavailable  the candidate could not be materialised or reached, a command
+ *                declaring reportsUnavailable said what it could not obtain,
+ *                or the run was cancelled — nothing was proven either way
  *   not-run      there is no target (recorded by the engine, not here)
  *
  * Transport for `ssh` is an archive of the verified reconstruction whose
@@ -64,7 +65,10 @@ export async function runChecks ({
   keep = null,
   // A full drive that continues a kept smoke: `{ instance, smoke, plan }`. A proof
   // that fails discards the instance and this drive runs from scratch, saying why.
-  continueFrom = null
+  continueFrom = null,
+  // The run this drive belongs to: every command of every drive of it gets it as
+  // DEVPANEL_RUN_ID. Not part of the target, so no target key or cache identity moves.
+  runId = null
 }) {
   const startedAt = clock.now()
   const dir = path.join(runDir, 'checks', dirName ?? String(await nextIndex(path.join(runDir, 'checks'))).padStart(3, '0'))
@@ -111,9 +115,9 @@ export async function runChecks ({
 
     // 2. Commands, in the isolated candidate, or on the target host.
     if (target.kind === 'local') {
-      await runCommandsLocally({ target, cwd: rebuilt, dir, result, clock, signal, platform })
+      await runCommandsLocally({ target, cwd: rebuilt, dir, result, clock, signal, platform, runId })
     } else {
-      await runCommandsOverSsh({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom })
+      await runCommandsOverSsh({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId })
     }
 
     // 3. The candidate must still BE the revision. A command that edits a
@@ -230,6 +234,29 @@ function judge (result) {
   result.result = required.every((c) => c.passed) && !(result.skipped ?? []).some((s) => s.required) ? 'passed' : 'failed'
 }
 
+/*
+ * A command declaring `reportsUnavailable` may say that the drive cannot be made
+ * (a pinned snapshot it cannot obtain): it exits non-zero with a line
+ * `devpanel-unavailable: <reason>`. Nothing is then proven about the candidate.
+ * The line means nothing from any other command, on a pass, or when the engine
+ * ended the command: output alone never turns a failure into this.
+ */
+const UNAVAILABLE_LINE = 'devpanel-unavailable: '
+function reportedReason (out) {
+  const said = [out.stderr, out.stdout].flatMap((text) => text.split(NL)).map((l) => l.trimEnd()).filter((l) => l.startsWith(UNAVAILABLE_LINE)).at(-1)
+  return said?.slice(UNAVAILABLE_LINE.length).trim().slice(0, 1000) || null
+}
+
+/** The drive's result when a command reported: unavailable with the reason, unless another required command failed. */
+function settleReported (result, target) {
+  const reported = result.commands.find((c) => c.unavailable)
+  if (!reported) return
+  const finalizers = new Set((target.finallyCommands ?? []).map((c) => c.id))
+  if (result.commands.some((c) => !finalizers.has(c.id) && c.required !== false && !c.passed && !c.unavailable)) return
+  result.result = 'unavailable'
+  result.error = `${reported.id} reported the drive cannot be made: ${reported.unavailable}${result.error ? `; ${result.error}` : ''}`
+}
+
 /**
  * The local check fence (0e): the candidate's commands run inside the seat
  * fence (harness/fence.mjs) — the rebuilt candidate writable, the declared
@@ -261,7 +288,7 @@ async function localFence ({ target, cwd, signal, platform }) {
   return { level: 'local-refused', reason: fence.reason, wrap: null, refused: true }
 }
 
-async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, platform }) {
+async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, platform, runId = null }) {
   const { wrap, refused = false, ...confinement } = await localFence({ target, cwd, signal, platform })
   result.confinement = confinement
   if (refused) {
@@ -270,7 +297,7 @@ async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, pl
     return
   }
   // Inside the fence /tmp is private; a TMPDIR naming a host path would not exist.
-  const env = { ...childEnvironment('none'), HOME: os.homedir(), ...(wrap ? { TMPDIR: '/tmp' } : {}) }
+  const env = { ...childEnvironment('none'), HOME: os.homedir(), ...(wrap ? { TMPDIR: '/tmp' } : {}), ...(runId ? { DEVPANEL_RUN_ID: runId } : {}) }
   const spawn = c => ({ ...(wrap ? wrap('/bin/sh', ['-c', c.run]) : { command: '/bin/sh', args: ['-c', c.run] }), env })
   try {
     await runCommandSet({ commands: target.commands, result, signal, run: (command) => runOne({ command, cwd, dir, clock, signal, spawn }) })
@@ -278,6 +305,7 @@ async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, pl
     for (const command of target.finallyCommands ?? []) result.commands.push(await runOne({ command, cwd, dir, clock, spawn }))
   }
   judge(result)
+  settleReported(result, target)
   if (signal?.aborted) { result.error = 'cancelled'; result.result = 'unavailable' }
 }
 
@@ -305,7 +333,7 @@ export async function discardInstance ({ target, instance, signal = AbortSignal.
   } catch (error) { return { passed: false, error: error.message } }
 }
 
-async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null }) {
+async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null, runId = null }) {
   const { command: SSH, args: sshArgs } = await sshConnection(target.ssh)
   // A directory that is ours alone: named for the revision AND a fresh random
   // suffix, created without -p so an existing one is an error, never reused.
@@ -432,7 +460,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
   const finalizerIds=new Set((target.finallyCommands??[]).map(c=>c.id))
   const all = [...(target.commands ?? []), ...(target.finallyCommands ?? [])]
   const units = Object.fromEntries(all.filter(c => c.kind === 'candidate').map(c => [c.id, unitName(remoteDir, c.id)]))
-  const options = { control, units, confinement, keepSeconds: keep?.seconds ?? 0 }
+  const options = { control, units, confinement, keepSeconds: keep?.seconds ?? 0, runId }
   const remoteSpawn = c => ({command:SSH,remoteTimeout:true,args:[...sshArgs,managedRemoteCommand(remoteDir,c,finalizerIds.has(c.id),options)]})
   const stop = async({ services = true } = {})=>{
     try {
@@ -537,7 +565,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
   // the candidate. A collector that then finds nothing to collect (a tester
   // that never booted) is a consequence, and must not turn that failure into
   // `unavailable`: only `failed` gives the author another round.
-  const failedCommands = result.commands.filter(c => !isFinalizer(c) && c.required !== false && !c.passed).map(c => c.id)
+  const failedCommands = result.commands.filter(c => !isFinalizer(c) && c.required !== false && !c.passed && !c.unavailable).map(c => c.id)
   if (failedFinalizers.length || !materialized.remoteTermination?.confirmed) {
     // Name what failed: a required finalizer (often a result collector) is not a cleanup fault.
     const causes = [
@@ -550,6 +578,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
     await cleanup()
     judge(result)
   }
+  settleReported(result, target)
   if (signal?.aborted) { result.error = 'cancelled'; result.result = 'unavailable' }
 
 }
@@ -619,6 +648,10 @@ async function runOne ({ command, cwd, dir, clock, signal, spawn }) {
     record.signal = out.signal
     record.timedOut = (out.cancelled && timeout.aborted && !(signal?.aborted)) || (remoteTimeout === true && out.code === 124)
     record.passed = out.code === 0 && !out.cancelled
+    if (command.reportsUnavailable === true && command.required !== false && !record.passed && !record.timedOut && !out.cancelled && out.code !== null) {
+      const reason = reportedReason(out)
+      if (reason) record.unavailable = reason
+    }
     // Check commands are not reaped: the record says no scan was made, which
     // is not the same as a scan that found nothing.
     record.descendants = out.leftovers?.scan ?? null

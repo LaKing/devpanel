@@ -149,8 +149,8 @@ if ! "\${pid_test[@]}" 2>/dev/null; then
   fi
 fi`
 
-function execution (remoteDir, command, { units = {}, confinement = {} } = {}) {
-  const env = [`--setenv=DEVPANEL_CANDIDATE_DIR=${remoteDir}`, ...Object.entries(units).map(([id, unit]) => `--setenv=${unitVariable(id)}=${unit}`)]
+function execution (remoteDir, command, { units = {}, confinement = {}, runId = null } = {}) {
+  const env = [`--setenv=DEVPANEL_CANDIDATE_DIR=${remoteDir}`, ...(runId ? [`--setenv=DEVPANEL_RUN_ID=${runId}`] : []), ...Object.entries(units).map(([id, unit]) => `--setenv=${unitVariable(id)}=${unit}`)]
   if (command.kind === 'candidate') {
     requireAccount(confinement)
     const { user, home } = confinement

@@ -78,7 +78,7 @@ export const baselinesDir = (issuePath) => path.join(path.dirname(issuePath), '.
  * The exact key of a base drive, read now. `{ key, record }`, or `{ error }`
  * naming the component that could not be computed.
  */
-export async function baselineIdentity ({ target, targetKey, baseCommit, signal = null }) {
+export async function baselineIdentity ({ target, targetKey, baseCommit, signal = null, runId = null }) {
   const cache = target?.baselineCache
   if (!cache?.environment) return { error: 'no baselineCache.environment is configured' }
   const files = cache.files ?? []
@@ -108,7 +108,11 @@ export async function baselineIdentity ({ target, targetKey, baseCommit, signal 
       fileHashes.push([file, hashes.get(file)])
     }
   }
-  const environment = await exec(cache.environment)
+  // The environment command may read what this run pinned, so it is told the run;
+  // only its output enters the key, so runs that read the same share an entry.
+  const environment = !runId ? await exec(cache.environment) : remote
+    ? await runProcess({ command: connection.command, args: [...connection.args, `DEVPANEL_RUN_ID=${shellQuote(runId)} sh -c ${shellQuote(cache.environment)}`], signal })
+    : await runProcess({ command: '/bin/sh', args: ['-c', cache.environment], env: { ...process.env, DEVPANEL_RUN_ID: runId }, signal })
   if (environment.code !== 0) return { error: `the environment command failed (exit ${environment.code}): ${environment.stderr.trim().slice(0, 300)}` }
   const record = {
     version: 1,
@@ -201,7 +205,7 @@ export async function pruneBaselines ({ dir, clock, maxEntries = 12, maxAgeDays 
 export function baselineCacheFor ({ target, targetKey, baseCommit, issuePath, runDir, runId, clock, signal }) {
   if (!target?.baselineCache) return null
   const dir = baselinesDir(issuePath)
-  const read = () => baselineIdentity({ target, targetKey, baseCommit, signal }).catch((error) => ({ error: error.message }))
+  const read = () => baselineIdentity({ target, targetKey, baseCommit, signal, runId }).catch((error) => ({ error: error.message }))
   let before = null
   const cache = {
     status: null,
