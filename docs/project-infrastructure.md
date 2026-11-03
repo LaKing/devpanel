@@ -256,7 +256,8 @@ for the base.
 `DEVPANEL_RUN_ID` is the run's id. Every check command receives it: local and
 SSH, `kind: candidate`, `kind: privileged` or none, services and joining commands,
 finalizers, in every drive of the run (candidate and base, smoke and full, a
-retry, refresh-checks, a reconciled candidate's revalidation). It is the same for
+retry, refresh-checks, a reconciled candidate's revalidation, a diagnostic drive
+(execution-contract.md "Diagnostic drives")). It is the same for
 all of them and differs in another run. The `baselineCache.environment` command
 receives it too. It is not part of the target definition, so it changes neither
 the `targetKey` nor the baseline key.

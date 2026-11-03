@@ -60,7 +60,7 @@ const OUTPUT_FIELDS = {
   reportDisposition: ['disposition', 'reasoning', 'response', 'issues'],
   triageResult: ['fit', 'issuePresent', 'reasoning', 'acceptanceCriteria', 'concerns', 'suggestion', 'autonomy'],
   handoff: ['targetRole', 'prompt', 'rationale', 'mustAddress', 'assumptions'],
-  authorArtifact: ['summary', 'basedOnRevision', 'resolves', 'notes'],
+  authorArtifact: ['summary', 'basedOnRevision', 'resolves', 'notes', 'diagnosticDrive'],
   documentArtifact: ['summary', 'resolves', 'openQuestions', 'notes'],
   reviewResult: ['verdict', 'artifactRevision', 'findings', 'priorFindings'],
   closureConfirmation: ['satisfied', 'revision', 'criteria', 'reasoning', 'residualRisks']

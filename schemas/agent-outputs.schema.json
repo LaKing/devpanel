@@ -394,6 +394,34 @@
         "notes": {
           "type": "string"
         },
+        "diagnosticDrive": {
+          "type": "object",
+          "required": [
+            "reason",
+            "patch"
+          ],
+          "additionalProperties": false,
+          "description": "Only on the author turn that records a revision in a review loop: ask for one drive of the check target on this revision plus a patch kept outside the worktree. The variant is never the revision, never reviewed or delivered, and its result gates nothing.",
+          "properties": {
+            "reason": {
+              "type": "string",
+              "maxLength": 600,
+              "description": "What this drive is meant to find out."
+            },
+            "patch": {
+              "type": "string",
+              "maxLength": 300,
+              "description": "A unified diff, as a path relative to your scratch directory."
+            },
+            "tier": {
+              "enum": [
+                "smoke",
+                "full"
+              ],
+              "description": "Which tier of a tiered target to drive; full when omitted."
+            }
+          }
+        },
         "basedOnRevision": {
           "type": [
             "string",

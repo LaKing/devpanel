@@ -59,6 +59,7 @@ function checkIntervals (run) {
   return [
     ...results.flatMap((c) => [span(c), ...(c.attempts ?? []).map(span)]),
     ...(run.baselineChecks ?? []).map(span),
+    ...(run.diagnosticDrives ?? []).map(span),
     ...(run.checkHistory ?? []).flatMap((h) => (h.runs ?? []).map(span))
   ].filter(Boolean)
 }

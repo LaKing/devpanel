@@ -254,6 +254,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   probes decide `result.confinement.level` (`remote-enforced`, else `remote-unconfined` — labelled, never refused).
   The unit user and home are the project's `testDrive.confinement`, else the host settings'; there is no built-in
   account. See docs/project-infrastructure.md "Confined test drives".
+- `runtime/diagnostic-drive.mjs` — an author's `authorArtifact.diagnosticDrive` (`{reason, patch, tier?}`): the check target once on the revision
+  plus a patch in its scratch directory, applied only to the drive's temporary rebuild (`runChecks`' `variant`). Recorded in `run.diagnosticDrives` with no
+  `revision` key, so no approval, gate, closure, baseline or selftest history reads it; the author gets the result in a further turn of the step and round
+  (`step.diagnosticOf`), and every later seat's prompt says it was diagnostic. At most 3 per run, each at most once (`interrupted` after a crash). execution-contract.md "Diagnostic drives".
 - `runtime/working-tree.mjs` — what `git add -A` would make of the untracked tree, used by BOTH the launch
   condition and the `working-tree` snapshot so a reading cannot be more permissive than the build: a nested
   repository is `gitlink:<HEAD>`, an unreadable file or special file BLOCKS (`UNREADABLE_WORKTREE`), a

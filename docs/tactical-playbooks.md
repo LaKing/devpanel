@@ -52,6 +52,11 @@ model and effort can be overridden per run.
 
 ## Coordinator and consensus
 
+An author may ask for a diagnostic drive: the check target on its revision plus a
+patch kept outside the worktree, to gather evidence without adding diagnostic code to
+the candidate. It is never reviewed, delivered or counted as a check
+(execution-contract.md "Diagnostic drives").
+
 Every newly resolved playbook assigns its coordinator `coordinationOnly: true`.
 The engine runs that seat from its scratch directory in the adapters' tool-free
 mode: no source tools, shell, MCP, skills or inherited tool configuration. Workers

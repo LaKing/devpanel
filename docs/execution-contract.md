@@ -526,6 +526,55 @@ result never rewrites the requirement. Scratch selftests an author or auditor
 runs by hand are their evidence, not the run's: only the runner's results feed
 `checksSatisfied` and the verification level.
 
+### Diagnostic drives
+
+An author who needs evidence from the check target that only extra code can
+produce does not put that code in the candidate. It sets
+`authorArtifact.diagnosticDrive` (`{ reason, patch, tier? }`), naming a unified
+diff in its scratch directory, outside the worktree. The engine then drives the
+configured target once on the current revision plus that patch, and gives the
+author the result in another turn of the same step and round (`step.diagnosticOf`)
+before any audit. That turn numbers its own attempts and uses no review round; it
+is a step of the run's budget. `runtime/diagnostic-drive.mjs`.
+
+The variant is not a revision:
+
+- The revision is rebuilt and proved as for a check. Only then is the patch applied,
+  to that temporary directory alone, and the tree fingerprinted again for the
+  arrival and after-command comparisons. The worktree never holds it, so no
+  revision, fingerprint, patch or delivery can.
+- The record is in `run.diagnosticDrives[]` (`diagnostic: true`, `ofRevision`, `variant`
+  with its fingerprint, files and patch hash), with no `revision` key, never in
+  `checkResults`, `checkHistory` or `baselineChecks`. No approval, consensus round,
+  gate, closure condition or refresh-checks reads it. An audit echoing the variant's
+  fingerprint is a protocol failure like any other wrong revision.
+- The drive calls the runner directly: no retry, base drive, baseline cache, selftest
+  comparison or selftest history, and it neither keeps nor continues an instance. Its
+  logs and the frozen `variant.patch` are under `checks/diagnostic-NNN/`. Its time is
+  counted in `checksMs`.
+- Every later seat's prompt lists these drives as diagnostic and not a check of the
+  revision under audit (`diagnostic-drives`).
+
+The turn that asks starts no check, because its revision is not the author's answer
+yet. A drive waits for checks in flight and runs inline, so no other drive of the run
+overlaps it. It gets the run's `DEVPANEL_RUN_ID`, and so the run's pin.
+
+A run has at most 3 records, refused and interrupted ones included. A request on a
+turn that records no revision or outside a review loop, a path that is absolute or
+contains `..`, and a request past the limit are contract violations, repaired as usual.
+What only the drive can find is a refusal on the record, told to the author in the
+same next turn: `no-target`, `in-place` (nothing to rebuild from), `integrity`,
+`workspace-moved`, `no-smoke-tier`, `patch-unreadable` (missing, not a regular file,
+resolving outside scratch, empty, or over 16 MiB), `patch-does-not-apply` (with git's
+message; diagnostic code left in the candidate reads this way) and `no-op`. A `local`
+target runs the variant as it runs a check, inside the local check fence.
+
+A request is driven at most once. The record is persisted as `running` before any
+command, and one still `running` when `drive()` starts lost its owner: it becomes
+`interrupted` / `unavailable` and is not run again, though the author may ask anew
+within the limit. A finished record answers on replay. A run whose frozen contract
+lacks the field is not offered it.
+
 ### Inherited check failures (baseline-known)
 
 A failure the project already had before the change must not cost the change

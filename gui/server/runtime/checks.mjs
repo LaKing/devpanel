@@ -68,13 +68,19 @@ export async function runChecks ({
   continueFrom = null,
   // The run this drive belongs to: every command of every drive of it gets it as
   // DEVPANEL_RUN_ID. Not part of the target, so no target key or cache identity moves.
-  runId = null
+  runId = null,
+  // A diagnostic drive (diagnostic-drive.mjs): `{ patchFile }`, applied to the
+  // rebuild once it is proved to be the revision. The result then names no
+  // revision, only `ofRevision`: it is evidence about a variant, and nothing
+  // bound to a fingerprint can read it.
+  variant = null
 }) {
   const startedAt = clock.now()
   const dir = path.join(runDir, 'checks', dirName ?? String(await nextIndex(path.join(runDir, 'checks'))).padStart(3, '0'))
   await fs.mkdir(dir, { recursive: true })
   const result = {
-    revision,
+    revision: variant ? null : revision,
+    ...(variant ? { diagnostic: true, ofRevision: revision } : {}),
     result: 'unavailable',
     target: target?.kind ?? null,
     at: clock.iso(),
@@ -100,7 +106,7 @@ export async function runChecks ({
     if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
     else patch = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
     await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
-    const check = await fingerprint(rebuilt, { baseCommit, baseline, clock })
+    let check = await fingerprint(rebuilt, { baseCommit, baseline, clock })
     // The base is the commit itself, checked out unchanged; its fingerprint is
     // recorded rather than compared with a revision it does not have.
     if (base) Object.assign(result, { baseCommit, baseFingerprint: check.fingerprint })
@@ -109,6 +115,10 @@ export async function runChecks ({
       materialized.detail = `rebuilt candidate fingerprints to ${check.fingerprint.slice(0, 23)}…, not the revision under check`
       result.error = 'candidate could not be materialised to the revision'
       return finish()
+    }
+    if (variant) {
+      check = await applyVariant({ rebuilt, patchFile: variant.patchFile, revisionPrint: check.fingerprint, result, baseCommit, baseline, clock, signal })
+      if (!check) return finish()
     }
     // The bytes this drive tests, the same for a candidate and a base of one tree (selftest-history.mjs).
     result.treeIdentity = treeIdentity(check.entries)
@@ -152,6 +162,26 @@ export async function runChecks ({
     await discardReconstruction({ dir: rebuilt, workspacePath, gitDir })
   }
   return finish()
+}
+
+/**
+ * A diagnostic variant: the author's patch on the verified rebuild, and that
+ * tree's fingerprint, or null with `result.refused` saying why nothing runs. Only
+ * this temporary directory ever holds the patch. Git refuses a path that escapes
+ * the tree, enters `.git` or passes through a link, and a patch adding what the
+ * revision already holds, which is how diagnostic code left in the candidate reads.
+ */
+async function applyVariant ({ rebuilt, patchFile, revisionPrint, result, baseCommit, baseline, clock, signal }) {
+  const refuse = (code, detail) => { result.refused = { code, detail }; result.error = detail; return null }
+  const git = (...args) => runProcess({ command: 'git', args: ['-C', rebuilt, ...args], signal })
+  const applied = await git('apply', '--binary', '--whitespace=nowarn', patchFile)
+  if (applied.cancelled) throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
+  if (applied.code !== 0) return refuse('patch-does-not-apply', `the patch does not apply to the revision: ${applied.stderr.trim().slice(0, 1000)}`)
+  const after = await fingerprint(rebuilt, { baseCommit, baseline, clock })
+  if (after.fingerprint === revisionPrint) return refuse('no-op', 'the patch leaves the revision as it is, so a drive would only repeat the revision\'s own check')
+  const listed = await git('apply', '--numstat', patchFile)
+  result.variant = { fingerprint: after.fingerprint, files: listed.stdout.split(NL).filter(Boolean).map((l) => l.split('\t').slice(2).join('\t')).slice(0, 200) }
+  return after
 }
 
 /**
@@ -338,7 +368,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
   // A directory that is ours alone: named for the revision AND a fresh random
   // suffix, created without -p so an existing one is an error, never reused.
   // Only a proved kept instance is another drive's directory (claim, below).
-  let remoteDir = `${target.ssh.workdir.replace(/\/+$/, '')}/devpanel-check-${sha256(result.revision ?? `base:${result.baseCommit}`).slice(0, 12)}-${crypto.randomBytes(6).toString('hex')}`
+  let remoteDir = `${target.ssh.workdir.replace(/\/+$/, '')}/devpanel-check-${sha256(result.revision ?? result.ofRevision ?? `base:${result.baseCommit}`).slice(0, 12)}-${crypto.randomBytes(6).toString('hex')}`
   // The engine's launch bookkeeping lives beside the candidate, owned by the
   // SSH account alone: candidate code can neither forge nor erase it (R8-4).
   let control = controlDir(remoteDir)

@@ -1434,6 +1434,19 @@ watch(() => route.query.run, (runId) => {
                   </p>
                 </div>
 
+                <template v-if="run.diagnosticDrives?.length">
+                  <h3 class="block__sub">Diagnostic drives</h3>
+                  <p class="muted">Variants of a revision, driven for evidence: not checks, not reviewed, not delivered.</p>
+                  <div v-for="d in run.diagnosticDrives" :key="d.n" class="check">
+                    <p class="kv"><span>{{ d.result ?? d.status }}</span>of <code>{{ short(d.ofRevision) }}</code> · {{ d.target ?? 'no drive' }} · {{ d.reason }}</p>
+                    <p v-if="d.error" class="muted">{{ d.error }}</p>
+                    <p v-for="cmd in d.commands ?? []" :key="cmd.id" class="kv kv--indent">
+                      <v-icon :icon="cmd.passed ? '$checkCircle' : '$alertCircle'" size="14" :color="cmd.passed ? 'success' : 'warning'" />
+                      <code>{{ cmd.id }}</code> exit {{ cmd.exitCode ?? cmd.signal ?? '—' }} · <code>{{ d.dir }}/{{ cmd.log }}</code>
+                    </p>
+                  </div>
+                </template>
+
                 <h3 class="block__sub">Outstanding findings</h3>
                 <p v-if="!run.outstandingFindings.length" class="muted">None.</p>
                 <p v-for="f in run.outstandingFindings" :key="f.id" class="kv"><span>{{ f.severity }}</span>{{ f.description }}</p>

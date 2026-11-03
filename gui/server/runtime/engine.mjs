@@ -25,6 +25,7 @@ import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
+import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
@@ -51,7 +52,7 @@ const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, duration
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log, ...(x.fromSmoke ? { fromSmoke: x.fromSmoke } : {}) })),
   ...(c.continuedFrom ? { continuedFrom: c.continuedFrom } : {}), ...(c.continuation ? { continuation: c.continuation } : {}) })
 /** What a step keeps of which drive it was asked about, and which one its prompt quoted (plan()). */
-const recheckFields = ({ recheckDrive, reconcileNotice, checksSeen }) => ({ ...(recheckDrive ? { recheckDrive } : {}), ...(reconcileNotice ? { reconcileNotice } : {}), ...(checksSeen ? { checksSeen } : {}) })
+const recheckFields = ({ recheckDrive, reconcileNotice, checksSeen, diagnosticOf }) => ({ ...(diagnosticOf ? { diagnosticOf } : {}), ...(recheckDrive ? { recheckDrive } : {}), ...(reconcileNotice ? { reconcileNotice } : {}), ...(checksSeen ? { checksSeen } : {}) })
 const targetKeyOf = (target) => crypto.createHash('sha256').update(JSON.stringify(target)).digest('hex')
 
 export const FINALIZABLE_BLOCKS = ['delivery-unverifiable', 'delivery-failed', 'delivery-unavailable', 'candidate-changed-during-delivery', 'source-delivery-blocked', 'source-delivery-interrupted']
@@ -309,14 +310,19 @@ function stepSpec (snapshot, stepId) {
  * counts against the other. `recheckDrive` is the check directory of a drive
  * that ignored an unstable failure and the seat had not read: each such drive is
  * a re-review of its own, so an earlier one never answers for a later drive.
+ * `diagnosticOf` is the author's turn after its diagnostic drive `n`: the same
+ * step and round, with its own attempts, so it spends no repair and no round.
  */
-const attemptsOf = (steps, phaseId, stepId, round, recheck = null, drive = null) =>
-  steps.filter((s) => s.phase === phaseId && s.stepId === stepId && s.round === round && (s.recheck ?? null) === recheck && (s.recheckDrive ?? null) === drive)
+const attemptsOf = (steps, phaseId, stepId, round, recheck = null, drive = null, diagnosticOf = null) =>
+  steps.filter((s) => s.phase === phaseId && s.stepId === stepId && s.round === round && (s.recheck ?? null) === recheck && (s.recheckDrive ?? null) === drive && (s.diagnosticOf ?? null) === diagnosticOf)
     .sort((a, b) => a.attempt - b.attempt)
 
 /** `repair` is false for a fresh turn, or { error, classification } naming what to restate. */
-const turnOf = (phase, step, round, attempt, repair = false, recheck = null, recheckDrive = null) =>
-  ({ kind: 'turn', phase, step, round, attempt, repair, ...(recheck ? { recheck } : {}), ...(recheckDrive ? { recheckDrive } : {}) })
+const turnOf = (phase, step, round, attempt, repair = false, recheck = null, recheckDrive = null, diagnosticOf = null) =>
+  ({ kind: 'turn', phase, step, round, attempt, repair, ...(recheck ? { recheck } : {}), ...(recheckDrive ? { recheckDrive } : {}), ...(diagnosticOf ? { diagnosticOf } : {}) })
+
+/** One turn's identity in `run.failures`. A turn after a diagnostic drive has its own retries. */
+const cursorKeyOf = (stepId, round, attempt, diagnosticOf = null) => `${stepId}#${round}#${attempt}${diagnosticOf ? `#d${diagnosticOf}` : ''}`
 
 const turnKey = (phase, step, round, recheck = null, drive = null) => `${phase.id}/${step.id}/${round}${recheck ? '/recheck' : ''}${drive ? `/${drive}` : ''}`
 
@@ -429,7 +435,7 @@ function reopenedFindings (rounds, last) {
 /**
  * Where are we? A pure function of the snapshot and what has been recorded.
  */
-export function plan (snapshot, steps, outputs, { skip = null, checkResults = [], notice = null } = {}) {
+export function plan (snapshot, steps, outputs, { skip = null, checkResults = [], notice = null, diagnostics = [] } = {}) {
   const policy = snapshot.reviewPolicy
   const maxRepair = policy.protocolRepair.maxAttempts
   const prior = priorFindings(steps, outputs, policy)
@@ -439,9 +445,9 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
   // asked it. An older answer to the same key belongs to an earlier asking.
   const answerAfter = (key, stepNumber) => decisions.find((d) => d.key === key && d.step > stepNumber) ?? null
 
-  const inspect = (phase, step, round, recheck = null, drive = null) => {
-    const turn = (phase, step, round, attempt, repair = false) => turnOf(phase, step, round, attempt, repair, recheck, drive)
-    const attempts = attemptsOf(steps, phase.id, step.id, round, recheck, drive)
+  const inspect = (phase, step, round, recheck = null, drive = null, diagnosticOf = null) => {
+    const turn = (phase, step, round, attempt, repair = false) => turnOf(phase, step, round, attempt, repair, recheck, drive, diagnosticOf)
+    const attempts = attemptsOf(steps, phase.id, step.id, round, recheck, drive, diagnosticOf)
     if (!attempts.length) return { need: turn(phase, step, round, 1) }
     const last = attempts[attempts.length - 1]
     const out = outputs[last.number]
@@ -458,6 +464,14 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       const startedFrom = revisionBefore(steps, last)
       if (startedFrom && out.output.basedOnRevision !== startedFrom) {
         const problem = `basedOnRevision ${out.output.basedOnRevision.slice(0, 23)}… is not the revision this turn started from (${startedFrom.slice(0, 23)}…); echo the revision you were given, or null when none was`
+        if (last.attempt <= maxRepair) return { need: turn(phase, step, round, last.attempt + 1, { error: problem, classification: 'contract-violation' }) }
+        return { need: terminal('protocol-blocked') }
+      }
+    }
+    // A diagnostic drive nobody has answered yet; a recorded one stays accepted on replay.
+    if (out.contract === 'authorArtifact' && out.output.diagnosticDrive && !diagnostics.some((d) => d.requestStep === last.number)) {
+      const problem = diagnosticRequestProblem(out.output.diagnosticDrive, { recordsRevision: step.recordsRevision === true, inLoop: Boolean(phase.loop), used: diagnostics.length })
+      if (problem) {
         if (last.attempt <= maxRepair) return { need: turn(phase, step, round, last.attempt + 1, { error: problem, classification: 'contract-violation' }) }
         return { need: terminal('protocol-blocked') }
       }
@@ -587,7 +601,14 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
         // find the next one. Only used to assemble a concurrent review batch; a
         // plan made with `skip` is never acted on beyond that.
         if (skip?.has(turnKey(phase, step, round))) continue
-        const r = inspect(phase, step, round)
+        let r = inspect(phase, step, round)
+        // The author asked for a diagnostic drive: the drive runs, then the author
+        // has another turn of this step with its result, before any review.
+        while (r.done && r.contract === 'authorArtifact' && r.output.diagnosticDrive) {
+          const record = diagnostics.find((d) => d.requestStep === r.done.number)
+          if (!record) return { kind: 'diagnostic', phase, round, step, requestStep: r.done.number, request: r.output.diagnosticDrive }
+          r = inspect(phase, step, round, null, null, record.n)
+        }
         if (r.need) return r.need
         lastNumber = Math.max(lastNumber, r.done.number)
         if (r.contract === 'reviewResult') count(t, step, r)
@@ -1952,6 +1973,61 @@ export class Engine {
     return attempts.length ? { ...latest, attempts } : latest
   }
 
+  /**
+   * One diagnostic drive (diagnostic-drive.mjs): the target on the current
+   * revision plus the author's patch, once, recorded apart from every check.
+   * It calls the runner directly, past `checkCandidate`: no retry, no base drive,
+   * no baseline cache, no selftest comparison or history. A refusal is a record
+   * too, so the author's next turn is told and the request is not asked again.
+   */
+  async runDiagnosticDrive ({ phase, round, step, requestStep, request }) {
+    const drives = (this.run.diagnosticDrives ??= [])
+    const n = drives.length + 1
+    const dirName = `diagnostic-${String(n).padStart(3, '0')}`
+    const runDir = store.runDir(this.issuePath, this.runId)
+    const ws = this.run.workspace
+    const current = this.run.revisions.at(-1)?.fingerprint ?? null
+    const configured = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
+    const tier = request.tier ?? 'full'
+    const record = { n, diagnostic: true, requestStep, requestedBy: step.role, phase: phase.id, round, stepId: step.id, ofRevision: current, reason: request.reason, patch: request.patch,
+      ...(configured?.tiers || request.tier ? { tier } : {}), status: 'running', result: null, at: this.clock.iso(), durationMs: null, dir: `checks/${dirName}` }
+    const refuse = async (code, detail) => {
+      Object.assign(record, { status: 'refused', refused: { code, detail }, error: detail, durationMs: 0 })
+      drives.push(record)
+      await this.persist({ type: 'diagnostic-drive', n, status: 'refused', code })
+    }
+    // Rebuilding needs a base and a patch, as for a check (maybeRunChecks).
+    if (ws?.isolation === 'in-place') return refuse('in-place', 'an in-place run has no base and patch to rebuild a variant from; run the issue isolated to use a diagnostic drive')
+    if (['quarantined', 'abandoned'].includes(this.run.integrity?.status)) return refuse('integrity', `the run's source integrity is ${this.run.integrity.status}`)
+    if (!configured) return refuse('no-target', 'this project has no check target to drive')
+    if (tier === 'smoke' && !configured.tiers) return refuse('no-smoke-tier', 'this check target has no smoke tier')
+    const baseline = this.baseline ?? new Map()
+    const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline, clock: this.clock, projection: workspaceProjection(ws) })
+    if (!current || fp.fingerprint !== current) return refuse('workspace-moved', 'the worktree is no longer the revision this request was made on')
+    const patchFile = path.join(runDir, record.dir, 'variant.patch')
+    const scratchDir = this.snapshot.tactic ? path.join(ws.scratchPath, step.role) : ws.scratchPath
+    let frozen
+    try { frozen = await freezePatch({ scratchDir, patch: request.patch, dest: patchFile }) } catch (error) {
+      if (!(error instanceof DiagnosticRefusal)) throw error
+      return refuse(error.code, error.message)
+    }
+    record.variant = frozen
+    drives.push(record)
+    await this.persist({ type: 'diagnostic-drive-started', n, ofRevision: current, ...(record.tier ? { tier } : {}) })
+    await this.hook('beforeDiagnosticDrive')
+    const target = tierTarget(configured, configured.tiers ? tier : null)
+    let result
+    try {
+      result = await runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, dirName, variant: { patchFile } })
+    } catch (error) {
+      result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
+    }
+    const { revision: _none, variant, ...rest } = result
+    Object.assign(record, rest, { status: result.refused ? 'refused' : 'finished', result: result.refused ? null : result.result, variant: { ...frozen, ...variant } })
+    await this.persist({ type: 'diagnostic-drive', n, status: record.status, result: record.result, commands: record.commands?.length ?? 0 })
+    await this.hook('afterDiagnosticDrive')
+  }
+
   /** Fingerprint the workspace and bind it to the step that produced it. */
   async recordRevision (number) {
     const existing = this.run.steps.find((s) => s.number === number)?.revision
@@ -1977,7 +2053,7 @@ export class Engine {
   async runTurn (next) {
     await this.assertJournal()
     if (this.refusalReason()) return { blocked: true }
-    const { phase, step, round, attempt, repair, recheck = null, recheckDrive = null } = next
+    const { phase, step, round, attempt, repair, recheck = null, recheckDrive = null, diagnosticOf = null } = next
     const role = step.role
     const p = this.run.participants[role]
     const adapter = this.harnesses[p.harness]
@@ -2206,6 +2282,14 @@ export class Engine {
       append('tooling', `Source workspace: ${this.run.workspace.path}. ${tooling.writesCode ? 'You may edit and stage source; do not change Git HEAD or create commits.' : 'Source and Git state are read-only for your role. Write temporary files and output only in the scratch directory.'}${tooling.allowedRoots.length ? ` You may also read ${tooling.allowedRoots.join(', ')}.` : ''} ${tooling.allowLiveCheckout ? 'You may read the project\'s live checkout.' : `Do not read or run anything from the project's live checkout${tooling.liveCheckout ? ` at ${tooling.liveCheckout}` : ''}: tooling loaded from there is code outside the candidate.`}`)
       if (this.run.checkResults.length) append('check-logs', `The run's check logs are readable (read-only): ${path.join(store.runDir(this.issuePath, this.runId), 'checks')}, one directory per check (a check record's \`dir\`), each command's full .log and .stdout, the base drive under base-*. When a criterion needs a test name, a timing or a log line the summary does not hold, read it there and quote it; do not report it as unreadable or ask for it.`)
     }
+    // Diagnostic drives: how to ask, the answer to an asking, and what every later seat must not mistake for a check.
+    const diagnosticDrives = this.run.diagnosticDrives ?? []
+    const diagnosticTarget = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
+    if (offersDiagnosticDrive(this.snapshot, phase, step) && diagnosticTarget && this.run.workspace?.isolation !== 'in-place' && diagnosticDrives.length < MAX_DIAGNOSTIC_DRIVES) {
+      append('diagnostic-offer', diagnosticOffer({ target: diagnosticTarget, left: MAX_DIAGNOSTIC_DRIVES - diagnosticDrives.length }))
+    }
+    if (diagnosticOf) append('diagnostic-result', diagnosticResult(diagnosticDrives.find((d) => d.n === diagnosticOf), store.runDir(this.issuePath, this.runId)))
+    if (diagnosticDrives.length) append('diagnostic-drives', diagnosticDrivesBlock(diagnosticDrives, store.runDir(this.issuePath, this.runId)))
     if (recheck && recheckDrive) {
       // A drive this seat has not read ignored an unstable failure: it is told, and judges as ever.
       const notice = this.noticeCheck?.check.dir === recheckDrive ? this.noticeCheck : null
@@ -2229,7 +2313,7 @@ export class Engine {
       append('protocol-repair', `Your previous response was not accepted as the required \`${step.output}\` contract: ${why}.${NL}Restate it in the required shape. Do not change your conclusions.`)
     }
     // Derived from the record, so a resumed run's turn is told as well.
-    const ranOut = (this.run.failures ?? []).filter((f) => f.cursorKey === `${step.id}#${round}#${attempt}` && f.class === 'output-limit').length
+    const ranOut = (this.run.failures ?? []).filter((f) => f.cursorKey === cursorKeyOf(step.id, round, attempt, diagnosticOf) && f.class === 'output-limit').length
     if (ranOut) append('output-limit-retry', `Your previous attempt at this turn ran out of output: it reached the model's output token limit before it finished, and its answer was lost (${ranOut} such ${ranOut === 1 ? 'attempt' : 'attempts'} so far). Answer sooner this time: reason less, write less, and give the required answer as soon as you can support it. Any edits that attempt made are still in the worktree; build on them instead of redoing them.`)
 
     // What the agent was ASKED is half the interaction. Persisted before the
@@ -2272,7 +2356,7 @@ export class Engine {
       // escaped descendants can still be found by it (cleanup-barrier.mjs).
       reapTag: crypto.randomUUID(),
       stepNumber: null,
-      cursor: { phase: phase.id, stepId: step.id, round, attempt, ...(recheck ? { recheck } : {}), ...recheckFields({ recheckDrive, reconcileNotice: recheckDrive && this.noticeCheck?.check.dir === recheckDrive ? this.noticeCheck.entry.n : null, checksSeen: step.output === 'reviewResult' && (step.context ?? []).includes('checks.latest') ? latestCheck?.dir : null }), contract: step.output ?? null, recordsRevision: Boolean(step.recordsRevision), startedFromRevision: currentRevision ?? null },
+      cursor: { phase: phase.id, stepId: step.id, round, attempt, ...(recheck ? { recheck } : {}), ...recheckFields({ diagnosticOf, recheckDrive, reconcileNotice: recheckDrive && this.noticeCheck?.check.dir === recheckDrive ? this.noticeCheck.entry.n : null, checksSeen: step.output === 'reviewResult' && (step.context ?? []).includes('checks.latest') ? latestCheck?.dir : null }), contract: step.output ?? null, recordsRevision: Boolean(step.recordsRevision), startedFromRevision: currentRevision ?? null },
       // What the runtime has been seen doing. Liveness, not progress: a tool call
       // a second ago proves the process is alive, not that the answer is near.
       activity: { pid: null, events: 0, lastAt: null, lastKind: null, lastDetail: null },
@@ -2450,7 +2534,7 @@ export class Engine {
       // Only when that retry will really run (the same conditions as
       // handleRuntimeFailure's willRetry): accepted edits that are never
       // retried would leave unreviewed work vouched for.
-      const cursorKey = `${step.id}#${round}#${attempt}`
+      const cursorKey = cursorKeyOf(step.id, round, attempt, diagnosticOf)
       const retryPolicy = { maxAttempts: 3, ...(this.snapshot.retryPolicy ?? {}) }
       const priorRetries = (this.run.failures ?? []).filter((f) => f.cursorKey === cursorKey && f.retried).length
       const failure = error.name !== 'AbortError' ? classifyFailure(error, { now: this.clock.now() }) : null
@@ -2928,7 +3012,7 @@ export class Engine {
     const spec = this.participantSpec(role)
     const classified = classifyFailure(error, { now: this.clock.now() })
     const record = {
-      at: this.clock.iso(), role, stepId: step.id, round, attempt, invocationId: pending.invocationId, cursorKey: `${step.id}#${round}#${attempt}`,
+      at: this.clock.iso(), role, stepId: step.id, round, attempt, invocationId: pending.invocationId, cursorKey: cursorKeyOf(step.id, round, attempt, pending.cursor?.diagnosticOf),
       class: classified.class, retryable: classified.retryable, message: classified.message, evidence: classified.evidence,
       ...(classified.credentials ? { credentials: classified.credentials } : {}),
       model: spec?.model?.id ?? null, retried: false, retryInMs: null, availability: null, quarantined: true,
@@ -2966,7 +3050,7 @@ export class Engine {
     const spec = this.participantSpec(role)
     const policy = { maxAttempts: 3, baseDelaySeconds: 30, maxDelaySeconds: 600, ...(this.snapshot.retryPolicy ?? {}) }
     let classified = classifyFailure(error, { now: this.clock.now() })
-    const cursorKey = `${step.id}#${round}#${attempt}`
+    const cursorKey = cursorKeyOf(step.id, round, attempt, pending.cursor?.diagnosticOf)
     // What no rule recognised gets a second opinion from the decision provider,
     // which may only call it temporary (decisions/failure-advisor.mjs). The
     // record is written before it is acted on; a skip or an error changes nothing.
@@ -3109,6 +3193,11 @@ export class Engine {
       .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false } : c)
   }
 
+  /** What replay reads besides the steps. A plan without the drives would ask for every answered one again. */
+  planEvidence () {
+    return { checkResults: this.checkEvidence(), diagnostics: this.run.diagnosticDrives ?? [] }
+  }
+
   /** Checks beside reviews unless the strategy keeps them first (`checks.concurrent: false`). */
   concurrentChecks () {
     return this.snapshot.checks?.concurrent !== false && this.snapshot.reviewPolicy?.concurrentReviews !== false
@@ -3157,7 +3246,7 @@ export class Engine {
     const room = limit ? Math.max(1, limit - agentSteps(this.run.steps).length) : Infinity
     const skip = new Set([turnKey(next.phase, next.step, next.round, next.recheck, next.recheckDrive)])
     while (batch.length < room) {
-      const more = plan(this.snapshot, this.activeSteps(), this.outputs, { skip, checkResults: this.checkEvidence() })
+      const more = plan(this.snapshot, this.activeSteps(), this.outputs, { skip, ...this.planEvidence() })
       if (!concurrentReview(more) || more.phase.id !== next.phase.id || more.round !== next.round || more.recheck !== next.recheck || more.recheckDrive !== next.recheckDrive || batch.some((b) => b.step.role === more.step.role)) break
       batch.push(more)
       skip.add(turnKey(more.phase, more.step, more.round, more.recheck, more.recheckDrive))
@@ -3277,6 +3366,10 @@ export class Engine {
       return this.run
     }
 
+    // A drive still `running` here lost its owner: it proves nothing and is not run again.
+    for (const d of this.run.diagnosticDrives ?? []) {
+      if (d.status === 'running') Object.assign(d, { status: 'interrupted', result: 'unavailable', error: 'the panel stopped during this drive; its result was lost, and a remote directory or service may remain until its lifetime limit' })
+    }
     this.run.status = 'running'
     await this.persist({ type: 'running' })
     if (this.run.checkRefresh?.pending) {
@@ -3320,7 +3413,7 @@ export class Engine {
       if (this.snapshot.completion.requires.includes('reportDispositionRecorded')) {
         if (!await this.applyOperatorRequests()) break
         if (!await this.applyCoordinatorEffects()) break
-        const completed = plan(this.snapshot, this.activeSteps(), this.outputs, { checkResults: this.checkEvidence() })
+        const completed = plan(this.snapshot, this.activeSteps(), this.outputs, this.planEvidence())
         if (completed.kind === 'terminal') {
           await this.finish(completed)
           break
@@ -3341,7 +3434,7 @@ export class Engine {
       // the ask would be lost without ever being made.
       if (!await this.applyOperatorRequests()) break
       if (this.snapshot.tactic && !await this.applyCoordinatorEffects()) break
-      const next = plan(this.snapshot, this.activeSteps(), this.outputs, { checkResults: this.checkEvidence() })
+      const next = plan(this.snapshot, this.activeSteps(), this.outputs, this.planEvidence())
 
       // An acceptance buys one confirmation of this revision. A replay that wants any
       // other turn (a re-review awaiting the drive, say) refuses it: no author round, no
@@ -3370,6 +3463,10 @@ export class Engine {
       if (next.kind === 'pause') {
         await this.pauseFor(next)
         break
+      }
+      if (next.kind === 'diagnostic') {
+        await this.runDiagnosticDrive(next)
+        continue
       }
       if (next.kind === 'checks') {
         await this.maybeRunChecks()
@@ -3423,7 +3520,9 @@ export class Engine {
       await this.persist()
       // Checks run right after a candidate exists, so the next turn's
       // `checks.latest` names a result for the revision it is reviewing.
-      if (next.step.recordsRevision && early) {
+      // Not while the author is asking for a diagnostic drive: this revision is not its answer yet.
+      const asking = this.outputs[this.run.steps.at(-1)?.number]?.output?.diagnosticDrive
+      if (next.step.recordsRevision && early && !asking) {
         if (this.concurrentChecks()) this.startChecks(early.tier)
         else await this.maybeRunChecks({ tier: early.tier })
       }
@@ -3795,7 +3894,7 @@ export class Engine {
     try {
       for (;;) {
         if (this.cleanupHold()) return stand('notice-unfinished', 'a turn\'s escaped processes are not proved gone, so no auditor could read this drive')
-        const next = plan(this.snapshot, this.activeSteps(), this.outputs, { checkResults: this.checkEvidence(), notice: { phase: reviewed.phase, round: reviewed.round, revision: entry.revision, drive: check.dir } })
+        const next = plan(this.snapshot, this.activeSteps(), this.outputs, { ...this.planEvidence(), notice: { phase: reviewed.phase, round: reviewed.round, revision: entry.revision, drive: check.dir } })
         if (next.kind === 'notice-complete') {
           const findings = next.reviews.filter((r) => r.output.verdict !== 'approved').flatMap((r) => r.output.findings ?? [])
           const refused = next.reviews.some((r) => r.output.verdict !== 'approved')
