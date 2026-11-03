@@ -109,7 +109,8 @@ export async function getValidator (root = CONFIG_ROOT) {
   for (const name of SCHEMA_NAMES) {
     sources.push(await fs.readFile(path.join(root, 'schemas', `${name}.schema.json`), 'utf8'))
   }
-  const key = `${root}\u0000${sha256(sources.join('\u0000'))}`
+  // The schemas' bytes decide, not where they were read: a compile costs far more than this read.
+  const key = sha256(sources.join('\u0000'))
 
   if (!validators.has(key)) {
     const ajv = new Ajv2020({ allErrors: true, strict: false })
@@ -127,8 +128,7 @@ async function readYaml (file) {
   return { data: YAML.parse(text), hash: sha256(text) }
 }
 
-async function validate (root, name, data, file, errors, field = '') {
-  const ajv = await getValidator(root)
+function validate (ajv, name, data, file, errors, field = '') {
   const check = ajv.getSchema(schemaId(name))
   if (check(data)) return true
   for (const e of check.errors) {
@@ -161,6 +161,9 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
   const playbooks = new Map()
   const sources = {}
   const shadowed = []
+  // One read of the schemas per load, when the first file needs them.
+  let validating = null
+  const validator = () => (validating ??= getValidator(root))
   const hostFiles = async (id) => {
     const files = await discover(id, { root, hostDir })
     sources[id] = { tree: files.filter((f) => f.source === 'tree').length, host: files.filter((f) => f.source === 'host').length }
@@ -172,7 +175,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
   const disabledModels = new Map()
   for (const { name, file } of await hostFiles('roster')) {
     const { data, hash } = await readYaml(file)
-    if (!await validate(root, 'roster-model', data, file, errors)) continue
+    if (!validate(await validator(),'roster-model', data, file, errors)) continue
     if (disabled.has(data.harness)) { disabledModels.set(data.id, data.harness); continue }
     if (data.defaultEffort != null && !(data.efforts ?? []).includes(data.defaultEffort)) {
       err(errors, `defaultEffort "${data.defaultEffort}" is not in efforts`, file, '/defaultEffort')
@@ -187,7 +190,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     const file = path.join(root, 'strategy-templates', dir, 'strategy.yaml')
     let read
     try { read = await readYaml(file) } catch { err(errors, 'strategy.yaml missing', file, '/'); continue }
-    if (!await validate(root, 'strategy-template', read.data, file, errors)) continue
+    if (!validate(await validator(),'strategy-template', read.data, file, errors)) continue
     if (projectOnlyTooling(read.data, file, errors)) continue
     const strategy = { ...read.data, dir: path.dirname(file), file, hash: read.hash, intents: new Map() }
 
@@ -200,7 +203,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
       const ifile = path.join(strategy.dir, 'intents', name)
       let iread
       try { iread = await readYaml(ifile) } catch (e) { err(errors, `unreadable intent: ${e.message}`, ifile, '/'); continue }
-      if (!await validate(root, 'intent', iread.data, ifile, errors)) continue
+      if (!validate(await validator(),'intent', iread.data, ifile, errors)) continue
       if (iread.data.id !== name.replace(/\.yaml$/, '')) { err(errors, `intent id "${iread.data.id}" does not match its file name`, ifile, '/id'); continue }
       const unknown = Object.keys(iread.data.guidance).filter((id) => !stepIds.has(id))
       if (unknown.length) { err(errors, `intent guidance names steps the strategy does not have: ${unknown.join(', ')}`, ifile, '/guidance'); continue }
@@ -211,7 +214,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
 
   for (const { file } of await hostFiles('playbooks')) {
     const { data, hash } = await readYaml(file)
-    if (!await validate(root, 'playbook', data, file, errors)) continue
+    if (!validate(await validator(),'playbook', data, file, errors)) continue
     if (projectOnlyTooling(data, file, errors)) continue
     if (playbooks.has(data.id)) { err(errors, `duplicate playbook id "${data.id}"`, file, '/id'); continue }
     const tiers = tierErrors(data.checks?.target)
@@ -227,7 +230,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
   const projects = new Map()
   for (const { name, file } of await hostFiles('projects')) {
     const { data, hash } = await readYaml(file)
-    if (!await validate(root, 'project', data, file, errors)) continue
+    if (!validate(await validator(),'project', data, file, errors)) continue
     const problems = infrastructureErrors(data.infrastructure)
     if (new Set((data.evidence ?? []).map(e => e.name)).size !== (data.evidence ?? []).length) problems.push('evidence names must be unique')
     const mountProblems = targetErrors(data.workspace?.tooling?.mounts ?? [])

@@ -227,7 +227,7 @@ gui/
 ├── tools/
 │   └── install-browser.sh  fetches a headless Chromium into .browser/
 ├── test/
-│   ├── run.mjs           the runner: `npm test [filter]`
+│   ├── run.mjs           the runner: `npm test [filter]`; a `time:` line per section and suite, with a filter what waited and what held the CPU, and with `--sequential` every section its own figures (`time-report.mjs`)
 │   ├── fakes/            scripted harness, fixtures, fake CLIs
 │   └── browser/          the staged server, the jsdom page, the Chromium page
 └── src/

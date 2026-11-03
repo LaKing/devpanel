@@ -3,6 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { measuring } from './time-report.mjs'
+
 /**
  * The checkout THIS suite lives in, never a fixed path: a frozen copy of the
  * tree must test its own configuration and harnesses, not whatever the live
@@ -39,6 +41,65 @@ export async function sandbox (mutate) {
 
 export async function cleanupSandboxes () {
   await Promise.all(sandboxes.splice(0).map((d) => fs.rm(d, { recursive: true, force: true })))
+}
+
+/**
+ * Run sections side by side, for suites whose time is spent waiting on child
+ * processes: each `[name, async (t) => {}]` records its checks, judged at the moment
+ * it made them, and once all have ended they are told to `t` in the written order, so
+ * the output and the tally read as if they had run one after another. Nested, a name
+ * of null adds rows to the enclosing section. A section that threw has what it
+ * checked told first, and the first such error ends the suite as it would have.
+ *
+ * Their figures are taken while they run: the group's as one, since overlapping
+ * sections cannot be told apart, and a lone section's or a measuring run's
+ * (`--sequential`) section by section, the sections then running as written.
+ */
+export async function overlappingSections (t, sections) {
+  if (measuring.sequential || sections.length === 1) {
+    for (const [name, body] of sections) {
+      if (name !== null) t.section(name)
+      await body(t)
+    }
+    if (sections[0]?.[0] !== null) t.afterSections?.()
+    return
+  }
+  const grouped = sections[0]?.[0] !== null
+  if (grouped) t.overlapBegin?.()
+  const records = sections.map(() => ({ checks: [], wallMs: 0 }))
+  const ended = await Promise.allSettled(sections.map(async ([, body], i) => {
+    const { checks } = records[i]
+    const at = performance.now()
+    try {
+      await body({
+        ok: (label, condition, detail = '') => checks.push(['ok', label, condition, detail]),
+        eq (label, actual, expected) {
+          const equal = Object.is(actual, expected) || JSON.stringify(actual) === JSON.stringify(expected)
+          checks.push(['ok', label, equal, equal ? '' : `got ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`])
+        },
+        skip: (label, reason = '') => checks.push(['skip', label, reason])
+      })
+    } finally { records[i].wallMs = performance.now() - at }
+  }))
+  if (grouped) t.overlapEnd?.(sections.length)
+  sections.forEach(([name], i) => {
+    if (name !== null) {
+      t.section?.(name)
+      console.log(`    \x1b[2mtime: ${(records[i].wallMs / 1000).toFixed(1)} s wall, overlapping — ${name}\x1b[0m`)
+    }
+    for (const [kind, ...args] of records[i].checks) t[kind](...args)
+  })
+  if (grouped) t.afterSections?.()
+  const failed = ended.find((e) => e.status === 'rejected')
+  if (failed) throw failed.reason
+}
+
+/** The same choice for drives inside one section: side by side, or in turn in a measuring run. */
+export async function sideBySide (tasks) {
+  if (!measuring.sequential) return Promise.all(tasks.map((task) => task()))
+  const results = []
+  for (const task of tasks) results.push(await task())
+  return results
 }
 
 /**

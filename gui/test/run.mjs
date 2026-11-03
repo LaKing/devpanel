@@ -13,6 +13,7 @@ import { cleanupFixtures } from './fakes/fixture.mjs'
 import { cleanupStages } from './browser/stage.mjs'
 import { cleanupBuild } from './browser/build.mjs'
 import { closeChromium } from './browser/chromium.mjs'
+import { installTimeReport } from './time-report.mjs'
 
 // The seat fence (fence.namespace: 1) mounts only a run's own paths; the
 // suite's fake CLIs live in gui/test/fakes and write to temp files it does not
@@ -40,7 +41,10 @@ process.env.DEVPANEL_PROJECTS_DIR = PROJECTS
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // runner.test.mjs points this at its fixture suites.
 const SUITES = path.resolve(process.env.DEVPANEL_TEST_SUITES ?? HERE)
-const filter = process.argv[2] ?? ''
+// `--sequential`: a measuring run, every section its own figures (time-report.mjs).
+const sequential = process.argv.includes('--sequential')
+const filter = process.argv.slice(2).find((a) => a !== '--sequential') ?? ''
+const report = installTimeReport({ detail: Boolean(filter), sequential })
 const c = { dim: '\x1b[2m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m', off: '\x1b[0m' }
 
 const files = (await fs.readdir(SUITES))
@@ -76,6 +80,7 @@ const cleanupAll = async () => {
   await cleanupFixtures().catch(() => {})
   await fs.rm(EMPTY_HOST_CONFIG, { recursive: true, force: true }).catch(() => {})
   await fs.rm(PROJECTS, { recursive: true, force: true }).catch(() => {})
+  report.cleanup()
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => { cleanupAll().finally(() => process.exit(130)) })
 
@@ -85,8 +90,14 @@ const skipped = []
 
 function context (file) {
   let section = ''
+  const clock = report.sectionClock(file)
   return {
-    section (name) { section = name; console.log(`  ${c.dim}${name}${c.off}`) },
+    section (name) { clock.section(name); section = name; console.log(`  ${c.dim}${name}${c.off}`) },
+    overlapBegin: clock.overlapBegin,
+    overlapEnd: clock.overlapEnd,
+    afterSections: clock.afterSections,
+    // The last section's time and the suite's own, however the suite ended.
+    finish: clock.finish,
     ok (label, condition, detail = '') {
       const line = `${label}${detail ? ` ${c.dim}— ${detail}${c.off}` : ''}`
       if (condition) { passed++; console.log(`    ${c.green}✓${c.off} ${line}`) }
@@ -135,12 +146,14 @@ process.on('unhandledRejection', uncaught)
 
 for (const file of files) {
   current = file
+  await report.startProfile().catch((error) => console.log(`    no profile: ${error.message}`))
+  const t = context(file)
   try {
     const mod = await import(path.join(SUITES, file))
     console.log(`\n${c.cyan}${mod.name ?? file}${c.off}`)
     await new Promise((resolve, reject) => {
       abandon = resolve
-      Promise.resolve().then(() => mod.default(context(file))).then(resolve, reject)
+      Promise.resolve().then(() => mod.default(t)).then(resolve, reject)
     })
     // A rejection the suite left unawaited is reported only after its
     // microtasks drain; it is still this suite's.
@@ -149,6 +162,7 @@ for (const file of files) {
     failures.push(`${file} › threw › ${error.message}`)
     console.log(`    ${c.red}✗ suite threw${c.off} ${error.message}`)
   } finally {
+    await t.finish()
     current = abandon = null
   }
 }

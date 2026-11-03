@@ -42,6 +42,9 @@ const run = promisify(execFile)
 const NL = String.fromCharCode(10)
 const fence = (obj) => ['```json', JSON.stringify(obj, null, 2), '```'].join(NL)
 
+let fixtureImports = Promise.resolve()
+let fixtureCount = 0
+
 const temps = []
 async function temp (prefix) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -213,8 +216,14 @@ export async function engineFixture ({ script = scriptFor(), sessionAssignment =
   })
 
   const issuesDir = await temp('devpanel-issues-')
-  process.env.DEVPANEL_ISSUES_DIR = issuesDir
-  const issues = await import(`../../server/issues.js?fixture=${Date.now()}`)
+  // issues.js fixes its directory when it loads, so a fresh module per fixture; fixtures
+  // made side by side (overlappingSections) take turns setting what that module reads.
+  const loading = fixtureImports.then(() => {
+    process.env.DEVPANEL_ISSUES_DIR = issuesDir
+    return import(`../../server/issues.js?fixture=${Date.now()}-${fixtureCount++}`)
+  })
+  fixtureImports = loading.catch(() => {})
+  const issues = await loading
   const issue = await issues.createIssue('devpanel-project', { name: 'Engine fixture' })
 
   const ledgerPath = path.join(await temp('devpanel-ledger-'), 'ledger.jsonl')

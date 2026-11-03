@@ -7,6 +7,7 @@ import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents, runDir } from '../server/runtime/store.mjs'
 import { classifyTest, historyDir, readDrives, recordDrive } from '../server/runtime/selftest-history.mjs'
+import { overlappingSections } from './helpers.mjs'
 
 export const name = 'check tiers — a smoke beside the reviews, the full drive once after approval, and only the full drive closes; a base drive reused across runs'
 
@@ -65,8 +66,9 @@ async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null,
 const started = (events, tier) => events.filter((e) => e.type === 'checks-started' && e.tier === tier).map((e) => e.revision)
 
 export default async function (t) {
-  t.section('a smoke failure returns to the author through the failed-check path; that revision gets no full drive')
-  {
+  const sections = []
+
+  sections.push(['a smoke failure returns to the author through the failed-check path; that revision gets no full drive', async (t) => {
     // Fails on the first revision only (round-0.txt without round-1.txt); the base has neither and passes.
     const { engine, events } = await scenario({ boot: 'test ! -f round-0.txt || test -f round-1.txt', deep: 'true' })
     const [first, second] = engine.run.revisions.map((r) => r.fingerprint)
@@ -76,10 +78,9 @@ export default async function (t) {
     t.eq('the smoke ran on both revisions', started(events, 'smoke'), [first, second])
     t.eq('the full drive ran once, on the approved second revision', started(events, 'full'), [second])
     await releaseWorkspace(engine)
-  }
+  }])
 
-  t.section('the smoke runs on every revision beside the reviews; the full drive once, after approval')
-  {
+  sections.push(['the smoke runs on every revision beside the reviews; the full drive once, after approval', async (t) => {
     const { engine, events, log } = await scenario({ boot: 'true', deep: 'true', reject: new Set([0]) })
     const [first, second] = engine.run.revisions.map((r) => r.fingerprint)
     t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
@@ -91,10 +92,9 @@ export default async function (t) {
     t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
     t.eq('a local target has no instance to continue, and says so', closing.find((c) => c.tier === 'full')?.continuation?.reason, 'local-target')
     await releaseWorkspace(engine)
-  }
+  }])
 
-  t.section('a passing smoke never stands in for the full drive at closure')
-  {
+  sections.push(['a passing smoke never stands in for the full drive at closure', async (t) => {
     // The full drive fails on every candidate (it has round-0.txt), never on the base: a new failure.
     const { engine, events } = await scenario({ boot: 'true', deep: 'test ! -f round-0.txt' })
     t.ok('every smoke passed', engine.run.checkHistory.filter((h) => h.tier === 'smoke').every((h) => h.result === 'passed'))
@@ -102,9 +102,9 @@ export default async function (t) {
     t.ok('the run did not complete', engine.run.status !== 'completed', `${engine.run.status} ${engine.run.blockedReason}`)
     t.ok('and nothing closed on the smoke', engine.run.closure?.conditions?.checksSatisfied !== true)
     await releaseWorkspace(engine).catch(() => {})
-  }
+  }])
 
-  t.section('a baseline the run holds is reused for a later revision only while its identity still matches')
+  sections.push(['a baseline the run holds is reused for a later revision only while its identity still matches', async (t) => {
   for (const change of [false, true]) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-tier-held-'))
     const counter = path.join(dir, 'base-runs')
@@ -140,8 +140,9 @@ export default async function (t) {
     await releaseWorkspace(engine)
     await fs.rm(dir, { recursive: true, force: true })
   }
+  }])
 
-  t.section('a base drive whose identity changed or could not be read during it is never reused')
+  sections.push(['a base drive whose identity changed or could not be read during it is never reused', async (t) => {
   for (const fault of ['changed', 'unreadable']) {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-tier-unstable-'))
     const counter = path.join(dir, 'base-runs')
@@ -178,9 +179,9 @@ export default async function (t) {
     await releaseWorkspace(engine)
     await fs.rm(dir, { recursive: true, force: true })
   }
+  }])
 
-  t.section('the base drive of each tier is reused by the next run on the same base commit, and the run says so')
-  {
+  sections.push(['the base drive of each tier is reused by the next run on the same base commit, and the run says so', async (t) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-tier-cache-'))
     const counter = path.join(dir, 'base-runs')
     const staged = path.join(dir, 'deployment-scope.json')
@@ -211,7 +212,7 @@ export default async function (t) {
     t.ok('and nothing is marked reused', three.engine.run.baselineChecks.every((b) => !b.reused))
     await releaseWorkspace(three.engine)
     await fs.rm(dir, { recursive: true, force: true })
-  }
+  }])
 
   /*
    * The whole engine on an SSH target, through the fake service manager without
@@ -227,14 +228,18 @@ export default async function (t) {
   const saved = { bin: process.env.DEVPANEL_SSH_BIN, host: process.env.CHECK_TEST_HOST }
   process.env.DEVPANEL_SSH_BIN = path.join(sshDir, 'ssh')
   process.env.CHECK_TEST_HOST = 'shim'
+  // Each target says in a file of its own what ran, so targets can be driven side by side.
   const executedFile = path.join(sshDir, 'executed')
-  const executed = async () => (await fs.readFile(executedFile, 'utf8').catch(() => '')).split('\n').filter(Boolean)
+  const executedFiles = new Map()
+  const executed = async (target) => (await fs.readFile(executedFiles.get(target), 'utf8').catch(() => '')).split('\n').filter(Boolean)
   const cmd = (id, run = 'true', extra = {}) => ({ id, kind: 'candidate', run: `echo ${id} >> ${executedFile}; ${run}`, ...extra })
   const service = { id: 'start', kind: 'candidate', service: true, run: `echo start >> ${executedFile}; exec sleep 120` }
   const sshTarget = async (commands, smoke, { retryFailed = 0, tiers = {}, ...rest } = {}) => {
-    await fs.rm(executedFile, { force: true })
     const workdir = await fs.realpath(await fs.mkdtemp(path.join(sshDir, 'remote-')))
-    return { kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, retryFailed, confinement: { user: os.userInfo().username, home: os.homedir() }, tiers: { smoke, ...tiers }, commands, ...rest }
+    const file = `${workdir}.executed`
+    const target = { kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, retryFailed, confinement: { user: os.userInfo().username, home: os.homedir() }, tiers: { smoke, ...tiers }, commands: commands.map((c) => ({ ...c, run: c.run.replaceAll(executedFile, file) })), ...rest }
+    executedFiles.set(target, file)
+    return target
   }
   const STANDARD = [cmd('prepare'), service, cmd('ready'), cmd('deep')]
   const SMOKE = ['prepare', 'start', 'ready']
@@ -243,12 +248,11 @@ export default async function (t) {
   const smokeOf = (engine) => engine.run.checkResults.filter((c) => c.tier === 'smoke').at(-1)
 
   try {
-    t.section('the full drive continues the smoke\'s instance, and closure counts it as the full drive')
-    {
+    sections.push(['the full drive continues the smoke\'s instance, and closure counts it as the full drive', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE)
       const { engine, events } = await scenario({ target })
       t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason} ${JSON.stringify(fullOf(engine)?.continuation)}`)
-      t.eq('each command executed once', await executed(), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('each command executed once', await executed(target), ['prepare', 'start', 'ready', 'deep'])
       t.eq('the record states what it continued', fullOf(engine)?.continuedFrom?.dir, smokeOf(engine)?.dir)
       t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
       t.eq('the verification is the same as any full drive\'s', fullOf(engine)?.tier, 'full')
@@ -257,21 +261,19 @@ export default async function (t) {
       t.eq('the instance is no longer held', engine.run.keptInstance, null)
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('a passing non-prefix tier continues and closes')
-    {
+    sections.push(['a passing non-prefix tier continues and closes', async (t) => {
       const target = await sshTarget([cmd('prepare'), cmd('lint'), service, cmd('ready'), cmd('deep')], SMOKE)
       const { engine } = await scenario({ target })
       t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
-      t.eq('the command outside the smoke ran on the instance', await executed(), ['prepare', 'start', 'ready', 'lint', 'deep'])
+      t.eq('the command outside the smoke ran on the instance', await executed(target), ['prepare', 'start', 'ready', 'lint', 'deep'])
       t.eq('and is on the record as out of position', fullOf(engine)?.continuedFrom?.declaredBeforeServices, ['lint'])
       t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('a rejected revision\'s instance is discarded before the author\'s next turn; the approved one is continued')
-    {
+    sections.push(['a rejected revision\'s instance is discarded before the author\'s next turn; the approved one is continued', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE)
       let leftAtAuthor = null
       const { engine, events } = await scenario({ target, reject: new Set([0]), onRound: async (round) => { if (round === 1) leftAtAuthor = await left(target) } })
@@ -283,10 +285,9 @@ export default async function (t) {
       t.eq('the full drive continued the approved revision\'s smoke', [fullOf(engine)?.revision, fullOf(engine)?.continuedFrom?.dir], [second, smokeOf(engine)?.dir])
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('a cancelled run discards its instance')
-    {
+    sections.push(['a cancelled run discards its instance', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE)
       let held = null
       // The smoke has finished and kept its instance when the operator cancels.
@@ -301,10 +302,9 @@ export default async function (t) {
       t.eq('discarded for the run ending', engine.run.discardedInstances?.map((d) => [d.reason, d.passed]), [['run-ended', true]])
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine).catch(() => {})
-    }
+    }])
 
-    t.section('a restart: the instance survives on the record, and the proof decides')
-    {
+    sections.push(['a restart: the instance survives on the record, and the proof decides', async (t) => {
       const crashing = () => ({ beforeInvoke: async (x) => {
         if (!Object.values(x.run.participants).some((p) => p.pendingInvocation?.cursor?.stepId?.startsWith('audit-'))) return
         delete x.hooks.beforeInvoke
@@ -342,22 +342,20 @@ export default async function (t) {
         t.eq('the old instance is gone', await left(target), [])
         await releaseWorkspace(resumed)
       }
-    }
+    }])
 
-    t.section('Refresh checks always runs from scratch')
-    {
+    sections.push(['Refresh checks always runs from scratch', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE)
       const { engine } = await scenario({ target })
-      await fs.rm(executedFile, { force: true })
+      await fs.rm(executedFiles.get(target), { force: true })
       await engine.maybeRunChecks({ force: true, target: engine.snapshot.checks.target })
       t.eq('says why', fullOf(engine)?.continuation?.reason, 'refresh')
-      t.eq('every command executed', await executed(), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('every command executed', await executed(target), ['prepare', 'start', 'ready', 'deep'])
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('a continued drive that fails is retried from scratch; the fresh result is the one that counts')
-    {
+    sections.push(['a continued drive that fails is retried from scratch; the fresh result is the one that counts', async (t) => {
       const once = path.join(sshDir, 'failed-once')
       const target = await sshTarget([cmd('prepare'), service, cmd('ready'), cmd('deep', `test -e ${once} || { touch ${once}; exit 1; }`)], SMOKE, { retryFailed: 1 })
       const { engine } = await scenario({ target })
@@ -366,13 +364,12 @@ export default async function (t) {
       t.eq('the retry passed, marked flaky', [full?.result, full?.flaky], ['passed', true])
       t.ok('the attempt that continued is on the record', Boolean(full?.attempts?.[0]?.continuedFrom), JSON.stringify(full?.attempts))
       t.eq('the record says why this drive ran from scratch', full?.continuation?.reason, 'retry')
-      t.eq('the retry ran in declared order', (await executed()).slice(-4), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('the retry ran in declared order', (await executed(target)).slice(-4), ['prepare', 'start', 'ready', 'deep'])
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('the same scenario as auditor-1\'s, with the default retry: the fresh drive reaches comparison, and the verdict is its own')
-    {
+    sections.push(['the same scenario as auditor-1\'s, with the default retry: the fresh drive reaches comparison, and the verdict is its own', async (t) => {
       const target = await sshTarget([cmd('prepare'), cmd('lint', 'echo lint failed; exit 3'), service, cmd('ready')], SMOKE, { retryFailed: 1, compareBaseline: true })
       const { engine } = await scenario({ target })
       const full = engine.run.checkHistory.filter((h) => h.tier === 'full')
@@ -384,10 +381,9 @@ export default async function (t) {
         t.ok('from the drive that ran from scratch', Boolean(record.attempts?.[0]?.continuedFrom) && !record.continuedFrom, JSON.stringify(record.attempts))
       }
       await releaseWorkspace(engine).catch(() => {})
-    }
+    }])
 
-    t.section('new selftest failures on a smoke discard its instance before the second drive')
-    {
+    sections.push(['new selftest failures on a smoke discard its instance before the second drive', async (t) => {
       const collect = 'if ls round-*.txt >/dev/null 2>&1; then r=\'{"test":"core/a","error":"x"}\'; else r=\'{"test":"core/a"}\'; fi; echo "== runtime/selftest.report"; printf \'{"tests":[%s]}\\n\' "$r"'
       const target = await sshTarget([cmd('prepare'), service, cmd('collect', collect, { report: 'selftest' }), cmd('deep')], ['prepare', 'start', 'collect'], { retryFailed: 1 })
       const { engine, events } = await scenario({ target })
@@ -399,10 +395,9 @@ export default async function (t) {
       t.eq('no instance is held', engine.run.keptInstance ?? null, null)
       t.eq('nothing is left on the host', await left(target), [])
       await releaseWorkspace(engine).catch(() => {})
-    }
+    }])
 
-    t.section('a carried report stays one observation through the retry path, and a later failure is classified as it would be')
-    {
+    sections.push(['a carried report stays one observation through the retry path, and a later failure is classified as it would be', async (t) => {
       const once = path.join(sshDir, 'failed-once-report')
       const report = 'echo "== runtime/selftest.report"; printf \'{"tests":[{"test":"core/a"}]}\\n\''
       const target = await sshTarget([cmd('prepare'), service, cmd('collect', report, { report: 'selftest' }), cmd('deep', `test -e ${once} || { touch ${once}; exit 1; }`)], ['prepare', 'start', 'collect'], { retryFailed: 1 })
@@ -424,25 +419,23 @@ export default async function (t) {
       t.eq('so a later failure of the test still reads as unstable', later?.routes, ['same-bytes'], JSON.stringify(later))
       t.eq('with the passes that really happened', later?.passesSinceLastFailure, 4)
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('tiers.continueSmoke: false runs the full drive from scratch and keeps nothing')
-    {
+    sections.push(['tiers.continueSmoke: false runs the full drive from scratch and keeps nothing', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE, { tiers: { continueSmoke: false } })
       const { engine } = await scenario({ target })
       t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
       t.eq('says why', fullOf(engine)?.continuation?.reason, 'opted-out')
-      t.eq('every smoke command ran twice', await executed(), ['prepare', 'start', 'ready', 'prepare', 'start', 'ready', 'deep'])
+      t.eq('every smoke command ran twice', await executed(target), ['prepare', 'start', 'ready', 'prepare', 'start', 'ready', 'deep'])
       t.ok('the smoke kept nothing', !smokeOf(engine)?.kept)
       await releaseWorkspace(engine)
-    }
+    }])
 
-    t.section('the base drive stays a from-scratch drive of the whole target, and the comparison reads every command')
-    {
+    sections.push(['the base drive stays a from-scratch drive of the whole target, and the comparison reads every command', async (t) => {
       const target = await sshTarget(STANDARD, SMOKE, { compareBaseline: true })
       const { engine } = await scenario({ target })
       const count = (list, id) => list.filter((x) => x === id).length
-      const ran = await executed()
+      const ran = await executed(target)
       t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
       t.ok('it continued', Boolean(fullOf(engine)?.continuedFrom), JSON.stringify(fullOf(engine)?.continuation))
       t.eq('prepare: the smoke, its base and the full tier\'s base; not the continued drive', count(ran, 'prepare'), 3)
@@ -450,7 +443,9 @@ export default async function (t) {
       t.eq('every command compared with the base', fullOf(engine)?.baselineComparison?.unchanged, ['prepare', 'start', 'ready', 'deep'])
       t.eq('no base drive left anything behind', await left(target), [])
       await releaseWorkspace(engine)
-    }
+    }])
+
+    await overlappingSections(t, sections)
   } finally {
     process.env.DEVPANEL_SSH_BIN = saved.bin; process.env.CHECK_TEST_HOST = saved.host
     if (saved.bin === undefined) delete process.env.DEVPANEL_SSH_BIN

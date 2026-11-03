@@ -4,7 +4,6 @@ import path from 'node:path'
 import { withStepReservation } from './step-allocation.mjs'
 import { writeAtomic } from './runtime/persistence.mjs'
 import * as store from './runtime/store.mjs'
-import { approvedCheckPatch } from './runtime/apply-artifact.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
 import { runResult } from './runtime/run-result.mjs'
 import { ignoredSelftests, ignoredWords } from './runtime/selftest-history.mjs'
@@ -150,6 +149,9 @@ export async function writeRunResultStep ({ issuePath, runId, projectPath = null
   if (!run || !ENDED.includes(run.status)) return null
   const outputs = await store.readOutputs(issuePath, runId).catch(() => ({}))
   // A check artifact that does not verify is simply not carried, like any other missing piece.
+  // Imported here: apply-artifact loads launch and the engine, and this module is reached from
+  // issues.js, so a static import would load them into read-only tools such as tools/overview.mjs.
+  const { approvedCheckPatch } = await import('./runtime/apply-artifact.mjs')
   const approved = await approvedCheckPatch({ issuePath, runId, projectPath }).catch(() => null)
   const source = approved?.file ?? (run.delivery?.artifactRef ? path.join(store.runDir(issuePath, runId), run.delivery.artifactRef) : null)
   let patch = null
