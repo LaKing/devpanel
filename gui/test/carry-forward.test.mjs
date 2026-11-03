@@ -60,6 +60,7 @@ export default async function (t) {
     const told = prompts.filter((p) => p.run === two.runId && p.prompt.includes(`This run continues run ${one.runId}`))
     t.ok('every turn of run 2 was told', told.length > 0 && told.length === prompts.filter((p) => p.run === two.runId).length, `${told.length}`)
     t.eq('run 2 delivered the carried patch', two.run.delivery?.application?.state, 'complete', two.run.delivery?.error)
+    t.ok('its record names the paths it changed', two.run.delivery?.changedPaths?.includes('server.mjs'), JSON.stringify(two.run.delivery?.changedPaths))
     t.eq('the source runs the approved code', (await exec('node', [path.join(f.projectPath, 'server.mjs')])).stdout, 'Hello Beautiful world\n')
     await releaseOwnership(two, { reason: 'test' }).catch(() => {})
   }

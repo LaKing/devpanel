@@ -202,6 +202,7 @@ async function readIssue (project, dirName) {
     // Issues that must be settled first (issue-dependencies.mjs), or null.
     dependsOn: meta.dependsOn ?? null,
     archiveOverride: archive?.override ?? null,
+    ...(archive ? { archivedNotes: await readArchivedNotes(project, dirName) } : {}),
     stepCount,
     runCount: runs.length,
     // The newest run, reduced to what a list can tag an issue with. Read from
@@ -330,7 +331,7 @@ export async function listIssues (project, { archived = false } = {}) {
     // Packed issues are no longer folders here; their summaries stand in.
     const present = new Set(listed.map((i) => i.id))
     for (const summary of await packedSummaries(ISSUES_DIR, project)) {
-      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null })
+      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null, stagingOperations: summary.operations?.length ?? 0 })
     }
   }
   return listed.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
@@ -384,6 +385,11 @@ export async function readRunRecords (project, issueId) {
     .map((e) => fs.readFile(path.join(runsDir, e.name, 'run.json'), 'utf8').then(JSON.parse, () => null)))
   return records.filter(Boolean)
 }
+
+/** A packed issue's shared staging deployments, as its summary kept them. */
+export const packedOperations = async (project, id) => (await packedSummary(ISSUES_DIR, project, id))?.operations ?? []
+
+export const packedReceiptsFile = (project, id) => bundleFiles(ISSUES_DIR, project, id).receipts
 
 /** Open an issue against a project. Both the project and the name are required. */
 export async function createIssue (project, { name, input, fromInquiry = null, openedBy = null, reportOrigin = null } = {}) {
@@ -658,7 +664,7 @@ export async function getIssue (project, id) {
     // Archived issues are packed out of the project folder; they are read from
     // their summary (issue-bundle.mjs) until restored.
     if (!error.packed) throw error
-    return describePacked(await packedSummary(ISSUES_DIR, project, id))
+    return { ...describePacked(await packedSummary(ISSUES_DIR, project, id)), archivedNotes: await readArchivedNotes(project, id) }
   }
   const issue = await readIssue(project, id)
   if (!issue) throw new IssueError('no such issue', 404)
@@ -673,7 +679,7 @@ function describePacked (summary) {
     packed: true,
     location: bundleFiles(ISSUES_DIR, summary.issue.project, summary.issue.id).bundle,
     steps: [],
-    archive: { packedAt: summary.packedAt ?? null, bundle: summary.bundle ?? null, runs: summary.runs ?? [], results: summary.results ?? [] }
+    archive: { packedAt: summary.packedAt ?? null, bundle: summary.bundle ?? null, runs: summary.runs ?? [], results: summary.results ?? [], operations: summary.operations ?? [] }
   }
 }
 
@@ -888,7 +894,10 @@ export async function setIssueArchived (project, id, archived, { overrideReason 
   if (archived && ISSUE_PATTERN.test(String(id)) && !await fs.stat(path.join(ISSUES_DIR, project, id)).then(() => true, () => false) &&
       await packedSummary(ISSUES_DIR, project, id)) return getIssue(project, id)
   const result = await markArchived(project, id, archived, { overrideReason })
-  if (!archived) return result
+  if (!archived) {
+    await drainArchivedNotes(project, id)
+    return getIssue(project, id)
+  }
   await packArchived(project, id)
   return getIssue(project, id)
 }
@@ -1038,6 +1047,7 @@ export async function deleteIssue (project, id) {
     const runIds = (await fs.readdir(path.join(dir,'runs')).catch(error=>{if(error.code==='ENOENT')return [];throw error})).filter(id=>!id.startsWith('worktree-')&&!id.startsWith('workspace-'))
     const released = await releaseWorktrees(dir, project)
     await fs.rm(dir, { recursive: true, force: true })
+    await fs.rm(bundleFiles(ISSUES_DIR, project, id).notes, { force: true })
     await writeJson(path.join(path.dirname(dir),'.deleted-issues',id+'.json'), {project,id,runIds,deletedAt:new Date().toISOString()})
     // After the directory is gone, so every registration that pointed into it
     // is now prunable.
@@ -1114,6 +1124,56 @@ export function classifyReference (value) {
 
   throw new IssueError(
     `cannot tell what "${raw}" refers to — give a full http(s) URL or an absolute path`, 400)
+}
+
+const readArchivedNotes = (project, id) => fs.readFile(bundleFiles(ISSUES_DIR, project, id).notes, 'utf8').then(JSON.parse, () => [])
+
+async function isArchived (project, id) {
+  return Boolean(await archiveState(path.join(ISSUES_DIR, project, id))) || Boolean(await packedSummary(ISSUES_DIR, project, id))
+}
+
+/**
+ * A note the engine owes an issue, whatever state the issue is in. An ordinary
+ * step, or, for an archived issue, kept beside it (issue-bundle.mjs): archiving
+ * refuses new steps and the bundle stays as it was verified. Keyed by
+ * invocationId in both places, so writing it again rewrites it. A restore turns
+ * the kept ones into steps; `archivedNotes` shows them until then.
+ */
+export async function createEngineNote (project, id, { name, text, invocationId }) {
+  await requireProject(project)
+  if (typeof id !== 'string' || !ISSUE_PATTERN.test(id)) throw new IssueError('no such issue', 404)
+  if (!await isArchived(project, id)) {
+    try {
+      return { where: 'step', step: (await createStep(project, id, { name, text, invocationId })).number }
+    } catch (error) {
+      if (error.status !== 409 || !await isArchived(project, id)) throw error
+    }
+  }
+  const { dir, notes } = bundleFiles(ISSUES_DIR, project, id)
+  await fs.mkdir(dir, { recursive: true })
+  await withLock(`${notes}.lock`, { purpose: 'archived-notes', waitMs: 10000 }, async () => {
+    const kept = await readArchivedNotes(project, id)
+    const note = { name, text, invocationId, at: new Date().toISOString() }
+    await writeJson(notes, [...kept.filter((n) => n.invocationId !== invocationId), note])
+  })
+  // A restore may have finished between the two: nothing would come for this one.
+  if (!await isArchived(project, id)) await drainArchivedNotes(project, id)
+  return { where: 'archive' }
+}
+
+/** Kept notes of a restored issue become its steps. Without an id, of every restored issue of the project (a restore that died midway). */
+export async function drainArchivedNotes (project, id = null) {
+  const { dir } = bundleFiles(ISSUES_DIR, project, id ?? 'x')
+  const ids = id ? [id] : (await fs.readdir(dir).catch(() => [])).filter((n) => n.endsWith('.notes.json')).map((n) => n.slice(0, -'.notes.json'.length))
+  for (const issueId of ids) {
+    if (await isArchived(project, issueId)) continue
+    const file = bundleFiles(ISSUES_DIR, project, issueId).notes
+    if (!await fs.stat(file).then(() => true, () => false)) continue
+    await withLock(`${file}.lock`, { purpose: 'archived-notes', waitMs: 10000 }, async () => {
+      for (const { name, text, invocationId } of await readArchivedNotes(project, issueId)) await createStep(project, issueId, { name, text, invocationId })
+      await fs.rm(file, { force: true })
+    })
+  }
 }
 
 /** Links and paths, as markdown: links followable, paths as literal text. */

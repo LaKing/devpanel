@@ -17,6 +17,7 @@ import { projectPath } from './project-path.mjs'
 import { performanceForModel } from './model-performance.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
 import { deployStaging, deploymentReport } from './staging-deployment.mjs'
+import { deploymentCoverage, stagingPendingReport, writeDeploymentNotes } from './staging-coverage.mjs'
 
 export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null }) {
  const configRoot=process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
@@ -88,7 +89,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    projects:()=>issues.listProjects(),playbooks:()=>listPlaybooks({root:configRoot}),seatModels,
    // Every project on the panel, never a selection: a management reading that
    // omits a project is how the supervisor came to report work as non-existent.
-   overview:async({focus=[]}={})=>buildOverview({projects:(await issues.listProjects()).map(p=>p.id),focus,listIssues:(p,o)=>issues.listIssues(p,o),openDependencies}),
+   overview:async({focus=[]}={})=>{let config=null;return buildOverview({projects:(await issues.listProjects()).map(p=>p.id),focus,listIssues:(p,o)=>issues.listIssues(p,o),openDependencies,
+     stagingPending:(project,lists)=>stagingPendingReport({project,projectPath:projectPath(project),root:configRoot,lists,config:config??=loadConfig({root:configRoot}),listIssues:(p,o)=>issues.listIssues(p,o)})})},
    setPriority:a=>mutate(()=>issues.setIssuePriority(a.project,a.issueId,{value:a.priority,reason:a.reason,by:a.by??'supervisor'})),
    setDependencies:a=>mutate(()=>setIssueDependencies(a.project,a.issueId,{dependsOn:a.dependsOn,reason:a.reason,by:'supervisor'})),
    openDependencies:async a=>openDependencies(await issues.getIssue(a.project,a.issueId)),
@@ -115,8 +117,10 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     const issue=await issues.getIssue(a.project,a.issueId)
     if(issue.archived)throw Object.assign(new Error('Cannot deploy for an archived issue'),{status:409})
     if(supervisor.isActive(a.project,a.issueId))throw Object.assign(new Error('Stop the active issue run before a shared staging deployment'),{status:409})
-    const result=await deployStaging({project:a.project,issuePath:issue.path,root:configRoot,signal})
+    const result=await deployStaging({project:a.project,issuePath:issue.path,root:configRoot,signal,coverage:deploymentCoverage({project:a.project,projectPath:projectPath(a.project),listIssues:(p,o)=>issues.listIssues(p,o)})})
     await mutate(()=>issues.createStep(a.project,a.issueId,{name:'staging-deployment',text:deploymentReport(result),format:'md',invocationId:`staging-deployment:${result.id}`}))
+    // After the report step, which the notes name; on a replay too, so a note a crash lost is written.
+    await mutate(()=>writeDeploymentNotes({project:a.project,issue,operation:result,issues}))
     return result
    },
    listIssues:project=>issues.listIssues(project),

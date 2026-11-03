@@ -14,8 +14,10 @@
  */
 import { ISSUES_DIR, listIssues, listProjects } from '../server/issues.js'
 import { buildOverview } from '../server/supervisor-overview.mjs'
+import { stagingPendingReport } from '../server/staging-coverage.mjs'
 import { openDependencies } from '../server/issue-dependencies.mjs'
-import { projectsRoot } from '../server/project-path.mjs'
+import { loadConfig } from '../server/config/load.mjs'
+import { projectPath, projectsRoot } from '../server/project-path.mjs'
 
 const USAGE = 'usage: npm run overview [-- --project <id> ...]'
 const args = process.argv.slice(2)
@@ -42,7 +44,10 @@ if (unknown.length) {
 }
 const projects = named.length ? named : known
 
-const { generatedAt, ...overview } = await buildOverview({ projects, listIssues: (p, o) => listIssues(p, o), openDependencies })
+// One reading of the configuration, however many projects ask about it.
+let config = null
+const { generatedAt, ...overview } = await buildOverview({ projects, listIssues: (p, o) => listIssues(p, o), openDependencies,
+  stagingPending: (project, lists) => stagingPendingReport({ project, projectPath: projectPath(project), lists, config: config ??= loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT }), listIssues: (p, o) => listIssues(p, o) }) })
 console.log(JSON.stringify({
   generatedAt,
   scope: {

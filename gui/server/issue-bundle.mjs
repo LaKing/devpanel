@@ -20,6 +20,11 @@ import { worktreeGitArgs, engineGitEnv } from './runtime/engine-git.mjs'
  *   <id>.json        what is shown without unpacking: the issue as the lists
  *                    describe it, each run's summary, and each run's result
  *   <id>.runs.json   the run records, for the supervisor's history statistics
+ *   <id>.notes.json  notes the engine owed the issue after it was archived, kept
+ *                    beside the bundle, which stays as verified; a restore turns
+ *                    them into steps (issues.js createEngineNote)
+ *   <id>.coverage-receipts.json  which notes this issue's own releases still owe
+ *                    others, since packing (staging-coverage.mjs)
  *
  * Packing is verified before anything is removed: the bundle must list every
  * file that was packed. Restore unpacks it back into the project folder, after
@@ -33,7 +38,7 @@ const BIG = { maxBuffer: 256 * 1024 * 1024 }
 export const archiveRoot = (issuesDir) => path.join(issuesDir, '.archive')
 export function bundleFiles (issuesDir, project, id) {
   const base = path.join(archiveRoot(issuesDir), project, id)
-  return { dir: path.dirname(base), bundle: `${base}.tar.gz`, summary: `${base}.json`, runs: `${base}.runs.json` }
+  return { dir: path.dirname(base), bundle: `${base}.tar.gz`, summary: `${base}.json`, runs: `${base}.runs.json`, notes: `${base}.notes.json`, receipts: `${base}.coverage-receipts.json` }
 }
 
 const exists = (p) => fs.access(p).then(() => true, () => false)
@@ -86,6 +91,17 @@ async function results (dir, runs) {
     const folder = written.get(record.runId)
     const text = folder ? await fs.readFile(path.join(dir, folder, 'result.md'), 'utf8').catch(() => null) : null
     out.push({ runId: record.runId, startedAt: record.startedAt ?? null, status: record.status, folder: folder ?? null, text: text ?? renderResult(record, outputs) })
+  }
+  return out
+}
+
+/** Shared staging deployments of this issue, retries included: what its packed page and the pending list still read. */
+async function stagingOperations (dir) {
+  const names = await fs.readdir(path.join(dir, 'operations')).catch(() => [])
+  const out = []
+  for (const name of names.filter((n) => /^staging-deployment(-.+)?\.json$/.test(n))) {
+    const op = await readJson(path.join(dir, 'operations', name)).catch(() => null)
+    if (op) out.push({ id: op.id ?? null, status: op.status ?? null, startedAt: op.startedAt ?? null, endedAt: op.endedAt ?? null, ...(op.coverage ? { coverage: op.coverage } : {}) })
   }
   return out
 }
@@ -148,6 +164,7 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
     issue: { ...described, path: null, packed: true },
     runs: runList,
     results: await results(dir, runs),
+    operations: await stagingOperations(dir),
     packedAt: new Date().toISOString()
   }
 
@@ -211,7 +228,7 @@ export async function unpackIssue ({ issuesDir, project, id }) {
       await writeJson(file, record)
     }
   }
-  await Promise.all([files.bundle, files.summary, files.runs].map((f) => fs.rm(f, { force: true })))
+  await Promise.all([files.bundle, files.summary, files.runs, files.receipts].map((f) => fs.rm(f, { force: true })))
   return target
 }
 
@@ -223,7 +240,7 @@ export async function packedSummary (issuesDir, project, id) {
 /** Every packed issue of a project, as summaries. */
 export async function packedSummaries (issuesDir, project) {
   const dir = path.join(archiveRoot(issuesDir), project)
-  const names = (await fs.readdir(dir).catch(() => [])).filter((n) => /^\d{4}-\d{2}-\d{2}-.+\.json$/.test(n) && !n.endsWith('.runs.json'))
+  const names = (await fs.readdir(dir).catch(() => [])).filter((n) => /^\d{4}-\d{2}-\d{2}-.+\.json$/.test(n) && !n.endsWith('.runs.json') && !n.endsWith('.notes.json') && !n.endsWith('.coverage-receipts.json'))
   const out = []
   for (const n of names) {
     const s = await readJson(path.join(dir, n)).catch(() => null)
@@ -240,5 +257,5 @@ export async function packedRuns (issuesDir, project, id) {
 /** Remove a packed issue for good. */
 export async function deletePacked (issuesDir, project, id) {
   const files = bundleFiles(issuesDir, project, id)
-  await Promise.all([files.bundle, files.summary, files.runs].map((f) => fs.rm(f, { force: true })))
+  await Promise.all([files.bundle, files.summary, files.runs, files.notes, files.receipts].map((f) => fs.rm(f, { force: true })))
 }

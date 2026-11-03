@@ -58,10 +58,18 @@ export default async function (t) {
   t.ok('source HTML remains visible', doc.body.textContent.includes('<script>window.markdownExecuted'))
   t.ok('image alt text retained', doc.body.textContent.includes('Tracking image'))
   dom.window.close()
-  for (const target of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'jav&#x61;script:alert(1)', 'data:text/html,hello', 'vbscript:alert(1)', 'file:///etc/passwd', '//example.com/tracker', '/api/projects']) {
+  for (const target of ['javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'jav&#x61;script:alert(1)', 'data:text/html,hello', 'vbscript:alert(1)', 'file:///etc/passwd', '//example.com/tracker', '/api/projects', '/projects/../x', '/projects/p/i?x=1', '/projects/p/i/j', '/projects//i']) {
     const html = await renderToString(h('div', markdownNodes(`[link](${target})`)))
     const doc = new JSDOM(html)
     t.eq(`unsafe or unresolved target stays unlinked: ${target}`, doc.window.document.querySelectorAll('a').length, 0)
+    doc.window.close()
+  }
+
+  for (const target of ['/projects/d250.hu-project/2026-01-01-issue', '/projects/p/i?run=2026-01-01T00-00-00-000Z-abc']) {
+    const doc = new JSDOM(await renderToString(h('div', markdownNodes(`[link](${target})`))))
+    const link = doc.window.document.querySelector('a')
+    t.eq(`a panel page links: ${target}`, link?.getAttribute('href'), target)
+    t.eq('in this tab, which keeps the operator token', link?.getAttribute('target'), null)
     doc.window.close()
   }
 

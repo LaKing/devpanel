@@ -76,6 +76,18 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
   if (d?.artifactRef) lines.push('', 'The change is in `changes.patch` next to this file.')
   if (approvedPatch) lines.push('', 'The approved revision\'s patch is in `changes.patch` next to this file: its check artifact, verified against the revision\'s fingerprint. It reached no project.')
   lines.push('')
+  const coverage = run.release?.coverage
+  if (coverage) {
+    lines.push('## Release coverage', '')
+    if (coverage.error) lines.push(`What this release carried could not be recorded: ${coverage.error}`)
+    else {
+      for (const e of coverage.covered ?? []) lines.push(`- covered: \`${e.runId}\` (${e.issueId})${e.superseded?.length ? `; superseded by a later delivery on ${e.superseded.join(', ')}` : ''}`)
+      for (const e of coverage.indeterminate ?? []) lines.push(`- indeterminate: \`${e.runId}\` (${e.issueId}): ${e.reason}${e.paths?.length ? `, at ${e.paths.join(', ')}` : ''}`)
+      for (const e of coverage.notShipped ?? []) lines.push(`- delivered after the snapshot, not shipped: \`${e.runId}\` (${e.issueId})`)
+      if (!coverage.covered?.length && !coverage.indeterminate?.length && !coverage.notShipped?.length) lines.push('No delivered run was waiting.')
+    }
+    lines.push('')
+  }
   const asked = run.ownerInput
   if (asked?.questions?.length) {
     lines.push('## Asked before starting', '')

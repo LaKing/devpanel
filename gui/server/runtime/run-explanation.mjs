@@ -400,12 +400,35 @@ function splitSuggestion (run, outputs) {
 /** Where a run stands, for a person. See the header for the fields. */
 export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [] } = {}) {
   if (!run) return null
-  const standing = withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership }), outputs, ownership)
+  const standing = withReleaseCoverage(run, withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership }), outputs, ownership))
   const unaccepted = riskStatement(run, acceptedRisks)
   if (!unaccepted) return standing
   const n = unaccepted.risks.length
   const choice = `${plural(n, 'residual risk')} ${n === 1 ? 'is' : 'are'} unaccepted: to record resolved, accept ${n === 1 ? 'it' : 'each'} with a reason; otherwise record partially-resolved.`
   return { ...standing, next: [standing.next, choice].filter(Boolean).join(' '), unacceptedRisks: unaccepted }
+}
+
+/*
+ * What a Staging run's release carried of the delivered runs (staging-coverage.mjs),
+ * however it ended: a red release's failure belongs to the same runs. The field holds
+ * all of them; the sentence the first few.
+ */
+function withReleaseCoverage (run, standing) {
+  const coverage = run.release?.coverage
+  if (!coverage) return standing
+  const add = (words) => [standing.detail, words].filter(Boolean).join(' ')
+  if (coverage.error) return { ...standing, detail: add(`What this release carried could not be recorded: ${coverage.error}.`) }
+  const covered = coverage.covered ?? []
+  const indeterminate = coverage.indeterminate ?? []
+  const names = (list) => `${list.slice(0, 20).map((e) => `${e.runId} (${e.issueId})`).join(', ')}${list.length > 20 ? ` and ${list.length - 20} more` : ''}`
+  const words = [
+    covered.length ? `This release carried ${names(covered)}.` : 'This release carried no delivered run that was waiting.',
+    indeterminate.length ? `Indeterminate, so not covered: ${names(indeterminate)}.` : null
+  ].filter(Boolean).join(' ')
+  return { ...standing, detail: add(words), releaseCoverage: {
+    covered: covered.map((e) => ({ issueId: e.issueId, runId: e.runId })),
+    indeterminate: indeterminate.map((e) => ({ issueId: e.issueId, runId: e.runId, reason: e.reason }))
+  } }
 }
 
 function withSplitSuggestion (run, standing, outputs, ownership) {

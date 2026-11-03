@@ -4,6 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { runProcess } from './process.mjs'
+import { stagedReleasePassed } from './run-result.mjs'
 import { writeJson, writeAtomic } from './persistence.mjs'
 import { withLock } from './lock.mjs'
 import { hostConfigDir, HOST_CONFIG_ENV } from '../config/host-config.mjs'
@@ -26,7 +27,7 @@ export async function stagedRelease (projectDir, releaseId) {
     let receipt
     try { receipt=JSON.parse(await fs.readFile(path.join(dir,'release.json'),'utf8')) }catch(e){if(e.code==='ENOENT')continue;throw e}
     const run=JSON.parse(await fs.readFile(path.join(dir,'run.json'),'utf8'))
-    if(receipt.tactic!=='staging'||receipt.status!=='completed'||run.status!=='completed'||run.outcome!=='resolved')throw new Error('staged release has not passed its coordinator and all verifiers')
+    if(!stagedReleasePassed(receipt,run))throw new Error('staged release has not passed its coordinator and all verifiers')
     const archive=path.join(dir,'artifacts','release.tar')
     if(sha(await fs.readFile(archive))!==receipt.sha256)throw new Error('staged release artifact changed')
     return {...receipt,archive}
@@ -37,7 +38,7 @@ export async function stagedRelease (projectDir, releaseId) {
 // Installed configuration only. Models cannot supply command text, destinations
 // or filesystem roots. Persist intent before every external operation; a crash
 // requires recovery rather than replaying a possibly completed mutation.
-export async function executeRelease ({issuePath,runId,workspace,snapshot,signal,execute=runProcess,verifySource=null,onUpdate=null,hostDir=hostConfigDir()}) {
+export async function executeRelease ({issuePath,runId,workspace,snapshot,signal,execute=runProcess,verifySource=null,onUpdate=null,hostDir=hostConfigDir(),coverage:readCoverage=null}) {
   const dir=path.join(issuePath,'runs',runId),file=path.join(dir,'release.json')
   return withReleaseLock(issuePath,async()=>{
     let previous
@@ -71,7 +72,10 @@ export async function executeRelease ({issuePath,runId,workspace,snapshot,signal
     } finally { await fs.rm(reconstruction,{recursive:true,force:true}) }
     if(verifySource)await verifySource()
     const digest=sha(await fs.readFile(archive))
-    const state={runId,tactic,environment,sourceRelease,sha256:digest,archive,startedAt:new Date().toISOString(),status:'running',commands:[],checkpointVerified:false,mutated:false,ownership:config.ownership,rollback:config.rollback}
+    // What this snapshot carries of the project's delivered runs (staging-coverage.mjs).
+    // Read here, where the worktree is proved to be the archive. It records and never gates.
+    const coverage=tactic==='staging'&&readCoverage?await readCoverage({snapshotPath:workspace.path}).catch(error=>({error:error.message})):null
+    const state={runId,tactic,environment,sourceRelease,sha256:digest,archive,startedAt:new Date().toISOString(),status:'running',commands:[],checkpointVerified:false,mutated:false,ownership:config.ownership,rollback:config.rollback,...(coverage?{coverage}:{})}
     await writeJson(file,state)
     const env=releaseEnvironment({hostDir,runId,archive,sha256:digest,environment,stateDir:dir,startedAt:state.startedAt})
     const command=async(id,recovery=false)=>{

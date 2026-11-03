@@ -54,3 +54,70 @@ active run on the same issue. Bounded stdout/stderr and command exit status are
 retained; truncation is explicitly recorded. A failed action skips remaining actions but still runs configured diagnostics. A diagnostic failure also prevents success. Cancellation stops further commands. The observation command refuses to label a service start older than the operation as new deployment evidence.
 Shared deployment does not mark source revisions approved or automatically close
 an issue. The historical analysis triage result stays unchanged.
+
+## What a release covers
+
+`GET /api/projects/:project/staging-pending`, and `stagingPending` per project in the
+supervisor's `overview`, list the runs delivered into a project's development checkout
+(by the engine, or landed by hand) that no successful Staging run has covered.
+`server/staging-coverage.mjs` derives them, for every project, whether or not it can
+release (`configured` says what it has).
+
+**History.** A delivery from before the coverage baseline (`COVERAGE_BASELINE`, the date
+coverage began, the same for every project and independent of any staging target) is
+history: counted in `history.count`, and absent from `pending`, `indeterminate`, every
+release's and deployment's record, and every note. Its content is never read, so a first
+deployment after upgrade notes nothing for it. A delivery is placed by when it was made
+(a landing by when it was recorded); one with no time on record stays listed. Everything
+below is about deliveries from the baseline on.
+
+**When to cut a batch.** When `batch.ready` is true: the `pending` list is non-empty, no
+delivery is in progress (`liveRuns` is empty), and a Staging release target is
+configured. The top-level supervisor or an operator decides, never an agent inside a
+run. The engine only supplies the list and records coverage: it starts no release and
+bisects no red batch, and serial runs need nothing more.
+
+**Covered.** A Staging run compares its snapshot with what each waiting run delivered,
+when the release happens, and records the result on `run.release.coverage`. A run is
+covered when, for every path it changed, the snapshot's bytes are the delivered bytes,
+or those of a later delivery built on them (the delivery's before-image is the earlier
+one's after-image). The bytes come from each delivery's patch, whose index lines name the
+blobs. A delivery's record names the paths it changed (`delivery.changedPaths`), so looking
+for a later delivery on one path opens no other's patch or bundle; a record older than that
+field, or a landing of another revision, is read from its patch. Recorded order only says which delivery is later, and a release counts only for
+runs delivered before it started: order can exclude a release and never establishes
+coverage. A successful Staging run that recorded nothing counts through its
+retained `artifacts/release.tar`, verified against its recorded hash; a missing or
+changed archive establishes nothing, and that reading writes no record or note.
+
+**Indeterminate.** A run whose bytes cannot be known (a landing with hand changes, an
+older in-place run, an unreadable patch, a chmod, whose patch names no blob) or whose paths hold something else, in the
+snapshot or in the checkout, is `indeterminate`, never covered. It stays listed until a
+successful Staging run's bytes establish it. A person reads this list, and there is no
+dismissal. It does not count towards `batch.ready`, so a hand-edited path cannot prompt
+batches for ever.
+
+**Only a Staging run clears a run.** `deploy_staging` runs opaque saved commands and
+leaves no shipped bytes to compare, so reading the instance or the checkout around them
+would not prove what shipped. Its record (`coverage` on the operation) names every
+waiting run `indeterminate`, reason `deployed-content-unproven`; it covers none and
+changes neither list. A run with no hand change stays in `pending`, with `lastDeployment`,
+and can still prompt the Staging release that clears it. The record's `checkout` field
+says whether the development checkout held each run's bytes before and after the
+commands; that is information only and decides nothing. A project with shared deployment
+and no Staging release target can never clear a run: its runs stay listed and
+`batch.ready` stays false, with the reason.
+
+**Notes.** Each issue a Staging run carried gets one note per release, on success and on
+failure, naming the release run, its outcome and a link to it; a later end of the run
+rewrites the note. An indeterminate run's issue gets one when it is first named and on
+every red release. A red release keeps its configured automatic restore, and its failure
+is attributed to every issue it carried; which issue gets the follow-up is the
+supervisor's or the operator's choice. A deployment notes the issues of first-named runs
+when green and of every run it names when red, linking to the issue holding its report.
+An archived issue refuses new steps, so its note is kept beside it
+(`issues/.archive/<project>/<id>.notes.json`), shown on its page, and becomes a step when
+it is restored; the bundle is not touched. At startup the panel writes any note a crash
+or a failed write left owing, for every deployment attempt and every release issue,
+archived ones included, leaving written notes alone. A packed release issue's receipts
+are kept beside its bundle.

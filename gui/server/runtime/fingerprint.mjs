@@ -111,6 +111,23 @@ async function hashEntry (full, link, rule = FINGERPRINT_RULE) {
 }
 
 /**
+ * What Git calls this path's content, the way a delivery's patch names it: its
+ * mode and blob id (both hash kinds, a repository uses one). Null when nothing is
+ * there, `{ other: true }` for a directory or special file.
+ */
+export async function gitIdentity (full) {
+  const stat = await fs.lstat(full).catch((error) => {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null
+    throw error
+  })
+  if (!stat) return null
+  if (!stat.isFile() && !stat.isSymbolicLink()) return { other: true }
+  const bytes = stat.isSymbolicLink() ? await fs.readlink(full, { encoding: 'buffer' }) : await fs.readFile(full)
+  const digest = (kind) => crypto.createHash(kind).update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+  return { mode: stat.isSymbolicLink() ? '120000' : (stat.mode & 0o100) ? '100755' : '100644', sha1: digest('sha1'), sha256: digest('sha256') }
+}
+
+/**
  * @param dir       the workspace to fingerprint
  * @param baseline  map of path -> contentHash at the base commit, so deletions
  *                  can be recorded rather than silently vanishing

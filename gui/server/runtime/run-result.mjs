@@ -16,6 +16,9 @@
 //   completed    closure reached with nothing more specific to say
 //   needs-input  triage asked the owner first (run.ownerInput); no work started
 //   incomplete   closure not reached; blockedReason says why
+/** Whether a Staging run's release passed: its operations completed, and its coordinator and verifiers accepted it. */
+export const stagedReleasePassed = (receipt, run) => receipt?.tactic === 'staging' && receipt.status === 'completed' && run?.status === 'completed' && run.outcome === 'resolved'
+
 export const SUCCESS_RESULTS = ['reported', 'delivered', 'artifact-ready', 'staged', 'deployed', 'completed']
 
 const REPORT_LABELS = {

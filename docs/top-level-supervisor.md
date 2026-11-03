@@ -61,10 +61,23 @@ Shared staging is a separate action. Where a project's infrastructure enables
 commands outside agent sandboxes, and the supervisor uses it on its own judgement
 whenever deploying moves work forward: a delivered fix that test drives or live
 verification need, a stale or broken staging instance, or a user request. It deploys
-the project's live checkout as it stands, uncommitted deliveries included, so the
-supervisor's note names the delivered runs it carried, beside its assessment of the
-recorded logs. Production is never deployed without an explicit operator instruction;
+the project's live checkout as it stands, uncommitted deliveries included. The engine
+records the delivered runs it may have carried as unproven and notes their issues; the
+supervisor's own note is its assessment of the recorded logs. A deployment never
+clears the staging pending list: only a Staging run does. Production is never deployed without an explicit operator instruction;
 production environments stay inspection-only.
+
+`overview` gives each project `stagingPending`, the list of `GET
+/api/projects/:project/staging-pending`: runs delivered into the development checkout
+that no successful Staging run has covered. When to cut a batch: `batch.ready` is true,
+meaning the `pending` list is non-empty, no delivery is in progress (`liveRuns` is
+empty) and a Staging release target is configured. The supervisor or the operator
+decides; the engine never starts a release, and no agent inside a run decides it.
+`indeterminate` runs are read by a person and prompt no batch. Deliveries from before the
+coverage baseline are history: one number (`history.count`), in neither list and in no
+note, so they never prompt a batch. A red release is noted on
+every issue it carried, and which one gets the follow-up is the supervisor's or the
+operator's choice. See [Shared staging deployment](staging-deployment.md#what-a-release-covers).
 
 `focus` is what the operator asked to be attended to first. It orders the
 overview and nothing else; an empty focus means the whole panel. If per-tenant or

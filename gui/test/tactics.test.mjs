@@ -1,4 +1,5 @@
 import YAML from 'yaml'
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -9,6 +10,8 @@ import { executeRelease, stagedRelease, recoverRelease } from '../server/runtime
 import { runProcess } from '../server/runtime/process.mjs'
 import { captureWindow } from '../server/runtime/current-window.mjs'
 import { publishFindings } from '../server/runtime/tactical-issues.mjs'
+import { stagingRunCoverage } from '../server/staging-coverage.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
 const fence=o=>'```json\n'+JSON.stringify(o)+'\n```'
 const revision=p=>(p.match(/Current revision: (sha256:[a-f0-9]{64})/)??[])[1]??null
 const finding={key:'missing-check',kind:'bug',title:'Missing check',description:'A check is missing.',evidence:['source.txt:1'],acceptanceCriteria:['Reject invalid input']}
@@ -99,8 +102,23 @@ export default async function(t){
  infrastructure.release={targets:{stage:{workdir:rf.projectPath,ownership:'Fixture source only',rollback:'automatic',commands:Object.fromEntries(['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test','restore','verifyRestore'].map(id=>[id,{run:'printf verified',timeoutSeconds:10}]))}}}
  await fs.mkdir(path.join(rf.configRoot,'projects'))
  await fs.writeFile(path.join(rf.configRoot,'projects/devpanel-project.yaml'),YAML.stringify({id:'devpanel-project',evidence:[],infrastructure}))
- const rse=await start(rf,{participants:{'verifier-1':{model:'gpt-6-astra'}}});await rse.drive()
+ const rse=await start(rf,{participants:{'verifier-1':{model:'gpt-6-astra'}}})
+ // A run delivered before this one: its patch left the bytes the snapshot holds (the fixture's source.txt).
+ const carried=await fs.mkdtemp(path.join(os.tmpdir(),'devpanel-carried-'))
+ await fs.mkdir(path.join(carried,'runs/delivered/artifacts'),{recursive:true})
+ const blob=text=>crypto.createHash('sha1').update(`blob ${Buffer.byteLength(text)}\0`).update(text).digest('hex')
+ await fs.writeFile(path.join(carried,'runs/delivered/artifacts/x.patch'),`diff --git a/source.txt b/source.txt\nindex ${blob('old\n')}..${blob('original\n')} 100644\n--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n`)
+ const deliveredRun={runId:'delivered',status:'completed',outcome:'resolved',startedAt:'2026-11-03T00:00:00.000Z',revisions:[{fingerprint:'rev'}],delivery:{action:'apply-to-source',revision:'rev',completedAt:'2026-11-03T00:00:00.000Z',artifactRef:'artifacts/x.patch',application:{verified:true}}}
+ const carriedIssue={id:'carried-issue',project:'devpanel-project',path:carried}
+ // The engine's clock here is a fixture's, older than the coverage baseline: the snapshot time is stated.
+ rse.releaseCoverage=args=>stagingRunCoverage({...args,snapshotAt:'2026-11-03T01:00:00.000Z',project:'devpanel-project',projectPath:rf.projectPath,listIssues:async(_,{archived=false}={})=>archived?[]:[carriedIssue],readRuns:async()=>[deliveredRun],readOperations:async()=>[]})
+ await rse.drive()
  t.eq('configured staging playbook completes',rse.run.status,'completed')
+ t.eq('a Staging run records the delivered run its snapshot carries',rse.run.release.coverage.covered,[{issueId:'carried-issue',runId:'delivered'}])
+ t.eq('with none indeterminate',rse.run.release.coverage.indeterminate,[])
+ t.eq('its explanation names it',explainRun(rse.run).releaseCoverage.covered,[{issueId:'carried-issue',runId:'delivered'}])
+ t.ok('in words',explainRun(rse.run).detail.includes('delivered (carried-issue)'))
+ await fs.rm(carried,{recursive:true,force:true})
  t.eq('all release stages recorded',rse.run.release.commands.filter(c=>c.status==='completed').length,8)
  t.ok('operator preparation precedes mutation',!releaseSeen.find(x=>x.stepId==='investigate-release-plan')?.prompt.includes('checkpointVerified'))
  t.ok('operator receives execution evidence afterwards',releaseSeen.find(x=>x.stepId==='investigate-release-operator')?.prompt.includes('checkpointVerified'))

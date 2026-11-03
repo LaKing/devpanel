@@ -1,5 +1,3 @@
-import { runProcess } from './runtime/process.mjs'
-
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 
 export function infrastructureErrors (infra) {
@@ -169,9 +167,10 @@ function brokerBrief (infra) {
 Broker (devpanel MCP server): ${envs.map((e) => e.id).join(', ')} declare a database. Read environment state with the tools inspect_environment {environment, resource} and db_query {environment, query: {op, database, collection, filter, projection, sort, limit, skip, field, pipeline}} — never over SSH, and never by reading database files. db_query is read-only and allow-listed (find, count, distinct, aggregate, listCollections; no $where/$function/$out/$merge); results are capped and truncation is marked. Staging is granted to the project; a production environment answers only under an operator's grant on this issue. Every call is recorded as run evidence, and its results belong to the whole run.`
 }
 
-export async function projectInfrastructure (project, { root } = {}) {
+/** `config`: a configuration already loaded (or being loaded), for a reader asking about many projects. */
+export async function projectInfrastructure (project, { root, config: loaded = null } = {}) {
   const { loadConfig } = await import('./config/load.mjs')
-  const config = await loadConfig({ root })
+  const config = await (loaded ?? loadConfig({ root }))
   const errors = config.errors.filter(e => e.file?.endsWith(`/projects/${project}.yaml`))
   if (errors.length) throw new Error(errors.map(e => e.message).join('; '))
   return config.projects.get(project)?.infrastructure ?? null
@@ -185,7 +184,8 @@ export async function inspectEnvironment ({ project, environment, resource = 'st
   const file = Object.hasOwn(env.files, resource) ? env.files[resource] : null
   const command = resource === 'status' ? env.statusCommand : file ? `tail -c 32768 -- ${quote(file)}` : null
   if (!command) throw Object.assign(new Error('Unknown configured diagnostic resource'), { status: 400 })
-  const { sshConnection } = await import('./runtime/ssh.mjs')
+  // Imported here: reading a project's infrastructure, as npm run overview does, loads nothing that spawns.
+  const [{ sshConnection }, { runProcess }] = await Promise.all([import('./runtime/ssh.mjs'), import('./runtime/process.mjs')])
   const ssh = await sshConnection(env.ssh)
   const timeout = AbortSignal.timeout(20000)
   const result = await runProcess({ ...ssh, args: [...ssh.args, command], signal: signal ? AbortSignal.any([signal, timeout]) : timeout, maxBuffer: 65536 })

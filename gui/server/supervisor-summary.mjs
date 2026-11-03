@@ -297,7 +297,8 @@ export function summariseIssue ({ issue, reports, runs }) {
       openedOn: issue.openedOn, openedBy: issue.openedBy ?? null, report: issue.report ?? null, path: issue.path, disposition: issue.disposition ?? null,
       // Never clipped: a risk's text, like its id, names it in acceptRisks.
       unacceptedRisks: issue.unacceptedRisks ?? null, acceptedRisks: issue.acceptedRisks ?? [],
-      steps: (issue.steps ?? []).map((s) => ({ number: s.number, slug: s.slug, files: (s.files ?? []).map((f) => f.name) }))
+      steps: (issue.steps ?? []).map((s) => ({ number: s.number, slug: s.slug, files: (s.files ?? []).map((f) => f.name) })),
+      ...(issue.archivedNotes?.length ? { archivedNotes: issue.archivedNotes.map((n) => ({ text: clip(n.text, 2000), at: n.at })) } : {})
     },
     reports: (reports ?? []).map((r) => ({ step: r.step, name: r.name, text: clip(r.text, 6000), truncated: typeof r.text === 'string' && r.text.length > 6000 })),
     runs: (runs ?? []).map((r) => ({ runId: r.runId, playbook: r.playbook, status: r.status, outcome: r.outcome, result: r.result ?? null, blockedReason: r.blockedReason, startedAt: r.startedAt, endedAt: r.endedAt, steps: r.steps, workspaceState: r.workspaceState ?? null })),

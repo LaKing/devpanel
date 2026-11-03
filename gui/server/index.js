@@ -24,6 +24,7 @@ import { getRun, listPlaybooks, listRuns, preview, readLiveOutput, readStepRespo
 import { sourceState } from './staleness.mjs'
 import { topSupervisorService } from './top-supervisor-service.mjs'
 import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
+import { stagingPendingReport } from './staging-coverage.mjs'
 import { readGrants, writeGrant, revokeGrant } from './broker/broker.mjs'
 import { listProjectActions, readOperation, startProjectAction, stopProjectAction } from './project-actions.mjs'
 import { createSupervisor } from './supervisor.mjs'
@@ -164,6 +165,12 @@ app.get('/api/projects/:project/infrastructure', route(async (req, res) => {
 app.get('/api/projects/:project/infrastructure/:environment/:resource', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
   res.json(await inspectEnvironment(req.params, { root: process.env.DEVPANEL_CONFIG_ROOT }))
+}))
+
+// Delivered runs no successful Staging run has covered (staging-coverage.mjs). Reads; starts nothing.
+app.get('/api/projects/:project/staging-pending', route(async (req, res) => {
+  await knownInfrastructureProject(req.params.project)
+  res.json(await stagingPendingReport({ project: req.params.project, projectPath: projectPath(req.params.project), root: process.env.DEVPANEL_CONFIG_ROOT, listIssues: (p, o) => issues.listIssues(p, o) }))
 }))
 
 /*

@@ -38,7 +38,7 @@ export async function captureWindow ({ issuePath, runId, workspace, evidence = [
     const number=String(r.number).padStart(3,'0')
     // Published findings and operation receipts are new report inputs, not
     // the source issue's old agent conversation. Recognize older receipts too.
-    if(r.origin==='external-report' || /^(finding|staging-deployment):/.test(r.invocationId??'')) reportNumbers.add(number)
+    if(r.origin==='external-report' || /^(finding|staging-deployment|staging-coverage):/.test(r.invocationId??'')) reportNumbers.add(number)
     else if(r.invocationId || r.origin==='agent-turn') agentNumbers.add(number)
   }
   const runs=await fs.readdir(path.join(issuePath,'runs'),{withFileTypes:true}).catch(e=>{if(e.code==='ENOENT')return [];throw e})

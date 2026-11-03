@@ -1125,6 +1125,12 @@ watch(() => route.query.run, (runId) => {
         <IssueStats :project="project" :issue-id="issueId" :version="issueVersion" />
       </v-card>
       <!-- A packed archive: what each run came to, read from its summary. -->
+      <v-card v-if="issue.archivedNotes?.length" elevation="0" border class="card" data-testid="archived-notes">
+        <h2 class="packed__title">Notes since this issue was archived</h2>
+        <p class="muted">Restoring the issue makes each a step.</p>
+        <MarkdownText v-for="note in issue.archivedNotes" :key="note.invocationId" :text="note.text" compact />
+      </v-card>
+
       <v-card v-if="issue.packed" v-show="shown('run')" elevation="0" border class="card runcard packed">
         <div class="packed__head">
           <h2 class="packed__title">What the runs came to</h2>
@@ -1139,6 +1145,7 @@ watch(() => route.query.run, (runId) => {
             </summary>
             <MarkdownText :text="r.text.split('\n').slice(1).join('\n').trim()" compact />
           </details>
+          <p v-for="op in issue.archive?.operations ?? []" :key="op.id" class="muted" data-testid="packed-operation">Shared staging deployment {{ op.id }} · {{ op.status }}{{ op.startedAt ? ` · ${op.startedAt.slice(0, 16).replace('T', ' ')}` : '' }}</p>
         </div>
       </v-card>
 

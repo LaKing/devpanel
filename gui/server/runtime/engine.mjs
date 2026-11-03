@@ -19,7 +19,7 @@ import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { openCleanup, unprovedScan, cleanupEntry, proveEntries, cleanupRefusal, noteLostTags, addBarrierEntries, syncBarrier, readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
 import { ownerLost } from './run-control.mjs'
-import { fingerprint, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
+import { fingerprint, gitIdentity, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity, writeIntegrity } from './integrity.mjs'
 import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
@@ -3517,7 +3517,7 @@ export class Engine {
         if(!releaseAssessmentAccepted(prepared)) {
           this.run.status='blocked';this.run.blockedReason='release-preparation-unresolved';this.run.outcome='unresolved';await this.persist();break
         }
-        this.run.release = await executeRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),workspace:this.run.workspace,snapshot:this.snapshot,signal:this.controller.signal,onUpdate:async state=>{this.run.release=structuredClone(state);await this.persist({type:'release-command',command:state.commands.at(-1)?.id,status:state.commands.at(-1)?.status})},verifySource:async()=>{
+        this.run.release = await executeRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),workspace:this.run.workspace,snapshot:this.snapshot,signal:this.controller.signal,coverage:this.releaseCoverage?args=>this.releaseCoverage({...args,snapshotAt:this.run.startedAt}):null,onUpdate:async state=>{this.run.release=structuredClone(state);await this.persist({type:'release-command',command:state.commands.at(-1)?.id,status:state.commands.at(-1)?.status})},verifySource:async()=>{
           if(!await this.beginIntegrity('release-operator',{invocationId:`release-${uuid()}`}))throw new Error('release source integrity changed')
         }})
         await this.persist({type:'release-operation',status:this.run.release.status})
@@ -4238,7 +4238,12 @@ export class Engine {
       // The candidate already is the project checkout: there is nothing to hand
       // off. What is recorded is what changed, so the run says what it did.
       conditions.deliveryCompleted = true
-      this.run.delivery = { action: 'in-place', revision: current, revalidated: true, completedAt: this.clock.iso(), artifactRef: null, bytes: null, reconstruction: null, repository: null, branch: null, commit: null, error: null, path: this.run.workspace.path, changedPaths: (fresh?.entries ?? []).filter((e) => e.status !== 'unchanged').map((e) => e.path) }
+      this.run.delivery = { action: 'in-place', revision: current, revalidated: true, completedAt: this.clock.iso(), artifactRef: null, bytes: null, reconstruction: null, repository: null, branch: null, commit: null, error: null, path: this.run.workspace.path, changedPaths: (fresh?.entries ?? []).filter((e) => e.status !== 'unchanged').map((e) => e.path),
+        // An in-place run has no patch: what it left, in a patch's terms, so a staging release can be compared with it (staging-coverage.mjs).
+        content: await Promise.all((fresh?.entries ?? []).filter((e) => e.status !== 'unchanged').map(async (e) => {
+          const id = e.status === 'deleted' ? null : await gitIdentity(path.join(this.run.workspace.path, e.path))
+          return { path: e.path, post: id ? { blob: id.sha1, mode: id.mode } : null, ...(e.status === 'added' ? { pre: null } : {}) }
+        })) }
     } else if (this.snapshot.completion.delivery.action === 'none') {
       // Nothing leaves the run: the deliverable is what the steps recorded.
       conditions.deliveryCompleted = true
@@ -4283,6 +4288,8 @@ export class Engine {
         action,
         revision: current,
         revalidated: after.fingerprint === current,
+        // Lets a later reader rule this delivery out for a path without opening its patch (staging-coverage.mjs).
+        changedPaths: (after.entries ?? []).filter((e) => e.status !== 'unchanged').map((e) => e.path),
         completedAt: null,
         artifactRef: receipt?.artifactRef ?? null,
         bytes: receipt?.bytes ?? null,

@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises'
-import { packedRuns } from './issue-bundle.mjs'
+import { bundleFiles, packedRuns } from './issue-bundle.mjs'
 import path from 'node:path'
 
 import * as store from './runtime/store.mjs'
@@ -153,7 +153,17 @@ function deepFreeze (value) {
 /** The run records a packed archived issue kept (issue-bundle.mjs), frozen like the others. */
 export async function packedRunsOf (project, id) {
   const { ISSUES_DIR } = await import('./issues.js')
-  return deepFreeze(await packedRuns(ISSUES_DIR, project, id))
+  // Parsed once per version of the file, as below: the overview and the staging report both read them.
+  const file = bundleFiles(ISSUES_DIR, project, id).runs
+  const stat = await fs.stat(file).catch(() => null)
+  const cached = stat && parsedRuns.get(file)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.run
+  const run = deepFreeze(await packedRuns(ISSUES_DIR, project, id))
+  if (stat) {
+    if (parsedRuns.size >= 2000) parsedRuns.delete(parsedRuns.keys().next().value)
+    parsedRuns.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, run })
+  }
+  return run
 }
 
 /** Every run.json under an issue, read light: no outputs, no journal. */
@@ -182,12 +192,21 @@ export async function runsOf (issuePath) {
   return runs.sort((a, b) => String(a.startedAt ?? '').localeCompare(String(b.startedAt ?? '')))
 }
 
+/** The project's staging-pending list, as many of each kind as the open issues get, and how many more. */
+async function pendingLine (read, project, limit, lists) {
+  try {
+    const report = await read(project, lists)
+    return { ...report, pending: report.pending.slice(0, limit), indeterminate: report.indeterminate.slice(0, limit),
+      truncated: { pending: Math.max(0, report.pending.length - limit), indeterminate: Math.max(0, report.indeterminate.length - limit) } }
+  } catch (error) { return { error: error.message } }
+}
+
 /**
  * @param projects    every project on the panel — a management reading has no scope
  * @param focus       what the operator asked to be attended to first; ordering only
  * @param listIssues  (project, {archived}) => issues, as issues.js returns them
  */
-export async function buildOverview ({ projects, focus = [], listIssues, openDependencies = null, readRuns = runsOf, readPackedRuns = packedRunsOf, now = Date.now(), openIssueLimit = 40 }) {
+export async function buildOverview ({ projects, focus = [], listIssues, openDependencies = null, readRuns = runsOf, readPackedRuns = packedRunsOf, now = Date.now(), openIssueLimit = 40, stagingPending = null }) {
   const out = []
   const totals = { projects: 0, openIssues: 0, archivedIssues: 0, unprioritised: 0 }
   const all = emptyRuns()
@@ -313,7 +332,8 @@ export async function buildOverview ({ projects, focus = [], listIssues, openDep
       flow7d: flow,
       openIssues: lines.slice(0, openIssueLimit),
       truncated: lines.length > openIssueLimit ? lines.length - openIssueLimit : 0,
-      ...(inquiries.length ? { inquiries } : {})
+      ...(inquiries.length ? { inquiries } : {}),
+      ...(stagingPending ? { stagingPending: await pendingLine(stagingPending, project, openIssueLimit, { open, archived }) } : {})
     })
   }
 
@@ -345,6 +365,7 @@ export async function buildOverview ({ projects, focus = [], listIssues, openDep
       delivered: 'per open issue, every run whose candidate reached its destination: kind engine (the engine delivered it) or manual (a person recorded landing it by hand, with who and the commit or checkout); runs carry delivered.engine / delivered.manual and deliveryRate, counting each run once, as the landing when there is one',
       waitingOn: 'open prerequisites (set_dependencies); such an issue sorts after every ready one and start_run refuses it until they have a disposition or are archived',
       flow7d: 'last 7 days per project, counted in issues: opened, given each disposition, and with a candidate delivered (deliveredIssues; a patch, a source application or a commit, or a landing by hand a person recorded; analyses and inquiries deliver nothing), split in delivered.engine and delivered.manual (an issue with both kinds counts in each) — compare opened with settled before calling the backlog shrinking, and resolved with partially-resolved before calling it fixed',
+      stagingPending: 'per project, runs delivered into the development checkout that no successful Staging run has covered: pending (a new release would carry them) and indeterminate (their bytes are unknown, a release could not find them, or the checkout no longer holds them; a person reads these, and they prompt no batch). history counts deliveries from before the coverage baseline, which are neither listed nor noted. batch.ready is pending non-empty, nothing live, and a Staging release target configured; whether to cut one is yours. A deployment clears nothing: only a Staging run does',
       priority: 'execution order decided by a person or by you; "unset" means nobody has decided, which is not the same as low'
       ,metrics: 'per group of terminal runs: agent time, operator wait and suspended time kept apart; plan-review round executions beside cycle restarts and ignored restart requests; in bySeat the whole-run figures are a participation cohort and only `seat` is that seat\'s own effort; compare groups of the same configuration before changing seats or models'
     },

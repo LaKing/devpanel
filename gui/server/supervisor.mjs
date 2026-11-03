@@ -1,5 +1,6 @@
 import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
+import { resumeArchivedCoverageNotes, resumeCoverageNotes, stagingRunCoverage, writeRunCoverageNotes } from './staging-coverage.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { createPathOverlap, deliveryActionOf, worthRecording } from './runtime/path-overlap.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
@@ -680,6 +681,7 @@ export function createSupervisor ({
   const armAutoReconcile = (engine, project) => {
     engine.reconcilePolicy = () => reconcilePolicyOf(project)
     engine.reconcileOwner = instanceId
+    engine.releaseCoverage = async (args) => stagingRunCoverage({ ...args, project, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null), listIssues: (p, o) => issues.listIssues(p, o) })
   }
   // No record is left to hold a decision, so nothing is left to wait on.
   const recordGone = (error) => error.status === 404 || error.code === 'ENOENT'
@@ -806,6 +808,9 @@ export function createSupervisor ({
   async function writeResult (project, issueId, runId) {
     try {
       const issue = await issues.getIssue(project, issueId)
+      // Before the account, and never in its way: a release's notes on the issues it carried.
+      await writeRunCoverageNotes({ project, issue, run: await store.readRun(issue.path, runId).catch(() => null), issues })
+        .catch((error) => console.warn(`[devpanel] could not write the coverage notes of ${project}/${issueId} run ${runId}: ${error.message}`))
       await writeRunResultStep({ issuePath: issue.path, runId, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
       return { written: true, inquiry: issue.kind === 'inquiry' }
     } catch (error) {
@@ -1482,8 +1487,11 @@ export function createSupervisor ({
       // as live that nothing will ever reconcile.
       let list = []
       try { list = await issues.listIssues(projectId) } catch { unread.push({ project: projectId }); continue }
+      // Notes kept for an archived issue whose restore did not get to them.
+      await issues.drainArchivedNotes?.(projectId).catch((error) => console.warn(`[devpanel] could not finish the archived notes of ${projectId}: ${error.message}`))
 
       for (const issue of list) {
+        await resumeCoverageNotes({ project: projectId, issue, issues }).catch((error) => console.warn(`[devpanel] could not resume the deployment notes of ${projectId}/${issue.id}: ${error.message}`))
         let names = []
         try {
           names = await runNames(issue)
@@ -1508,7 +1516,10 @@ export function createSupervisor ({
           // left off it are put back (or held here), settled ones lifted.
           await keepOnBarrier(path.dirname(issue.path), run)
           await releaseIfLeftBehind(projectId, issue.id, run)
-          if (!LIVE_STATUSES.includes(run.status)) continue
+          if (!LIVE_STATUSES.includes(run.status)) {
+            await resumeCoverageNotes({ project: projectId, issue, run, issues }).catch((error) => console.warn(`[devpanel] could not resume the coverage notes of ${projectId}/${issue.id} run ${runId}: ${error.message}`))
+            continue
+          }
 
           const owner = await lockOwner(issue.path, runId)
           const foreignLive = held(owner) && !owner.mine
@@ -1520,6 +1531,12 @@ export function createSupervisor ({
           await markUnowned(issue.path, run, owner, { releaseLock: !foreignLive })
           recovered.push({ project: projectId, issueId: issue.id, runId })
           emit?.({ type: 'run-recovery-required', project: projectId, issueId: issue.id, runId })
+        }
+      }
+      // A release's notes outlive its issue being archived: nothing else would come for them.
+      if (issues.createEngineNote) {
+        for (const issue of await issues.listIssues(projectId, { archived: true }).catch(() => [])) {
+          await resumeArchivedCoverageNotes({ project: projectId, issue, issues }).catch((error) => console.warn(`[devpanel] could not resume the coverage notes of archived ${projectId}/${issue.id}: ${error.message}`))
         }
       }
     }
