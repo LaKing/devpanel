@@ -243,29 +243,37 @@ function findingStats (run, outputs) {
   const bounds = cycleBoundaries(run)
   // Last valid review per (review, seat): a repaired attempt supersedes.
   const reviews = new Map()
+  const blockingByRound = new Map()   // review → its row, in the order the reviews ran
   for (const s of steps) {
     const out = outputs[s.number]
     if (!out?.valid || out.contract !== 'reviewResult') continue
-    const key = `${cycleOf(bounds, s.number)}:${s.phase}:${s.round}`
-    if (!reviews.has(key)) reviews.set(key, new Map())
+    const cycle = cycleOf(bounds, s.number)
+    const key = `${cycle}:${s.phase}:${s.round}`
+    if (!reviews.has(key)) {
+      reviews.set(key, new Map())
+      blockingByRound.set(key, { phase: s.phase, cycle, round: s.round, blocking: 0, blockingSlugs: 0 })
+    }
     reviews.get(key).set(s.role, out.output?.findings ?? [])
   }
   const stats = { reported: 0, distinctSlugs: 0, matchedAcrossSeats: 0, restatedBySameSeat: 0, repeatedLater: 0, blocking: 0, reviews: reviews.size, supersededReports: 0 }
   const seenEver = new Set()
-  for (const seats of reviews.values()) {
+  for (const [key, seats] of reviews) {
     const namedBy = new Map()   // slug → Set(seat)
+    const row = blockingByRound.get(key)
+    const blockingSlugs = new Set()
     for (const [seat, findings] of seats) {
       for (const f of findings) {
         if (!f?.id) continue
         const slug = String(f.id).replace(new RegExp(`^${seat}-`, 'i'), '').toLowerCase()
         stats.reported++
-        if (f.blocking) stats.blocking++
+        if (f.blocking) { stats.blocking++; row.blocking++; blockingSlugs.add(slug) }
         const by = namedBy.get(slug)
         if (!by) { namedBy.set(slug, new Set([seat])); if (seenEver.has(slug)) stats.repeatedLater++; else { stats.distinctSlugs++; seenEver.add(slug) } }
         else if (by.has(seat)) stats.restatedBySameSeat++
         else { by.add(seat); stats.matchedAcrossSeats++ }
       }
     }
+    row.blockingSlugs = blockingSlugs.size
   }
   // Reports that a later valid attempt of the same turn replaced.
   const counted = new Set([...reviews.values()].flatMap((m) => [...m.values()]))
@@ -275,8 +283,9 @@ function findingStats (run, outputs) {
   }
   return {
     ...stats,
+    blockingByRound: [...blockingByRound.values()],
     basis: bounds.basis,
-    means: 'counts finding SLUGS (the id after the seat prefix), not defects: distinctSlugs = first named in a review, matchedAcrossSeats = a different seat named the same slug in the same review, restatedBySameSeat = one seat twice, repeatedLater = named again in a later review; equal slugs are evidence of agreement, not proof, and differently worded slugs may be one defect'
+    means: 'counts finding SLUGS (the id after the seat prefix), not defects: distinctSlugs = first named in a review, matchedAcrossSeats = a different seat named the same slug in the same review, restatedBySameSeat = one seat twice, repeatedLater = named again in a later review; equal slugs are evidence of agreement, not proof, and differently worded slugs may be one defect; blockingByRound has one row per review (cycle, phase, round) in the order they ran, from each seat\'s last valid report: blocking = blocking findings reported across its seats, blockingSlugs = the distinct slugs among them, so a clean round reads 0; rounds per loop are rounds.byPhase[phase].roundExecutions and maxDepth'
   }
 }
 

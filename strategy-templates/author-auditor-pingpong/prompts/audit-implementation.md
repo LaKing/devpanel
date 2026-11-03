@@ -37,8 +37,10 @@ Findings still outstanding from your previous round, if any:
 2. **Goal conformance.** For each acceptance criterion, say whether the candidate
    satisfies it and point at the lines that do. Quote the criterion.
 3. **Run what you can.** Execute the project's own tests or checks from the
-   worktree when they can run here, and record exactly what you ran under
-   `verification.performed`. Set `verification.gate` to `executed` only when you
+   worktree when they can run here: the suites the change touches, and the whole
+   suite only when the change warrants it (it changes something most suites depend
+   on). Record exactly what you ran under `verification.performed`, naming each
+   suite and why you ran it. Set `verification.gate` to `executed` only when you
    ran the project's gate yourself; `not-executed` when you deliberately did not,
    with `notRun` saying why; `unknown` when you cannot tell. Never borrow a green
    result you did not observe. A `checks.latest` result above is the engine's
@@ -59,6 +61,12 @@ observed: the behaviour, the command, the line). A finding that cannot cite all 
 these is `minor` or `info` with `blocking: false`. Style, naming, documentation
 wording and test completeness default to `minor` unless they hide a demonstrated
 correctness or safety risk. One root cause is one finding.
+
+Report every blocking finding you can establish in this round, each with those
+citations: do not stop at the first, and do not hold one back for a later round.
+If you stopped short (time, or part of the patch, the code it touches or a criterion
+left unexamined), say so under `verification.notRun`, naming what you did not
+examine and why.
 
 Approve only when nothing substantial remains and every plan finding is addressed
 or withdrawn. Do not withhold approval solely because you could not run something;

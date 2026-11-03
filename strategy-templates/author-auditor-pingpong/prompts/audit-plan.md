@@ -41,8 +41,19 @@ Style, wording and test completeness default to `minor` unless they hide a
 demonstrated correctness or safety risk. Group manifestations of one root cause
 into one finding.
 
+Report every blocking finding you can establish in this round, each with those
+citations: do not stop at the first, and do not hold one back for a later round.
+If you stopped short (time, or part of the plan, the code it touches or a criterion
+left unexamined), say so under `verification.notRun`, naming what you did not
+examine and why.
+
 Approve only when nothing substantial remains. Do not withhold approval for
 things you could not verify; name them instead under `verification.notRun`.
+
+A plan review rarely needs a test run. If you run tests, run the suites the planned
+change touches, and the whole suite only when the change warrants it (it changes
+something most suites depend on); under `verification.performed` name each suite
+you ran and why you ran it.
 
 End with a fenced `json` block matching the `reviewResult` contract. Set
 `artifactRevision` to null: a plan has no candidate revision. Fill `verification`

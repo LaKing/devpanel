@@ -191,6 +191,25 @@ export default async (t) => {
     t.eq('without outputs there is no findings reading rather than a zero one', runMetrics(run).findings, null)
   }
 
+  t.section('   …blocking findings per round, beside the rounds per loop')
+  {
+    const rows = m.findings.blockingByRound.map((r) => [r.phase, r.cycle, r.round, r.blocking, r.blockingSlugs])
+    t.eq('one row per review in the order they ran: reports and distinct slugs, a repaired attempt left out, a clean round 0', rows, [
+      ['plan-review', 0, 0, 6, 3],
+      ['plan-review', 1, 0, 2, 2],
+      ['plan-review', 1, 1, 0, 0],
+      ['implement-review', 1, 0, 3, 1],
+      ['implement-review', 1, 1, 0, 0]
+    ])
+    t.eq('the rows add up to the whole-run count', m.findings.blockingByRound.reduce((a, r) => a + r.blocking, 0), m.findings.blocking)
+    t.eq('the loops\' rounds are the rounds reading', [m.rounds.byPhase['plan-review'].roundExecutions, m.rounds.byPhase['implement-review'].roundExecutions], [3, 2])
+    t.ok('and the reading says where rounds per loop are', /blockingByRound/.test(m.findings.means) && /roundExecutions/.test(m.findings.means))
+    n = 0
+    const one = step({ stepId: 'audit-plan-1', role: 'auditor-1', phase: 'plan-review', from: 0, minutes: 1 })
+    const mixed = runMetrics({ startedAt: at(0), endedAt: at(1), status: 'completed', steps: [one] }, { outputs: { [one.number]: review([finding('auditor-1-a'), finding('auditor-1-b', false)]) } })
+    t.eq('a non-blocking finding is not counted as blocking', [mixed.findings.blockingByRound[0].blocking, mixed.findings.reported], [1, 2])
+  }
+
   t.section('4. a run still waiting counts an open question as waiting and a manual pause as suspension')
   {
     const later = T0 + (clock + 15) * 60_000

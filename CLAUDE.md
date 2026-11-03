@@ -382,7 +382,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   older record's total); and reviewer finding
   SLUGS (id after the seat prefix) as distinct / matched by another seat in the same review / restated by the
   same seat / repeated later — slug equality is evidence of agreement, not proof of one defect, and the reading
-  says so. The engine marks each coordinator effect's `reset` (`plan`/`evidence`); a fresh first step that no
+  says so — with `findings.blockingByRound` giving each review's blocking findings (`blocking`, `blockingSlugs`). The engine marks each coordinator effect's `reset` (`plan`/`evidence`); a fresh first step that no
   recorded reset explains is an inferred restart (`restartsInferred`, basis `inferred`/`mixed`), reconciled
   boundary by boundary so a record resumed across the upgrade keeps its history. Check time is `checksMs` (union of every
   recorded check interval: `checkResults` and their attempts, `priorCheckResults`, `baselineChecks`, and `checkHistory`

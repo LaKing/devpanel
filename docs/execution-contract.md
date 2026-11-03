@@ -2106,7 +2106,11 @@ invocation time and capped at 256 KB.
 A substantial finding (`blocking: true`, or severity `major`/`critical`) must
 carry `criterion` and `location`; the engine treats a review missing either as
 a contract violation and asks the reviewer to cite or downgrade. `verification`
-(`gate`, `performed`, `notRun`) records what the reviewer actually did.
+(`gate`, `performed`, `notRun`) records what the reviewer actually did. The audit
+templates ask for every blocking finding the reviewer can establish in the round;
+`notRun` says where it stopped short, and `performed` names each test suite it ran
+and why (the suites the change touches, the whole suite only when the change
+warrants it). The templates ask this; the engine does not check it.
 
 ### Persistence and decision identity
 

@@ -33,6 +33,17 @@ description stating the minimum change that resolves it. Anything that cannot
 cite these is `minor` or `info` with `blocking: false`. Wording and structure are
 `minor` unless they make the document misleading.
 
+Report every blocking finding you can establish in this round, each with those
+citations: do not stop at the first, and do not hold one back for a later round.
+If you stopped short (time, or part of the document, the source it cites or a
+criterion left unexamined), say so under `verification.notRun`, naming what you did
+not examine and why.
+
+A document review rarely needs a test run. If a claim can only be settled by running
+tests, run the suites that claim touches, and the whole suite only when the claim
+warrants it (it is about the whole project); under `verification.performed` name
+each suite you ran and why you ran it.
+
 End with a fenced `json` block matching the `reviewResult` contract, with
 `artifactRevision` null (a document has no candidate revision) and `verification`
 listing what you read and checked.
