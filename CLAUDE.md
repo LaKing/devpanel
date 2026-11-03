@@ -234,7 +234,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   worktree-relative target in every seat fence (claude, codex, gemini), proved before launch; the engine makes the
   target an empty directory without following a link out of the worktree. A missing source is recorded `missing` at
   resolution (never a config error; `config:check --project` warns) and refuses that project's seat turns naming it.
-  Targets are left out of the snapshot, every fingerprint (`workspaceProjection`) and the patch. Declared commands are
+  Targets are left out of the snapshot, every fingerprint (`workspaceProjection`) and the patch. So are the stubs of the CLI's Bash sandbox (`workspace.fenceStubs`: read-only empty files at listed config paths, removed at each turn's end, docs/source-integrity.md). Declared commands are
   given to authors, auditors and the coordinator only as `cd <cwd> && /run/devpanel/tooling/offline sh -c '<run>'`
   (`harness/tooling/offline`: a fresh network namespace, no `--`; where that cannot start (Codex's sandbox) the
   runtime's own denial is accepted only when proved before the command — a seccomp filter and EPERM creating TCP/UDP

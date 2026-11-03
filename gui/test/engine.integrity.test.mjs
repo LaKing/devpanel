@@ -1,14 +1,18 @@
 import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
-import { readRun, readEvents } from '../server/runtime/store.mjs'
-import { captureIntegrity, readIntegrity } from '../server/runtime/integrity.mjs'
+import { startRun, resumeRun, releaseWorkspace, worktreeDiffDelivery } from '../server/runtime/launch.mjs'
+import { readRun, readEvents, runDir, writeRun } from '../server/runtime/store.mjs'
+import { captureIntegrity, integrityChanges, readIntegrity } from '../server/runtime/integrity.mjs'
+import { FENCE_STUBS, fingerprint, workspaceProjection } from '../server/runtime/fingerprint.mjs'
+import { removeFenceStubs } from '../server/runtime/tooling-mounts.mjs'
+import { candidateDiff } from '../server/runtime/diff.mjs'
 import { integrateRun } from '../server/runtime/integrate.mjs'
 import { workspaceDisposition, supportedActions } from '../server/supervisor.mjs'
-import { engineFixture, scriptFor, simulateProcessDeath } from './fakes/fixture.mjs'
+import { engineFixture, leaveFenceStubs, scriptFor, simulateProcessDeath } from './fakes/fixture.mjs'
 
 export const name = 'engine — per-turn source permissions and integrity quarantine'
 const exec = promisify(execFile)
@@ -351,6 +355,285 @@ export default async function (t) {
     state = await captureIntegrity(engine.run.workspace, { clock: engine.clock })
     await engine.resolveIntegrity({ disposition: 'restored', expectedStateHash: state.hash, actor: 'operator', reason: 'restored original source' })
     t.eq('verified restoration clears quarantine', engine.run.integrity.status, 'clear')
+    await releaseWorkspace(engine)
+  }
+
+  const onDisk = async (root, paths = [...FENCE_STUBS, '.claude']) => (await Promise.all(paths.map((rel) => fs.lstat(path.join(root, rel)).then(() => rel, () => null)))).filter(Boolean)
+  const REAL = '{"mcpServers":{}}\n'
+  // The candidate's patch, recomputed by delivery from what is on disk now.
+  const patchOf = async (engine) => {
+    const ws = engine.run.workspace
+    const receipt = await worktreeDiffDelivery.deliver({ action: 'worktree-diff', revision: engine.run.revisions.at(-1).fingerprint, fingerprint: null, baseCommit: ws.baseCommit, baseline: engine.baseline, workspacePath: ws.path, workspace: ws, runDir: runDir(engine.issuePath, engine.runId) })
+    return { receipt, text: await fs.readFile(path.join(runDir(engine.issuePath, engine.runId), receipt.artifactRef), 'utf8') }
+  }
+
+  t.section('fence stubs: a killed or failed turn that left only stubs is not quarantined, and they are removed')
+  for (const mode of ['cancelled', 'failed']) {
+    const { engine } = await changedTurn({ role: 'implementer', abort: mode === 'cancelled', fail: mode === 'failed', change: (cwd) => leaveFenceStubs(cwd) })
+    t.eq(`${mode}: not quarantined`, engine.run.integrity.status, 'clear')
+    t.eq(`${mode}: no change counted`, engine.run.integrity.latest.changes.paths, [])
+    t.eq(`${mode}: nothing is left, the directory they needed included`, await onDisk(engine.run.workspace.path), [])
+    t.eq(`${mode}: the report names what went`, [...engine.run.integrity.latest.fenceStubsRemoved].sort(), [...FENCE_STUBS.map((rel) => rel.replace(/\/$/, '')), '.claude'].sort())
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: a turn killed before any cleanup could run, the owner lost with it')
+  {
+    const f = await engineFixture()
+    const original = f.fake.invoke
+    f.fake.invoke = async (args) => {
+      if (args.meta.stepId === 'implement') await fs.writeFile(path.join(args.cwd, 'source.txt'), 'the real change\n')
+      return original(args)
+    }
+    const first = await start(f)
+    first.hooks.beforeInvoke = async (e) => {
+      if (!e.run.participants.implementer?.pendingInvocation) return
+      delete e.hooks.beforeInvoke
+      throw new Error('simulated process death')
+    }
+    t.ok('the owner dies in the turn', await rejected(() => first.drive()))
+    await leaveFenceStubs(first.run.workspace.path)
+    await simulateProcessDeath(f.issuePath)
+    const stored = await readRun(f.issuePath, first.runId)
+    Object.assign(stored, { status: 'blocked', outcome: 'unresolved', blockedReason: 'recovery-required', recovery: { required: true, ownerLost: true, reason: 'the run was live when its owner disappeared', detectedAt: f.clock.iso(), lastActivityAt: f.clock.iso() } })
+    if (stored.workspace?.state === 'active') stored.workspace.state = 'retained'
+    await writeRun(f.issuePath, first.runId, stored)
+    const engine = await resumeRun({ issuePath: f.issuePath, runId: first.runId, harnesses: f.harnesses, stepStore: f.stepStore, clock: f.clock, configRoot: f.configRoot, deliveryProvider: f.delivery, workspaceProvider: f.workspaceProvider, projectPath: f.projectPath })
+    const outcome = await engine.recoverOwnerLoss()
+    t.ok('recovery resumes it: stubs alone do not quarantine', outcome.resumed, outcome.reason)
+    t.eq('not quarantined', engine.run.integrity.status, 'clear')
+    t.eq('recovery removed them', await onDisk(engine.run.workspace.path), [])
+    await engine.drive()
+    t.eq('the run completes', engine.run.outcome, 'resolved')
+    // Worse than the sweep ever leaves it: they stand again as the revision is read.
+    const ws = engine.run.workspace
+    const revision = engine.run.revisions.at(-1).fingerprint
+    await leaveFenceStubs(ws.path)
+    const projected = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+    t.eq('the fingerprint does not count them', projected.fingerprint, revision)
+    const checkpoint = await readIntegrity(engine.integrityDir(), engine.run.integrity.checkpoint)
+    t.eq('nor does the integrity capture', integrityChanges(checkpoint, await captureIntegrity(ws, { clock: engine.clock, trackedPaths: checkpoint.trackedPaths })).paths, [])
+    const diff = await candidateDiff(ws.path, { baseCommit: ws.baseCommit, gitDir: ws.gitDir, fenceStubs: ws.fenceStubs })
+    t.ok('the auditor\'s diff holds the change', diff.text.includes('the real change'))
+    t.eq('and none of them', FENCE_STUBS.filter((rel) => diff.text.includes(rel)), [])
+    const { receipt, text } = await patchOf(engine)
+    t.eq('the patch reconstructs the revision', receipt.reconstruction.verified, true, receipt.reconstruction.detail)
+    t.ok('the patch holds the change', text.includes('the real change'))
+    t.eq('and none of them', FENCE_STUBS.filter((rel) => text.includes(rel)), [])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: what was there before the turn stays as it was')
+  for (const mode of ['completed', 'cancelled']) {
+    const f = await engineFixture()
+    await fs.mkdir(path.join(f.projectPath, '.claude'))
+    await fs.writeFile(path.join(f.projectPath, '.mcp.json'), REAL)
+    await fs.writeFile(path.join(f.projectPath, '.claude', 'settings.json'), '{}\n')
+    await fs.writeFile(path.join(f.projectPath, '.profile'), '')
+    await fs.writeFile(path.join(f.projectPath, '.idea'), '')
+    await git(f.projectPath, ['add', '-f', '.mcp.json', '.claude/settings.json', '.profile', '.idea'])
+    await git(f.projectPath, ['commit', '-qm', 'config the project owns'])
+    const original = f.fake.invoke
+    f.fake.invoke = async (args) => {
+      if (args.meta.stepId === 'implement') {
+        await leaveFenceStubs(args.cwd)
+        if (mode === 'cancelled') throw Object.assign(new Error('stopped'), { name: 'AbortError' })
+      }
+      return original(args)
+    }
+    const engine = await start(f)
+    const root = engine.run.workspace.path
+    await engine.drive()
+    t.eq(`${mode}: not quarantined`, engine.run.integrity.status, 'clear')
+    t.eq(`${mode}: a file with content keeps it`, await fs.readFile(path.join(root, '.mcp.json'), 'utf8'), REAL)
+    t.eq(`${mode}: and so does its neighbour`, await fs.readFile(path.join(root, '.claude', 'settings.json'), 'utf8'), '{}\n')
+    t.eq(`${mode}: a tracked empty file stays`, (await fs.stat(path.join(root, '.profile'))).size, 0)
+    t.eq(`${mode}: only what the turn left is gone`, await onDisk(root), ['.idea', '.mcp.json', '.profile', '.claude/settings.json', '.claude'])
+    const fp = await fingerprint(root, { baseCommit: engine.run.workspace.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(engine.run.workspace) })
+    t.eq(`${mode}: a tracked empty file is still the base's`, fp.entries.find((e) => e.path === '.profile')?.status, 'unchanged')
+    await fs.rm(path.join(root, '.profile'))
+    const removed = await fingerprint(root, { baseCommit: engine.run.workspace.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(engine.run.workspace) })
+    t.eq(`${mode}: and deleting it is a deletion`, removed.entries.find((e) => e.path === '.profile')?.status, 'deleted')
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: a real file at one of those paths is still a change')
+  {
+    const { engine } = await changedTurn({ role: 'implementer', change: async (cwd) => { await leaveFenceStubs(cwd); await fs.chmod(path.join(cwd, '.mcp.json'), 0o644); await fs.writeFile(path.join(cwd, '.mcp.json'), REAL) } })
+    const report = (await readEvents(engine.issuePath, engine.runId)).events.find((e) => e.type === 'turn-integrity' && e.role === 'implementer')
+    t.eq('the integrity check counts it, and only it', report.changes.paths, [{ path: '.mcp.json', change: 'added' }])
+    t.eq('the rest of the stubs are gone and it is not', await onDisk(engine.run.workspace.path), ['.mcp.json'])
+    const ws = engine.run.workspace
+    const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+    t.eq('the fingerprint holds it', fp.entries.filter((e) => e.status !== 'unchanged').map((e) => [e.path, e.status]), [['.mcp.json', 'added']])
+    t.eq('that is the revision', fp.fingerprint, engine.run.revisions.at(-1).fingerprint)
+    t.ok('the auditor\'s diff shows it', (await candidateDiff(ws.path, { baseCommit: ws.baseCommit, gitDir: ws.gitDir, fenceStubs: ws.fenceStubs })).text.includes('mcpServers'))
+    const { receipt, text } = await patchOf(engine)
+    t.eq('the patch reconstructs it', receipt.reconstruction.verified, true, receipt.reconstruction.detail)
+    t.ok('the patch holds it', text.includes('mcpServers') && text.includes('b/.mcp.json'))
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await changedTurn({ stepId: 'audit-implement-1', change: (cwd) => fs.writeFile(path.join(cwd, '.mcp.json'), REAL) })
+    t.eq('from an auditor it quarantines', engine.run.integrity.status, 'quarantined')
+    t.eq('naming the path', engine.run.integrity.latest.changes.paths, [{ path: '.mcp.json', change: 'added' }])
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await changedTurn({ role: 'implementer', abort: true, change: async (cwd) => { await fs.writeFile(path.join(cwd, '.mcp.json'), REAL); await leaveFenceStubs(cwd) } })
+    t.eq('from a killed author it is partial work to dispose of', engine.run.integrity.status, 'quarantined')
+    t.eq('the report names only it', engine.run.integrity.latest.changes.paths, [{ path: '.mcp.json', change: 'added' }])
+    t.eq('it is retained, the stubs are not', await onDisk(engine.run.workspace.path), ['.mcp.json'])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: an empty file the author made is real, on every route a stub is left out of')
+  {
+    const { engine } = await changedTurn({ role: 'implementer', change: async (cwd) => { await fs.writeFile(path.join(cwd, '.mcp.json'), ''); await leaveFenceStubs(cwd) } })
+    const ws = engine.run.workspace
+    const report = (await readEvents(engine.issuePath, engine.runId)).events.find((e) => e.type === 'turn-integrity' && e.role === 'implementer')
+    t.eq('the integrity check counts it, and only it', report.changes.paths, [{ path: '.mcp.json', change: 'added' }])
+    t.eq('the sweep takes the stubs and leaves it', await onDisk(ws.path), ['.mcp.json'])
+    const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+    t.eq('the fingerprint holds it', fp.entries.filter((e) => e.status !== 'unchanged').map((e) => [e.path, e.status]), [['.mcp.json', 'added']])
+    t.eq('that is the revision', fp.fingerprint, engine.run.revisions.at(-1).fingerprint)
+    t.ok('the auditor\'s diff names it', (await candidateDiff(ws.path, { baseCommit: ws.baseCommit, gitDir: ws.gitDir, fenceStubs: ws.fenceStubs })).text.includes('.mcp.json'))
+    const { receipt, text } = await patchOf(engine)
+    t.eq('the patch reconstructs it', receipt.reconstruction.verified, true, receipt.reconstruction.detail)
+    t.ok('the patch holds it', text.includes('b/.mcp.json'))
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await changedTurn({ stepId: 'audit-implement-1', change: (cwd) => fs.writeFile(path.join(cwd, '.mcp.json'), '') })
+    t.eq('from an auditor it quarantines', engine.run.integrity.latest.changes?.paths, [{ path: '.mcp.json', change: 'added' }])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: an incomplete set, a kill inside the sandbox\'s setup or cleanup, still counts for nothing')
+  const leaveIncomplete = async (root, keep) => {
+    await leaveFenceStubs(root)
+    for (const rel of FENCE_STUBS) if (!rel.endsWith('/') && !keep(rel)) await fs.rm(path.join(root, rel))
+  }
+  for (const [kill, keep] of [['setup', (rel) => ['.mcp.json', '.claude/agents'].includes(rel)], ['cleanup', (rel) => rel !== '.zshrc']]) {
+    for (const mode of ['completed', 'cancelled', 'failed']) {
+      const { engine } = await changedTurn({ role: 'implementer', abort: mode === 'cancelled', fail: mode === 'failed', change: (cwd) => leaveIncomplete(cwd, keep) })
+      const ws = engine.run.workspace
+      t.eq(`${kill}/${mode}: not quarantined`, engine.run.integrity.status, 'clear')
+      t.eq(`${kill}/${mode}: the sweep leaves nothing`, await onDisk(ws.path), [])
+      const fingerprintNow = () => fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+      const clean = (await fingerprintNow()).fingerprint
+      // They stand again for the readings a sweep does not get ahead of.
+      await leaveIncomplete(ws.path, keep)
+      const checkpoint = await readIntegrity(engine.integrityDir(), engine.run.integrity.checkpoint)
+      t.eq(`${kill}/${mode}: the integrity capture does not count them`, integrityChanges(checkpoint, await captureIntegrity(ws, { clock: engine.clock, trackedPaths: checkpoint.trackedPaths })).paths, [])
+      t.eq(`${kill}/${mode}: nor the fingerprint`, (await fingerprintNow()).fingerprint, clean)
+      await fs.writeFile(path.join(ws.path, 'source.txt'), 'a real change\n')
+      const diff = await candidateDiff(ws.path, { baseCommit: ws.baseCommit, gitDir: ws.gitDir, fenceStubs: ws.fenceStubs })
+      t.eq(`${kill}/${mode}: nor the auditor's diff`, FENCE_STUBS.filter((rel) => diff.text.includes(rel)), [])
+      const receipt = await worktreeDiffDelivery.deliver({ action: 'worktree-diff', revision: (await fingerprintNow()).fingerprint, fingerprint: null, baseCommit: ws.baseCommit, baseline: engine.baseline, workspacePath: ws.path, workspace: ws, runDir: runDir(engine.issuePath, engine.runId) })
+      const patch = await fs.readFile(path.join(runDir(engine.issuePath, engine.runId), receipt.artifactRef), 'utf8')
+      t.eq(`${kill}/${mode}: the patch reconstructs`, receipt.reconstruction.verified, true, receipt.reconstruction.detail)
+      t.ok(`${kill}/${mode}: holding the change`, patch.includes('a real change'))
+      t.eq(`${kill}/${mode}: and none of them`, FENCE_STUBS.filter((rel) => patch.includes(rel)), [])
+      await removeFenceStubs(ws.path, ws.fenceStubs, [])
+      t.eq(`${kill}/${mode}: and a sweep takes them`, await onDisk(ws.path), [])
+      await releaseWorkspace(engine)
+    }
+  }
+
+  t.section('fence stubs: the accepted limit, a read-only empty file an author made reads as a stub')
+  for (const mode of ['completed', 'cancelled', 'failed']) {
+    const { engine } = await changedTurn({ role: 'implementer', abort: mode === 'cancelled', fail: mode === 'failed', change: (cwd) => fs.writeFile(path.join(cwd, '.gitmodules'), '', { mode: 0o444 }) })
+    t.eq(`${mode}: it is not counted`, engine.run.integrity.status, 'clear')
+    t.eq(`${mode}: and is removed`, await onDisk(engine.run.workspace.path), [])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: a writable empty file alone, content, and a path the base holds stay changes or stay put')
+  {
+    const { engine } = await changedTurn({ role: 'implementer', abort: true, change: (cwd) => fs.writeFile(path.join(cwd, '.gitmodules'), '') })
+    t.eq('a writable empty file from a killed author is partial work', engine.run.integrity.latest.changes.paths, [{ path: '.gitmodules', change: 'added' }])
+    t.eq('and it stays', await onDisk(engine.run.workspace.path), ['.gitmodules'])
+    await releaseWorkspace(engine)
+  }
+  {
+    const { engine } = await changedTurn({ role: 'implementer', abort: true, change: (cwd) => fs.writeFile(path.join(cwd, '.gitmodules'), '[real]\n', { mode: 0o444 }) })
+    t.eq('a read-only file with content is a change', engine.run.integrity.latest.changes.paths, [{ path: '.gitmodules', change: 'added' }])
+    t.eq('and it stays', await onDisk(engine.run.workspace.path), ['.gitmodules'])
+    await releaseWorkspace(engine)
+  }
+  {
+    const f = await engineFixture()
+    await fs.writeFile(path.join(f.projectPath, '.profile'), '')
+    await git(f.projectPath, ['add', '-f', '.profile'])
+    await git(f.projectPath, ['commit', '-qm', 'an empty file the base holds'])
+    const original = f.fake.invoke
+    f.fake.invoke = async (args) => {
+      if (args.meta.stepId === 'implement') await fs.chmod(path.join(args.cwd, '.profile'), 0o444)
+      return original(args)
+    }
+    const engine = await start(f)
+    await engine.drive()
+    const ws = engine.run.workspace
+    t.eq('a path the base holds is left, read-only and empty', [engine.run.integrity.status, await onDisk(ws.path)], ['clear', ['.profile']])
+    const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+    t.eq('and is still the base\'s', fp.entries.find((e) => e.path === '.profile')?.status, 'unchanged')
+    await fs.rm(path.join(ws.path, '.profile'))
+    const removed = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline: engine.baseline, clock: engine.clock, projection: workspaceProjection(ws) })
+    t.eq('deleting it is a deletion', removed.entries.find((e) => e.path === '.profile')?.status, 'deleted')
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: overlapping seats, the stub of the first seen by the second')
+  {
+    const f = await engineFixture()
+    await fs.writeFile(path.join(f.projectPath, '.idea'), '')
+    await git(f.projectPath, ['add', '-f', '.idea'])
+    await git(f.projectPath, ['commit', '-qm', 'an empty file the project owns'])
+    const engine = await start(f)
+    await engine.drive()
+    const root = engine.run.workspace.path
+    const first = { invocationId: 'first' }
+    t.ok('the first seat begins', await engine.beginIntegrity('auditor-1', first))
+    engine.run.participants['auditor-1'].pendingInvocation = first
+    await leaveFenceStubs(root)
+    const second = { invocationId: 'second' }
+    t.ok('the second begins, its seat fenced beside the stubs', await engine.beginIntegrity('implementer', second))
+    engine.run.participants.implementer.pendingInvocation = second
+    t.eq('it does not take them for what it received', second.fenceStubsPresent, ['.idea'])
+    t.eq('the first to end leaves them to the other', await engine.sweepFenceStubs(first), [])
+    t.ok('the last to end removes them', (await engine.sweepFenceStubs(second)).includes('.gitmodules'))
+    t.eq('only what was there before either began stays', await onDisk(root), ['.idea'])
+    engine.run.participants['auditor-1'].pendingInvocation = null
+    engine.run.participants.implementer.pendingInvocation = null
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: removal stops at a link, at content, and while another seat is still running')
+  {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-stubs-'))
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-stubs-outside-'))
+    await fs.symlink(outside, path.join(root, '.claude'))
+    await fs.mkdir(path.join(root, '.vscode'))
+    await fs.writeFile(path.join(root, '.vscode', 'settings.json'), '{}\n')
+    await fs.mkdir(path.join(root, '.idea'))
+    await fs.writeFile(path.join(root, '.profile'), '')
+    await leaveFenceStubs(root)
+    t.eq('only the stubs go: not a directory the list names as a file, nor a writable empty file', await removeFenceStubs(root, FENCE_STUBS, []), ['.bash_profile', '.bashrc', '.gitconfig', '.gitmodules', '.mcp.json', '.ripgreprc', '.zprofile', '.zshrc'])
+    t.ok('nothing is removed through the link', await fs.lstat(path.join(outside, 'agents')).then(() => true, () => false))
+    t.eq('a directory with content stays', await fs.readFile(path.join(root, '.vscode', 'settings.json'), 'utf8'), '{}\n')
+    await fs.rm(root, { recursive: true, force: true })
+    await fs.rm(outside, { recursive: true, force: true })
+
+    const { engine } = await changedTurn({ role: 'implementer', change: () => {} })
+    const running = { invocationId: 'still-running', fenceStubsPresent: [] }
+    engine.run.participants['auditor-1'].pendingInvocation = running
+    await leaveFenceStubs(engine.run.workspace.path)
+    t.eq('a seat ending beside a running one leaves them', await engine.sweepFenceStubs({ invocationId: 'ended-first', fenceStubsPresent: [] }), [])
+    t.eq('still there', (await onDisk(engine.run.workspace.path)).length, FENCE_STUBS.length + 1)
+    t.ok('the last to end removes them', (await engine.sweepFenceStubs(running)).includes('.mcp.json'))
+    t.eq('gone', await onDisk(engine.run.workspace.path), [])
+    engine.run.participants['auditor-1'].pendingInvocation = null
     await releaseWorkspace(engine)
   }
 

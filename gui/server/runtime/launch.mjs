@@ -12,7 +12,7 @@ import { promisify } from 'node:util'
 import { resolvePlaybook } from '../config/load.mjs'
 import { preflight, assertLaunchable } from '../config/preflight.mjs'
 import { systemClock } from './clock.mjs'
-import { baselineOf, escapingLinks, fingerprint, workspaceProjection } from './fingerprint.mjs'
+import { baselineOf, escapingLinks, FENCE_STUBS, fingerprint, workspaceProjection } from './fingerprint.mjs'
 import { walkSelection, authorizer, knownProjectRoots, forbiddenRootsReport, homeExemption, copySelected, exportProject, SELECTION_RULE } from './selection.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
 import { worktreeGitArgs, repositoryGitArgs, engineGitEnv, HARDENED, LOCAL_TRANSPORT } from './engine-git.mjs'
@@ -581,6 +581,7 @@ export const gitWorktreeProvider = {
       base: { policy: kind, ref, headCommit, snapshotRef, dirtyPaths, untrackedPaths, excludes, ...(selection ? { selection: SELECTION_RULE } : {}), ...(sourceRevision ? { sourceRevision } : {}), ...(nested.length ? { nested } : {}) },
       // Left out of every fingerprint of this worktree (workspaceProjection).
       ...(toolingMounts.length ? { toolingMounts } : {}),
+      fenceStubs: [...FENCE_STUBS],
       symlinks,
       source: await sourceTarget(projectPath)
     }
@@ -1182,6 +1183,7 @@ export const inPlaceProvider = {
       baseCommit: null,
       isolation: 'in-place',
       base: { policy: 'in-place', ref: null, headCommit, snapshotRef: null, dirtyPaths, untrackedPaths, excludes },
+      fenceStubs: [...FENCE_STUBS],
       symlinks: { policy: 'allow', escaping: escaping.map((l) => ({ path: l.path, target: l.target })), materialized: [] }
     }
   },

@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { worktreeGitArgs, engineGitEnv } from './engine-git.mjs'
+import { fenceStubSet } from './fingerprint.mjs'
 
 const exec = promisify(execFile)
 const NL = String.fromCharCode(10)
@@ -19,6 +20,12 @@ export const DEFAULT_DIFF_LIMIT = 256 * 1024
 /** What the fingerprint leaves out (fingerprint.mjs DEFAULT_EXCLUDES); `.git` is never listed. */
 const FINGERPRINT_EXCLUDES = ['node_modules', '.devpanel-lock']
 
+/** Untracked paths without the fence's stubs: the fingerprint does not hold them, so the patch will not. */
+const withoutFenceStubs = async (dir, paths, stubs) => {
+  const fence = await fenceStubSet(dir, stubs)
+  return paths.filter((rel) => !fence.has(rel))
+}
+
 const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, timeout = 0 } = {}) => {
   try {
     return (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], { env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer, timeout })).stdout
@@ -32,7 +39,7 @@ const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, tim
 /**
  * @returns {{ text: string, files: number, truncated: boolean, bytes: number }}
  */
-export async function candidateDiff (workspacePath, { baseCommit = null, maxBytes = DEFAULT_DIFF_LIMIT, gitDir = null } = {}) {
+export async function candidateDiff (workspacePath, { baseCommit = null, maxBytes = DEFAULT_DIFF_LIMIT, gitDir = null, fenceStubs = [] } = {}) {
   if (!workspacePath) return { text: '', files: 0, truncated: false, bytes: 0 }
   const base = baseCommit ?? 'HEAD'
   const parts = []
@@ -44,7 +51,7 @@ export async function candidateDiff (workspacePath, { baseCommit = null, maxByte
   // The scope is the fingerprint's, not .gitignore's: a file the writer adds
   // AND ignores is still delivered, so the reviewer sees it, marked (audit I10).
   const list = async (extra) => (await git(workspacePath, ['ls-files', '--others', '-z', ...extra], { gitDir })).split('\0').filter(Boolean)
-  const untracked = (await list(FINGERPRINT_EXCLUDES.map((e) => `--exclude=${e}`))).sort()
+  const untracked = (await withoutFenceStubs(workspacePath, await list(FINGERPRINT_EXCLUDES.map((e) => `--exclude=${e}`)), fenceStubs)).sort()
   const notIgnored = new Set(await list(['--exclude-standard']))
   for (const file of untracked) {
     files += 1
@@ -64,9 +71,9 @@ export async function candidateDiff (workspacePath, { baseCommit = null, maxByte
 }
 
 /** The paths candidateDiff would show, without their content: tracked changes and untracked files. */
-export async function candidatePaths (workspacePath, { baseCommit = null, gitDir = null, timeout = 30000 } = {}) {
+export async function candidatePaths (workspacePath, { baseCommit = null, gitDir = null, timeout = 30000, fenceStubs = [] } = {}) {
   const names = async (args) => (await git(workspacePath, args, { gitDir, timeout })).split('\0').filter(Boolean)
   const tracked = await names(['diff', '--name-only', '-z', '--no-ext-diff', '--no-renames', baseCommit ?? 'HEAD', '--'])
   const untracked = await names(['ls-files', '--others', '-z', ...FINGERPRINT_EXCLUDES.map((e) => `--exclude=${e}`)])
-  return [...new Set([...tracked, ...untracked])]
+  return [...new Set([...tracked, ...await withoutFenceStubs(workspacePath, untracked, fenceStubs)])]
 }

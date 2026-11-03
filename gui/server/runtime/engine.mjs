@@ -59,7 +59,7 @@ export const FINALIZABLE_BLOCKS = ['delivery-unverifiable', 'delivery-failed', '
 import { candidateDiff } from './diff.mjs'
 import { COORDINATOR_INSTRUCTIONS, TRIAGE_READ_INSTRUCTIONS, coordinationInput } from './coordination.mjs'
 import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
-import { ensureMountPoint } from './tooling-mounts.mjs'
+import { ensureMountPoint, fenceStubsPresent, removeFenceStubs } from './tooling-mounts.mjs'
 import { toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
 
@@ -1075,6 +1075,7 @@ export class Engine {
         await this.initialiseIntegrity()
       }
       const before = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
+      await this.recordFenceStubs(pending)
       const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: before.trackedPaths })
       const changes = integrityChanges(before, current)
       pending.integrityBefore = `${pending.invocationId}-before`
@@ -1099,11 +1100,41 @@ export class Engine {
     }
   }
 
+  /**
+   * What this turn received. Seats of one round overlap: a path a seat already in
+   * flight did not find may be that seat's own stub, so it is not this turn's to
+   * keep, and the last of them to end still removes it. Read after the disk: a
+   * stub seen there came from a turn whose record is already up.
+   */
+  async recordFenceStubs (pending) {
+    const ws = this.run.workspace
+    if (!ws?.fenceStubs) return
+    const found = await fenceStubsPresent(ws.path, ws.fenceStubs)
+    const inFlight = Object.values(this.run.participants).map((p) => p.pendingInvocation?.fenceStubsPresent).filter(Boolean)
+    pending.fenceStubsPresent = found.filter((rel) => inFlight.every((theirs) => theirs.includes(rel)))
+  }
+
+  /**
+   * Take away what the fence left when a turn ends, however it ended; after a
+   * lost owner, recovery ends the turn and so gets here too. Seats of one round
+   * run side by side, and unlinking a mount target detaches it from a command
+   * still running under it, so the last of them to end does this.
+   */
+  async sweepFenceStubs (pending) {
+    const ws = this.run.workspace
+    if (!ws?.fenceStubs || !pending.fenceStubsPresent) return []
+    this.endedTurns ??= new Set()
+    this.endedTurns.add(pending.invocationId)
+    const running = Object.values(this.run.participants).some(({ pendingInvocation: other }) => other && other.integrity !== 'not-applicable' && !this.endedTurns.has(other.invocationId))
+    return running ? [] : removeFenceStubs(ws.path, ws.fenceStubs, pending.fenceStubsPresent)
+  }
+
   async endIntegrity (role, pending, outcome, failure = null, { acceptPartial = null } = {}) {
+    if (pending.integrity === 'not-applicable') return this.run.integrity?.status !== 'quarantined'
+    const fenceStubsRemoved = await this.sweepFenceStubs(pending)
     if (this.run.integrity?.status === 'quarantined') return false
-    if (pending.integrity === 'not-applicable') return true
     const report = {
-      role, invocationId: pending.invocationId, outcome, failure,
+      role, invocationId: pending.invocationId, outcome, failure, ...(fenceStubsRemoved.length ? { fenceStubsRemoved } : {}),
       writesCode: this.snapshot.participants[role].writesCode === true && (!this.snapshot.tactic || pending.cursor?.recordsRevision === true),
       before: pending.integrityBefore ?? null, after: `${pending.invocationId}-after`, at: this.clock.iso()
     }
@@ -2129,7 +2160,7 @@ export class Engine {
     // The candidate as a patch, computed now from the worktree: the one context
     // item that cannot be recorded ahead of time because it IS the disk.
     if ((step.context ?? []).includes('revision.diff') && this.run.workspace?.path) {
-      const diff = await candidateDiff(this.run.workspace.path, { baseCommit: this.run.workspace.baseCommit ?? null, gitDir: this.run.workspace.gitDir ?? null })
+      const diff = await candidateDiff(this.run.workspace.path, { baseCommit: this.run.workspace.baseCommit ?? null, gitDir: this.run.workspace.gitDir ?? null, fenceStubs: this.run.workspace.fenceStubs })
       ctx.revision.diff = diff.text
       ctx.revision.diffMeta = { files: diff.files, bytes: diff.bytes, truncated: diff.truncated }
     }

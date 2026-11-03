@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 
 import { manualClock } from '../../server/runtime/clock.mjs'
 import { gitWorktreeProvider, worktreeDiffDelivery } from '../../server/runtime/launch.mjs'
+import { FENCE_STUBS } from '../../server/runtime/fingerprint.mjs'
 import { createFakeHarness } from './harness.mjs'
 import { CONFIG_ROOT, sandbox } from '../helpers.mjs'
 
@@ -21,6 +22,16 @@ export async function simulateProcessDeath (issuePath) {
     lock.owner.processStartedAt = '1'
     await fs.writeFile(file, JSON.stringify(lock, null, 2))
   } catch { /* no lock to age */ }
+}
+
+/** What a killed seat turn leaves: the fence's mount targets the CLI never got to remove. A path that exists is left. */
+export async function leaveFenceStubs (root) {
+  for (const rel of FENCE_STUBS) {
+    const full = path.join(root, rel)
+    await fs.mkdir(path.dirname(full), { recursive: true })
+    if (rel.endsWith('/')) await fs.mkdir(full, { recursive: true })
+    else await fs.writeFile(full, '', { flag: 'wx', mode: 0o444 }).catch((error) => { if (error.code !== 'EEXIST') throw error })
+  }
 }
 
 /** Records what was delivered, so tests can assert delivery actually happened. */

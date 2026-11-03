@@ -112,7 +112,9 @@ It is a canonical `sha256` over the complete deliverable content set: every path
 with its mode and content hash, sorted by path, with **deletions recorded
 explicitly** so removing a file changes the fingerprint. The base commit and the
 exclusion globs are recorded alongside, so a fingerprint computed over a different
-scope cannot be mistaken for the same candidate.
+scope cannot be mistaken for the same candidate. The workspace projection leaves out
+tooling mount targets and the fence's own stubs (read-only empty files at the listed
+paths the base does not hold, [source-integrity.md](source-integrity.md)).
 
 Everything binds to it: an approval names the fingerprint it examined, a check
 result names the fingerprint it ran against, and closure names the fingerprint it

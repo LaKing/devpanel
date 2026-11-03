@@ -16,6 +16,27 @@ and logical index entries/flags are checked separately. A read-only `git status`
 that only refreshes index stat caches is not a source change. An unreadable or
 unsupported source entry blocks acceptance rather than being silently omitted.
 
+A seat turn's fence leaves mount targets behind: the Claude CLI's Bash sandbox binds
+`/dev/null` over a list of config paths (`.mcp.json`, `.bashrc`, `.claude/agents`, …),
+bubblewrap creates each missing one, and the CLI removes them only when the command
+ends, so a killed turn leaves them. A worktree records the list (`workspace.fenceStubs`,
+`FENCE_STUBS` in `fingerprint.mjs`, read off a live seat's mount table because the CLI
+publishes none). At a turn's end, and at recovery after a lost owner, the engine removes
+those that were not there before the turn (the record on the pending invocation; the
+last of overlapping seats does it, and a path the first of them did not find is not
+kept for a later one having seen it). `workspaceProjection` leaves out what is left, as
+it does tooling mount targets, so no manifest, fingerprint, auditor diff, patch or
+destination reading counts them. A stub is told from a real file, path by path, by what
+was measured on live targets: an empty regular file with no write bit, at a listed path
+the base does not hold. A file there with bytes or a write bit, even empty, is reviewed
+and delivered. A CLI that binds another path reads as a change: a quarantine naming empty
+files, until the list has it.
+
+Accepted limit: nothing on disk says who made such a file, so a file an author made empty
+and read-only on purpose at a listed path reads as a stub. It is left out of the patch and
+removed at the turn's end. It holds no content, and counting stubs is what can put empty
+files over real ones at delivery. Under the CLI's sandbox a command cannot make one there.
+
 `writesCode` from the resolved participant owns permission. Authors may edit and
 stage source. Other roles may not change source or the index. Git HEAD/history is
 engine-owned for every role. Reviewer Codex sessions run with scratch as their

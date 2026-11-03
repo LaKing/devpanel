@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { startRun, resumeRun, worktreeDiffDelivery, gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { applyToSource } from '../server/runtime/source-delivery.mjs'
-import { fingerprint, baselineOf } from '../server/runtime/fingerprint.mjs'
+import { FENCE_STUBS, fingerprint, baselineOf } from '../server/runtime/fingerprint.mjs'
 import { readRun, runDir, writeRun } from '../server/runtime/store.mjs'
 import { workspaceDisposition, createSupervisor, supportedActions } from '../server/supervisor.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
@@ -13,7 +13,7 @@ import { applyRunArtifact } from '../server/runtime/apply-artifact.mjs'
 import { launchReadiness } from '../server/supervisor-readiness.mjs'
 import { previewRun } from '../server/runtime/preview.mjs'
 import { runResult } from '../server/runtime/run-result.mjs'
-import { engineFixture, scriptFor, simulateProcessDeath } from './fakes/fixture.mjs'
+import { engineFixture, leaveFenceStubs, scriptFor, simulateProcessDeath } from './fakes/fixture.mjs'
 
 const exec = promisify(execFile)
 const git = async (dir, ...args) => (await exec('git', ['-C', dir, ...args])).stdout
@@ -27,6 +27,7 @@ async function fixture ({ drift = false, deliveryProvider = worktreeDiffDelivery
       await fs.writeFile(path.join(engine.run.workspace.path, 'server.mjs'), 'console.log("Hello Beautiful world")')
       if (drift === 'unrelated') await fs.writeFile(path.join(f.projectPath, 'source.txt'), 'newer unrelated work\n')
       if (drift === 'overlap') await fs.writeFile(path.join(f.projectPath, 'server.mjs'), 'console.log("Hello Other world")')
+      if (drift === 'stubs') await leaveFenceStubs(engine.run.workspace.path)
     }
     return script(turn.stepId.startsWith('audit-implement-') ? { ...turn, stepId: 'audit-implementation' } : turn)
   } })
@@ -118,6 +119,36 @@ export default async function (t) {
   await resumed.finalize()
   t.eq('finalize resolved', resumed.run.outcome, 'resolved')
   t.eq('destination reproduces approved revision', resumed.run.delivery.application.fingerprint, (await fingerprint(resumed.run.workspace.path, { baseline: resumed.baseline })).fingerprint)
+
+  t.section('fence stubs: never drift, and no empty file over a real one at the destination')
+  {
+    const real = '{"mcpServers":{}}\n'
+    const s = await fixture({
+      drift: 'stubs',
+      // The issue's case: real at the destination, ignored there, so not in the snapshot.
+      prepare: async (f) => {
+        await fs.writeFile(path.join(f.projectPath, '.gitignore'), '.mcp.json\n')
+        await fs.writeFile(path.join(f.projectPath, '.mcp.json'), real)
+        await git(f.projectPath, 'add', '.gitignore')
+        await git(f.projectPath, 'commit', '-qm', 'ignore local config')
+      },
+      // They stand in the worktree and in the checkout as delivery reads both.
+      deliveryProvider: { ...worktreeDiffDelivery, deliver: async (args) => {
+        await leaveFenceStubs(args.workspacePath)
+        await leaveFenceStubs(args.workspace.source.path)
+        return worktreeDiffDelivery.deliver(args)
+      } }
+    })
+    await s.engine.drive()
+    const { application, artifactRef } = s.engine.run.delivery
+    t.eq('delivered: no drift reported', application.state, 'complete', application.error)
+    t.eq('nothing was taken for someone else\'s work', [application.composed ?? null, application.drifted ?? null], [null, null])
+    t.eq('the real file is untouched', await fs.readFile(path.join(s.f.projectPath, '.mcp.json'), 'utf8'), real)
+    t.eq('the reviewed bytes landed', (await exec('node', [path.join(s.f.projectPath, 'server.mjs')])).stdout, 'Hello Beautiful world\n')
+    const patch = await fs.readFile(path.join(runDir(s.f.issuePath, s.engine.runId), artifactRef), 'utf8')
+    t.eq('the patch holds none of them', FENCE_STUBS.filter((rel) => patch.includes(rel)), [])
+    t.eq('the run completes', `${s.engine.run.status}/${s.engine.run.outcome}`, 'completed/resolved', s.engine.run.blockedReason)
+  }
 
   t.section('explicit patch-only choice leaves the checkout untouched')
   const patchOnly = await fixture({ runOptions: { delivery: 'worktree-diff' } })

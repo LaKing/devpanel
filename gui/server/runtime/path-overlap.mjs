@@ -94,7 +94,7 @@ async function patchPaths (file, runId, gaps) {
 
 const readWorktree = async (workspace) => {
   const exclude = workspaceProjection(workspace).exclude
-  const paths = await candidatePaths(workspace.path, { baseCommit: workspace.baseCommit ?? null, gitDir: workspace.gitDir ?? null })
+  const paths = await candidatePaths(workspace.path, { baseCommit: workspace.baseCommit ?? null, gitDir: workspace.gitDir ?? null, fenceStubs: workspace.fenceStubs })
   return exclude ? paths.filter((p) => !exclude(p)) : paths
 }
 

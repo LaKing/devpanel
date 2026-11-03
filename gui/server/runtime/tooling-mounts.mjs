@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import { fenceStubSet } from './fingerprint.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from './selection.mjs'
 import { gitRead } from './working-tree.mjs'
 import { certDir, issuesRoot, logDir, tokenFile } from '../project-path.mjs'
@@ -16,6 +17,9 @@ import { certDir, issuesRoot, logDir, tokenFile } from '../project-path.mjs'
  *                    is recorded, never an error (the turn refuses it)
  *   ensureMountPoint the empty directory bubblewrap mounts onto, created inside
  *                    the worktree without ever following a link out of it
+ *   fenceStubsPresent / removeFenceStubs  the targets the fence itself leaves
+ *                    (fingerprint.mjs FENCE_STUBS): what a turn received, and
+ *                    what is taken away again when it ends
  */
 
 const within = (root, p) => p === root || p.startsWith(root + path.sep)
@@ -117,4 +121,39 @@ export async function ensureMountPoint (worktree, rel) {
   const target = path.join(root, rel)
   if ((await fs.readdir(target)).length) refuse('is occupied in the worktree (it must be absent or an empty directory)')
   return target
+}
+
+/** The stub paths and their parents, deepest first, so a parent is reached empty. */
+const stubPaths = (stubs) => [...new Set(stubs.map((listed) => listed.replace(/\/$/, '')).flatMap((rel) => {
+  const parents = []
+  for (let p = path.posix.dirname(rel); p !== '.'; p = path.posix.dirname(p)) parents.push(p)
+  return [rel, ...parents]
+}))].sort((a, b) => b.split('/').length - a.split('/').length)
+
+/** Which of those exist before a turn: they are the turn's to find, never to lose. */
+export async function fenceStubsPresent (worktree, stubs = []) {
+  const found = await Promise.all(stubPaths(stubs).map((rel) => fs.lstat(path.join(worktree, rel)).then(() => rel, () => null)))
+  return found.filter(Boolean)
+}
+
+/**
+ * Remove what the fence left and was not there before the turn: a stub, and an
+ * empty directory the list names or that holds a listed path. Nothing else, and
+ * never through a link, since the worktree is seat-writable. A failure leaves the
+ * path to the projection, which still does not count it. Returns the paths removed.
+ */
+export async function removeFenceStubs (worktree, stubs = [], present = []) {
+  const removed = []
+  const fence = await fenceStubSet(worktree, stubs)
+  for (const rel of stubPaths(stubs)) {
+    if (present.includes(rel)) continue
+    const parent = path.posix.dirname(rel)
+    if (parent !== '.' && !(await fs.lstat(path.join(worktree, parent)).catch(() => null))?.isDirectory()) continue
+    const full = path.join(worktree, rel)
+    const stat = await fs.lstat(full).catch(() => null)
+    const fenceDirectory = stat?.isDirectory() && stubs.some((listed) => listed.startsWith(rel + '/'))
+    const gone = fenceDirectory ? fs.rmdir(full) : fence.has(rel) && stat?.isFile() ? fs.unlink(full) : null
+    if (gone && await gone.then(() => true, () => false)) removed.push(rel)
+  }
+  return removed
 }

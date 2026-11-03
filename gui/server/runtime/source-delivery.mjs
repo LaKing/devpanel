@@ -70,6 +70,9 @@ export async function destinationFingerprint (workspace, baseline, clock = syste
     baseline, baseCommit: workspace.baseCommit, clock, strict: true,
     projection: {
       materialize,
+      // A stub left in the checkout (a killed session there) is neither drift nor
+      // source; a real file at that path has bytes and still is.
+      stubs: workspace.fenceStubs,
       exclude: rel => {
         if (selected.has(rel) || ancestors.has(rel)) return false
         // Before v1, materialization force-added the whole external tree at

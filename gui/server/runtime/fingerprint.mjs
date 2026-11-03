@@ -16,6 +16,36 @@ import { systemClock } from './clock.mjs'
 const DEFAULT_EXCLUDES = ['.git', 'node_modules', '.devpanel-lock']
 
 /*
+ * Mount targets a seat turn's fence leaves in the worktree. The Claude CLI's
+ * Bash sandbox (harness/claude.mjs `settings.sandbox`) binds /dev/null over these
+ * paths for each command; bubblewrap creates each missing one and the CLI removes
+ * it when the command ends, so a killed turn leaves them. `.claude/.cc-writes/`
+ * (a trailing slash: a directory) the CLI leaves behind even on a clean end. The
+ * list is the CLI's and is not published: it was read off a live seat's mount
+ * table. A CLI that binds another path shows up as a quarantine naming read-only
+ * empty files; change it here. A run keeps the list it was provisioned with (`workspace.fenceStubs`).
+ */
+export const FENCE_STUBS = Object.freeze([
+  '.bash_profile', '.bashrc', '.gitconfig', '.gitmodules', '.idea', '.mcp.json', '.profile', '.ripgreprc', '.vscode', '.zprofile', '.zshrc',
+  '.claude/.cc-writes/', '.claude/agents', '.claude/commands', '.claude/hooks', '.claude/launch.json', '.claude/loop.md', '.claude/output-styles',
+  '.claude/routines', '.claude/scheduled_tasks.json', '.claude/settings.json', '.claude/settings.local.json', '.claude/skills', '.claude/workflows'
+])
+
+/**
+ * Which listed files are the fence's, file by file, so a kill inside a sandbox's
+ * setup or cleanup leaves nothing that counts: as measured on a live seat's targets,
+ * each is an empty regular file with no write bit. Any file with bytes or a write bit
+ * is a change, and a path the base holds (`held`) never is a stub. Nothing on disk
+ * says who made such a file, so one an author made empty and read-only on purpose
+ * reads as a stub: an accepted limit (docs/source-integrity.md).
+ */
+export async function fenceStubSet (root, stubs = [], held = null) {
+  const files = stubs.filter((rel) => !rel.endsWith('/') && !held?.has(rel))
+  const stats = await Promise.all(files.map((rel) => fs.lstat(path.join(root, rel)).catch(() => null)))
+  return new Set(files.filter((rel, i) => stats[i]?.isFile() && stats[i].size === 0 && !(stats[i].mode & 0o222)))
+}
+
+/*
  * How a file's mode enters the fingerprint. `exec-bit` (current) records the
  * executable bit only, the one thing Git carries and a patch can rebuild.
  * `posix` (legacy) recorded every permission bit, which made a candidate with a
@@ -44,6 +74,7 @@ async function walk (root, excludes, prefix = '', strict = false, projection = {
     if (excludes.includes(entry.name)) continue
     const rel = prefix ? `${prefix}/${entry.name}` : entry.name
     if (projection.exclude?.(rel)) continue
+    if (entry.isFile() && projection.stubs?.has(rel)) continue
     // Delivery reads the same materialized source composition as the candidate.
     // This traversal is read-only; delivery routes changes to bound Git owners.
     if (entry.isSymbolicLink() && projection.materialize?.some(p => rel === p || rel.startsWith(p + '/'))) {
@@ -113,7 +144,8 @@ export async function fingerprint (dir, {
   // without them would call a mode-only change unchanged. Refuse instead.
   if (baseline.modesError) throw new Error(`cannot fingerprint against a baseline whose recorded modes are unreadable: ${baseline.modesError}`)
   const seenGit = { nestedGit: [] }
-  const present = await walk(dir, excludes, '', strict, projection, seenGit)
+  const stubs = projection.stubs ? await fenceStubSet(dir, projection.stubs, baseline) : undefined
+  const present = await walk(dir, excludes, '', strict, { ...projection, stubs }, seenGit)
   const found = new Set(present.map((p) => p.rel))
   // Tracked paths under exclusions (a committed node_modules can be tens of
   // thousands): stat them in parallel, keep their order.
@@ -216,7 +248,8 @@ export function treeIdentity (entries) {
 export async function baselineOf (dir, { excludes = DEFAULT_EXCLUDES, projection = {} } = {}) {
   const map = new Map()
   map.modes = new Map()
-  for (const { rel, link } of await walk(dir, excludes, '', false, projection)) {
+  // Nothing on disk before the first turn is a stub: it is what the turn received.
+  for (const { rel, link } of await walk(dir, excludes, '', false, { ...projection, stubs: undefined })) {
     const { contentHash, mode } = await hashEntry(path.join(dir, rel), link)
     map.set(rel, contentHash)
     map.modes.set(rel, mode)
@@ -231,13 +264,19 @@ export async function baselineOf (dir, { excludes = DEFAULT_EXCLUDES, projection
  * source: runtime state, sockets, secrets and dependency trees a running
  * application keeps changing. Every fingerprint of that checkout skips them.
  * The project's tooling mount targets (`workspace.toolingMounts`) are never
- * the candidate's either: tooling bound read-only into the seat fence.
+ * the candidate's either: tooling bound read-only into the seat fence. Nor is a
+ * fence stub (`workspace.fenceStubs`, FENCE_STUBS), which the tree tells from a
+ * real file at that path (fenceStubSet), so it is a list beside `exclude`, not in it.
  */
 export function workspaceProjection (workspace) {
   const patterns = workspace?.isolation === 'in-place' ? (workspace.base?.excludes ?? []) : []
   const mounts = workspace?.toolingMounts ?? []
-  if (!patterns.length && !mounts.length) return {}
-  return { exclude: (rel) => mounts.some((t) => rel === t || rel.startsWith(t + '/')) || patterns.some((pattern) => path.matchesGlob(rel, pattern)) }
+  const stubs = workspace?.fenceStubs ?? []
+  if (!patterns.length && !mounts.length && !stubs.length) return {}
+  return {
+    ...(stubs.length ? { stubs } : {}),
+    ...(patterns.length || mounts.length ? { exclude: (rel) => mounts.some((t) => rel === t || rel.startsWith(t + '/')) || patterns.some((pattern) => path.matchesGlob(rel, pattern)) } : {})
+  }
 }
 
 /**
