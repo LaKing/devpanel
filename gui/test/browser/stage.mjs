@@ -39,8 +39,9 @@ async function temp (prefix) {
 
 /**
  * @param control  initial fake-runtime control (see fakes/harness-module.mjs)
+ * @param env      added to the server's environment
  */
-export async function startStage ({ control = {}, project = 'devpanel-project' } = {}) {
+export async function startStage ({ control = {}, project = 'devpanel-project', env: extraEnv = {} } = {}) {
   const projectsDir = await temp('devpanel-stage-srv-')
   const issuesDir = await temp('devpanel-stage-issues-')
   const stateDir = await temp('devpanel-stage-state-')
@@ -111,7 +112,8 @@ export async function startStage ({ control = {}, project = 'devpanel-project' }
     DEVPANEL_HARNESS_DIR: harnessDir,
     DEVPANEL_FAKE_CONTROL: controlFile,
     // Staleness is recomputed per request here, so a test does not wait out a cache.
-    DEVPANEL_SOURCE_CACHE_MS: '0'
+    DEVPANEL_SOURCE_CACHE_MS: '0',
+    ...extraEnv
   }
 
   const log = []

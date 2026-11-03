@@ -1,4 +1,4 @@
-import { acceptableCheck, acceptanceCovers, acceptCheckUnavailable, continueUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, supervisorAcceptRefusal } from './run-control.mjs'
+import { acceptableCheck, acceptanceCovers, acceptCheckUnavailable, awaitsSetup, continueUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, SERVICE_SHUTDOWN, supervisorAcceptRefusal } from './run-control.mjs'
 import { describeCommand } from './command-line.mjs'
 import { checkSummary } from './check-summary.mjs'
 import { earlierDrives, reproducedSelftests, retryNewSelftestFailures, sameFailureEarlier } from './selftest-retry.mjs'
@@ -2446,24 +2446,30 @@ export class Engine {
       const rotation = error.name !== 'AbortError' && error?.credentials?.changed === true ? classifyFailure(error, { now: this.clock.now() }) : null
       const rotated = Boolean(rotation?.retryable) && !lost && !this.cleanupHold() && priorRetries < Math.min(retryPolicy.maxAttempts, rotation.maxRetries ?? Infinity) &&
         !(this.run.failures ?? []).some((f) => f.partialAccepted && f.stepId === step.id && f.round === round)
-      if (!await this.endIntegrity(role, pending, error.name === 'AbortError' ? 'cancelled' : 'failed', error.message, { acceptPartial: rotated ? 'credential-rotated' : null })) {
+      // So is a writing turn a service shutdown interrupted: nobody chose to stop
+      // it, and a quarantine would cost the person the resume this run is owed.
+      const byShutdown = error.name === 'AbortError' && this.abortReason === SERVICE_SHUTDOWN
+      if (!await this.endIntegrity(role, pending, error.name === 'AbortError' ? 'cancelled' : 'failed', error.message, { acceptPartial: rotated ? 'credential-rotated' : byShutdown ? SERVICE_SHUTDOWN : null })) {
         this.invocationStoppedAt = this.clock.now()
         if (error.name !== 'AbortError') await this.recordQuarantinedFailure({ error, role, step, round, attempt, pending })
         return { blocked: true }
       }
       if (error.name === 'AbortError') {
         const byDeadline = this.abortReason === 'deadline'
+        p.state = 'ready'
+        p.pendingInvocation = null
+        if (await this.pauseForShutdown({ role, stepId: step.id, invocationId, abandonedMs, ...(lost ? { cleanup: lost.status } : {}) })) return { cancelled: true, byDeadline }
         this.run.status = byDeadline ? 'blocked' : 'cancelled'
         this.run.blockedReason = byDeadline ? 'budget-exhausted' : null
         this.run.outcome = 'unresolved'
         this.run.endedAt = this.clock.iso()
-        p.state = 'ready'
-        p.pendingInvocation = null
+        if (byShutdown) this.run.stoppedBy = SERVICE_SHUTDOWN
         await this.persist({
           type: byDeadline ? 'budget-exhausted' : 'cancelled',
           role, stepId: step.id, invocationId, abandonedMs,
           ...(lost ? { cleanup: lost.status } : {}),
-          budget: byDeadline ? 'wallClockMinutes' : undefined
+          budget: byDeadline ? 'wallClockMinutes' : undefined,
+          stoppedBy: this.run.stoppedBy
         })
         return { cancelled: true, byDeadline }
       }
@@ -2542,6 +2548,19 @@ export class Engine {
   }
 
   /**
+   * A service shutdown stopped this run while a pause was pending: the stop the
+   * operator asked for is what it records, not a cancellation. Siblings of one
+   * consensus round each end here; the first takes the request, the rest find the pause.
+   */
+  async pauseForShutdown (event) {
+    if (this.abortReason !== SERVICE_SHUTDOWN) return false
+    if (this.run.pauseRequested) await this.pauseAtBoundary()
+    else if (this.run.status !== 'paused') return false
+    await this.persist({ type: 'stopped-for-pause', stoppedBy: SERVICE_SHUTDOWN, ...event })
+    return true
+  }
+
+  /**
    * The budget limits a continued run (resume, Continue) gets: raised by the
    * operator, never lowered, and the time it stood still not counted. Refuses
    * when a limit is still exhausted after the raise.
@@ -2581,9 +2600,11 @@ export class Engine {
       const barred = barrierRefusal(await readBarrier(path.dirname(this.issuePath)), { exceptRunId: this.runId, unrecorded: unrecordedBarrier })
       if (barred) throw barred
     }
-    const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
-    const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
-    if (current.hash !== checkpoint.hash) throw Object.assign(new Error('The retained workspace changed; resolve integrity before resuming.'), { status: 409 })
+    if (!awaitsSetup(this.run)) {
+      const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
+      const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
+      if (current.hash !== checkpoint.hash) throw Object.assign(new Error('The retained workspace changed; resolve integrity before resuming.'), { status: 409 })
+    }
     const { limits, suspendedMs } = await this.continuationLimits({ budgets, stoppedAt })
     const previousStatus = this.run.status
     const previousReason = this.run.blockedReason
@@ -2607,6 +2628,9 @@ export class Engine {
     this.run.budgets.limits = limits
     this.run.pause = null
     this.run.pauseRequested = null
+    // Answered: a later stop of this run says who made that one.
+    delete this.run.stoppedBy
+    delete this.run.autoResumeRefused
     this.run.status = 'pending'
     this.run.blockedReason = null
     this.run.endedAt = null
@@ -3250,10 +3274,12 @@ export class Engine {
         // true and the run settles without waiting for a process to die.
         if (this.run.status !== 'cancelled') {
           this.invocationStoppedAt = this.clock.now()
+          if (await this.pauseForShutdown({ between: 'turns' })) break
           this.run.status = 'cancelled'
           this.run.outcome = 'unresolved'
           this.run.endedAt = this.clock.iso()
-          await this.persist({ type: 'cancelled', between: 'turns' })
+          if (this.abortReason === SERVICE_SHUTDOWN) this.run.stoppedBy = SERVICE_SHUTDOWN
+          await this.persist({ type: 'cancelled', between: 'turns', stoppedBy: this.run.stoppedBy })
         }
         break
       }

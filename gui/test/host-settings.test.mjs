@@ -19,6 +19,7 @@ export default async function (t) {
     {
       const root = await temp('devpanel-settings-root-')
       const s = hostSettings({ root, hostDir: path.join(root, 'host-config'), env: {} })
+      t.eq('a shutdown\'s runs are resumed unless switched off', s.resumeAfterShutdown, true)
       t.eq('defaults', [s.file, s.pending, s.projectsRoot, s.proxyLogin, s.projectActions.headerMarkers, s.testDrive.confinement, s.selection.forbiddenPrefixes, s.skill.linkBaseVariable, s.reporter.panelUrl, s.seatGuidance.projects],
         [null, false, path.dirname(root), { usersDir: null, digestFiles: DEFAULT_DIGEST_FILES }, ['DEVPANEL'], { user: null, home: null }, DEFAULT_FORBIDDEN_PREFIXES, null, null, []])
     }
@@ -38,6 +39,8 @@ export default async function (t) {
         [path.join(hostDir, 'settings.json'), '/opt/projects', `/var/lib/proxy/${os.hostname()}/users`, ['.proxy.hash', '.hash'], ['DEVPANEL', 'EDITOR'], { user: 'app', home: '/var/app' }, ['production', 'stage'], []])
       await write(path.join(hostDir, 'settings.json'), JSON.stringify({ projectsRoot: '/opt/other' }))
       t.eq('an edit is seen without a restart', hostSettings({ hostDir }).projectsRoot, '/opt/other')
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ resumeAfterShutdown: false }))
+      t.eq('the automatic resume can be switched off', hostSettings({ hostDir }).resumeAfterShutdown, false)
 
       const projects = await temp('devpanel-settings-projects-')
       for (const name of ['production.app.example', 'stage.app.example', 'staging.app.example', 'app-project']) await fs.mkdir(path.join(projects, name))

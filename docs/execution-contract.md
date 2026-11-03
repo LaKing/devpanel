@@ -2255,11 +2255,55 @@ current invocation finishes and is recorded; no new turn starts afterwards.
 The request is durable and visible while the invocation finishes. The resulting
 pause has `kind: manual`. Stop remains a separate action that cancels an invocation.
 
+A service shutdown (`supervisor.shutdown()`, on SIGTERM or SIGINT) stops every run
+the process drives, and what it records depends on the run. A run with
+`pauseRequested` is recorded as that manual pause (journal: `stopped-for-pause`),
+not cancelled: it carries no mark, no start resumes it, and the ordinary resume
+continues it. Any other run ends `cancelled` with `stoppedBy: 'service-shutdown'`;
+an operator's Stop never sets it, and a stop already under way keeps its own reason.
+A writing turn's partial edits are kept for such a stop (`partialAccepted`, reason
+`service-shutdown`) rather than quarantined, and reach review with the next revision;
+unauthorized changes still quarantine, and a quarantined run is neither marked nor resumed.
+
+A run the shutdown stops during preflight has no workspace yet, and is paused or marked
+the same way. It has nothing to keep and nothing to verify, so resuming it, by a person
+or at the next start, runs its setup from its snapshot: preflight again, with the probes
+that spends (the aborted ones proved nothing), then provisioning, then its turns. A run
+stopped once provisioning has finished has a workspace and an integrity checkpoint, and
+resumes as any other. A provisioning that itself fails ends the run `failed`, with or
+without a pause pending, as it does for any start.
+
+At the next start, after reconcile and before anything is served,
+`supervisor.resumeInterrupted()` resumes the marked runs, unless the host settings'
+`resumeAfterShutdown` is false: then they stay cancelled and marked, for a person's
+ordinary resume. It is that same resume with no `budgets`, so limits are unchanged and
+every refusal applies; its `resumeHistory` entry reads `actor: service`,
+`origin: service-restart`, and it clears the mark. It makes one attempt per mark: a
+refused run (a limit already exhausted, a missing workspace, an unproved cleanup, a
+newer run of the issue, an occupied project) is not started, stays cancelled and
+marked, and carries the reason on `run.autoResumeRefused` and in its explanation until
+a person's resume clears both. The newest mark goes first, so a project's one slot goes
+to what the last shutdown stopped. A mark left while the setting was off is resumed at
+the first start with it on, unless a newer run of the issue exists.
+
+It reserves nothing and counts no start: like a panel resume, it draws on no
+top-level supervisor or spending allowance, and concurrency is only the one live run
+per project. What a run that misses the grace period gets is unchanged: it is still
+`stopping` when the process exits, carries no mark, and the next start's reconcile makes
+it `recovery-required`, with no automatic resume.
+
+What is kept of the interrupted turn: completed steps, native sessions and, for a
+writer, the edits on disk. The turn's answer is not: it never arrived, its time is
+counted in `timing.abandonedMs`, and the step runs again from its prompt. The shutdown
+grace (seconds) is far shorter than a turn (minutes), so waiting for the turn to finish
+is not attempted.
+
 `POST …/runs/:runId/resume` continues that same run, including cleanly stopped,
 failed, budget-blocked, round-exhausted and protocol-repair-exhausted runs with
 retained, unchanged workspaces. It takes the usual issue lock and project slot,
 checks the journal and integrity checkpoint, and preserves native sessions,
-completed steps, findings, checks and usage. It never reruns preflight. A pending
+completed steps, findings, checks and usage. It never reruns preflight, except for
+a run a shutdown stopped before it had a workspace (below). A pending
 operator question still requires the existing answer endpoint. Missing workspaces,
 uncertain invocations, quarantines and release mutations require their existing
 recovery paths; resume does not waive those conditions or closure requirements.
@@ -2272,7 +2316,8 @@ excluded from the deadline; spent steps and tokens are never reset. Resume grant
 one additional review round or protocol repair when that is the exhausted limit.
 Changes are recorded in `resumeHistory` and `controlOverrides`, and each
 `resumeHistory` entry and `operator-resumed` event names its `actor` and `origin`
-(`panel` or `supervisor`; `operator` when no name was known; older entries carry
+(`panel` or `supervisor`, or `service-restart` with actor `service` for a resume at
+start-up; `operator` when no name was known; older entries carry
 neither and are not rewritten); the original
 resolved playbook snapshot stays immutable. Explicit continuation does not imply
 approval of any outstanding finding or automatic resolution of the issue.

@@ -92,7 +92,9 @@ Two details in the unit are load-bearing:
   the supervisor's shutdown — stop every run it is driving, wait for the runtimes
   to confirm termination, then exit. If systemd's timeout were the shorter of the
   two it would SIGKILL part-way through, and those runs would come back needing
-  recovery: the exact state the shutdown path exists to prevent.
+  recovery: the exact state the shutdown path exists to prevent. A run that did settle
+  is paused if a pause was pending, else cancelled, marked and resumed at the next
+  start (`resumeAfterShutdown`, docs/execution-contract.md "Operator pause and resume").
 - **No `NoNewPrivileges=yes`.** Port 443 is reached through `cap_net_bind_service`
   on the node binary, and `NoNewPrivileges` blocks that class of capability. The
   alternative, `AmbientCapabilities`, would hand the capability to every agent

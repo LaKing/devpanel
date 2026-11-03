@@ -30,9 +30,24 @@ export function reconcileUnavailable (run) {
   return null
 }
 
+/** `run.stoppedBy` of a run a service shutdown cancelled, and the reason its engine is cancelled with. */
+export const SERVICE_SHUTDOWN = 'service-shutdown'
+
+/** A cancellation the service caused and the next start has not yet tried to undo (supervisor.resumeInterrupted). */
+export const awaitsAutoResume = (run) => run?.status === 'cancelled' && run.stoppedBy === SERVICE_SHUTDOWN && !run.abandonment && !run.autoResumeRefused
+
+/**
+ * A shutdown stopped this run before it had a workspace (preflight): there is no
+ * work to keep and nothing to verify, so resuming it is doing its setup, from its
+ * snapshot (supervisor.answer). A workspace path is set once provisioning began.
+ */
+export const awaitsSetup = (run) => !run?.workspace?.path &&
+  ((run?.status === 'paused' && run.pause?.kind === 'manual') || (run?.status === 'cancelled' && run.stoppedBy === SERVICE_SHUTDOWN))
+
 /** Resume is an explicit operator action; uncertain mutations still need recovery. */
 export function resumeUnavailable (run) {
   if (run.abandonment || run.integrity?.status === 'abandoned') return 'This run was abandoned.'
+  if (awaitsSetup(run) && !run.journal?.recoveryRequired && !run.recovery?.required) return null
   if (run.journal?.recoveryRequired || run.recovery?.required || run.integrity?.status !== 'clear') return 'Resolve the run’s recovery or integrity condition first.'
   if (Object.values(run.participants ?? {}).some(p => p.pendingInvocation || p.state === 'recovery-required')) return 'An invocation still needs recovery.'
   if (!run.workspace?.path || run.workspace.state === 'removed') return 'The saved workspace is no longer available.'

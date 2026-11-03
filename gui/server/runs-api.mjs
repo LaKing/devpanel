@@ -203,6 +203,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     abandonment: run.abandonment ? { at: run.abandonment.at, by: run.abandonment.by } : null,
     pause: run.pause ?? null,
     pauseRequested: run.pauseRequested ?? null,
+    stoppedBy: run.stoppedBy ?? null,
+    autoResumeRefused: run.autoResumeRefused ?? null,
     resumeUnavailable: resumeUnavailable(run),
     resumeHistory: run.resumeHistory ?? [],
     suspendedMs: (run.controlSuspendedMs ?? 0) + (run.inputRetrySuspendedMs ?? 0) + (run.checkRefreshSuspendedMs ?? 0),

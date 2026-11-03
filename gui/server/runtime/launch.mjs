@@ -796,6 +796,24 @@ export async function abandonReservation (reservation, { status = 'failed', bloc
 }
 
 /**
+ * A shutdown stopped a reservation with a pause pending: recorded as that pause
+ * (engine.pauseForShutdown, for a run that has an engine). Resume does the setup.
+ */
+export async function pauseReservation (reservation) {
+  const { run, issuePath, runId, runLock, clock } = reservation
+  const pause = { id: crypto.randomUUID(), key: `manual:${crypto.randomUUID()}`, question: 'Paused by the operator. Resume to run the setup and continue.', options: null, askedBy: null, kind: 'manual', at: clock.iso() }
+  run.status = 'paused'
+  run.blockedReason = null
+  run.pauseRequested = null
+  run.pause = pause
+  await store.writeRun(issuePath, runId, run)
+  await store.appendEvent(issuePath, runId, { type: 'paused', pauseId: pause.id, key: pause.key, question: pause.question, options: null, askedBy: null }, { clock })
+  await store.appendEvent(issuePath, runId, { type: 'stopped-for-pause', stoppedBy: 'service-shutdown', between: 'preflight-and-provisioning' }, { clock })
+  await runLock.release()
+  return run
+}
+
+/**
  * Turn a proven reservation into a driveable engine: workspace, baseline, engine.
  * Called only after preflight gave positive evidence.
  */

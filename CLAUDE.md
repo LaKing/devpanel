@@ -340,6 +340,8 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   `retryable: false`) is on the rejected start, not on `run.failure`. Cleanliness stays the base policy's call:
   `launch-preconditions.mjs` reads that policy (clean base under `head`, escaping tracked symlinks under
   `reject`) before reservation too, so a doomed start is refused before paid preflight; provisioning re-checks.
+  `shutdown()` records a pending pause as a pause and any other stopped run as `cancelled` with `stoppedBy: 'service-shutdown'`;
+  `resumeInterrupted()` resumes those at the next start (host settings `resumeAfterShutdown`, default on; execution-contract.md "Operator pause and resume").
   `resolvableBy` is capability, never permission. The supervisor has no direct checkout command, and source
   delivery requires a usable base; a repository fault therefore becomes an issue rather than an improvised command. Project actions are an
   operator capability on the project page. An action may declare `effect: commit-checkout` (`projects/<id>.yaml`

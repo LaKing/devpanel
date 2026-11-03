@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, checksOnlyBlock, reconcilePending, reconcileUnavailable } from './run-control.mjs'
+import { acceptCheckUnavailable, checksOnlyBlock, reconcilePending, reconcileUnavailable, resumeUnavailable, SERVICE_SHUTDOWN } from './run-control.mjs'
 import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
@@ -409,7 +409,11 @@ function standingOf (run, { outputs, active, ownership }) {
     case 'cancelled':
       return run.abandonment
         ? { tone: 'neutral', headline: 'Abandoned', detail: `An operator abandoned this run. ${kept}`, next: 'Start a new run to continue.' }
-        : { tone: 'neutral', headline: 'Stopped by an operator', detail: `Nothing was delivered. ${kept}`, next: 'Start a new run to continue.' }
+        : run.stoppedBy === SERVICE_SHUTDOWN
+          ? { tone: run.autoResumeRefused ? 'warning' : 'neutral', headline: 'Stopped by a service shutdown',
+              detail: [`Nothing was delivered. ${kept}`, run.autoResumeRefused ? `It was not resumed automatically: ${run.autoResumeRefused.reason}` : null].filter(Boolean).join(' '),
+              next: resumeUnavailable(run) ? 'Start a new run to continue.' : 'Resume it to continue where it stopped, or start a new run.' }
+          : { tone: 'neutral', headline: 'Stopped by an operator', detail: `Nothing was delivered. ${kept}`, next: 'Start a new run to continue.' }
     case 'failed':
       return { tone: 'error', kept, ...failed(run) }
     case 'completed': {

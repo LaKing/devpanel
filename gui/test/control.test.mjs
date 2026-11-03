@@ -474,14 +474,15 @@ export default async function (t) {
     await until(async () => (await stage.run(issue.id, runId)).active?.length > 0,
       { label: 'a turn to be in flight' })
 
+    await stage.setControl({ delayMs: 0 })
     await stage.restart({ signal: 'SIGTERM' })
 
-    const after = await stage.run(issue.id, runId)
-    t.ok('the run is settled, not left claiming to be live',
-      !LIVE_STATUSES.includes(after.status), after.status)
-    t.ok('as a stop rather than a mystery', ['cancelled', 'blocked'].includes(after.status), after.status)
+    // shutdown-resume.control.test.mjs covers what the next start does with it.
+    const journal = await fs.readFile(path.join(stage.issuesDir, project, issue.id, 'runs', runId, 'events.jsonl'), 'utf8')
+    t.ok('the run settled as a stop rather than a mystery', journal.includes('"type":"cancelled"'))
+    await settledRun(issue.id)
+    t.eq('the next start resumed it', (await stage.run(issue.id, runId)).resumeHistory.at(-1).actor, 'service')
 
-    await stage.setControl({ delayMs: 0 })
     const next = await stage.request(runsRoute(issue.id), {
       method: 'POST', body: JSON.stringify({ playbook: 'implementation' })
     })

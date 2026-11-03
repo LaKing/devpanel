@@ -26,6 +26,10 @@
       "enum": ["gitlink", "include"],
       "description": "What a working-tree snapshot takes of a repository nested in the project's checkout (a monorepo's parts). `gitlink` (default): what `git add -A` records, the nested repository's HEAD commit id and no content, so its directory is empty in the run's worktree. `include`: what that repository would carry (tracked and untracked, unignored files, as they are on disk; never its .git), so the run sees the whole tree; apply-to-source writes changes there in place, and a commit delivery that touches one is refused. runtime/working-tree.mjs includeNested."
     },
+    "resumeAfterShutdown": {
+      "type": "boolean",
+      "description": "Whether the next start resumes the runs a service shutdown cancelled (run.stoppedBy: service-shutdown), limits unchanged. Default true; false leaves them cancelled and marked, for a person to resume."
+    },
     "projectDiscovery": {
       "type": "object",
       "additionalProperties": false,

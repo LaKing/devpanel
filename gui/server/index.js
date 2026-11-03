@@ -960,6 +960,13 @@ modelPerformance = await createModelPerformanceService({ file: path.join(issues.
  * knew about.
  */
 const recovered = await supervisor.reconcile()
+// What the last shutdown cancelled comes back, before the top-level supervisor or
+// anyone else could take its project's slot. Recovery above is untouched: a run
+// that missed the shutdown's grace is recovery-required, and carries no mark.
+if (hostSettings().resumeAfterShutdown) {
+  const { resumed, refused } = await supervisor.resumeInterrupted()
+  if (resumed.length || refused.length) console.log(`              ${resumed.length} run(s) stopped by the last shutdown resumed, ${refused.length} refused and left stopped`)
+}
 let previousSupervisorState = null
 topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformance,
   decisions: ({ spending }) => (wakeAdvisor = createAdvisor({ spending, availability: availabilityStore, loadProvider })),

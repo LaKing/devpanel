@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
+import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
@@ -10,6 +10,7 @@ import path from 'node:path'
 import { preflight, assertLaunchable } from './config/preflight.mjs'
 import {
   abandonReservation,
+  pauseReservation,
   discardWorkspace,
   gitWorktreeProvider,
   provisionRun,
@@ -409,6 +410,11 @@ export function createSupervisor ({
       if (state !== 'passed') {
         const stopped = state === 'cancelled' || record.controller.signal.aborted
         record.refusal = refusal
+        if (stopped && record.stoppedBy && reservation.run.pauseRequested) {
+          await pauseReservation(reservation)
+          return
+        }
+        if (stopped && record.stoppedBy) reservation.run.stoppedBy = record.stoppedBy
         await abandonReservation(reservation, {
           status: stopped ? 'cancelled' : 'failed',
           blockedReason: stopped ? null : 'preflight-refused'
@@ -417,6 +423,11 @@ export function createSupervisor ({
       }
 
       if (record.controller.signal.aborted) {
+        if (record.stoppedBy && reservation.run.pauseRequested) {
+          await pauseReservation(reservation)
+          return
+        }
+        if (record.stoppedBy) reservation.run.stoppedBy = record.stoppedBy
         await abandonReservation(reservation, { status: 'cancelled' })
         return
       }
@@ -452,13 +463,16 @@ export function createSupervisor ({
     record.phase = 'run'
     // A stop that arrived during preflight still applies: the engine inherits it.
     if (record.stopping || record.controller.signal.aborted) {
-      engine.cancel('requested')
+      engine.cancel(record.stoppedBy ?? 'requested')
+      if (record.stoppedBy && record.pauseRequested) engine.run.pauseRequested ??= { at: engine.clock.iso() }
+      if (await engine.pauseForShutdown({ between: 'provisioning-and-drive' })) return
       // No invocation has begun. drive() refuses an already-aborted controller,
       // so settle here instead of leaving a permanent "stopping" record.
       engine.run.status = 'cancelled'
       engine.run.outcome = 'unresolved'
       engine.run.endedAt = engine.clock.iso()
-      await engine.persist({ type: 'cancelled', between: 'provisioning-and-drive' })
+      if (record.stoppedBy) engine.run.stoppedBy = record.stoppedBy
+      await engine.persist({ type: 'cancelled', between: 'provisioning-and-drive', stoppedBy: record.stoppedBy })
       return
     }
     if (record.pauseRequested && !engine.run.pauseRequested) await engine.requestPause()
@@ -529,7 +543,24 @@ export function createSupervisor ({
           return { runId, status: engine.run.status, recovered: false, reason: outcome.reason }
         }
       }
+      const setup = resume && awaitsSetup(engine.run)
       const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      // Stopped before it had a workspace: the setup it never finished, from its
+      // own snapshot, and the turns after it, as a start would have gone on.
+      if (setup) {
+        engine.run.status = 'preflighting'
+        engine.run.preflight = { ...engine.run.preflight, state: 'pending', startedAt: engine.clock.iso(), endedAt: null }
+        await store.writeRun(engine.issuePath, engine.runId, engine.run)
+        const reservation = { runId, runLock: engine.runLock, resolution: { resolved: engine.snapshot }, run: engine.run, issuePath: issue.path, clock: engine.clock }
+        const record = { runId, issuePath: issue.path, project, issueId, phase: 'preflight', engine: null, reservation, controller: new AbortController(), stopping: false, finished: null }
+        const harnesses = await loadHarnesses()
+        const projectPath = await resolveProjectPath(project, { projectsDir })
+        active.set(k, record)
+        starting.delete(k)
+        emit?.({ type: 'run-resumed', project, issueId, runId, decision })
+        record.finished = drive(record, { harnesses, configRoot, projectPath, projectAlias: projectDir(project, projectsDir) })
+        return { runId, status: 'preflighting', decision }
+      }
       // The worktree was handed back when the run paused; it is ours again.
       if (engine.run.workspace?.state === 'retained') {
         engine.run.workspace.state = 'active'
@@ -1034,15 +1065,7 @@ export function createSupervisor ({
 
     if (!record || record.runId !== runId) return stopUnowned({ project, issueId, runId })
 
-    if (!record.stopping) {
-      record.stopping = true
-      const target = record.engine ?? record.reservation
-      target.run.status = 'stopping'
-      await store.writeRun(record.issuePath, runId, target.run)
-      emit?.({ type: 'stopping', project, issueId, runId, phase: record.phase })
-      record.controller.abort()
-      record.engine?.cancel('requested')
-    }
+    await beginStop(record)
 
     if (wait) {
       let timer
@@ -1053,6 +1076,25 @@ export function createSupervisor ({
       return { runId, status: current.status, settling: active.has(key(project, issueId)) }
     }
     return { runId, status: 'stopping' }
+  }
+
+  /**
+   * The stop itself. `stoppedBy` is only for the service's own shutdown, and
+   * reaches the record only if the run really ends cancelled: a run that misses
+   * the grace period is recovery-required, whatever was asked of it. A run
+   * already stopping keeps the reason of the stop that came first.
+   */
+  async function beginStop (record, stoppedBy = null) {
+    if (record.stopping) return
+    const { project, issueId, runId } = record
+    record.stopping = true
+    record.stoppedBy = stoppedBy
+    const target = record.engine ?? record.reservation
+    target.run.status = 'stopping'
+    await store.writeRun(record.issuePath, runId, target.run)
+    emit?.({ type: 'stopping', project, issueId, runId, phase: record.phase })
+    record.controller.abort()
+    record.engine?.cancel(stoppedBy ?? 'requested')
   }
 
   /**
@@ -1462,6 +1504,63 @@ export function createSupervisor ({
     return recovered
   }
 
+  /**
+   * Give back what the last shutdown took (host settings `resumeAfterShutdown`):
+   * at start-up, after reconcile, before anything is served. Each run marked
+   * `stoppedBy: 'service-shutdown'` goes through the ordinary resume, with no
+   * budgets, so its limits, admission and every refusal are that resume's. One
+   * attempt per mark: a refused run stays cancelled and marked with the reason on
+   * `run.autoResumeRefused`, for a person; their resume clears both.
+   *
+   * Newest first: the slot of a project goes to what the last shutdown stopped,
+   * not to an older mark left while this was switched off.
+   */
+  async function resumeInterrupted () {
+    const found = []
+    let projects = []
+    try { projects = await issues.listProjects() } catch (error) {
+      console.warn(`[devpanel] resuming interrupted runs: the projects could not be listed: ${error.message}`)
+      return { resumed: [], refused: [] }
+    }
+    for (const project of projects) {
+      const projectId = project.id ?? project.name ?? project
+      const list = await issues.listIssues(projectId).catch(() => [])
+      for (const issue of list) {
+        const names = await runNames(issue).catch(() => [])
+        for (const runId of names) {
+          const run = await store.readRun(issue.path, runId).catch(() => null)
+          if (awaitsAutoResume(run)) found.push({ project: projectId, issue, run })
+        }
+      }
+    }
+    found.sort((a, b) => String(b.run.endedAt).localeCompare(String(a.run.endedAt)))
+
+    const resumed = []
+    const refused = []
+    for (const { project, issue, run: { runId } } of found) {
+      const named = { project, issueId: issue.id, runId }
+      try {
+        // Not the run a person went on with: they started another after this one stopped.
+        if (issue.latestRun?.runId !== runId) throw err(409, `a newer run of this issue exists (${issue.latestRun?.runId ?? 'unknown'})`)
+        await answer({ ...named, resume: true, actor: 'service', origin: 'service-restart' })
+        resumed.push(named)
+      } catch (error) {
+        const reason = error.message
+        refused.push({ ...named, reason })
+        console.warn(`[devpanel] ${project}/${issue.id} run ${runId} was not resumed after the shutdown: ${reason}`)
+        await withLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-resume-refused', takeOverDead: false }, async () => {
+          const current = await store.readRun(issue.path, runId)
+          current.autoResumeRefused = { at: new Date().toISOString(), reason }
+          await store.writeRun(issue.path, runId, current)
+          // A journal needing recovery may be the refusal itself; the record above holds it.
+          await store.appendEvent(issue.path, runId, { type: 'auto-resume-refused', reason }).catch(() => {})
+        }).catch((writeError) => console.warn(`[devpanel] the refusal could not be recorded on run ${runId}, the next start tries again: ${writeError.message}`))
+        emit?.({ type: 'run-auto-resume-refused', ...named, reason })
+      }
+    }
+    return { resumed, refused }
+  }
+
   // ------------------------------------------------------------ live agents
 
   /**
@@ -1580,8 +1679,7 @@ export function createSupervisor ({
     shuttingDown = true
     const records = [...active.values()]
 
-    await Promise.allSettled(records.map((r) =>
-      stop({ project: r.project, issueId: r.issueId, runId: r.runId })))
+    await Promise.allSettled(records.map((r) => beginStop(r, SERVICE_SHUTDOWN)))
 
     // Whatever does not settle in time is left for the next start-up to
     // reconcile — as recovery-required, which is what it genuinely is.
@@ -1665,7 +1763,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, settle, reconcile, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**

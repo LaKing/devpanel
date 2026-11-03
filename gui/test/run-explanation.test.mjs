@@ -112,6 +112,8 @@ export default async function (t) {
   t.eq('a report counts its findings',
     explainRun({ status: 'completed', outcome: 'resolved', reportDisposition: { issues: [{}, {}], response: 'Two.' } }).headline, 'Done: report with 2 findings')
   t.eq('a cancelled run was stopped by an operator', explainRun({ status: 'cancelled' }).headline, 'Stopped by an operator')
+  t.eq('unless the service stopped it', explainRun({ status: 'cancelled', stoppedBy: 'service-shutdown' }).headline, 'Stopped by a service shutdown')
+  t.ok('a refused automatic resume is said, with its reason', explainRun({ status: 'cancelled', stoppedBy: 'service-shutdown', autoResumeRefused: { reason: 'no budget left' } }).detail.includes('no budget left'))
   t.section('a landing by hand')
   const landed = { by: 'alice', applied: 'the approved patch', commit: 'abc1234', handChanges: 'renamed one constant', landedAt: '2026-10-07T10:00:00.000Z', recordedAt: '2026-10-07T10:05:00.000Z' }
   const blocked = { status: 'blocked', outcome: 'unresolved', blockedReason: 'source-delivery-blocked', workspace: { state: 'retained' }, landed }

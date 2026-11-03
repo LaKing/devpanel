@@ -61,7 +61,7 @@ const cache = new Map()
 const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
 
 /**
- * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, projectDiscovery, proxyLogin, projectActions,
+ * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, projectDiscovery, proxyLogin, projectActions,
  * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
@@ -92,6 +92,7 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     dataRoot: data.dataRoot ? expandHome(data.dataRoot) : impliedDataRoot,
     gitStore: data.gitStore === true,
     nestedRepositories: data.nestedRepositories ?? 'gitlink',
+    resumeAfterShutdown: data.resumeAfterShutdown !== false,
     projectDiscovery: data.projectDiscovery ? { pattern: data.projectDiscovery.pattern, markers: data.projectDiscovery.markers ?? DEFAULT_PROJECT_MARKERS } : null,
     proxyLogin: {
       usersDir: data.proxyLogin?.usersDir ? data.proxyLogin.usersDir.replaceAll('{hostname}', os.hostname()) : null,
