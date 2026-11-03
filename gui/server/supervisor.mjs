@@ -39,6 +39,7 @@ import { createQuotaFallback } from './runtime/model-fallback.mjs'
 import { resolvePlaybook, loadConfig } from './config/load.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
+import { forgetRunDrives } from './runtime/selftest-history.mjs'
 
 /*
  * Owns the lifecycle of running playbooks.
@@ -1243,6 +1244,8 @@ export function createSupervisor ({
         // Only folders named like steps, directly in the issue: nothing outside it can be named here.
         for (const folder of folders) if (/^\d{3}-[a-z0-9-]+$/.test(folder)) await fs.rm(path.join(issue.path, folder), { recursive: true, force: true })
         await fs.rm(store.runDir(issue.path, runId), { recursive: true, force: true })
+        // What its drives told the classification of unstable selftests goes with them.
+        await forgetRunDrives(issue.path, runId)
         return { runId, deleted: true, steps: [...folders].sort() }
       })
     } catch (error) {

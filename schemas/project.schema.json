@@ -74,6 +74,9 @@
         "retryFailed": {
           "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/retryFailed"
         },
+        "classifyUnstable": {
+          "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/classifyUnstable"
+        },
         "compareBaseline": {
           "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/compareBaseline"
         },
@@ -407,6 +410,9 @@
               "maximum": 3,
               "default": 1,
               "description": "How many times a failed check runs again on the same revision before the failure counts. Every attempt is recorded; a pass after a failure is marked flaky."
+            },
+            "classifyUnstable": {
+              "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/classifyUnstable"
             },
             "tiers": {
               "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/tiers"

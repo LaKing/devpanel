@@ -270,6 +270,16 @@ opt-in) or `local-refused` (no fence and no opt-in: nothing runs, the result is
 implementation --project <id>` prints `target=local commands=…`. A project's
 own file stays with the installation that runs it (`host-config/projects/`).
 
+
+### Unstable selftests
+
+A selftest that recorded drives classify as unstable stops gating and is reported
+instead (execution-contract.md "Unstable selftests"). That is on by default; a
+project opts out with `classifyUnstable: false` on `infrastructure.testDrive` or
+`checks`, which makes such a failure gate like any other. A tester may state a
+test's module with a string `module` beside `test` in its report, a directory
+relative to the project: the classification then needs no module of its own making.
+
 ## What participants receive
 
 The infrastructure configuration contributes to the preview/configuration hash

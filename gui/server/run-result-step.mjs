@@ -7,6 +7,7 @@ import * as store from './runtime/store.mjs'
 import { approvedCheckPatch } from './runtime/apply-artifact.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
 import { runResult } from './runtime/run-result.mjs'
+import { ignoredSelftests, ignoredWords } from './runtime/selftest-history.mjs'
 
 /*
  * What a run left behind, written into the issue folder when it ends: a
@@ -118,6 +119,13 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
   if (inherited.length) {
     lines.push('## Baseline-known check failures', '', 'These also fail on the unchanged project, so they did not block this run. Each may be proposed as a separate issue.', '')
     for (const f of inherited) lines.push(`- \`${f.command}\`${f.test === '(command)' ? '' : `: ${f.test}`}${f.message && f.test !== '(command)' ? ` — ${f.message}` : ''}`)
+    lines.push('')
+  }
+  // The gate passed over these on history's word; the report says so, since one may be a real regression.
+  const ignored = ignoredSelftests(run)
+  if (ignored.length) {
+    lines.push('## Unstable selftests ignored by the gate', '')
+    for (const f of ignored) lines.push(`- ${ignoredWords(f)}`)
     lines.push('')
   }
   if (e.next || e.kept) lines.push('## Next', '', [e.kept, e.next].filter(Boolean).join(' '), '')

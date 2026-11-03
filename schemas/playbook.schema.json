@@ -515,6 +515,11 @@
           "default": 1,
           "description": "How many times a failed check runs again on the same revision before the failure counts. Every attempt is recorded; a pass after a failure is marked flaky."
         },
+        "classifyUnstable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether a selftest that recorded drives classify as unstable stops gating (execution-contract.md \"Unstable selftests\"). false: its new failure gates like any other. Drives are recorded either way."
+        },
         "tiers": {
           "type": "object",
           "additionalProperties": false,

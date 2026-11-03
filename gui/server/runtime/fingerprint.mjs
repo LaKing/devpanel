@@ -197,6 +197,18 @@ export async function fingerprint (dir, {
 }
 
 /**
+ * The identity of a tree's bytes, whatever base it was fingerprinted against:
+ * each present file's path, mode and content. A revision fingerprint holds each
+ * path's status against its baseline and the deletions, so the same bytes on
+ * another base have another fingerprint; this stays the same, for a candidate
+ * and for a base drive of the same tree (selftest-history.mjs).
+ */
+export function treeIdentity (entries) {
+  const present = (entries ?? []).filter((e) => e.status !== 'deleted' && e.contentHash)
+  return sha256(present.map((e) => [e.path, e.mode ?? '', e.contentHash].join('\0')).sort().join('\n'))
+}
+
+/**
  * Content hashes of everything in `dir`, for use as a later fingerprint's
  * baseline. The map carries a `modes` map beside it (path -> mode under the
  * current rule), so a change to nothing but the executable bit still counts.

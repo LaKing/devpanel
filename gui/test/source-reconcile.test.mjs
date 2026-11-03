@@ -714,6 +714,7 @@ export default async function (t) {
       const log = await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(driven.dir), command: 'count' })
       t.eq('its log still reads as the revision that was driven', log.revision, approved)
       t.ok('journaled as no drive', (await readEvents(f.issuePath, engine.runId)).events.some((e) => e.type === 'reconciled' && e.noDrive === true))
+      t.ok('no drive, so no auditor is asked to read one', !engine.run.steps.some((s) => s.reconcileNotice))
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
     }
 

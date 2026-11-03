@@ -122,7 +122,7 @@ export async function adoptBaseline ({ dir, identity, runDir, dirName }) {
     return null
   }
   return { ...stored.check, dir: path.relative(runDir, dest),
-    reused: { key: identity.key, entry: path.join('.baselines', identity.key), fromRun: stored.fromRun, capturedAt: stored.check.capturedAt ?? stored.check.at, storedAt: stored.storedAt } }
+    reused: { key: identity.key, entry: path.join('.baselines', identity.key), fromRun: stored.fromRun, fromDir: stored.check.dir, capturedAt: stored.check.capturedAt ?? stored.check.at, storedAt: stored.storedAt } }
 }
 
 /** Keep a base drive for later runs; the first entry under a key wins. Then prune. */

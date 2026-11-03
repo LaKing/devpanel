@@ -230,7 +230,8 @@ its attempts numbered on their own), with the drive's result, gating, baseline
 comparison and selftest report summary in the prompt. No author turn runs and
 no round is spent; the new verdicts replace the reviewers' earlier ones and
 decide the round. It happens once per (round, revision): the recorded re-review
-answers on replay, even when it again awaits the check. A failed drive gets no
+answers on replay, even when it again awaits the check. (A drive that ignored an
+unstable failure has a re-review of its own, per drive: "Unstable selftests".) A failed drive gets no
 re-review: it makes the round `changes-needed` as above. A passed drive
 approves nothing by itself, so closure still needs an approval and a passing
 check on the same revision.
@@ -303,7 +304,9 @@ beside the `newFailures` it named, and its comparison cleared of the one-drive
 failures, which stay listed as `selftest.flakyFailures` (a different unstable
 test in the second drive does not fail it). When some do, the first stands with
 `selftestReproduced: true` and `newFailures` narrowed to those, the rest listed
-as `flakyFailures`; only then does the author get a round.
+as `flakyFailures`; only then does the author get a round. A failure history
+classifies as unstable (below, "Unstable selftests") is out of `newFailures`
+already, so it asks for no second drive.
 
 Neither retry runs when an earlier revision of the run already answered it
 (`runtime/selftest-retry.mjs`). The result then carries `retrySkipped`, shown in
@@ -625,6 +628,9 @@ and line positions are never compared.
   same source revision.
 - `new-failures`: `newFailures` names the tests that fail only on the
   candidate, beside the `baselineKnown` ones.
+- `unstable`: every failure that would have counted is listed in `unstable`
+  because recorded drives classify the test as unstable (below); it does not fail
+  the check.
 - `not-made`, with the `reason`: the candidate lists failures but its report,
   or the base's, cannot be read, or there is no base of this source revision,
   or the base's report holds a suite-level failure (a name ending in a
@@ -663,6 +669,103 @@ round does not pass and the author gets another one, before any confirmation,
 including under `timing: approved`. Closure copies the comparison to
 `run.closure.checks.selftest`, and the run explanation names new selftest
 failures.
+
+### Unstable selftests
+
+The comparison above judges one drive. Across revisions and runs, a selftest that
+fails on bytes that also pass it, or on revisions that have nothing to do with it,
+says nothing about the change in front of it, so recorded drives classify it and
+its failure stops gating. Nobody keeps a list (`runtime/selftest-history.mjs`).
+
+**The record.** Each drive of a target with a report, candidate or base, leaves one
+line in `issues/<project>/.selftest-history/<runId>.jsonl`: which tests failed and
+passed, which failed as new, the tree it tested and what the revision changed.
+It sits outside the issue, so packing an issue leaves it readable; a base reused
+from the baseline cache keeps the id of the drive it came from and counts once. A
+file goes once all its drives are past 30 days, and deleting a run deletes its
+file. It starts empty: older runs do not record retried attempts or changed paths.
+`npm run selftest-history -- --project <id> [--test <name>]` reads it.
+
+**The routes**, within 14 days:
+- `same-bytes`: the test passed and failed on one `treeIdentity` under one
+  `targetKey`, the current failure included. `treeIdentity` is the hash of each
+  present file's path, mode and content of the tree the drive tested, set by
+  `runChecks` for both kinds, so the same tree pairs across a changed base and
+  between a candidate and a base. Unlike a revision fingerprint it holds no status
+  against a baseline. `targetKey` stays in the key: a pass under one target
+  definition and a failure under another may be the definition's doing.
+- `unrelated-revisions`: it failed as new on revisions proved not to touch its
+  module, in at least 2 issues other than the current one. That exclusion only
+  stops a run's own regression classifying itself; it proves nothing about touching.
+
+**Touching a module.** A revision is `touched`, `untouched` or `unknown` for a test;
+only `untouched` counts for the second route. It needs an established boundary, the
+test's own module and not what that module uses:
+- a `module` the report states beside the test (optional; a relative directory
+  present in the tree), or
+- exactly one directory that holds a manifest (`package.json` or
+  `module@<name>.mjs`), is named by the test name's first segment (its own name, or
+  the manifest's `<name>`), holds a file declaring the test (the whole name, or its
+  last segment of 4 or more characters, as a whole word), and is not test-only (not
+  named `test`, `tests`, `spec`, `specs`, `__tests__`, `e2e` or `selftest`, and
+  holding a file besides its manifests and declaring files).
+
+A directory merely named like the test and the directory of any declaring file only
+widen a module: a change there is `touched`, a change elsewhere proves nothing.
+Everything else is `unknown` with a `reason`, as is a tree that could not be read
+whole (1 MiB a file, 512 MiB in all) or a revision of over 5000 changed paths.
+
+**Expiry.** In time order, 5 consecutive observed passes end the period and discard
+everything before them, passes included, so a new failure has nothing to pair with
+and gates, and so does the next. A drive that does not report a test, or skips it,
+observes nothing. Evidence also leaves the window.
+
+**What a classified failure does.** It is taken out before any base is read: it does
+not gate on a revision that touched its module, on one where that is `unknown`, as a
+suite-level entry, or with no base or an unfinished one. A test the base's report
+fails too stays `baselineKnown`. Others are in `selftest.unstable`, `ignoredByGate:
+true`, each with its `routes`, the `evidence` drives (the latest 6, and
+`evidenceTotal`), `passesSinceLastFailure` and `revisionTouch`. A suite-level entry
+also has `level: suite` and `notObserved`: the tests the base passed and this report
+lacks, since tests under it did not run. It asks for no second drive, sends the
+author no round, and no operator is asked to accept it. The rest of the drive is
+judged as if it were not there. `run.closure.checks.selftest`, the check summary
+(`unstableNote`), the run explanation and `result.md` all name it and say the gate
+ignored it, because one can still be a real regression. The closure confirmation is
+told it is no reason to call a criterion unmet and to name each `touched`, `unknown`
+or suite-level one under `residualRisks`. Such a risk does not stop delivery; like
+any other, while unaccepted it stops only a `resolved` disposition.
+
+**The auditors read every such drive.** Each drive that ignored a failure reaches each
+auditor who has not read it, before delivery, whatever ran it: a drive beside the
+reviews or after approval, a smoke, Refresh checks or a reconcile. A step records the
+drive its prompt quoted (`checksSeen`). In a round with no substantial findings, a
+seat that has not read a drive reviews the revision again in the same round (a step
+with `recheck` and `recheckDrive`, the drive's directory). That adds no author turn
+and spends no round, and it happens once per seat and drive, so an earlier re-review
+never answers for a later drive and nothing can loop. A listed failure alone is no
+ground for `changes-needed`; a finding that cites the revision decides as in any
+audit. The re-review replaces the seat's review of that round, so its approval is the
+one recorded, and a `changes-needed` leaves that seat with no approval of the revision. In a round with other findings the author answers next, and that audit reads
+it in `checks.latest` or `previousDrive.unstableIgnored`. An open check acceptance
+waits for this turn and is not refused by it.
+
+A reconcile runs outside the review loop, so its drive reaches the seats that
+reviewed the approved revision from inside the reconcile, once the gate is satisfied
+and before approvals are carried (`engine.noticeAuditors`, steps with
+`reconcileNotice`, which never change the approved revision's approvals). The merged
+tree is not on disk, so the prompt names the merged paths and a copy of the patch
+under `evidence/reconcile/<n>/`. Each approving, the reconcile goes on. A finding
+refuses it as `auditor-finding`, naming the findings; a turn that cannot finish
+refuses it as `notice-unfinished` or `notice-failed`. Then nothing is carried or
+delivered, no author round follows and the run stands blocked as it was, with Finalize
+and Reconcile offered as before; another Reconcile makes a new drive with its own turn.
+
+**Opting out.** `classifyUnstable: false` on `checks` or `infrastructure.testDrive`:
+drives are still recorded and the failure gates as above. An unset project's target
+and `configHash` do not change. History that cannot be read classifies nothing, so
+failures gate (`selftest.stabilityUnavailable`); a line that cannot be written never
+fails a check (`selftest.historyError`).
 
 ### Tooling policy
 

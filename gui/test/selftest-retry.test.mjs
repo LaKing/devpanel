@@ -39,6 +39,19 @@ export default async function (t) {
         t.eq('every one-drive failure is named as flaky', out.baselineComparison.selftest.flakyFailures.map((f) => f.test), ['service/settlement', 'fox/capture', 'service/fox'])
     }
 
+    t.section('a failure history classifies is out of the verdict: no second drive, and the lists of both drives merge')
+    {
+        const ignored = (test) => ({ command: 'collect', test, ignoredByGate: true })
+        const { out, calls } = await attempt({ first: drive('checks/002', { verdict: 'unstable', newFailures: [], unstable: [ignored('svc/flaky')] }) })
+        t.eq('an unstable verdict asks for no second drive', [calls.reruns, out.dir], [0, 'checks/002'])
+        const beside = { ...fresh(['core/new']), unstable: [ignored('svc/flaky')] }
+        const reproduced = await attempt({ first: drive('checks/002', beside), retry: drive('checks/003', null), again: { selftest: { ...fresh(['core/new']), unstable: [ignored('svc/flaky'), ignored('svc/other')] } } })
+        t.eq('a stable new failure still gets its second drive, and stands', [reproduced.calls.reruns, reproduced.out.baselineComparison.selftest.verdict, reproduced.out.baselineComparison.selftest.newFailures.map((f) => f.test)], [1, 'new-failures', ['core/new']])
+        t.eq('each ignored test is listed once', reproduced.out.baselineComparison.selftest.unstable.map((f) => f.test), ['svc/flaky', 'svc/other'])
+        const cleared = await attempt({ first: drive('checks/002', beside), retry: drive('checks/003', null), again: { selftest: { verdict: 'unstable', newFailures: [], unstable: [ignored('svc/other')] } } })
+        t.eq('cleared by the retry, the drive passes the gate as unstable, naming both', [cleared.out.dir, cleared.out.flaky, cleared.out.baselineComparison.selftest.verdict, cleared.out.baselineComparison.selftest.unstable.map((f) => f.test)], ['checks/003', true, 'unstable', ['svc/flaky', 'svc/other']])
+    }
+
     t.section('a partial reproduction names only what failed twice')
     {
         const { out } = await attempt({ first: drive('checks/002', fresh(['admin/(thread-ready)', 'seed-apply', 'service/fox'])), retry: drive('checks/003', null), again: { selftest: fresh(['seed-apply']) } })

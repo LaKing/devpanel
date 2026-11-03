@@ -2,6 +2,7 @@ import { acceptableCheck, acceptanceCovers, acceptCheckUnavailable, continueUnav
 import { describeCommand } from './command-line.mjs'
 import { checkSummary } from './check-summary.mjs'
 import { earlierDrives, reproducedSelftests, retryNewSelftestFailures, sameFailureEarlier } from './selftest-retry.mjs'
+import { ignoredWords, openStability, owedAsRisk } from './selftest-history.mjs'
 import { writeJson } from './persistence.mjs'
 import fs from 'node:fs/promises'
 import { executeRelease, recoverRelease } from './release.mjs'
@@ -48,6 +49,8 @@ export function harnessUnavailable (harnesses, id) {
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log })) })
+/** What a step keeps of which drive it was asked about, and which one its prompt quoted (plan()). */
+const recheckFields = ({ recheckDrive, reconcileNotice, checksSeen }) => ({ ...(recheckDrive ? { recheckDrive } : {}), ...(reconcileNotice ? { reconcileNotice } : {}), ...(checksSeen ? { checksSeen } : {}) })
 const targetKeyOf = (target) => crypto.createHash('sha256').update(JSON.stringify(target)).digest('hex')
 
 export const FINALIZABLE_BLOCKS = ['delivery-unverifiable', 'delivery-failed', 'delivery-unavailable', 'candidate-changed-during-delivery', 'source-delivery-blocked', 'source-delivery-interrupted']
@@ -302,17 +305,23 @@ function stepSpec (snapshot, stepId) {
  * A re-review (`recheck`, the revision it re-reviews) is the same seat's step
  * in the same round, judged again once the check its findings awaited has a
  * result. Its attempts are numbered on their own, so a repair of either never
- * counts against the other.
+ * counts against the other. `recheckDrive` is the check directory of a drive
+ * that ignored an unstable failure and the seat had not read: each such drive is
+ * a re-review of its own, so an earlier one never answers for a later drive.
  */
-const attemptsOf = (steps, phaseId, stepId, round, recheck = null) =>
-  steps.filter((s) => s.phase === phaseId && s.stepId === stepId && s.round === round && (s.recheck ?? null) === recheck)
+const attemptsOf = (steps, phaseId, stepId, round, recheck = null, drive = null) =>
+  steps.filter((s) => s.phase === phaseId && s.stepId === stepId && s.round === round && (s.recheck ?? null) === recheck && (s.recheckDrive ?? null) === drive)
     .sort((a, b) => a.attempt - b.attempt)
 
 /** `repair` is false for a fresh turn, or { error, classification } naming what to restate. */
-const turnOf = (phase, step, round, attempt, repair = false, recheck = null) =>
-  ({ kind: 'turn', phase, step, round, attempt, repair, ...(recheck ? { recheck } : {}) })
+const turnOf = (phase, step, round, attempt, repair = false, recheck = null, recheckDrive = null) =>
+  ({ kind: 'turn', phase, step, round, attempt, repair, ...(recheck ? { recheck } : {}), ...(recheckDrive ? { recheckDrive } : {}) })
 
-const turnKey = (phase, step, round, recheck = null) => `${phase.id}/${step.id}/${round}${recheck ? '/recheck' : ''}`
+const turnKey = (phase, step, round, recheck = null, drive = null) => `${phase.id}/${step.id}/${round}${recheck ? '/recheck' : ''}${drive ? `/${drive}` : ''}`
+
+/** The drives of a revision that ignored an unstable failure and passed the gate, each once, in the order they ran. */
+const drivesIgnoring = (checkResults, revision) => [...new Map(checkResults
+  .filter((c) => c.revision === revision && c.dir && c.unstableIgnored?.length && c.result !== 'failed').map((c) => [c.dir, c.dir])).values()]
 
 /*
  * The coordinator's first handoff after triage, and the seat it briefs: the
@@ -419,7 +428,7 @@ function reopenedFindings (rounds, last) {
 /**
  * Where are we? A pure function of the snapshot and what has been recorded.
  */
-export function plan (snapshot, steps, outputs, { skip = null, checkResults = [] } = {}) {
+export function plan (snapshot, steps, outputs, { skip = null, checkResults = [], notice = null } = {}) {
   const policy = snapshot.reviewPolicy
   const maxRepair = policy.protocolRepair.maxAttempts
   const prior = priorFindings(steps, outputs, policy)
@@ -429,9 +438,9 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
   // asked it. An older answer to the same key belongs to an earlier asking.
   const answerAfter = (key, stepNumber) => decisions.find((d) => d.key === key && d.step > stepNumber) ?? null
 
-  const inspect = (phase, step, round, recheck = null) => {
-    const turn = (phase, step, round, attempt, repair = false) => turnOf(phase, step, round, attempt, repair, recheck)
-    const attempts = attemptsOf(steps, phase.id, step.id, round, recheck)
+  const inspect = (phase, step, round, recheck = null, drive = null) => {
+    const turn = (phase, step, round, attempt, repair = false) => turnOf(phase, step, round, attempt, repair, recheck, drive)
+    const attempts = attemptsOf(steps, phase.id, step.id, round, recheck, drive)
     if (!attempts.length) return { need: turn(phase, step, round, 1) }
     const last = attempts[attempts.length - 1]
     const out = outputs[last.number]
@@ -478,6 +487,20 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     }
 
     return { done: last, output: out.output, contract: out.contract }
+  }
+
+  // A reconcile's drive reaches each seat that reviewed the approved revision's
+  // round (engine.noticeAuditors): replay of the rounds never sees that drive.
+  if (notice) {
+    const phase = snapshot.phases.find((p) => p.id === notice.phase)
+    const reviews = []
+    for (const step of phase?.loop?.steps ?? []) {
+      if (!snapshot.participants[step.role] || step.output !== 'reviewResult' || !attemptsOf(steps, phase.id, step.id, notice.round).length) continue
+      const r = inspect(phase, step, notice.round, notice.revision, notice.drive)
+      if (r.need) return r.need
+      reviews.push({ step, done: r.done, output: r.output })
+    }
+    return { kind: 'notice-complete', reviews }
   }
 
   for (const phase of snapshot.phases) {
@@ -586,6 +609,32 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
             if (rr.need) return rr.need
             lastNumber = Math.max(lastNumber, rr.done.number)
             count(again, step, rr)
+          }
+          t = again
+        }
+      }
+      // A drive of this revision ignored an unstable failure and a seat has not read
+      // it: its audit ran beside or before the drive. The seat reviews again in the
+      // same round, once per drive, with no author turn: a listed failure is reported
+      // to it, never held against the author. A step that read the drive in its prompt
+      // (`checksSeen`) answers for it; the re-review's own step answers on replay.
+      if (t.substantial === 0 && t.reviewed && !continued.has(round)) {
+        const drives = drivesIgnoring(checkResults, t.reviewed)
+        if (drives.length) {
+          const again = tally()
+          for (const { step, r } of t.reviews) {
+            let latest = r
+            for (const drive of drives) {
+              const own = steps.filter((s) => s.phase === phase.id && s.stepId === step.id)
+              // This round's re-review answers on replay; a seat that read the drive in any other turn is not asked again.
+              if (!own.some((s) => s.round === round && s.recheckDrive === drive) && own.some((s) => s.checksSeen === drive || s.recheckDrive === drive)) continue
+              if (skip?.has(turnKey(phase, step, round, t.reviewed, drive))) continue
+              const rr = inspect(phase, step, round, t.reviewed, drive)
+              if (rr.need) return rr.need
+              lastNumber = Math.max(lastNumber, rr.done.number)
+              latest = rr
+            }
+            count(again, step, latest)
           }
           t = again
         }
@@ -1375,6 +1424,7 @@ export class Engine {
         round: cursor.round,
         attempt: cursor.attempt,
         ...(cursor.recheck ? { recheck: cursor.recheck } : {}),
+        ...recheckFields(cursor),
         invocationId: pending.invocationId,
         adopted
       })
@@ -1409,6 +1459,7 @@ export class Engine {
         attempt: cursor.attempt,
         // A re-review of this revision once its check had a result (plan()).
         ...(cursor.recheck ? { recheck: cursor.recheck } : {}),
+        ...recheckFields(cursor),
         invocationId: pending.invocationId,
         startedAt: pending.startedAt ?? null,
         endedAt,
@@ -1646,7 +1697,9 @@ export class Engine {
     this.run.checkHistory.push({ revision: current, ...tierOf, result: result.result, gating: gatingResult(result, this.run), ...(inconclusiveBase(result, this.run) ? { inconclusive: true } : {}), at: this.clock.iso(), step: step?.number ?? null, afterApproval, dir: result.dir,
       // Each check run's own interval (the retried attempts too), so check time
       // stays measurable after a later revision drops this from checkResults.
-      runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence })
+      runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence,
+      // Survives a new revision, so the next audit still reads what the gate passed over.
+      ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}) })
     await this.persist({ type: 'checks', revision: current, ...tierOf, result: result.result, commands: result.commands?.length ?? 0 })
   }
 
@@ -1674,6 +1727,8 @@ export class Engine {
     // otherwise it is captured when a candidate check fails, since only then
     // can a failure be inherited.
     const targetKey = targetKeyOf(target)
+    const stability = openStability({ issuePath: this.issuePath, runId: this.runId, target, targetKey, clock: this.clock, runDir: common.runDir })
+    const withStability = (selftest) => ({ ...selftest, ...(stability.unavailable ? { stabilityUnavailable: stability.unavailable } : {}), ...(stability.historyError ? { historyError: stability.historyError } : {}) })
     const earlier = earlierDrives(history, { revision: current, targetKey })
     const sourceRevision = baseCommit
     this.run.baselineChecks ??= []
@@ -1735,7 +1790,11 @@ export class Engine {
       // A cached one was stored before unfinished bases were refused: drop it, or every later run hits it again.
       if (base.reused) await cache?.discard()
       // Recorded as evidence of the redrive, never offered for reuse (`held` skips it).
-      if (base !== known) this.run.baselineChecks.push({ ...base, targetKey, sourceRevision, capturedAt: base.at, unfinished: true })
+      if (base !== known) {
+        this.run.baselineChecks.push({ ...base, targetKey, sourceRevision, capturedAt: base.at, unfinished: true })
+        // What its finished suites reported stays on the record of outcomes.
+        await stability.record({ check: { ...base, unfinished: true }, kind: 'base', baseCommit: sourceRevision })
+      }
       base = await runChecks({ ...common, revision: null, base: true, dirName: await freshDir(dirName) })
     }
     const incomplete = await unfinished(base)
@@ -1752,6 +1811,7 @@ export class Engine {
       if (cache?.verified) base.identityKey = cache.verified
       if (cache?.status) base.cache = cache.status
       this.run.baselineChecks.push(base)
+      await stability.record({ check: base, kind: 'base', baseCommit: sourceRevision })
     }
     if (base?.result === 'unavailable') result.baselineComparison = { baselineDir: base.dir, baselineResult: 'unavailable', error: base.error, commands: [], instruction: 'The base commit could not be checked, so there is no comparison: do not infer which failures are pre-existing from this check.' }
     else if (base) result.baselineComparison = await compareWithBaseline({ runDir: common.runDir, baseline: base, candidate: result })
@@ -1759,16 +1819,21 @@ export class Engine {
       result.baselineComparison = { ...(result.baselineComparison ?? {}),
         failures: await compareFailures({ runDir: common.runDir, target, base, candidate: result, sourceRevision }) }
     }
-    const selftest = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: result, sourceRevision })
-    if (selftest) result.baselineComparison = { ...(result.baselineComparison ?? {}), selftest }
+    // What history says of this drive's failures, and the drive added to it (selftest-history.mjs).
+    const judged = await stability.prepare({ check: result, revision: current, fp, workspacePath, baseCommit })
+    const selftest = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: result, sourceRevision, unstable: judged })
+    for (const attempt of result.attempts ?? []) await stability.record({ check: attempt, kind: 'candidate', revision: current, baseCommit, fp, treeIdentity: result.treeIdentity })
+    await stability.record({ check: result, kind: 'candidate', revision: current, baseCommit, fp, selftest })
+    if (selftest) result.baselineComparison = { ...(result.baselineComparison ?? {}), selftest: withStability(selftest) }
     // A base from another run of the same key says so to every reader.
     if (base?.reused && result.baselineComparison) result.baselineComparison.reused = base.reused
     return retryNewSelftestFailures({ result, limit: Number.isInteger(target.retryFailed) ? target.retryFailed : 1, aborted: () => this.controller.signal.aborted,
       rerun: () => runChecks({ ...common, revision: current, fingerprint: fp }), record: attemptRecord, persist: (event) => this.persist(event), earlier,
       compare: async (retry) => {
         const comparison = base && base.result !== 'unavailable' ? await compareWithBaseline({ runDir: common.runDir, baseline: base, candidate: retry }) : { ...(result.baselineComparison ?? {}) }
-        const again = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: retry, sourceRevision })
-        return { ...comparison, ...(again ? { selftest: again } : {}), ...(base?.reused ? { reused: base.reused } : {}) }
+        const again = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: retry, sourceRevision, unstable: await stability.prepare({ check: retry, revision: current, fp, workspacePath, baseCommit }) })
+        await stability.record({ check: retry, kind: 'candidate', revision: current, baseCommit, fp, selftest: again })
+        return { ...comparison, ...(again ? { selftest: withStability(again) } : {}), ...(base?.reused ? { reused: base.reused } : {}) }
       } })
   }
 
@@ -1833,7 +1898,7 @@ export class Engine {
   async runTurn (next) {
     await this.assertJournal()
     if (this.refusalReason()) return { blocked: true }
-    const { phase, step, round, attempt, repair, recheck = null } = next
+    const { phase, step, round, attempt, repair, recheck = null, recheckDrive = null } = next
     const role = step.role
     const p = this.run.participants[role]
     const adapter = this.harnesses[p.harness]
@@ -1898,7 +1963,7 @@ export class Engine {
       const previous = this.run.checkResults.some((c) => c.revision === current && isFull(c)) ? null
         : (this.run.checkHistory ?? []).filter((h) => isFull(h) && h.revision !== current && h.result !== 'not-run').at(-1)
       if (previous) {
-        ctx.checks.latest.previousDrive = { revision: previous.revision, result: previous.result, gating: previous.gating ?? previous.result, at: previous.at, dir: previous.dir ?? null, failures: previous.retryEvidence?.failures ?? [],
+        ctx.checks.latest.previousDrive = { revision: previous.revision, result: previous.result, gating: previous.gating ?? previous.result, at: previous.at, dir: previous.dir ?? null, failures: previous.retryEvidence?.failures ?? [], ...(previous.unstableIgnored ? { unstableIgnored: previous.unstableIgnored } : {}),
           instruction: 'The full drive of an earlier revision, not of this one. It may inform your judgement of a finding that awaited it, but it satisfies no gate and no closure: approving this revision still drives it.' }
       }
     }
@@ -1999,7 +2064,7 @@ export class Engine {
           ...(asked ? { acceptanceRequest: { failures: asked.failures.map((f) => f.key), notRun: asked.notRun, reason: asked.reason, by: asked.by } } : {}),
           instruction: asked
             ? `${asked.by} asks to accept the failures in acceptanceRequest and deliver this revision. Nothing is accepted unless this confirmation is met: judge each criterion from the evidence, as always. A named failure alone is not evidence that a criterion is unmet unless the criterion is about it; any failure not named still counts against the change. State the named failures under residualRisks.`
-            : 'gating is what closure counts: failed blocks it. baselineComparison.selftest names every failed selftest, new against the base or inherited (baselineKnown); a new one is a criterion the change has not met.' }))
+            : `gating is what closure counts: failed blocks it. baselineComparison.selftest names every failed selftest, new against the base or inherited (baselineKnown); a new one is a criterion the change has not met.${latestCheck.baselineComparison?.selftest?.unstable?.length ? ` selftest.unstable lists failures the gate ignored because recorded drives classify the test as unstable: such a failure is not a new failure, is no reason to call a criterion unmet and does not stop delivery. Name ${latestCheck.baselineComparison.selftest.unstable.filter(owedAsRisk).map((f) => f.test).join(', ') || 'any that touches what this change does'} under residualRisks: each may be a real regression, or stands for tests that did not run.` : ''}` }))
       }
       // The prohibition and the way round it belong together, and they have to
       // reach the seat that can act on it: every coordinator is coordinationOnly,
@@ -2062,7 +2127,13 @@ export class Engine {
       append('tooling', `Source workspace: ${this.run.workspace.path}. ${tooling.writesCode ? 'You may edit and stage source; do not change Git HEAD or create commits.' : 'Source and Git state are read-only for your role. Write temporary files and output only in the scratch directory.'}${tooling.allowedRoots.length ? ` You may also read ${tooling.allowedRoots.join(', ')}.` : ''} ${tooling.allowLiveCheckout ? 'You may read the project\'s live checkout.' : `Do not read or run anything from the project's live checkout${tooling.liveCheckout ? ` at ${tooling.liveCheckout}` : ''}: tooling loaded from there is code outside the candidate.`}`)
       if (this.run.checkResults.length) append('check-logs', `The run's check logs are readable (read-only): ${path.join(store.runDir(this.issuePath, this.runId), 'checks')}, one directory per check (a check record's \`dir\`), each command's full .log and .stdout, the base drive under base-*. When a criterion needs a test name, a timing or a log line the summary does not hold, read it there and quote it; do not report it as unreadable or ask for it.`)
     }
-    if (recheck) {
+    if (recheck && recheckDrive) {
+      // A drive this seat has not read ignored an unstable failure: it is told, and judges as ever.
+      const notice = this.noticeCheck?.check.dir === recheckDrive ? this.noticeCheck : null
+      const drive = notice?.check ?? this.run.checkResults.find((c) => c.dir === recheckDrive) ?? null
+      const selftest = drive?.baselineComparison?.selftest ?? null
+      append('recheck', `Re-review of revision ${recheck} in this same round. A check drive you have not read finished, and the gate ignored failures in it because recorded drives classify those tests as unstable:${NL}${(selftest?.unstable ?? []).map((f) => `- ${ignoredWords(f)}`).join(NL)}${NL}A listed failure alone is no ground for changes-needed. Raise a finding only for a defect you can cite in the revision itself, with its location; otherwise approve, and the author takes no turn.${notice ? `${NL}This drive is of the approved revision merged onto the current source, on the way to delivery. Merged paths: ${(notice.entry.merged ?? []).join(', ') || 'none'}. The merged change is the patch at ${notice.patch}; the worktree still holds the approved revision, so echo ${notice.approved} as artifactRevision. A finding here refuses this reconcile: nothing is delivered and no author round follows.` : ''}${NL}${JSON.stringify({ revision: recheck, dir: recheckDrive, result: drive?.result ?? null, gating: notice ? notice.gating : drive ? gatingResult(drive, this.run) : null, selftest })}`)
+    } else if (recheck) {
       // The re-review is judged on the drive its findings awaited: quoted here
       // whatever checks.latest says, since a later smoke could be the latest.
       const full = this.run.checkResults.filter((c) => c.revision === recheck && isFull(c)).at(-1)
@@ -2090,6 +2161,7 @@ export class Engine {
       round,
       attempt,
       ...(recheck ? { recheck } : {}),
+      ...(recheckDrive ? { recheckDrive } : {}),
       source: step.promptFrom
         ? {
             kind: 'authored',
@@ -2118,7 +2190,7 @@ export class Engine {
       // escaped descendants can still be found by it (cleanup-barrier.mjs).
       reapTag: crypto.randomUUID(),
       stepNumber: null,
-      cursor: { phase: phase.id, stepId: step.id, round, attempt, ...(recheck ? { recheck } : {}), contract: step.output ?? null, recordsRevision: Boolean(step.recordsRevision), startedFromRevision: currentRevision ?? null },
+      cursor: { phase: phase.id, stepId: step.id, round, attempt, ...(recheck ? { recheck } : {}), ...recheckFields({ recheckDrive, reconcileNotice: recheckDrive && this.noticeCheck?.check.dir === recheckDrive ? this.noticeCheck.entry.n : null, checksSeen: step.output === 'reviewResult' && (step.context ?? []).includes('checks.latest') ? latestCheck?.dir : null }), contract: step.output ?? null, recordsRevision: Boolean(step.recordsRevision), startedFromRevision: currentRevision ?? null },
       // What the runtime has been seen doing. Liveness, not progress: a tool call
       // a second ago proves the process is alive, not that the answer is near.
       activity: { pid: null, events: 0, lastAt: null, lastKind: null, lastDetail: null },
@@ -2907,7 +2979,8 @@ export class Engine {
   checkEvidence () {
     const accepted = this.run.closure?.acceptedCheckRisk?.revision ?? this.run.checkAcceptanceRequest?.revision ?? null
     return [...(this.run.checkHistory ?? []).map((h) => ({ ...h, result: h.gating ?? h.result })),
-      ...this.run.checkResults.map((c) => ({ revision: c.revision, ...(c.tier ? { tier: c.tier } : {}), result: gatingResult(c, this.run), ...(inconclusiveBase(c, this.run) ? { inconclusive: true } : {}) }))]
+      ...this.run.checkResults.map((c) => ({ revision: c.revision, ...(c.tier ? { tier: c.tier } : {}), result: gatingResult(c, this.run), ...(inconclusiveBase(c, this.run) ? { inconclusive: true } : {}),
+        ...(c.baselineComparison?.selftest?.unstable?.length ? { dir: c.dir, unstableIgnored: c.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}) }))]
       .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false } : c)
   }
 
@@ -2957,12 +3030,12 @@ export class Engine {
     if (!concurrentReview(next) || this.snapshot.reviewPolicy?.concurrentReviews === false) return batch
     const limit = this.run.budgets.limits?.maxSteps
     const room = limit ? Math.max(1, limit - agentSteps(this.run.steps).length) : Infinity
-    const skip = new Set([turnKey(next.phase, next.step, next.round, next.recheck)])
+    const skip = new Set([turnKey(next.phase, next.step, next.round, next.recheck, next.recheckDrive)])
     while (batch.length < room) {
       const more = plan(this.snapshot, this.activeSteps(), this.outputs, { skip, checkResults: this.checkEvidence() })
-      if (!concurrentReview(more) || more.phase.id !== next.phase.id || more.round !== next.round || more.recheck !== next.recheck || batch.some((b) => b.step.role === more.step.role)) break
+      if (!concurrentReview(more) || more.phase.id !== next.phase.id || more.round !== next.round || more.recheck !== next.recheck || more.recheckDrive !== next.recheckDrive || batch.some((b) => b.step.role === more.step.role)) break
       batch.push(more)
-      skip.add(turnKey(more.phase, more.step, more.round, more.recheck))
+      skip.add(turnKey(more.phase, more.step, more.round, more.recheck, more.recheckDrive))
     }
     return batch
   }
@@ -3016,7 +3089,7 @@ export class Engine {
     // anything yet, however well-formed its JSON was.
     const reviews = (this.snapshot.tactic ? this.activeSteps() : this.run.steps)
       .map((s) => ({ step: s, out: this.outputs[s.number] }))
-      .filter((x) => x.out?.contract === 'reviewResult' && x.out.valid)
+      .filter((x) => x.out?.contract === 'reviewResult' && x.out.valid && !x.step.reconcileNotice)
       .filter((x) => reviewProblem(x.out.output, policy, priorBefore(prior, x.step.number), expectsPrior(x.step.stepId), criteria) === null)
     const latest = reviews.at(-1)
     if (!latest) return
@@ -3038,7 +3111,12 @@ export class Engine {
     // names is still the candidate. Accumulating let an invalidated approval be
     // re-added by a later pass.
     const current = this.run.revisions.at(-1)?.fingerprint ?? null
+    // A seat's re-review of a drive it had not read replaces its review of that round, as replay reads
+    // it (plan()): the earlier approval must not stand beside a later verdict.
+    const replaced = ({ step }) => reviews.some(({ step: later }) => later.recheckDrive && Number(later.number) > Number(step.number) &&
+      later.role === step.role && later.phase === step.phase && later.stepId === step.stepId && later.round === step.round)
     this.run.approvals = reviews
+      .filter((x) => !replaced(x))
       .map(({ step, out }) => ({ step, review: summariseReview(out.output, policy, priorBefore(prior, step.number)) }))
       // `current` may be null before anything is fingerprinted; a null-to-null
       // match would let a plan approval stand in for approval of the code.
@@ -3141,7 +3219,7 @@ export class Engine {
       // An acceptance buys one confirmation of this revision. A replay that wants any
       // other turn (a re-review awaiting the drive, say) refuses it: no author round, no
       // new revision, and the run stands where it stopped.
-      if (next.kind === 'turn' && this.run.checkAcceptanceRequest && next.step.output !== 'closureConfirmation') {
+      if (next.kind === 'turn' && this.run.checkAcceptanceRequest && next.step.output !== 'closureConfirmation' && !next.recheckDrive) {
         const previous = this.refuseAcceptanceRequest(`replay needs a ${next.step.id} turn before the coordinator can confirm`)
         this.run.status = 'blocked'
         this.run.blockedReason = previous
@@ -3527,6 +3605,9 @@ export class Engine {
         if (!satisfied && check && accepted?.revision === approved.revision && acceptanceCovers(accepted, check, gateRun)) entry.acceptedCheckRisk = true
         // The raw result alone misleads: a drive can pass while a selftest new against the baseline still gates it.
         else if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
+        // The gate ignored a failure on this drive: the auditors hear of it before anything is carried or delivered.
+        const unheard = check?.baselineComparison?.selftest?.unstable?.length ? await this.noticeAuditors({ check, gating, entry, approved, kept, runDir }) : null
+        if (unheard) return await refuse(unheard.state, unheard.error)
       }
 
       // Accepted: the merged candidate is the run's revision, with the approvals carried.
@@ -3554,6 +3635,51 @@ export class Engine {
     this.run.endedAt = this.clock.iso()
     await this.persist({ type: 'finished', reason: 'reconcile', outcome: this.run.outcome, blockedReason: this.run.blockedReason })
     return this.run
+  }
+
+  /**
+   * The auditors' turn on a reconcile's drive that ignored an unstable failure:
+   * reconcileDelivery runs outside drive() and replay never sees the merged
+   * revision, so the turns run here. Null when each approved; otherwise why the
+   * attempt is refused, with the run standing exactly as it did before it. A seat's
+   * own finding refuses the reconcile: a reconcile has no author round to send it to.
+   */
+  async noticeAuditors ({ check, gating, entry, approved, kept, runDir }) {
+    const approvals = this.run.approvals.filter((a) => a.revision === approved.revision && !a.reconciledFrom)
+    const reviewed = this.run.steps.find((s) => approvals.some((a) => a.step === s.number))
+    if (!reviewed) return null   // No auditor is seated: closure already records that nobody reviewed.
+    const patch = path.join(runDir, 'evidence', 'reconcile', String(entry.n), 'merged.patch')
+    await fs.mkdir(path.dirname(patch), { recursive: true })
+    await fs.copyFile(path.join(runDir, kept.patch), patch)
+    const before = { status: this.run.status, blockedReason: this.run.blockedReason, endedAt: this.run.endedAt, outcome: this.run.outcome, failure: this.run.failure ?? null }
+    const stand = (state, error) => {
+      Object.assign(this.run, before)
+      return { state, error }
+    }
+    Object.assign(this.run, { status: 'running', blockedReason: null, endedAt: null })
+    this.noticeCheck = { check, gating, entry, patch, approved: approved.revision }
+    await this.persist({ type: 'reconcile-notice', n: entry.n, drive: check.dir })
+    try {
+      for (;;) {
+        if (this.cleanupHold()) return stand('notice-unfinished', 'a turn\'s escaped processes are not proved gone, so no auditor could read this drive')
+        const next = plan(this.snapshot, this.activeSteps(), this.outputs, { checkResults: this.checkEvidence(), notice: { phase: reviewed.phase, round: reviewed.round, revision: entry.revision, drive: check.dir } })
+        if (next.kind === 'notice-complete') {
+          const findings = next.reviews.filter((r) => r.output.verdict !== 'approved').flatMap((r) => r.output.findings ?? [])
+          const refused = next.reviews.some((r) => r.output.verdict !== 'approved')
+          if (!refused) return null
+          entry.auditorFindings = findings
+          return stand('auditor-finding', `an auditor found a defect in the merged candidate: ${findings.map((f) => `${f.id}: ${f.description}`).join('; ') || 'no finding named'}`)
+        }
+        if (next.kind !== 'turn') return stand('notice-unfinished', `no auditor could answer on this drive (${next.reason ?? next.kind})`)
+        const outcome = await this.runTurn(next)
+        if (outcome.cancelled) return stand('notice-unfinished', 'the auditor\'s turn on this drive was cancelled')
+        if (outcome.blocked) return stand('notice-unfinished', `the auditor\'s turn on this drive could not finish (${this.refusalReason() ?? this.run.blockedReason ?? 'blocked'})`)
+      }
+    } catch (error) {
+      return stand('notice-failed', `the auditor\'s turn on this drive failed: ${error.message}`)
+    } finally {
+      this.noticeCheck = null
+    }
   }
 
   /**
@@ -3816,7 +3942,7 @@ export class Engine {
         // The checks as closure counted them, with the inherited-failure comparison.
         ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
           ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
-          ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown }) => ({ verdict, reason, newFailures, baselineKnown }))(check.baselineComparison.selftest) } : {}) } } : {}),
+          ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown, unstable, flakyFailures }) => ({ verdict, reason, newFailures, baselineKnown, ...(unstable ? { unstable } : {}), ...(flakyFailures ? { flakyFailures } : {}) }))(check.baselineComparison.selftest) } : {}) } } : {}),
         // What the seat said stopped it, kept where closure explains itself.
         ...(workerResult ? { workerCompleted: workerResult.completed === true, blockers: workerResult.blockers ?? [], unverified: workerResult.unverified ?? [] } : {}),
         // Who accepted which check failures on this revision (acceptCheckResult).

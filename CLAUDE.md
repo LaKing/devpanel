@@ -54,6 +54,8 @@ npm run config:check -- implementation --preflight   # one playbook in full, wit
 npm run preview -- <playbook> [--issue <project>/<id>] [--prompts]   # dry-run a run, reads config only
 npm run publish:check        # does the tracked tree name this installation? greps it for host-config/publish-denylist.txt
                              # (tools/publish-check.mjs; no denylist, nothing to find)
+npm run --silent selftest-history -- --project <id> [--test <name>]   # recorded selftest outcomes and which tests read
+                             # as unstable, with the drives that made them so, as JSON; read-only (tools/selftest-history.mjs)
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
 npm run contract             # launches the INSTALLED claude/codex CLIs to prove they still honour
@@ -206,6 +208,11 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   prefix, `<site>-selftest`, is read the same) has its selftest report read by `baseline-failures.mjs`: a failed test whose name the
   base's report lacks, or a report that cannot be compared while failures are listed, makes `gatingResult` `failed`
   (`baselineComparison.selftest`); inherited failures never block, and the byte rules for failed commands are unchanged.
+  `runtime/selftest-history.mjs`: each drive leaves a line in `issues/<project>/.selftest-history/`, and a test that passed
+  and failed on one tree (`treeIdentity`, `targetKey`), or failed as new on revisions proved not to touch its module in 2 other
+  issues, within 14 days, is `unstable`: its failure is in `selftest.unstable`, not `newFailures`, and does not gate, reported as
+  ignored; each auditor who has not read such a drive re-reviews once per drive (`recheckDrive`; a reconcile's from inside the reconcile, `engine.noticeAuditors`),
+  with no author turn; 5 consecutive passes expire it; `classifyUnstable: false` opts a project out (execution-contract.md "Unstable selftests").
   `runtime/baseline-cache.mjs`: a target's `baselineCache` reuses each tier's base drive across runs from
   `issues/<project>/.baselines/<key>/` only on an exact key (base commit, tier target hash, `files` content hashes on the
   target, the `environment` command's output hash); a component that cannot be read means no lookup and no store, and a baseline the run already holds is reused for a

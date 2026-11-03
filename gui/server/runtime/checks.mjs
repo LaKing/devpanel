@@ -7,7 +7,7 @@ import path from 'node:path'
 
 import { systemClock } from './clock.mjs'
 import { sshConnection, shellQuote } from './ssh.mjs'
-import { fingerprint } from './fingerprint.mjs'
+import { fingerprint, treeIdentity } from './fingerprint.mjs'
 import { runProcess } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
@@ -100,6 +100,8 @@ export async function runChecks ({
       result.error = 'candidate could not be materialised to the revision'
       return finish()
     }
+    // The bytes this drive tests, the same for a candidate and a base of one tree (selftest-history.mjs).
+    result.treeIdentity = treeIdentity(check.entries)
 
     // 2. Commands, in the isolated candidate, or on the target host.
     if (target.kind === 'local') {

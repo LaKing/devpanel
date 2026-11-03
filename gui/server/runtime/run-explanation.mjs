@@ -2,6 +2,7 @@ import { acceptCheckUnavailable, checksOnlyBlock, reconcilePending, reconcileUna
 import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
+import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -340,7 +341,14 @@ function withAcceptance (run, standing) {
 }
 
 function explainStanding (run, options) {
-  return withAcceptance(run, standingOf(run, options))
+  return withIgnoredSelftests(run, withAcceptance(run, standingOf(run, options)))
+}
+
+/** A selftest failure the gate passed over is named however the run stands: it may be a real regression. */
+function withIgnoredSelftests (run, standing) {
+  const ignored = ignoredSelftests(run)
+  if (!ignored.length) return standing
+  return { ...standing, detail: [standing.detail, ...ignored.map(ignoredWords)].filter(Boolean).join(' ') }
 }
 
 function standingOf (run, { outputs, active, ownership }) {

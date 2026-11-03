@@ -349,22 +349,39 @@ function jsonEnd (text) {
 }
 
 /** A tester entry for a whole suite or thread, not one test: the last name segment is parenthesised. */
-const isSuiteLevel = (test) => /(^|\/)\([a-z-]+\)$/.test(test)
+export const isSuiteLevel = (test) => /(^|\/)\([a-z-]+\)$/.test(test)
 
-/** The names of the report's failed tests (a name that failed once is failed). */
-export function failedSelftests (report) {
+/**
+ * Each test the report names and how it ended (a name that failed once is failed),
+ * and the `module` a tester may state beside a test (selftest-history.mjs).
+ */
+export function selftestStates (report) {
   const state = new Map()
+  const modules = new Map()
   const walk = (o) => {
     if (Array.isArray(o)) return o.forEach(walk)
     if (!o || typeof o !== 'object') return
-    if (typeof o.test === 'string' && state.get(o.test) !== 'FAIL') state.set(o.test, o.skipped ? 'SKIP' : (o.error || o.stack) ? 'FAIL' : 'PASS')
+    if (typeof o.test === 'string') {
+      if (state.get(o.test) !== 'FAIL') state.set(o.test, o.skipped ? 'SKIP' : (o.error || o.stack) ? 'FAIL' : 'PASS')
+      if (typeof o.module === 'string' && !modules.has(o.test)) modules.set(o.test, o.module)
+    }
     Object.values(o).forEach(walk)
   }
   walk(report)
-  return [...state].filter(([, s]) => s === 'FAIL').map(([test]) => test)
+  return { state, modules }
 }
 
-async function readReport (runDir, check, id) {
+const namedAs = (states, wanted) => [...states].filter(([, s]) => s === wanted).map(([test]) => test)
+
+/** The names of the report's failed tests (a name that failed once is failed). */
+export function failedSelftests (report) {
+  return namedAs(selftestStates(report).state, 'FAIL')
+}
+
+/** The names of the report's tests that passed. */
+export const passedSelftests = (report) => namedAs(selftestStates(report).state, 'PASS')
+
+export async function readReport (runDir, check, id) {
   const c = (check?.commands ?? []).find((x) => x.id === id)
   if (!c) return { error: 'did not run', notRun: true }
   if (!c.passed) return { failed: true }
@@ -393,10 +410,15 @@ export async function unfinishedSuites ({ runDir, target, check }) {
  * The candidate's selftest failures against the base of the same source
  * revision, or null when no command declares a report. `new-failures` (naming
  * them) and `not-made` (a report that cannot be read or compared while the
- * candidate lists failures) fail the check; `baseline-known`, `none` and
- * `not-applicable` (the command itself failed: the byte rules judge it) do not.
+ * candidate lists failures) fail the check; `baseline-known`, `none`, `unstable`
+ * and `not-applicable` (the command itself failed: the byte rules judge it) do not.
+ *
+ * `unstable(command, test)` is what history says of a failed test
+ * (selftest-history.mjs): a test it classifies is taken out before any base is
+ * read, since no answer of the base could make its failure gate, and listed in
+ * `unstable` unless the base fails it too. The rest go on as if it were not there.
  */
-export async function compareSelftestReports ({ runDir, target, base, candidate, sourceRevision }) {
+export async function compareSelftestReports ({ runDir, target, base, candidate, sourceRevision, unstable = null }) {
   const declared = [...(target?.commands ?? []), ...(target?.finallyCommands ?? [])].filter((c) => isSelftestReport(c.report))
   if (!declared.length) return null
   const record = { verdict: 'none', reason: null, reports: [], newFailures: [], baselineKnown: [],
@@ -406,6 +428,7 @@ export async function compareSelftestReports ({ runDir, target, base, candidate,
   // tests no comparison judged, and the reports that could not be read at all.
   const unjudged = []
   const unread = []
+  const ignoredTests = []
   // How many of the not-made reasons are an unfinished base and nothing else: then the comparison is
   // inconclusive for a reason outside the candidate (inconclusiveBase), not a report it failed to produce.
   let unfinishedBase = 0
@@ -417,21 +440,42 @@ export async function compareSelftestReports ({ runDir, target, base, candidate,
     const failed = failedSelftests(cand.report)
     if (!failed.length) { record.reports.push({ command: id, path: cand.path, failed: 0, verdict: 'none' }); continue }
     const notJudged = (tests) => unjudged.push(...tests.map((test) => ({ command: id, test })))
-    if (!base || base.result === 'unavailable') { notMade.push(`${id}: no baseline of this source revision could be captured`); notJudged(failed); continue }
-    if ((base.sourceRevision ?? base.baseCommit) !== sourceRevision) { notMade.push(`${id}: the baseline is not of ${sourceRevision}`); notJudged(failed); continue }
+    const flagged = new Map(unstable ? failed.flatMap((test) => { const entry = unstable(id, test); return entry ? [[test, entry]] : [] }) : [])
+    const open = failed.filter((test) => !flagged.has(test))
+    // `report` is the base's when it was read; complete says it could call a failure new.
+    const ignore = ({ report: baseReport = null, known = new Set(), complete = false } = {}) => {
+      if (!flagged.size) return 0
+      const seen = selftestStates(cand.report).state
+      const passedOnBase = baseReport ? passedSelftests(baseReport).filter((test) => !seen.has(test)) : null
+      const ignored = [...flagged].filter(([test]) => !known.has(test)).map(([test, entry]) => ({ command: id, test, ...entry, ignoredByGate: true, comparedNew: complete,
+        ...(isSuiteLevel(test) ? { level: 'suite', notObserved: passedOnBase ? { count: passedOnBase.length, sample: passedOnBase.slice(0, 10) } : null } : {}) }))
+      ignoredTests.push(...ignored)
+      return ignored.length
+    }
+    // No answer of the base can judge what is open: the reason counts only if something is.
+    const giveUp = (reason, unfinishedRun = false) => {
+      ignore()
+      if (!open.length) { record.reports.push({ command: id, path: cand.path, failed: failed.length, verdict: 'unstable' }); return }
+      notMade.push(reason)
+      if (unfinishedRun) unfinishedBase++
+      notJudged(open)
+    }
+    if (!base || base.result === 'unavailable') { giveUp(`${id}: no baseline of this source revision could be captured`); continue }
+    if ((base.sourceRevision ?? base.baseCommit) !== sourceRevision) { giveUp(`${id}: the baseline is not of ${sourceRevision}`); continue }
     const b = await read(base, id)
     // A base whose report command failed or never ran stopped before its selftests (a readiness race on
     // 2026-11-01): like a suite that did not finish, a fresh base answers it, not the author. A report
     // that was produced but cannot be read is another matter, and stays a plain not-made.
-    if (b.failed || b.notRun) { notMade.push(`${id}: on the base, ${b.error ?? 'the command failed'}, so its selftest run did not complete`); unfinishedBase++; notJudged(failed); continue }
-    if (b.error) { notMade.push(`${id}: on the base, ${b.error}`); notJudged(failed); continue }
+    if (b.failed || b.notRun) { giveUp(`${id}: on the base, ${b.error ?? 'the command failed'}, so its selftest run did not complete`, true); continue }
+    if (b.error) { giveUp(`${id}: on the base, ${b.error}`); continue }
     const known = new Set(failedSelftests(b.report))
-    const fresh = failed.filter((test) => !known.has(test))
+    const fresh = open.filter((test) => !known.has(test))
     // A suite-level entry on the base ("worker/(suite)" after an RPC timeout, "(suite-busy)", "admin/(thread-ready)")
     // means some suite there never ran, so a failure absent from the base may simply not have been reached: the
     // comparison cannot call it new. DKIM run 2026-10-17 was refused twice on two inherited failures this way.
     const unfinished = [...known].filter(isSuiteLevel)
     if (fresh.length && unfinished.length) {
+      ignore({ report: b.report, known })
       notMade.push(`${id}: the base selftest run did not complete (${unfinished.join(', ')}), so ${fresh.length} candidate ${fresh.length === 1 ? 'failure' : 'failures'} cannot be judged new or inherited`)
       unfinishedBase++
       notJudged(fresh)
@@ -439,14 +483,20 @@ export async function compareSelftestReports ({ runDir, target, base, candidate,
     }
     record.newFailures.push(...fresh.map((test) => ({ command: id, test })))
     record.baselineKnown.push(...failed.filter((test) => known.has(test)).map((test) => ({ command: id, test })))
-    record.reports.push({ command: id, path: cand.path, failed: failed.length, verdict: fresh.length ? 'new-failures' : 'baseline-known' })
+    const ignoredHere = ignore({ report: b.report, known, complete: !unfinished.length })
+    record.reports.push({ command: id, path: cand.path, failed: failed.length, verdict: fresh.length ? 'new-failures' : ignoredHere ? 'unstable' : 'baseline-known' })
   }
   if (record.newFailures.length) { record.verdict = 'new-failures'; record.reason = `${record.newFailures.length} selftest ${record.newFailures.length === 1 ? 'failure does' : 'failures do'} not occur on the base` }
   else if (notMade.length) { record.verdict = 'not-made'; record.reason = notMade.join('; '); if (unfinishedBase === notMade.length) record.baseUnfinished = true }
+  else if (ignoredTests.length) record.verdict = 'unstable'
   else if (record.baselineKnown.length) record.verdict = 'baseline-known'
   else if (record.reports.length && record.reports.every((r) => r.verdict === 'not-applicable')) record.verdict = 'not-applicable'
   if (unjudged.length) record.unjudged = unjudged
   if (unread.length) record.unread = unread
+  if (ignoredTests.length) {
+    record.unstable = ignoredTests
+    record.instruction += ' unstable lists failures the gate ignored because recorded drives classify the test as unstable (each entry says which drives and whether this revision touched its module): they do not count against the candidate, but one can still be a real regression.'
+  }
   return record
 }
 

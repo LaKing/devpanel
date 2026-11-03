@@ -61,6 +61,12 @@ export function sameFailureEarlier ({ failures, earlier, base }) {
     return commands
 }
 
+/** The failures the gate ignored across both drives, each test once. */
+function bothIgnored (first, second) {
+    const list = [...(first?.unstable ?? []), ...(second?.unstable ?? [])].filter((f, i, all) => all.findIndex((x) => key(x) === key(f)) === i)
+    return list.length ? { unstable: list } : {}
+}
+
 export async function retryNewSelftestFailures ({ result, limit, aborted, rerun, compare, record, persist, earlier = [] }) {
     const selftest = result.baselineComparison?.selftest
     if (selftest?.verdict !== 'new-failures' || result.result !== 'passed' || result.attempts?.length || !(limit > 0) || aborted()) return result
@@ -81,9 +87,10 @@ export async function retryNewSelftestFailures ({ result, limit, aborted, rerun,
     const reproduced = selftest.newFailures.filter((f) => twice.has(key(f)))
     const once = [...selftest.newFailures, ...later].filter((f) => !reproduced.some((r) => key(r) === key(f)))
     if (reproduced.length) {
-        return { ...result, baselineComparison: { ...result.baselineComparison, selftest: { ...selftest, newFailures: reproduced, ...(once.length ? { flakyFailures: once } : {}) } },
+        return { ...result, baselineComparison: { ...result.baselineComparison, selftest: { ...selftest, newFailures: reproduced, ...(once.length ? { flakyFailures: once } : {}), ...bothIgnored(selftest, again.selftest) } },
             attempts: [{ ...record(retry), newFailures: later }], selftestReproduced: true }
     }
-    const cleared = again.selftest ? { ...again.selftest, newFailures: [], verdict: again.selftest.baselineKnown?.length ? 'baseline-known' : 'none', ...(once.length ? { flakyFailures: once } : {}) } : again.selftest
+    const ignored = bothIgnored(selftest, again.selftest)
+    const cleared = again.selftest ? { ...again.selftest, newFailures: [], verdict: ignored.unstable ? 'unstable' : again.selftest.baselineKnown?.length ? 'baseline-known' : 'none', ...(once.length ? { flakyFailures: once } : {}), ...ignored } : again.selftest
     return { ...retry, baselineComparison: { ...again, selftest: cleared }, attempts: [{ ...record(result), newFailures: selftest.newFailures }], flaky: true }
 }

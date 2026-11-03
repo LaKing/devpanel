@@ -1,3 +1,5 @@
+import { ignoredWords } from './selftest-history.mjs'
+
 /** Model-facing evidence summary. Full manifests/logs stay in the retained check artifact. */
 export function checkSummary (check, fullEvidence = null) {
   if (!check) return null
@@ -25,6 +27,8 @@ export function checkSummary (check, fullEvidence = null) {
     // Commands that did not run after a required failure: their outcome is unknown.
     ...(check.skipped?.length ? { skipped: check.skipped } : {}),
     ...(check.baselineComparison ? { baselineComparison: check.baselineComparison } : {}),
+    // Failures the gate passed over on history's word: never read as nothing happened.
+    ...(check.baselineComparison?.selftest?.unstable?.length ? { unstableNote: check.baselineComparison.selftest.unstable.map(ignoredWords) } : {}),
     // Earlier attempts on the same revision (the engine's retry of a failure).
     // `flaky` means this pass followed a failure of identical bytes.
     ...(check.attempts?.length ? { attempts: check.attempts, flaky: check.flaky === true,

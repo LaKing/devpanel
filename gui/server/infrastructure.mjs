@@ -86,6 +86,8 @@ export function stagingTarget (infra) {
     // pays for one; `retryFailed` absent means the engine's default of one retry.
     timing: infra.testDrive.timing ?? 'approved',
     ...(Number.isInteger(infra.testDrive.retryFailed) ? { retryFailed: infra.testDrive.retryFailed } : {}),
+    // Only when off: an unset project keeps its target hash, so its baselines stay valid.
+    ...(infra.testDrive.classifyUnstable === false ? { classifyUnstable: false } : {}),
     // Smoke beside the reviews, the full drive after approval (tierErrors
     // refuses every-revision timing with tiers).
     ...(infra.testDrive.tiers ? { tiers: infra.testDrive.tiers } : {}),
@@ -131,6 +133,7 @@ export function localTarget (checks) {
     // Absent timing is the engine's every-revision: a local check is cheap.
     ...(checks.timing ? { timing: checks.timing } : {}),
     ...(Number.isInteger(checks.retryFailed) ? { retryFailed: checks.retryFailed } : {}),
+    ...(checks.classifyUnstable === false ? { classifyUnstable: false } : {}),
     ...(checks.tiers ? { tiers: checks.tiers } : {}) }
 }
 
