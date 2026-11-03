@@ -8,7 +8,9 @@ import { reporterForKey } from './reporters.mjs'
 /*
  * POST /api/report/:project {input, kind?, category?} — open an issue from a project's deployment.
  *
- * It can do nothing else: no run is started, nothing is read back, the answer is only {project, id}.
+ * It can do nothing else: no run is started, nothing is read back, the answer is only {project, id, trust}.
+ * A report already opened today is answered 409 {error, project, id}, naming that issue so the reporter
+ * can stop resubmitting; only its id, which the report's own title and the date determine.
  * Mounted in index.js BEFORE the token gate, with its own small body parser.
  *
  * Who may: a peer whose address is private (RFC 1918, IPv6 ULA) and that did not come through the
@@ -89,7 +91,12 @@ export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refu
       const issue = await createIssue(req.params.project, { input, reportOrigin: report, openedBy: { user: reporter?.name ?? 'report', host: await clientHost(req) } })
       emit({ reason: 'issue-created', project: issue.project, id: issue.id })
       res.status(201).json({ project: issue.project, id: issue.id, trust: report.trust })
-    } catch (error) { next(error) }
+    } catch (error) {
+      // A resubmission is routine, not a failure: info here, because the app's error handler warns.
+      if (!error.existingId) return next(error)
+      console.info(`${req.method} ${req.path}: ${error.message}`)
+      res.status(409).json({ error: error.message, project: req.params.project, id: error.existingId })
+    }
   })
   return router
 }

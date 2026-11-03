@@ -1,4 +1,7 @@
+import fs from 'node:fs/promises'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 
 import express from 'express'
 
@@ -7,9 +10,10 @@ import { listen } from './helpers.mjs'
 
 export const name = 'anonymous reporting — a private-network peer may open an issue and nothing else'
 
-async function serve (options) {
+async function serve (options, onError = null) {
   const app = express()
   app.use(reportRouter(options))
+  if (onError) app.use(onError)
   const server = http.createServer(app)
   await listen(server, 0, '127.0.0.1')
   const post = async (project, body, headers = {}) => {
@@ -75,5 +79,55 @@ export default async function (t) {
       clock += 10 * 60 * 1000
       t.eq('after the window it is accepted again', (await s.post('app-project', { input: 'later' })).status, 201)
     } finally { await s.close() }
+  }
+
+  t.section('4. a duplicate report is answered with the existing id and logged at info')
+  {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'report-duplicate-'))
+    const saved = { issues: process.env.DEVPANEL_ISSUES_DIR, projects: process.env.DEVPANEL_PROJECTS_DIR, info: console.info, warn: console.warn }
+    process.env.DEVPANEL_ISSUES_DIR = path.join(root, 'issues')
+    process.env.DEVPANEL_PROJECTS_DIR = path.join(root, 'projects')
+    await fs.mkdir(path.join(root, 'projects', 'app-project'), { recursive: true })
+    await fs.mkdir(path.join(root, 'issues'))
+    const { createIssue, IssueError } = await import(`../server/issues.js?report=${Date.now()}`)
+    const logged = []
+    console.info = (message) => logged.push(['info', message])
+    console.warn = (message) => logged.push(['warn', message])
+    const events = []
+    // The app's error handler (index.js) warns about whatever reaches it.
+    const toHandler = (err, req, res, _next) => { console.warn(`${req.method} ${req.path}: ${err.message}`); res.status(err.status ?? 500).json({ error: err.message }) }
+    try {
+      const s = await serve({ createIssue, emit: (e) => events.push(e), refuse: () => null }, toHandler)
+      try {
+        const first = await s.post('app-project', { input: '# Same fault\nfirst body' })
+        t.eq('the first is created', [first.status, events.length, logged], [201, 1, []])
+        const dir = path.join(root, 'issues', 'app-project', first.body.id)
+        const before = await fs.readFile(path.join(dir, '000-report', 'response.md'), 'utf8')
+        const again = await s.post('app-project', { input: '# Same fault\nsecond body' })
+        t.eq('409 with the same error, the existing id beside it', [again.status, again.body], [409, { error: '"same-fault" was already opened against this project today', project: 'app-project', id: first.body.id }])
+        t.eq('no new issue and the existing one unchanged', [await fs.readdir(path.join(root, 'issues', 'app-project')), await fs.readFile(path.join(dir, '000-report', 'response.md'), 'utf8')], [[first.body.id], before])
+        t.eq('no second issue-created event', events.length, 1)
+        t.eq('logged once, at info, not at warn', logged, [['info', 'POST /api/report/app-project: "same-fault" was already opened against this project today']])
+      } finally { await s.close() }
+      logged.length = 0
+      const failing = (error) => serve({ createIssue: async () => { throw error }, emit: (e) => events.push(e), refuse: () => null }, toHandler)
+      for (const [what, error, status] of [
+        ['another 409 of createIssue', new IssueError('the proposal is already issue x', 409), 409],
+        ['a 404', new IssueError('no such project', 404), 404],
+        ['an unexpected error', new Error('disk full'), 500]
+      ]) {
+        const f = await failing(error)
+        try {
+          const r = await f.post('app-project', { input: '# Other\nbody' })
+          t.eq(`${what} reaches the error handler, warned, without an id`, [r.status, r.body, logged.pop()], [status, { error: error.message }, ['warn', `POST /api/report/app-project: ${error.message}`]])
+        } finally { await f.close() }
+      }
+      t.eq('none of them was logged at info', logged, [])
+    } finally {
+      console.info = saved.info
+      console.warn = saved.warn
+      for (const [key, value] of [['DEVPANEL_ISSUES_DIR', saved.issues], ['DEVPANEL_PROJECTS_DIR', saved.projects]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
+      await fs.rm(root, { recursive: true, force: true })
+    }
   }
 }

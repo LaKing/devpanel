@@ -455,7 +455,7 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
     await fs.mkdir(dir)
   } catch (err) {
     if (err.code === 'EEXIST') {
-      throw new IssueError(`"${slug}" was already opened against this project today`, 409)
+      throw Object.assign(new IssueError(`"${slug}" was already opened against this project today`, 409), { existingId: dirName })
     }
     throw err
   }

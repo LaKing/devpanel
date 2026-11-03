@@ -173,6 +173,9 @@ The key is `chmod 600` and `cert/` is git-ignored — it must never be committed
 > **Reporting from a project's deployment.** `POST /api/report/:project {input, kind?, category?}`
 > needs no token (`server/report.mjs`, mounted before the gate). It opens an issue and
 > does nothing else: no run starts, nothing is read back, the answer is `{project, id, trust}`.
+> The same report again on the same day changes nothing and is answered 409
+> `{error, project, id}`, `id` being the issue already open, so the reporter can stop
+> resubmitting. The panel logs that at info, not as a warning.
 > Allowed peers have a private address (10/8, 172.16/12, 192.168/16, fc00::/7) and no
 > `X-Forwarded-For` header, i.e. a sibling container reaching `https://<panel ip>/` directly;
 > a reverse proxy sets that header (`option forwardfor`) and behind it is the internet.
@@ -329,7 +332,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `GET /api/projects` | re-scans `/srv` — every `*-project`, each with its issue count |
 | `GET /api/projects/:project/issues` | that project's issues, newest first; each with `family` (`server/issue-family.mjs`): `parent` (`openedBy.from`, `known: false` when it is in no folder and no bundle), `children`, `openChildren`, `waitingOn` (unsettled prerequisites; one in another project is `unknown`) and `blocks`. The list page nests children under their parent (`src/issue-tree.js`) while no column sort is set |
 | `POST /api/projects/:project/issues` | open one — `{ name }` |
-| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), answers `{ project, id }` only; see the notes under "HTTPS" |
+| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), answers `{ project, id, trust }` only, or 409 `{ error, project, id }` naming the issue already opened today; see the notes under "HTTPS" |
 | `GET /api/projects/:project/issues/:id` | one issue with its steps and files |
 | `GET /api/projects/:project/issues/:id/family` | `{parent, children, dependsOn, dependsOnReason, blocks}`, each member `{project, id, name, disposition, archived, packed, settled, run}` (packed issues included; an unreadable one `missing: true`). Provenance and order stay separate: a parent is not a prerequisite |
 | `POST /api/projects/:project/issues/:id/steps` | add the next step — `{ name }` |
