@@ -205,7 +205,11 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
   summary.bundle = { bytes: (await fs.stat(files.bundle)).size, unpackedBytes, files: packed.length }
   await writeJson(files.runs, runs.map((r) => r.record))
   await writeJson(files.summary, summary)
-  await fs.rm(dir, { recursive: true, force: true })
+  // Out of reach in one step, then removed: a request reading the issue meanwhile sees it whole or
+  // not at all. It never sees a run whose journal has gone, and cannot write into a tree being removed.
+  const removing = await fs.mkdtemp(path.join(path.dirname(dir), '.removing-'))
+  await fs.rename(dir, path.join(removing, id))
+  await fs.rm(removing, { recursive: true, force: true })
   return summary
 }
 

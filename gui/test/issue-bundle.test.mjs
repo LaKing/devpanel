@@ -98,6 +98,41 @@ export default async function (t) {
     let missing = null
     try { await issues.getIssue(project, opened.id) } catch (error) { missing = error.status }
     t.eq('and it is no longer found', missing, 404)
+
+    t.section('a request reading the run does not undo the archive')
+    const store = await import('../server/runtime/store.mjs')
+    const withRun = async (name) => {
+      const issue = await issues.createIssue(project, { name })
+      const folder = path.join(issuesDir, project, issue.id)
+      const id = '2026-09-28T11-00-00-000Z-abcdef12'
+      await fs.mkdir(path.join(folder, 'runs', id, 'outputs'), { recursive: true })
+      await fs.writeFile(path.join(folder, 'runs', id, 'events.jsonl'), JSON.stringify({ at: 'x', type: 'started' }) + '\n')
+      await fs.writeFile(path.join(folder, 'runs', id, 'run.json'), JSON.stringify({ runId: id, status: 'cancelled', outcome: 'unresolved', playbook: { id: 'implementation' }, steps: [], participants: {} }))
+      return { issue, folder, id }
+    }
+    // A read that took the issue's path before the pack, and looks at the journal after it.
+    const late = await withRun('Late reader')
+    await issues.setIssueArchived(project, late.issue.id, true, { overrideReason: 'test fixture' })
+    const journal = await store.inspectRunJournal(late.folder, late.id)
+    t.eq('the journal it finds gone still requires recovery', journal.recoveryRequired, true)
+    t.eq('but the folder stays gone', await exists(late.folder), false)
+    const packed = await issues.getIssue(project, late.issue.id)
+    t.eq('and the issue still reads as archived and packed', [packed.archived, packed.packed], [true, true])
+    t.eq('with its run', packed.archive.runs.map((r) => r.runId), [late.id])
+    // Close does this: abandoning a run makes the open page reload while the archive request runs.
+    const outcomes = []
+    for (let round = 0; round < 15; round++) {
+      const beside = await withRun(`Reader beside the pack ${round}`)
+      let packing = true
+      const readers = Array.from({ length: 4 }, async () => { while (packing) await store.readRun(beside.folder, beside.id).catch(() => {}) })
+      const refused = await issues.setIssueArchived(project, beside.issue.id, true, { overrideReason: 'test fixture' }).then(() => null, (error) => error.message)
+      packing = false
+      await Promise.all(readers)
+      const read = await issues.getIssue(project, beside.issue.id)
+      outcomes.push([refused, read.archived, read.packed === true, await exists(beside.folder)])
+    }
+    t.eq('reads beside the pack: every archive succeeds, reads as packed and leaves no folder', outcomes.filter(([refused, archived, isPacked, folder]) => refused || !archived || !isPacked || folder), [])
+    t.eq('nothing of the removal stays in the project folder', (await fs.readdir(path.join(issuesDir, project))).filter((n) => n.startsWith('.removing-')), [])
   } finally {
     for (const [key, value] of [['DEVPANEL_ISSUES_DIR', saved.issues], ['DEVPANEL_PROJECTS_DIR', saved.projects]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
     await fs.rm(root, { recursive: true, force: true })

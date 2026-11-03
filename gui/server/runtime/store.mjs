@@ -226,7 +226,10 @@ export async function inspectRunJournal (issuePath, runId) {
   if (journal.recoveryRequired && !finding) {
     const { events, ...diagnostic } = journal
     finding = { ...diagnostic, detectedAt: new Date().toISOString() }
-    try { await writeJson(file, finding) } catch (error) {
+    // This runs on every read of a run. A reader can hold the path of an issue being packed or
+    // deleted: its journal is missing because the run is gone, and creating the directories here
+    // would bring back a folder without its archive marker, which then reads as an open issue.
+    try { await writeJson(file, finding, { parents: false }) } catch (error) {
       return { ...journal, recoveryPersistenceError: error.code ?? error.message,
         message: journal.message + ` Recovery finding could not be persisted: ${error.code ?? error.message}.` }
     }

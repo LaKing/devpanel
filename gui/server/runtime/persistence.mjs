@@ -12,9 +12,9 @@ export function persistence (io = fs) {
     }
   }
   const syncDir = async dir => use(await io.open(dir, 'r'), handle => handle.sync())
-  const prepare = async file => {
+  const prepare = async (file, parents = true) => {
     const dir = path.dirname(file)
-    await io.mkdir(dir, { recursive: true })
+    if (parents) await io.mkdir(dir, { recursive: true })
     // Include ancestors: a caller may just have created the run/issue folders.
     for (let current = dir; ; current = path.dirname(current)) {
       await syncDir(current)
@@ -22,8 +22,9 @@ export function persistence (io = fs) {
     }
     return dir
   }
-  const writeAtomic = async (file, data, { mode = 0o600 } = {}) => {
-    const dir = await prepare(file)
+  // `parents: false` fails with ENOENT rather than bring back a directory that has gone.
+  const writeAtomic = async (file, data, { mode = 0o600, parents = true } = {}) => {
+    const dir = await prepare(file, parents)
     const tmp = `${file}.${crypto.randomUUID()}.tmp`
     let failure
     try {

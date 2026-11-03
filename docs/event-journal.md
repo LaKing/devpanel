@@ -26,7 +26,9 @@ append. A separate `journal-recovery.json` finding survives restarts and subsequ
 journal edits. If the journal later parses successfully, `status` may describe
 complete bytes while `complete` remains false and `recoveryRequired` remains true;
 `finding` preserves the original diagnostic. Failures reading or persisting this
-finding are explicit and do not authorize execution.
+finding are explicit and do not authorize execution. The finding is written only into
+a run directory that still exists: a read that outlives its issue being packed or
+deleted reports a persistence failure and never brings the folder back.
 
 The engine checks the journal before driving, recovering a turn, invoking an agent,
 accepting a turn, persisting transitions, or evaluating delivery. Appending events,
