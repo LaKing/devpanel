@@ -970,6 +970,35 @@ level and whether any check ran, whether the delivery is a saved patch (not
 integrated) or a document, the base the candidate was cut from, and the
 disposition with a control to record one.
 
+## Suggesting a split
+
+Triage's `too-large` verdict is the size signal before any work. After work has
+begun, the run explanation says the same thing when the record shows it: `next`
+keeps its Resume or Continue wording and adds a suggestion to split the issue,
+with the run's open findings as candidate parts. `explanation.splitSuggestion`
+(`text`, `parts`, `theme`, `limitRaises`) holds the same words and parts, and the
+supervisor's run summary carries that object unchanged. It is a suggestion: it
+changes no state and no action. No button splits a run after triage, so it tells
+the reader to open the parts as issues and record the `split` disposition.
+
+The rule is `runtime/run-explanation.mjs`, over the run's record and outputs, with
+no model or decision provider. All of these must hold:
+
+- The run is `blocked` on `budget-exhausted`, `rounds-exhausted` or a Continue
+  stop, with Resume or Continue actually available. It was not landed by hand, and
+  no cleanup, reconcile or unknown owner is what it is waiting on.
+- A limit was raised by hand: a `resumeHistory` or `continueHistory` entry has a
+  limit higher than its `previousLimits` value. The engine raises none itself. The
+  extra round a `rounds-exhausted` Resume adds is not a limit, and neither is a
+  limit set where none stood.
+- At least one finding is open (`outstandingFindings`).
+- New findings keep naming the same thing. A finding is new where its slug (the id
+  after the seat prefix) first appears in the run. Its names are its `criterion`
+  and the file of its `location`, compared without case; a finding citing neither
+  counts neither way. A name qualifies when new findings cite it in at least two
+  review passes, at least one started after the first raise, and it is cited by at
+  least half of the new citing findings since that raise.
+
 ## Closure
 
 An issue closes automatically only when **all** of these hold:

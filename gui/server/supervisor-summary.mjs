@@ -123,6 +123,8 @@ export function summariseRun (detail) {
     blockedReason: detail.blockedReason ?? null,
     pause: detail.pause ?? null,
     ownerInput: detail.ownerInput ?? null,
+    // Verbatim: the words and parts the run explanation's `next` gives a person.
+    ...(detail.explanation?.splitSuggestion ? { splitSuggestion: detail.explanation.splitSuggestion } : {}),
     failure: detail.failure ?? null,
     modelSubstitutions: detail.modelSubstitutions ?? [],
     modelFallbackChecks: (detail.modelFallbackChecks ?? []).map(c => ({ at: c.at, role: c.role, model: c.model, launchReady: c.result?.launchReady })),

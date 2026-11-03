@@ -124,4 +124,100 @@ export default async function (t) {
   t.eq('the record is not changed by explaining it', [blocked.status, blocked.outcome, blocked.blockedReason], ['blocked', 'unresolved', 'source-delivery-blocked'])
   t.ok('a checkout path is named when there is no commit', explainRun({ status: 'completed', outcome: 'resolved', delivery: { action: 'worktree-diff', completedAt: 'x' }, landed: { ...landed, commit: null, checkout: '/opt/x-project' } }).detail.includes('/opt/x-project'))
   t.eq('no run, no explanation', explainRun(null), null)
+
+  t.section('a run that keeps finding new problems on one theme')
+  {
+  const when = (minutes) => new Date(Date.UTC(2026, 10, 1, 8, minutes)).toISOString()
+  const finding = (id, criterion, location, extra = {}) => ({ id: `auditor-1-${id}`, severity: 'major', blocking: true, description: `${id} is wrong.\nMore.`, criterion, location, ...extra })
+  // Reviews in order, each [round, minutes, findings]; the raise is at minute 30.
+  const reviewed = (reviews) => {
+    const outputs = {}
+    const steps = reviews.map(([round, minutes, findings, role = 'auditor-1'], i) => {
+      const number = String(i + 1).padStart(3, '0')
+      outputs[number] = { valid: true, contract: 'reviewResult', output: { verdict: 'changes-needed', findings } }
+      return { number, role, phase: 'implement-review', round, startedAt: when(minutes) }
+    })
+    return { outputs, steps }
+  }
+  const raise = { at: when(30), previousLimits: { maxSteps: 10, wallClockMinutes: 60 }, limits: { maxSteps: 20, wallClockMinutes: 60 } }
+  const theme = [
+    [0, 10, [finding('crash-a', 'restart-safe', 'gui/migrate.mjs:10')]],
+    [1, 40, [finding('crash-b', 'restart-safe', 'gui/migrate.mjs:20')]],
+    [2, 50, [finding('crash-c', 'restart-safe', 'gui/migrate.mjs:30'), finding('crash-b', 'restart-safe', 'gui/migrate.mjs:20')]]
+  ]
+  const stopped = (reviews, extra = {}) => {
+    const { outputs, steps } = reviewed(reviews)
+    return { run: { ...held, status: 'blocked', blockedReason: 'rounds-exhausted', steps, resumeHistory: [raise], outstandingFindings: reviews.at(-1)[2], ...extra }, outputs }
+  }
+  const held = { integrity: { status: 'clear' }, workspace: { path: '/w', state: 'retained' }, participants: {}, revisions: [{ fingerprint: 'r1' }] }
+  const explain = ({ run, outputs }, options = {}) => explainRun(run, { outputs, ...options })
+
+  const split = explain(stopped(theme))
+  t.ok('next suggests splitting', /Consider splitting the issue/.test(split.next), split.next)
+  t.ok('beside the Resume wording, which is still there', split.next.startsWith('Resume for one more round, or start a new run with clearer guidance. '), split.next)
+  t.ok('and offers no button that does not exist', /no button does that here, so open each part as a new issue and record the split disposition/.test(split.next))
+  t.ok('naming what the findings keep naming', split.next.includes('keep naming gui/migrate.mjs, restart-safe,'), split.next)
+  t.ok('giving the open findings as candidate parts', split.next.endsWith('Candidate parts, from the open findings: auditor-1-crash-c: crash-c is wrong.; auditor-1-crash-b: crash-b is wrong.'), split.next)
+  t.eq('the parts are structured too', split.splitSuggestion.parts.map((p) => [p.id, p.criterion, p.location]), [['auditor-1-crash-c', 'restart-safe', 'gui/migrate.mjs:30'], ['auditor-1-crash-b', 'restart-safe', 'gui/migrate.mjs:20']])
+  t.eq('counting the raises', split.splitSuggestion.limitRaises, 1)
+  t.eq('the same record gives the same answer', explain(stopped(theme)), split)
+  t.ok('it stands beside the choice about residual risks', (() => {
+    const risky = stopped(theme, { closure: { residualRisks: [{ description: 'A risk.', accepted: false }] } })
+    const said = explain(risky)
+    return said.next.includes('Consider splitting') && said.next.includes('residual risk') && said.unacceptedRisks
+  })())
+  t.ok('a raise by Continue counts as well, beside the Continue wording', (() => {
+    const said = explain(stopped(theme, { blockedReason: 'checks-inconclusive', resumeHistory: [], continueHistory: [raise] }))
+    return /Continue gives the author a round anyway/.test(said.next) && /Consider splitting/.test(said.next)
+  })())
+  t.ok('a spent budget says so beside its Resume wording', (() => {
+    const said = explain(stopped(theme, { blockedReason: 'budget-exhausted', budgets: { limits: { maxSteps: 20 }, used: { steps: 20 } } }))
+    return said.next.startsWith('Resume with a larger allowance. Limits were raised')
+  })())
+  t.ok('an area alone is enough: a minor finding citing only a location', explain(stopped([
+    [0, 10, [{ id: 'auditor-1-a', severity: 'minor', blocking: false, location: 'gui/x.mjs:1' }]],
+    [1, 40, [{ id: 'auditor-1-b', severity: 'minor', blocking: false, location: './gui/x.mjs:9-12, gui/y.mjs:1' }, finding('c', 'other', 'gui/z.mjs:1')]]
+  ])).splitSuggestion.theme.includes('gui/x.mjs'))
+
+  const absent = (label, record) => {
+    const said = explain(record)
+    t.ok(label, !said?.splitSuggestion && !/split/i.test(said?.next ?? ''), said?.next)
+  }
+  absent('absent when limits were never raised', stopped(theme, { resumeHistory: [] }))
+  absent('absent after a resume that raised no limit: its own extra round does not count', stopped(theme, { resumeHistory: [{ at: when(30), previousLimits: raise.previousLimits, limits: raise.previousLimits, overrides: { rounds: { 'implement-review': 3 } } }] }))
+  absent('absent when a limit was only set where none stood', stopped(theme, { resumeHistory: [{ at: when(30), previousLimits: {}, limits: { maxTokens: 5 } }] }))
+  absent('absent when the new findings name different things', stopped([
+    [0, 10, [finding('a', 'one', 'gui/a.mjs:1')]],
+    [1, 40, [finding('b', 'two', 'gui/b.mjs:1')]],
+    [2, 50, [finding('c', 'three', 'gui/c.mjs:1')]]
+  ]))
+  absent('absent when most new findings since the raise left the theme', stopped([
+    [0, 10, [finding('a', 'one', 'gui/a.mjs:1')]],
+    [1, 40, [finding('b', 'one', 'gui/a.mjs:2'), finding('c', 'two', 'gui/b.mjs:1'), finding('d', 'three', 'gui/c.mjs:1'), finding('e', 'four', 'gui/d.mjs:1')]]
+  ]))
+  absent('absent when nothing new came after the raise, however alike the earlier ones', stopped([
+    [0, 10, [finding('a', 'one', 'gui/a.mjs:1')]],
+    [1, 20, [finding('b', 'one', 'gui/a.mjs:2')]],
+    [2, 40, [finding('b', 'one', 'gui/a.mjs:2')]]
+  ]))
+  absent('absent when the name came from one review pass only', stopped([
+    [0, 40, [finding('a', 'one', 'gui/a.mjs:1'), finding('b', 'one', 'gui/a.mjs:2')]]
+  ]))
+  absent('absent when the same finding was only restated with another seat prefix', stopped([
+    [0, 10, [finding('a', 'one', 'gui/a.mjs:1')]],
+    [1, 40, [{ ...finding('a', 'one', 'gui/a.mjs:1'), id: 'auditor-2-a' }], 'auditor-2']
+  ]))
+  absent('absent when the findings cite nothing', stopped([
+    [0, 10, [{ id: 'auditor-1-a', severity: 'minor', blocking: false }]],
+    [1, 40, [{ id: 'auditor-1-b', severity: 'minor', blocking: false }]]
+  ]))
+  absent('absent when no finding is open to offer as a part', stopped(theme, { outstandingFindings: [] }))
+  absent('absent while the run is working', stopped(theme, { status: 'running', blockedReason: null }))
+  absent('absent when another round is not what stopped it', stopped(theme, { blockedReason: 'protocol-repair-exhausted' }))
+  absent('absent when the workspace is gone, so no round can be given', stopped(theme, { workspace: { path: '/w', state: 'removed' } }))
+  absent('absent on an abandoned run', stopped(theme, { abandonment: { at: when(60), by: 'alice' } }))
+  absent('absent when the work was landed by hand', stopped(theme, { landed }))
+  const owner = explain(stopped(theme), { ownership: { state: 'owner-unknown', pid: 1, host: 'h', file: '/l' } })
+  t.ok('absent while its owner cannot be established', !owner.splitSuggestion && !/split/i.test(owner.next), owner.next)
+  }
 }

@@ -8,7 +8,8 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 
 import { runResult } from './runtime/run-result.mjs'
-import { explainRun } from './runtime/run-explanation.mjs'
+import { explainRun, limitRaises } from './runtime/run-explanation.mjs'
+import { readOutputs } from './runtime/store.mjs'
 import { reconcilePending } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
 import { withLock } from './runtime/lock.mjs'
@@ -287,8 +288,9 @@ async function runSummaries (dir, unreadable = []) {
       ownerInput: run.ownerInput ? { verdict: run.ownerInput.verdict, questions: (run.ownerInput.questions ?? []).map((q) => q.question), parts: run.ownerInput.split?.length ?? 0, answered: Boolean(run.ownerInput.answer) } : null,
       recoveryReason: run.recovery?.required ? (run.recovery.reason ?? null) : null,
       // Only the last output is read here, which is where a closing
-      // confirmation sits; the run page reads them all.
-      explanation: explainRun(run, { outputs, acceptedRisks }),
+      // confirmation sits; the run page reads them all, and so does a run whose
+      // limits were raised, since its split suggestion reads every review.
+      explanation: explainRun(run, { outputs: limitRaises(run).length ? await readOutputs(dir, runId).catch(() => outputs) : outputs, acceptedRisks }),
       closed: Boolean(run.closure)
     }
     if (summaryCache.size >= SUMMARY_CACHE_LIMIT) summaryCache.delete(summaryCache.keys().next().value)

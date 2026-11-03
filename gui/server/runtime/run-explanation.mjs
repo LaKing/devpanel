@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, checksOnlyBlock, reconcilePending, reconcileUnavailable, resumeUnavailable, SERVICE_SHUTDOWN } from './run-control.mjs'
+import { acceptCheckUnavailable, checksOnlyBlock, continueUnavailable, CONTINUABLE_BLOCKS, reconcilePending, reconcileUnavailable, resumeUnavailable, SERVICE_SHUTDOWN } from './run-control.mjs'
 import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
@@ -21,6 +21,8 @@ import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 //   tone      progress | waiting | success | warning | error | neutral
 //   unacceptedRisks  what a `resolved` disposition would refuse on, each risk with
 //             what names it in acceptRisks, and the choices; absent when nothing is
+//   splitSuggestion  the suggestion `next` carries when the run looks larger than one
+//             run, with its candidate parts; absent otherwise
 //
 // It never decides anything. Actions a page may offer come from the run's
 // supportedActions; `next` names them in prose and a page shows the buttons.
@@ -305,15 +307,106 @@ const DELIVERY = {
   }
 }
 
+/** The resumes and Continues that raised a limit. Only those two write limits, and only when told to (engine.continuationLimits). */
+export function limitRaises (run) {
+  const raised = ({ previousLimits: before, limits }) => Object.entries(limits ?? {}).some(([key, value]) => Number.isFinite(before?.[key]) && value > before[key])
+  return [...(run.resumeHistory ?? []), ...(run.continueHistory ?? [])].filter(raised)
+}
+
+/** What a finding cites, as comparable names: its criterion, and the file of its location. A finding citing neither names nothing. */
+function findingNames (f) {
+  const names = []
+  const criterion = typeof f.criterion === 'string' ? f.criterion.trim().replace(/\s+/g, ' ') : ''
+  if (criterion) names.push({ key: `criterion:${criterion.toLowerCase()}`, label: criterion })
+  const location = typeof f.location === 'string' ? f.location.trim() : ''
+  if (location) {
+    const first = location.split(/[\s,;]+/)[0]
+    const area = /[/.]/.test(first) ? first.replace(/^\.\//, '').replace(/(:\d.*|#L\d.*)$/, '') : location.replace(/\s+/g, ' ')
+    names.push({ key: `area:${area.toLowerCase()}`, label: area })
+  }
+  return names
+}
+
+/*
+ * What the findings new since the first raise keep naming. A review pass is
+ * the (phase, round) its review steps ran in, consecutively, so a restart that
+ * reuses a round number is another pass; a seat's last valid report in a pass
+ * counts, as in run-metrics. A finding is new where its slug (the id after the
+ * seat prefix) first appears in the run. A name is kept when new findings of at
+ * least two passes cite it, and at least half of the citing new findings since
+ * the first raise are among them. Findings citing nothing count neither way.
+ */
+function keptNames (run, outputs, since) {
+  const passes = []
+  let previous = null
+  for (const s of run.steps ?? []) {
+    const out = outputs[s.number]
+    if (!out?.valid || out.contract !== 'reviewResult') continue
+    const key = `${s.phase}:${s.round}`
+    if (key !== previous) passes.push({ after: Date.parse(s.startedAt) >= since, seats: new Map() })
+    previous = key
+    passes.at(-1).seats.set(s.role, out.output?.findings ?? [])
+  }
+  const seen = new Set()
+  const named = new Map()
+  let citing = 0
+  passes.forEach(({ after, seats }, pass) => {
+    for (const [seat, findings] of seats) {
+      for (const f of findings) {
+        if (!f?.id) continue
+        const slug = String(f.id).replace(new RegExp(`^${seat}-`, 'i'), '').toLowerCase()
+        if (seen.has(slug)) continue
+        seen.add(slug)
+        const names = findingNames(f)
+        if (after && names.length) citing++
+        for (const { key, label } of names) {
+          if (!named.has(key)) named.set(key, { key, label, passes: new Set(), since: 0 })
+          named.get(key).passes.add(pass)
+          if (after) named.get(key).since++
+        }
+      }
+    }
+  })
+  return [...named.values()].filter((n) => n.passes.size >= 2 && n.since > 0 && n.since * 2 >= citing)
+    .sort((a, b) => b.since - a.since || (a.key < b.key ? -1 : 1)).map((n) => n.label)
+}
+
+/*
+ * A run that is larger than one run, read off its own record: stopped where
+ * another round is on offer, limits raised by hand at least once (a Resume's own
+ * extra round raises none), open findings to offer as parts, and new findings that
+ * keep naming the same things. It suggests and acts on nothing, and no button
+ * splits a run after triage, so the words send a person to what does exist.
+ */
+function splitSuggestion (run, outputs) {
+  if (run.status !== 'blocked' || run.landed || reconcilePending(run) || openCleanup(run).length) return null
+  if (!['budget-exhausted', 'rounds-exhausted', ...CONTINUABLE_BLOCKS].includes(run.blockedReason)) return null
+  if (resumeUnavailable(run) && continueUnavailable(run)) return null
+  const open = run.outstandingFindings ?? []
+  const raises = limitRaises(run)
+  if (!open.length || !raises.length) return null
+  const theme = keptNames(run, outputs, Math.min(...raises.map((r) => Date.parse(r.at))))
+  if (!theme.length) return null
+  const parts = open.map((f) => ({ id: f.id ?? null, description: firstLine(f.description, 160) || null, criterion: f.criterion ?? null, location: f.location ?? null }))
+  const listed = parts.map((p) => [p.id, p.description].filter(Boolean).join(': ')).join('; ')
+  const text = `Limits were raised by hand ${plural(raises.length, 'time')} and new findings keep naming ${theme.map((name) => firstLine(name, 80)).join(', ')}, so this may be larger than one run. Consider splitting the issue rather than one more round: no button does that here, so open each part as a new issue and record the split disposition on this one. Candidate parts, from the open findings: ${listed.replace(/\.$/, '')}.`
+  return { text, parts, theme, limitRaises: raises.length }
+}
+
 /** Where a run stands, for a person. See the header for the fields. */
 export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [] } = {}) {
   if (!run) return null
-  const standing = explainStanding(run, { outputs, active, ownership })
+  const standing = withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership }), outputs, ownership)
   const unaccepted = riskStatement(run, acceptedRisks)
   if (!unaccepted) return standing
   const n = unaccepted.risks.length
   const choice = `${plural(n, 'residual risk')} ${n === 1 ? 'is' : 'are'} unaccepted: to record resolved, accept ${n === 1 ? 'it' : 'each'} with a reason; otherwise record partially-resolved.`
   return { ...standing, next: [standing.next, choice].filter(Boolean).join(' '), unacceptedRisks: unaccepted }
+}
+
+function withSplitSuggestion (run, standing, outputs, ownership) {
+  const split = ownership?.state === 'owner-unknown' ? null : splitSuggestion(run, outputs)
+  return split ? { ...standing, next: [standing.next, split.text].filter(Boolean).join(' '), splitSuggestion: split } : standing
 }
 
 /*
