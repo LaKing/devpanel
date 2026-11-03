@@ -175,6 +175,10 @@ function failed (run) {
       case 'rate-limit':
       case 'transient':
         return { headline: 'Stopped: the AI provider kept refusing requests', detail: f.retries ? `Retried ${plural(f.retries, 'time')} first.` : null, cause: said || null, next: 'Start a new run later; the provider was busy or limiting requests.' }
+      case 'output-limit':
+        return { headline: `Stopped: ${who} ran out of output on the model's output token limit`, detail: f.retries ? `Retried ${plural(f.retries, 'time')} first.` : null, cause: said || null, next: run.integrity?.status === 'quarantined'
+          ? "Its last attempt's source edits were not accepted. Inspect the retained workspace, then keep them, restore them, or abandon the run; a narrower task or a lower effort for that seat leaves more room for the answer."
+          : 'Resume the run or start a new one; a narrower task or a lower effort for that seat leaves more room for the answer.' }
       case 'environment':
         return { headline: `Stopped: ${who}'s AI tool could not run on this host`, cause: said || null, next: 'Fix the host problem named above, then start a new run.' }
       default:

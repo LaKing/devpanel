@@ -301,7 +301,7 @@
     "retryPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "description": "How a runtime failure classified as rate-limit or transient is retried. Quota, credential and environment failures are never retried.",
+      "description": "How a runtime failure classified as rate-limit, transient or output-limit is retried. Quota, credential and environment failures are never retried.",
       "properties": {
         "maxAttempts": {
           "type": "integer",

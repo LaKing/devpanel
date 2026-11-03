@@ -35,4 +35,44 @@ export default async function (t) {
     t.eq('a failed turn with a 429 is a rate limit', classifyFailure({ message: 'codex exited 1', stdout: codexErrors(stream) }).class, 'rate-limit')
     t.eq('the agent message is not evidence', codexErrors(stream).includes('insufficient_quota'), false)
   }
+
+  t.section('the output limit: each runtime\'s ending, and never the model\'s own text')
+  {
+    const codex = [
+      line({ type: 'thread.started', thread_id: 't' }),
+      line({ type: 'item.completed', item: { type: 'reasoning', text: 'Still weighing it.' } }),
+      line({ type: 'turn.failed', error: { message: 'Incomplete response returned, reason: max_output_tokens' } })
+    ].join('\n')
+    const fromCodex = classifyFailure({ message: 'codex exited 1', stdout: codexErrors(codex) })
+    t.eq('codex: its own class, retryable', `${fromCodex.class}:${fromCodex.retryable}`, 'output-limit:true')
+
+    const words = "API Error: Claude's response exceeded the 64000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable. Lower the effort level to leave room for a reply."
+    const claude = [
+      line({ type: 'assistant', message: { model: 'claude-opus-5', content: [{ type: 'text', text: 'Partly done.' }] } }),
+      line({ type: 'assistant', error: 'max_output_tokens', is_api_error_message: true, message: { model: '<synthetic>', content: [{ type: 'text', text: words }] } }),
+      line({ type: 'result', subtype: 'success', is_error: true, stop_reason: 'max_tokens', result: words })
+    ].join('\n')
+    const result = JSON.parse(claude.split('\n').at(-1))
+    t.eq('claude: a non-zero exit, read from the stream', classifyFailure({ message: 'claude exited 1', stdout: runtimeErrors(claude), payload: runtimeResult(result) }).class, 'output-limit')
+    t.eq('claude: exit 0 with an error result, read from the record', classifyFailure({ message: 'claude reported an error: success', payload: result }).class, 'output-limit')
+
+    const gemini = 'Model response was truncated because it exceeded the token limit. Try using /compress to free up context space.'
+    const geminiResult = { type: 'result', status: 'error', error: { type: 'INVALID_STREAM', message: gemini } }
+    t.eq('gemini: an error result (the adapter passes its message as stderr)', classifyFailure({ message: 'gemini reported an error: INVALID_STREAM', stderr: gemini, payload: geminiResult }).class, 'output-limit')
+    t.eq('gemini: another invalid stream is not the limit', classifyFailure({ message: 'gemini reported an error: INVALID_STREAM', stderr: 'Model stream ended with an empty response text.', payload: { type: 'result', status: 'error', error: { type: 'INVALID_STREAM' } } }).class, 'runtime')
+
+    const talk = 'I now retry max_output_tokens.\nIncomplete response returned, reason: max_output_tokens\nmax_output_tokens: handled'
+    const codexTalk = [
+      line({ type: 'item.completed', item: { type: 'agent_message', text: talk } }),
+      line({ type: 'turn.failed', error: { message: 'exec session crashed' } })
+    ].join('\n')
+    t.eq('codex: an agent quoting the ending is not the ending', classifyFailure({ message: 'codex exited 1', stdout: codexErrors(codexTalk) }).class, 'runtime')
+    const claudeTalk = [
+      line({ type: 'assistant', message: { model: 'claude-opus-5', content: [{ type: 'text', text: talk }] } }),
+      line({ type: 'result', is_error: false, result: talk })
+    ].join('\n')
+    t.eq('claude: nor is an answer quoting it, read from the stream', classifyFailure({ message: 'claude exited 1', stdout: runtimeErrors(claudeTalk), payload: runtimeResult(JSON.parse(claudeTalk.split('\n').at(-1))) }).class, 'runtime')
+    t.eq('claude: nor a whole record the runtime did not mark as an error', classifyFailure({ message: 'claude exited 1', payload: { type: 'result', is_error: false, result: talk } }).class, 'runtime')
+    t.eq('raw stream text: the quote stays inside its JSON line', classifyFailure({ message: 'gemini exited 1', stdout: line({ type: 'message', content: talk }) }).class, 'runtime')
+  }
 }

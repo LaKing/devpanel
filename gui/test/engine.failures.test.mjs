@@ -3,6 +3,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { createQuotaFallback } from '../server/runtime/model-fallback.mjs'
 import { classifyFailure, backoffMs, parseRetryAfter, createAvailabilityStore } from '../server/runtime/failure.mjs'
+import { codexErrors } from '../../harness/codex.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { ProcessError } from '../server/runtime/process.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
@@ -121,6 +123,88 @@ export default async (t) => {
     t.eq('three retries, then the fourth failure ended it', engine.run.failures.length, 4)
     t.eq('with the class on the run', engine.run.failure?.class, 'transient')
     t.eq('and the retry count', engine.run.failure?.retries, 3)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('5b. a turn that ran out of output is retried, told so; a writer keeps its edits')
+  {
+    const f = await engineFixture()
+    const stream = JSON.stringify({ type: 'turn.failed', error: { message: 'Incomplete response returned, reason: max_output_tokens' } })
+    const prompts = []
+    let calls = 0
+    const invoke = async (args) => {
+      if (args.meta.stepId !== 'implement') return f.fake.invoke(args)
+      prompts.push(args.prompt)
+      if (calls++ < 2) {
+        await fs.writeFile(path.join(args.cwd, `partial-${calls}.txt`), 'half done\n')
+        throw new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stdout: codexErrors(stream), invocationId: args.meta.invocationId })
+      }
+      return f.fake.invoke(args)
+    }
+    const engine = await startRun({
+      playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke } }, stepStore: f.stepStore,
+      workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+    })
+    const before = f.clock.now()
+    const run = await engine.drive()
+    t.eq('the run completed', run.status, 'completed', run.blockedReason)
+    t.eq('the policy\'s backoff: 30s, 60s', f.clock.now() - before, 90_000)
+    t.eq('both attempts on record, retried', run.failures.map((x) => `${x.class}:${x.retried}`), ['output-limit:true', 'output-limit:true'])
+    t.eq('with the writer\'s edits accepted for the retry', run.failures.map((x) => x.partialAccepted?.reason), ['output-limit', 'output-limit'])
+    t.ok('the first attempt was not told anything', !/ran out of output/.test(prompts[0]))
+    t.ok('the retry is told it ran out of output', /ran out of output/.test(prompts[1]) && /Answer sooner/.test(prompts[1]))
+    t.ok('and the one after that', /ran out of output/.test(prompts[2]))
+    await releaseWorkspace(engine)
+  }
+
+  t.section('5c. retries spent: the run fails naming the limit; a last attempt\'s edits stay quarantined, not vouched for')
+  for (const writes of [false, true]) {
+    const f = await engineFixture()
+    let calls = 0
+    const invoke = async (args) => {
+      if (args.meta.stepId !== 'implement') return f.fake.invoke(args)
+      calls++
+      if (writes) await fs.writeFile(path.join(args.cwd, `partial-${calls}.txt`), 'half done\n')
+      throw new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stdout: 'Incomplete response returned, reason: max_output_tokens', invocationId: args.meta.invocationId })
+    }
+    const engine = await startRun({
+      playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke } }, stepStore: f.stepStore,
+      workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+    })
+    const before = f.clock.now()
+    let thrown = null
+    try { await engine.drive() } catch (error) { thrown = error }
+    const label = writes ? 'with edits' : 'without edits'
+    t.eq(`${label}: the waits were the policy's`, f.clock.now() - before, 210_000)
+    t.eq(`${label}: every attempt recorded, maxAttempts retried`, engine.run.failures.map((x) => x.retried), [true, true, true, false])
+    t.ok(`${label}: all of the class`, engine.run.failures.every((x) => x.class === 'output-limit'))
+    t.eq(`${label}: no more attempts than allowed`, calls, 4)
+    if (writes) {
+      t.ok('drive did not throw: the engine ended the run itself', thrown === null, thrown?.message)
+      t.eq('the run failed, not blocked', engine.run.status, 'failed')
+      t.eq('the class is on the run', engine.run.failure?.class, 'output-limit')
+      t.eq('with the retry count', engine.run.failure?.retries, 3)
+      t.ok('and an end time', Boolean(engine.run.endedAt))
+      t.eq('the last attempt\'s edits stay quarantined', engine.run.integrity.status, 'quarantined')
+      t.eq('its failure is on the record as quarantined', engine.run.failures.at(-1).quarantined, true)
+      t.eq('those edits were not accepted', [engine.run.failures.at(-1).partialAccepted, engine.run.integrity.latest.partialAccepted], [undefined, undefined])
+      t.eq('and they are exactly the last attempt\'s', engine.run.integrity.latest.changes.paths.map((c) => c.path), ['partial-4.txt'])
+      t.eq('the earlier attempts\' were accepted for their retries', engine.run.failures.slice(0, 3).map((x) => x.partialAccepted?.reason), ['output-limit', 'output-limit', 'output-limit'])
+      t.ok('the edits are preserved on disk', await fs.access(path.join(engine.run.workspace.path, 'partial-4.txt')).then(() => true, () => false))
+      const said = explainRun(engine.run)
+      t.ok('the headline names the limit', /output token limit/.test(said.headline), said.headline)
+      t.ok('without a crash or a refusing provider', !/crashed|refusing/.test(`${said.headline} ${said.detail} ${said.next}`))
+      t.ok('and says the edits need a decision', /not accepted/.test(said.next), said.next)
+      await engine.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: engine.run.integrity.latest.stateHash, reason: 'inspected', actor: 'operator' })
+      t.eq('a recorded disposition still reopens the run', `${engine.run.status}:${engine.run.integrity.status}`, 'pending:clear')
+      t.eq('without the failure it answered', engine.run.failure, null)
+    } else {
+      t.ok('drive threw the runtime error', thrown?.kind === 'runtime-error', thrown?.message)
+      t.eq('the class is on the run', engine.run.failure?.class, 'output-limit')
+      t.eq('with the retry count', engine.run.failure?.retries, 3)
+    }
     await releaseWorkspace(engine)
   }
 

@@ -878,7 +878,9 @@ const render = (template, ctx) =>
     return typeof v === 'string' ? v : JSON.stringify(v, null, 2)
   })
 
-const NL = String.fromCharCode(10)
+/** Why endIntegrity quarantines a writer's failed turn: its own partial work, nothing unauthorized. */
+const PARTIAL_CHANGES = 'unsuccessful invocation left partial source or Git changes'
+const NL =String.fromCharCode(10)
 
 /**
  * The named context, as text the recipient can actually read.
@@ -1100,7 +1102,7 @@ export class Engine {
       else if (report.changes.nested?.length) report.reason = `a repository was created inside the worktree (${report.changes.nested.slice(0, 3).join(', ')}): the host never resolves a repository the engine did not provision`
       else if (head || (!report.writesCode && (paths.length || index))) report.reason = 'role made unauthorized source or Git changes'
       else if (changed && outcome !== 'completed' && acceptPartial && report.writesCode && !report.reason) report.partialAccepted = { reason: acceptPartial, paths: paths.map((c) => c.path), index }
-      else if (changed && outcome !== 'completed') report.reason = 'unsuccessful invocation left partial source or Git changes'
+      else if (changed && outcome !== 'completed') report.reason = PARTIAL_CHANGES
       report.status = report.reason ? 'quarantined' : 'clear'
     } catch (error) {
       report.status = 'quarantined'
@@ -1172,7 +1174,7 @@ export class Engine {
     }
     this.run.status = disposition === 'abandon' ? 'failed' : 'pending'
     this.run.blockedReason = disposition === 'abandon' ? 'integrity-abandoned' : null
-    if (disposition !== 'abandon') this.run.endedAt = null
+    if (disposition !== 'abandon') { this.run.endedAt = null; this.run.failure = null }
     await this.persist({ type: 'integrity-disposition', ...record })
     return this.run
   }
@@ -2223,6 +2225,9 @@ export class Engine {
       const why = typeof repair === 'object' && repair.error ? repair.error : 'it could not be read'
       append('protocol-repair', `Your previous response was not accepted as the required \`${step.output}\` contract: ${why}.${NL}Restate it in the required shape. Do not change your conclusions.`)
     }
+    // Derived from the record, so a resumed run's turn is told as well.
+    const ranOut = (this.run.failures ?? []).filter((f) => f.cursorKey === `${step.id}#${round}#${attempt}` && f.class === 'output-limit').length
+    if (ranOut) append('output-limit-retry', `Your previous attempt at this turn ran out of output: it reached the model's output token limit before it finished, and its answer was lost (${ranOut} such ${ranOut === 1 ? 'attempt' : 'attempts'} so far). Answer sooner this time: reason less, write less, and give the required answer as soon as you can support it. Any edits that attempt made are still in the worktree; build on them instead of redoing them.`)
 
     // What the agent was ASKED is half the interaction. Persisted before the
     // call, in run metadata — the step folder still holds only response.md.
@@ -2436,20 +2441,24 @@ export class Engine {
       // shared credential under it is retried once (failure.mjs); its partial
       // edits are its own interrupted work, so they are kept for that retry
       // instead of quarantined. Once per step and round: a second failure
-      // quarantines as any other.
+      // quarantines as any other. A writing turn that ran out of output is the
+      // same, for every retry the policy allows: its edits are what the retried
+      // turn is told to build on.
       // Only when that retry will really run (the same conditions as
       // handleRuntimeFailure's willRetry): accepted edits that are never
       // retried would leave unreviewed work vouched for.
       const cursorKey = `${step.id}#${round}#${attempt}`
       const retryPolicy = { maxAttempts: 3, ...(this.snapshot.retryPolicy ?? {}) }
       const priorRetries = (this.run.failures ?? []).filter((f) => f.cursorKey === cursorKey && f.retried).length
-      const rotation = error.name !== 'AbortError' && error?.credentials?.changed === true ? classifyFailure(error, { now: this.clock.now() }) : null
-      const rotated = Boolean(rotation?.retryable) && !lost && !this.cleanupHold() && priorRetries < Math.min(retryPolicy.maxAttempts, rotation.maxRetries ?? Infinity) &&
+      const failure = error.name !== 'AbortError' ? classifyFailure(error, { now: this.clock.now() }) : null
+      const willRetry = Boolean(failure?.retryable) && !lost && !this.cleanupHold() && priorRetries < Math.min(retryPolicy.maxAttempts, failure.maxRetries ?? Infinity)
+      const outOfOutput = willRetry && failure.class === 'output-limit'
+      const rotated = willRetry && !outOfOutput && error?.credentials?.changed === true &&
         !(this.run.failures ?? []).some((f) => f.partialAccepted && f.stepId === step.id && f.round === round)
       // So is a writing turn a service shutdown interrupted: nobody chose to stop
       // it, and a quarantine would cost the person the resume this run is owed.
       const byShutdown = error.name === 'AbortError' && this.abortReason === SERVICE_SHUTDOWN
-      if (!await this.endIntegrity(role, pending, error.name === 'AbortError' ? 'cancelled' : 'failed', error.message, { acceptPartial: rotated ? 'credential-rotated' : byShutdown ? SERVICE_SHUTDOWN : null })) {
+      if (!await this.endIntegrity(role, pending, error.name === 'AbortError' ? 'cancelled' : 'failed', error.message, { acceptPartial: outOfOutput ? 'output-limit' : rotated ? 'credential-rotated' : byShutdown ? SERVICE_SHUTDOWN : null })) {
         this.invocationStoppedAt = this.clock.now()
         if (error.name !== 'AbortError') await this.recordQuarantinedFailure({ error, role, step, round, attempt, pending })
         return { blocked: true }
@@ -2899,7 +2908,8 @@ export class Engine {
   /**
    * A runtime that exited badly. Integrity has already been verified for the
    * failed turn, so the question left is whether the failure is worth another
-   * attempt. Rate limits and transient faults are retried after a bounded wait;
+   * attempt. Rate limits, transient faults and a turn that ran out of output are
+   * retried after a bounded wait;
    * a quota exhaustion is recorded for every other run on this host; anything
    * else fails the run with its classification on record.
    */
@@ -2931,6 +2941,20 @@ export class Engine {
     this.run.failures = this.run.failures ?? []
     this.run.failures.push(record)
     if (this.run.recovery) this.run.recovery.cause = { class: classified.class, message: classified.message }
+    // A writer out of output with its retries spent (a retry that would run kept
+    // its edits, and a held cleanup is not spent): the run has failed, whatever
+    // its last attempt left. Those edits stay quarantined, which is what keeps
+    // them unaccepted, the workspace retained and Resume refused until a person
+    // records a disposition; only the unauthorized changes keep the blocked ending.
+    if (classified.class === 'output-limit' && this.run.integrity?.latest?.reason === PARTIAL_CHANGES && !this.cleanupHold()) {
+      const p = this.run.participants[role]
+      p.pendingInvocation = null
+      p.state = p.session ? 'ready' : 'uninitialised'
+      this.run.failure = { class: classified.class, message: classified.message, role, stepId: step.id, invocationId: pending.invocationId, retries: this.run.failures.filter((f) => f.cursorKey === record.cursorKey && f.retried).length, availability: null }
+      this.run.status = 'failed'
+      this.run.blockedReason = `the model's output token limit ended the turn, its retries ran out, and its last attempt's source edits are quarantined (${classified.message})`
+      this.run.endedAt ??= this.clock.iso()
+    }
     await this.persist({ type: 'invocation-failed', ...record })
   }
 

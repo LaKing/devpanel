@@ -576,7 +576,7 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   the same handoff, or a window decision would block the run or reset past the step that asked. A closed question (`pause.options`) accepts
   exactly one option, never prose. Every later step may name `decisions` in its context. Operator steps spend
   no step budget.
-- Runtime failures are classified (`runtime/failure.mjs`): `rate-limit` and `transient` are retried after a
+- Runtime failures are classified (`runtime/failure.mjs`): `rate-limit`, `transient` and `output-limit` are retried after a
   bounded wait (`retryPolicy`, default 3 attempts, 30 s doubling, 10 min cap, provider retry-after honoured);
   `quota` records the model in the host-wide availability store (`issues/.availability.json`) and later starts
   naming it are refused until the recorded reset (the Model availability page at `/models`, `GET/POST/DELETE

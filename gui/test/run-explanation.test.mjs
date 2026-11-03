@@ -27,6 +27,15 @@ export default async function (t) {
   const auth = explainRun({ status: 'failed', failure: { class: 'auth', role: 'coordinator', message: 'login expired' }, participants: { coordinator: { model: 'opus' } } })
   t.eq('an auth failure is a sign-in problem', auth.headline, "Stopped: the coordinator's AI tool is not signed in")
   t.eq('the recorded message is the cause, verbatim', auth.cause, 'login expired')
+  const limited = explainRun({ status: 'failed', failure: { class: 'output-limit', role: 'auditor-1', message: 'codex exited 1', retries: 3 } })
+  t.ok('an output-limit failure names the limit', /output token limit/.test(limited.headline), limited.headline)
+  t.ok('and neither a crash nor a refusing provider', !/crashed|refusing/.test(`${limited.headline} ${limited.detail} ${limited.next}`))
+  t.eq('and says it was retried', limited.detail, 'Retried 3 times first.')
+  const limitedWithEdits = explainRun({ status: 'failed', blockedReason: "the model's output token limit ended the turn", failure: { class: 'output-limit', role: 'implementer', message: 'codex exited 1', retries: 3 },
+    integrity: { status: 'quarantined', latest: { reason: 'unsuccessful invocation left partial source or Git changes', changes: { changed: true } } }, recovery: { required: true, cause: { class: 'output-limit', message: 'codex exited 1' } }, participants: { implementer: { state: 'ready' } } })
+  t.ok('retries spent with quarantined edits: the headline names the limit', /output token limit/.test(limitedWithEdits.headline), limitedWithEdits.headline)
+  t.ok('and neither a crash nor a refusing provider nor an interruption', !/crashed|refusing|Interrupted/.test(`${limitedWithEdits.headline} ${limitedWithEdits.detail} ${limitedWithEdits.next}`))
+  t.ok('and the next step is the decision on those edits', /not accepted/.test(limitedWithEdits.next), limitedWithEdits.next)
   t.eq('a quota failure names the model', explainRun({ status: 'failed', failure: { class: 'quota', availability: { modelId: 'gpt-6' } } }).headline, 'Stopped: gpt-6 reached its usage limit')
 
   t.section('blocked runs explain the first unmet condition')

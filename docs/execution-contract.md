@@ -2027,7 +2027,7 @@ is recorded with the evidence it was read from (`run.failures[]`):
 
 | Class | Retried | Effect |
 | --- | --- | --- |
-| `rate-limit`, `transient` | yes, up to `retryPolicy.maxAttempts` (default 3), after `baseDelaySeconds`·2ⁿ capped at `maxDelaySeconds`, or the provider's own retry-after | the turn is re-invoked with a fresh invocation id |
+| `rate-limit`, `transient`, `output-limit` | yes, up to `retryPolicy.maxAttempts` (default 3), after `baseDelaySeconds`·2ⁿ capped at `maxDelaySeconds`, or the provider's own retry-after | the turn is re-invoked with a fresh invocation id |
 | `quota` | with a compatible replacement | the model is recorded in the host-wide availability store with the provider's reset instant, or a default hold marked `assumed`; later starts naming it are refused (409) until then |
 | `auth`, `environment`, `runtime` | no | the run fails with `run.failure` naming the class |
 
@@ -2041,6 +2041,23 @@ file is a change as well; its retry fails as `auth` against a file unchanged
 since that retry began). A seat's single-file bind keeps the inode it was
 launched with, so a refresh by another process is invisible to a running turn.
 Unchanged, it stays `auth`, and no auth failure touches model availability.
+
+**The output limit.** A turn that ends on the model's output token limit is
+`output-limit`. Only a whole line in the runtime's own words counts, so a model's
+text mentioning the limit does not. The retried prompt says the previous attempt
+ran out of output and asks for a sooner answer. A writing seat's partial edits are
+kept for a retry that will really run (`partialAccepted`, reason `output-limit`).
+When the retries are spent the run fails naming the limit (`run.failure`). If that
+last attempt left edits, they are not accepted: the run is `failed` and they stay
+quarantined in the retained workspace, so Resume is refused until a person records
+a disposition (`resolve-integrity`); one that reopens the run clears `run.failure`.
+
+| Runtime | What it reports | Reaches the engine as | Source |
+| --- | --- | --- | --- |
+| Codex | `turn.failed` with `Incomplete response returned, reason: max_output_tokens`, exit 1 | a failure | the stream of a recorded run; the CLI itself was not available to read |
+| Claude | recovers by itself first, then an assistant event with `error` and `api_error` `max_output_tokens`, `is_api_error_message`, text `Claude's response exceeded the N output token maximum…`, and a `result` that can carry `is_error` | a failure | the bundle of Claude Code 2.1.317, read, not run: no such turn was observed and its exit code was not established, so both adapter paths are recognised |
+| Gemini, empty answer | a `result` with `status: "error"`, `error.type` `INVALID_STREAM`, message `Model response was truncated because it exceeded the token limit…`, after the CLI's own retries | a failure | upstream `google-gemini/gemini-cli` main on 2026-11-03 (`nonInteractiveCli.ts`, `geminiChat.ts`, `utils/constants.ts`), read, not run: the CLI was not available |
+| Gemini, some text or a tool call | nothing: finish reason `MAX_TOKENS` is not an error and `result` says `success` | **not a failure**, so not retried: truncated text is an ordinary answer, which only the output contract's protocol repair can catch | the same upstream source |
 
 Source integrity is verified for the failed turn before any retry, exactly as for
 a completed one. The wait respects cancellation. `retryPolicy` is set per strategy.
@@ -2266,7 +2283,9 @@ partial edits are its own interrupted work, so the engine keeps them as the
 retry's baseline, as an operator's `accept-partial` would, and records
 `partialAccepted: { reason: 'credential-rotated', paths, index }` on the turn's
 integrity report and on the failure. Once per step and round; a second failure
-there quarantines as any other.
+there quarantines as any other. A turn out of output (`output-limit`) keeps its
+edits the same way, reason `output-limit`, for every retry the policy allows;
+"The output limit" above says how its last attempt ends.
 
 ### Integrity capture cost
 

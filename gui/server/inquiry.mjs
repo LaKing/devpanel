@@ -38,7 +38,7 @@ export function inquiryState ({ run = null, pending = false, unreadable = false 
   if (run.status === 'cancelled') return row(8, 'stopped', 'close')
   if (run.status === 'failed') {
     const failureClass = run.failure?.class ?? null
-    const next = ['transient', 'rate-limit'].includes(failureClass) ? 'already retried in-run'
+    const next = ['transient', 'rate-limit', 'output-limit'].includes(failureClass) ? 'already retried in-run'
       : failureClass === 'quota' ? 'may be started again once the model is available'
         : 'needs a person'
     return row(9, 'failed', 'close', { failureClass, next })

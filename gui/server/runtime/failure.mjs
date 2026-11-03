@@ -14,7 +14,24 @@ import fs from 'node:fs/promises'
  * was read from and never hidden behind a retry.
  */
 
-export const FAILURE_CLASSES = ['rate-limit', 'quota', 'auth', 'environment', 'transient', 'runtime']
+export const FAILURE_CLASSES = ['rate-limit', 'quota', 'auth', 'environment', 'transient', 'output-limit', 'runtime']
+
+/*
+ * A turn that ended on the model's output token limit, in each runtime's own
+ * words (docs/execution-contract.md "The output limit" says where each was read):
+ * Codex's turn.failed message; Claude's synthetic API error, as runtimeErrors
+ * renders it or on its own; Gemini's result error and the error behind it.
+ * A whole line, because the rules below read stdout: in a stream a model's text
+ * is inside a JSON line, so it cannot match, however it mentions the limit.
+ */
+const OUTPUT_LIMIT = /^(?:Incomplete response returned, reason: max_output_tokens|max_output_tokens(?:: .*)?|(?:\w+: )?(?:API Error: )?Claude's response exceeded the \d+ output token maximum\b.*|Model response was truncated because it exceeded the token limit\b.*|Model stream ended due to token limit exhaustion \(MAX_TOKENS\).*)$/m
+
+function endedOnOutputLimit (error) {
+  const said = [error?.message, error?.stderr, error?.stdout]
+  // A result record keeps the model's answer unless the runtime marked it an error.
+  if (error?.payload?.is_error === true && typeof error.payload.result === 'string') said.push(error.payload.result)
+  return said.some((text) => text && OUTPUT_LIMIT.test(text))
+}
 
 const RULES = [
   // Order matters: the most specific words first. A quota message often also
@@ -59,6 +76,7 @@ export function classifyFailure (error, { now = Date.now() } = {}) {
   const text = parts.filter(Boolean).join('\n')
   let cls = 'runtime'
   if (error?.kind === 'environment-error' || error?.kind === 'configuration-error' || error?.kind === 'spawn-error') cls = 'environment'
+  else if (endedOnOutputLimit(error)) cls = 'output-limit'
   else for (const rule of RULES) if (rule.re.test(text)) { cls = rule.cls; break }
   let retryAfterMs = parseRetryAfter(text, now)
   // A login rejected while the shared credential file changed under the turn
@@ -75,9 +93,10 @@ export function classifyFailure (error, { now = Date.now() } = {}) {
   }
   return {
     class: cls,
-    // A rate limit or a transient fault is worth another attempt. A quota, a
-    // credential or a broken environment is not: the same call fails the same way.
-    retryable: cls === 'rate-limit' || cls === 'transient',
+    // A rate limit or a transient fault is worth another attempt, and so is a turn
+    // that ran out of output, told so (engine.mjs). A quota, a credential or a
+    // broken environment is not: the same call fails the same way.
+    retryable: cls === 'rate-limit' || cls === 'transient' || cls === 'output-limit',
     retryAfterMs,
     ...(maxRetries != null ? { maxRetries } : {}),
     ...(credentials ? { credentials } : {}),
