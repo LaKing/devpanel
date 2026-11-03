@@ -19,9 +19,9 @@ export const DEFAULT_DIFF_LIMIT = 256 * 1024
 /** What the fingerprint leaves out (fingerprint.mjs DEFAULT_EXCLUDES); `.git` is never listed. */
 const FINGERPRINT_EXCLUDES = ['node_modules', '.devpanel-lock']
 
-const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null } = {}) => {
+const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, timeout = 0 } = {}) => {
   try {
-    return (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], { env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer })).stdout
+    return (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], { env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer, timeout })).stdout
   } catch (error) {
     // `git diff --no-index` exits 1 when files differ; that is the normal case.
     if (typeof error.code === 'number' && error.code === 1 && typeof error.stdout === 'string') return error.stdout
@@ -61,4 +61,12 @@ export async function candidateDiff (workspacePath, { baseCommit = null, maxByte
   }
   if (!text) text = '(the worktree is identical to the base commit: no candidate changes)' + NL
   return { text, files, truncated, bytes }
+}
+
+/** The paths candidateDiff would show, without their content: tracked changes and untracked files. */
+export async function candidatePaths (workspacePath, { baseCommit = null, gitDir = null, timeout = 30000 } = {}) {
+  const names = async (args) => (await git(workspacePath, args, { gitDir, timeout })).split('\0').filter(Boolean)
+  const tracked = await names(['diff', '--name-only', '-z', '--no-ext-diff', '--no-renames', baseCommit ?? 'HEAD', '--'])
+  const untracked = await names(['ls-files', '--others', '-z', ...FINGERPRINT_EXCLUDES.map((e) => `--exclude=${e}`)])
+  return [...new Set([...tracked, ...untracked])]
 }

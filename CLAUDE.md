@@ -351,6 +351,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operator capability on the project page. An action may declare `effect: commit-checkout` (`projects/<id>.yaml`
   or a `# DEVPANEL effect:` header; the host settings may name another marker word) to state what it does rather than leave it inferred from a filename — a script
   may also version, publish, restart or deploy.
+- `runtime/path-overlap.mjs` — would this candidate write files another project's live run is touching? Compared at the real destination, through links (`related` plays no part): expected paths from the issue's earlier runs (retained worktree, patch, plan text; none reads `unknown`, never `none`), a live run's from its worktree now and its plan. On readiness and preview as `pathOverlap`, an information prerequisite; every start reads it again and records `run.startOverlap`. It refuses nothing, for operator and supervisor alike. docs/top-level-supervisor.md "Readiness".
 - `runtime/call-cost.mjs` — a supervisor call's estimated cost from its own tokens and `roster-pricing/<id>.yaml` (unhashed, beside the entry), when the runtime reports none; a Codex delta counts only after a turn that proved a clean baseline (`state.ownUsageSession`). Marked `estimated` on the ledger, `cost` on the view; else unknown and counted.
 - `runtime/ledger.mjs` — append-only spending ledger (`issues/.supervisor/ledger.jsonl`): `reserve`/`settle`/
   `release`/`wake` lines, replayed on load, a torn final line truncated and reported. An outstanding

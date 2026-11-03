@@ -75,8 +75,9 @@ function indexSteps (phases) {
 /**
  * @param issue    optional issue descriptor, so issue-scoped placeholders resolve
  * @param project  optional { id, path }
+ * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null } = {}) {
   const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform })
   if (!resolution.ok) return { ok: false, errors: resolution.errors }
 
@@ -200,6 +201,11 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
           : `Delivery action "${action}" requires a provider supplied by the run launcher; this standalone preview cannot check it.`
     })
   }
+  // Information, whatever it says: it never makes the configuration unready.
+  const overlap = pathOverlap ? await pathOverlap({ deliveryAction: r.workspace.isolation === 'in-place' ? 'in-place' : r.completion.delivery.action }) : null
+  if (overlap?.state === 'overlap' || overlap?.state === 'unknown') {
+    prerequisites.push({ kind: 'path-overlap', category: 'information', status: overlap.state === 'overlap' || overlap.possible.length ? 'warning' : 'unknown', detail: overlap.detail })
+  }
   prerequisites.push({
     kind: 'not-probed',
     category: 'information',
@@ -227,6 +233,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     reviewPolicy: r.reviewPolicy,
     configHash: r.configHash,
     prerequisites,
+    ...(overlap ? { pathOverlap: overlap } : {}),
     configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
     liveEligible: r.liveExecution.eligible
   }

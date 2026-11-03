@@ -1428,7 +1428,9 @@ Two locks, both carrying owner identity — pid, boot id, process start time, ho
   one live run per **project**: a second issue on the same project is refused
   with 409 while another is starting or running, in this process or, judged by
   a live lock owner, in another. Two candidates cut from one base commit would
-  be two patches that conflict at integration.
+  be two patches that conflict at integration. Runs of different projects may write
+  one file through linked collections; that is reported and recorded, never refused
+  (`pathOverlap`, `run.startOverlap`; top-level-supervisor.md "Readiness").
 - **Step-allocation lock** — taken by *every* step-creating path, including manual
   creation through the API. Retry-on-`EEXIST` is not sufficient here: two
   concurrent creates with different slugs both succeed and both take the same

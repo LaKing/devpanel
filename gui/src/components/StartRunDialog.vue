@@ -69,7 +69,8 @@ const awaitingStagedRelease = computed(() => previewMatches.value &&
   !runOptions.value.releaseId && blockers.value.length === 1 &&
   blockers.value[0].kind === 'release-configuration')
 const outcomes = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'outcome'))
-const notices = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'information'))
+const notices = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'information' && !(p.kind === 'path-overlap' && p.status === 'warning')))
+const overlapWarning = computed(() => (previewData.value?.prerequisites ?? []).find((p) => p.kind === 'path-overlap' && p.status === 'warning') ?? null)
 
 /* Only the newest preview request may write to the page. An older response is
    an answer to a question nobody is asking any more. */
@@ -520,6 +521,10 @@ async function start (override = false) {
           </v-alert>
           <v-alert v-if="outcomes.length" type="warning" variant="tonal" density="compact" class="mt-3" title="Will not close automatically">
             <p v-for="pre in outcomes" :key="pre.kind" class="readiness-note">{{ pre.detail }}</p>
+          </v-alert>
+          <!-- Informs, never disables Start: the operator decides. -->
+          <v-alert v-if="overlapWarning" type="warning" variant="tonal" density="compact" class="mt-3" title="Another project's run touches these files">
+            <p class="readiness-note">{{ overlapWarning.detail }}</p>
           </v-alert>
           <!-- Open by default: the third column is the place to read what the
                run will actually do, and the notices are part of that. -->

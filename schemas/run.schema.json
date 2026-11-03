@@ -1186,6 +1186,10 @@
       "type": "object",
       "description": "The installation's notes frozen into evidence/host-guidance/ at run start (runtime/host-guidance.mjs): dir, files, bytes, skipped."
     },
+    "startOverlap": {
+      "type": "object",
+      "description": "The start went ahead while another project's live run was touching, or could not be ruled out as touching, this candidate's expected files (runtime/path-overlap.mjs): state (overlap | unknown), observedAt, detail, expected, overlaps, possible, uncompared, and by (operator | supervisor). A warning, read once at the start; it decides nothing."
+    },
     "host": {
       "type": "object",
       "description": "The host the run was reserved on (runtime/platform.mjs describe()): platform, startTimePrecision (clock-tick | second), descendantScan (proved | unproved), unavailable capabilities and notApplicable ones."

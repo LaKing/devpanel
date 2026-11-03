@@ -583,7 +583,8 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
     issue = { name: found.name, openedOn: found.openedOn, path: found.path, project: found.project }
     projectRef = { id: project, path: projectPath(project) }
   }
-  const result = await preview(req.params.id, { issue, project: projectRef, deliveryActions: supervisor.deliveryActions, runOptions })
+  const result = await preview(req.params.id, { issue, project: projectRef, deliveryActions: supervisor.deliveryActions, runOptions,
+    pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null })
   res.status(result.ok ? 200 : 422).json(result)
 }))
 

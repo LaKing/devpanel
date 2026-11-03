@@ -171,6 +171,7 @@ export function summariseRun (detail) {
   return {
     runId: detail.runId,
     supervisorLaunchId: detail.supervisorLaunchId ?? null,
+    ...(detail.startOverlap ? { startOverlap: detail.startOverlap } : {}),
     issue: detail.issue,
     playbook: detail.playbook,
     status: detail.status,
@@ -282,6 +283,7 @@ export function summarisePreview (preview) {
     delivery: preview.delivery ?? null,
     limits: preview.limits ?? null,
     prerequisites: preview.prerequisites ?? [],
+    ...(preview.pathOverlap ? { pathOverlap: preview.pathOverlap } : {}),
     configurationReady: preview.configurationReady,
     liveEligible: preview.liveEligible
   }

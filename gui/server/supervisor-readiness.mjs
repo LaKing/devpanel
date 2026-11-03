@@ -45,10 +45,11 @@ function ownershipOf (fault) {
  * @param playbook     resolve and evaluate this configuration's source policy too
  * @param resolve      resolvePlaybook, injected so this module stays testable
  * @param inspectLaunch  inspectLaunchState, likewise
+ * @param pathOverlap  ({ deliveryAction }) => the reading of runtime/path-overlap.mjs
  */
 export async function launchReadiness ({
   project, issueId = null, projectPath, budget = null, perIssueLeft = null,
-  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null,
+  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null,
   now = Date.now(), inspect = inspectSourceRepository
 }) {
   const fault = await inspect({ projectPath })
@@ -85,6 +86,9 @@ export async function launchReadiness ({
     configuration = await inspectConfiguration({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, now })
   }
 
+  // Not a prerequisite: nothing here refuses a start, so baselineReady does not hear of it.
+  const overlap = pathOverlap ? await pathOverlap({ deliveryAction: configuration?.delivery?.action ?? null }) : null
+
   return {
     project,
     issueId,
@@ -99,7 +103,8 @@ export async function launchReadiness ({
     baselineReady: prerequisites.length === 0,
     prerequisites,
     configuration,
-    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused.',
+    ...(overlap ? { pathOverlap: overlap } : {}),
+    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing.',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
 }

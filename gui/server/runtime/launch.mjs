@@ -660,6 +660,7 @@ async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommi
 export async function reserveRun ({
   playbookId,
   supervisorLaunchId = null,
+  startOverlap = null,
   issue,
   issuePath,
   configRoot,
@@ -726,6 +727,8 @@ export async function reserveRun ({
     run.status = status
     // The host it runs on, and what that host cannot do (platform.mjs).
     run.host = platform.describe()
+    // What another project's live run was touching as this start went ahead (path-overlap.mjs).
+    if (startOverlap) run.startOverlap = startOverlap
     // A run on a host without the fence, under the install's opt-in, says so
     // from its first record (confinement-policy.mjs; result.md, the run page).
     const fence = fencePolicy({ platform })

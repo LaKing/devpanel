@@ -1,6 +1,7 @@
 import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
+import { createPathOverlap, deliveryActionOf, worthRecording } from './runtime/path-overlap.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
 import { projectPath as projectDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import crypto from 'node:crypto'
@@ -108,6 +109,7 @@ export function createSupervisor ({
   platform = hostPlatform()
 } = {}) {
   const availability = createAvailabilityStore(availabilityFile)
+  const pathOverlap = createPathOverlap({ listProjects: () => issues.listProjects(), listIssues: (project) => issues.listIssues(project) })
   /** Runs this process is driving, keyed by issue. At most one per issue. */
   const active = new Map()
   /** Reservations in flight, so a double-click cannot become two runs. */
@@ -244,6 +246,7 @@ export function createSupervisor ({
     let harnesses
     let projectPath
     let pregateRecord = null
+    let startOverlap = null
     try { await admission(project, async () => {
       // The synchronous guard above covers this process. A run driven by
       // ANOTHER process shows only in persisted state: a live run on any other
@@ -302,9 +305,16 @@ export function createSupervisor ({
           pregateOverride.held = { gate: error.pregate.gate, confidence: error.pregate.confidence }
         }
       }
+      // Read again at the start, whatever a preview said. It informs and refuses
+      // nobody: the start goes ahead with the warning on its record.
+      if (resolution.ok) {
+        const overlap = await pathOverlap({ project, projectPath, issuePath: issue.path, deliveryAction: deliveryActionOf(resolution.resolved) })
+        if (worthRecording(overlap)) startOverlap = { ...overlap, by: supervisorLaunchId ? 'supervisor' : 'operator' }
+      }
       reservation = await reserveRun({
         playbookId,
         supervisorLaunchId,
+        startOverlap,
         // Name, folder and date travel with the run. Prompts render them, and a
         // coordinator told to read an issue folder needs the folder to be there.
         issue: { project, id: issueId, name: issue.name ?? null, openedOn: issue.openedOn ?? null, path: issue.path },
@@ -351,7 +361,7 @@ export function createSupervisor ({
       projectPath, projectAlias: projectDir(project, projectsDir)
     })
 
-    return { runId: record.runId, status: 'preflighting' }
+    return { runId: record.runId, status: 'preflighting', ...(startOverlap ? { startOverlap } : {}) }
   }
 
   /**
@@ -1776,7 +1786,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, projectHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, projectHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**

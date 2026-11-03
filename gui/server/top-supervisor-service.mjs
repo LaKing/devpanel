@@ -103,8 +103,12 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     }
     return {holders,reportLevels}
    },
-   readiness:async a=>launchReadiness({...a,projectPath:projectPath(a.project),
-    resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState}),
+   readiness:async a=>{
+    const issue=a.issueId?await issues.getIssue(a.project,a.issueId).catch(()=>null):null
+    return launchReadiness({...a,projectPath:projectPath(a.project),
+     resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState,
+     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue?.path??null,...args})})
+   },
    infrastructure:project=>projectInfrastructure(project,{root:configRoot}),
    inspectEnvironment:a=>inspectEnvironment(a,{root:configRoot}),
    deployStaging:async(a,{signal}={})=>{
@@ -145,7 +149,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    },
    preview:async a=>{
     const issue=await issues.getIssue(a.project,a.issueId)
-    return summarisePreview(await preview(a.playbook,{configRoot,issue,project:{id:a.project,path:projectPath(a.project)},runOptions:a.runOptions??{},deliveryActions:supervisor.deliveryActions}))
+    return summarisePreview(await preview(a.playbook,{configRoot,issue,project:{id:a.project,path:projectPath(a.project)},runOptions:a.runOptions??{},deliveryActions:supervisor.deliveryActions,
+     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue.path,...args})}))
    },
    launchState:async p=>{
     const resolved=await resolvePlaybook(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project})

@@ -749,6 +749,32 @@ later, which is why `start_run` re-checks every condition for itself. A reading 
 also explicitly **not a preview** — a preview binds a configuration, and one taken
 before these conditions changed is not evidence that a run is launchable now.
 
+A reading naming an issue, and a preview, also carry `pathOverlap`
+(`runtime/path-overlap.mjs`): whether this candidate's expected files are being
+touched by another project's live run. Both sides are compared at the real file a
+delivery would write, through symlinks, so a run of the owning project and a third
+project writing into the same owner both count (`relation`: `owner-live`,
+`co-writer`, `candidate-owns`); `workspace.related` plays no part, since it only
+grants read-only snapshots. Expected paths come from the issue's newest earlier
+run: its retained worktree, its patch, else the paths its plan names (`via: plan`,
+which a plan that only mentions a file can match; an absolute path counts through
+links when it lies in a listed project, and is otherwise only compared as a string).
+A live run's paths are its
+worktree's changes as of now plus its plan's. `state` is `overlap`, `none`,
+`not-applicable` (the configuration delivers nothing), `unavailable`, or `unknown`:
+no earlier plan or revision, a source that could not be read (`expected.incomplete`),
+or a live run that could not be compared. Every path is compared; only the file
+lists shown stop at 30 (`more`). `unknown` is not an all-clear, and `possible` names the live runs whose files the candidate's
+links can reach.
+
+It is not a prerequisite and refuses nothing: `baselineReady` and
+`configurationReady` do not hear of it, and one live run per project stays the only
+admission rule. Every start reads it again, and a start with `overlap` or `unknown`
+goes ahead with the reading on `run.startOverlap` (with `by`: `operator` or
+`supervisor`) and in its response. The supervisor is told to prefer other ready
+work, or wait for the named run, unless the issue is urgent; an operator sees a
+warning in the start dialog.
+
 Until a reading is taken, a fault the supervisor remembers is labelled as
 historical evidence — "a run on *date* failed with X; unverified since" — and its
 old remedy is never prescribed as the current fix.

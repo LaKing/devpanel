@@ -29,7 +29,7 @@ export async function priorRuns (issuePath, runId) {
 }
 
 // The step folder holds the full response; the run record may hold a shortened copy.
-async function stepText (issuePath, step) {
+export async function stepText (issuePath, step) {
   const file = path.join(issuePath, `${step.number}-${step.slug}`, 'response.md')
   return fs.readFile(file, 'utf8').catch(() => step.response ?? '')
 }

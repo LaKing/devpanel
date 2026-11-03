@@ -182,6 +182,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
   return {
     runId: run.runId,
     supervisorLaunchId: run.supervisorLaunchId ?? null,
+    ...(run.startOverlap ? { startOverlap: run.startOverlap } : {}),
     issue: run.issue,
     playbook: run.playbook,
     status: run.status,

@@ -759,6 +759,9 @@ export function planOf (steps, outputs, policy) {
   }
 }
 
+/** The plan of a run, by the rule its kind of run uses. */
+export const planOfRun = (snapshot, steps, outputs) => snapshot.tactic ? tacticalPlan(snapshot, steps, outputs) : planOf(steps, outputs, snapshot.reviewPolicy)
+
 function tacticalPlan (snapshot, steps, outputs) {
   const drafts=steps.filter(s => s.phase === 'plan-review' && outputs[s.number]?.valid && outputs[s.number]?.contract === 'authorArtifact')
   const draft=drafts.at(-1)
@@ -847,7 +850,7 @@ export function buildContext (snapshot, run, steps, outputs) {
   return {
     window: windowSummary(run.currentWindow),
     reports: boundedReports(snapshot,run,steps,outputs),
-    plan: snapshot.tactic ? tacticalPlan(snapshot,steps,outputs) : planOf(steps, outputs, snapshot.reviewPolicy),
+    plan: planOfRun(snapshot, steps, outputs),
     // Name, folder and date travel with the run: a coordinator told to "read the
     // issue folder" with the folder rendered as an empty string reads nothing.
     issue: run.issue,
