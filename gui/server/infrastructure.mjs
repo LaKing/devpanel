@@ -63,13 +63,15 @@ export function confinedCommandErrors (testDrive) {
   const seen = new Map()
   for (const c of all) {
     if (/^devpanel-probe-/.test(c.id ?? '')) errors.push(`${c.id}: the devpanel-probe- prefix is reserved for the engine's confinement probe`)
-    const options = ['network', 'service', 'join', 'unprivilegedPorts', 'lifetimeSeconds'].filter(k => c[k] !== undefined && c[k] !== false)
+    const options = ['network', 'service', 'join', 'unprivilegedPorts', 'lifetimeSeconds', 'startedMarker', 'startedTimeoutSeconds'].filter(k => c[k] !== undefined && c[k] !== false)
     if (c.kind !== 'candidate' && options.length) errors.push(`${c.id}: ${options.join(', ')} apply to kind: candidate only`)
     if (c.join) {
       const target = seen.get(c.join)
       if (!target || target.kind !== 'candidate' || target.service !== true || target.network) errors.push(`${c.id}: join must name an earlier candidate service without network (${c.join})`)
       if (c.network) errors.push(`${c.id}: a joining command shares the service's private network; network cannot be set`)
     }
+    if (c.startedMarker !== undefined && c.service !== true) errors.push(`${c.id}: startedMarker applies to a service: true command`)
+    if (c.startedTimeoutSeconds !== undefined && c.startedMarker === undefined) errors.push(`${c.id}: startedTimeoutSeconds bounds a startedMarker, and none is declared`)
     if (c.unprivilegedPorts && c.network) errors.push(`${c.id}: unprivilegedPorts needs a private network`)
     seen.set(c.id, c)
   }
@@ -117,7 +119,7 @@ export function localChecksErrors (project) {
   })
   for (const c of checks.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
   for (const c of all) {
-    const options = ['kind', 'network', 'service', 'join', 'unprivilegedPorts', 'lifetimeSeconds'].filter(k => c[k] !== undefined)
+    const options = ['kind', 'network', 'service', 'join', 'unprivilegedPorts', 'lifetimeSeconds', 'startedMarker', 'startedTimeoutSeconds'].filter(k => c[k] !== undefined)
     if (options.length) errors.push(`${c.id}: ${options.join(', ')} belong to an SSH test drive; local checks run through the local check fence`)
   }
   errors.push(...tierErrors(checks))
@@ -144,7 +146,7 @@ ${JSON.stringify(infra, null, 2)}
 Orient yourself using the configured documentation and source ownership before editing. Work on the candidate in your isolated worktree; do not substitute the live checkout or deployment code for the candidate.
 Staging is the test-drive environment. Deployment containers are inspection-only during authoring: do not deploy, restart, install into, or mutate them. Never copy instance secrets, runtime state or business data between environments.
 SSH hostRef uses ssh-config:<destination> or a named env:/file: reference resolved by devpanel. Credentials stay on the host; never print them. Environment files are named diagnostic resources, not source for the patch.
-The engine uploads and verifies the exact candidate in a fresh directory under staging.ssh.workdir and runs testDrive commands there after each recorded revision. finallyCommands collect logs and stop the test instance even on failure. Commands must run the uploaded candidate, keep it unchanged, and clean up their own processes. A command with kind: candidate runs as the unit user inside an allow-list (the candidate directory, read-only /usr, /etc and /sys, an empty home with only testDrive.confinement paths) in its own transient unit — no host secrets, other projects or the shared instance are visible, and it has no network unless it declares network: true; service: true starts the application and the engine stops it after the finalizers; join: <service> enters that running service's own fenced view and private network (readiness, selftests). kind: privileged (unit management, the journal) sees the host but not the candidate. A check result records its confinement level. Do not run the live-checkout deployment script as a candidate test.
+The engine uploads and verifies the exact candidate in a fresh directory under staging.ssh.workdir and runs testDrive commands there after each recorded revision. finallyCommands collect logs and stop the test instance even on failure. Commands must run the uploaded candidate, keep it unchanged, and clean up their own processes. A command with kind: candidate runs as the unit user inside an allow-list (the candidate directory, read-only /usr, /etc and /sys, an empty home with only testDrive.confinement paths) in its own transient unit — no host secrets, other projects or the shared instance are visible, and it has no network unless it declares network: true; service: true starts the application and the engine stops it after the finalizers (with startedMarker, the start command passes only once the unit is active and that file exists, within startedTimeoutSeconds, default 120); join: <service> enters that running service's own fenced view and private network (readiness, selftests). kind: privileged (unit management, the journal) sees the host but not the candidate. A check result records its confinement level. Do not run the live-checkout deployment script as a candidate test.
 Inspect recorded checks and command logs before making verification claims. Do not assume the project cannot run locally means it cannot be tested: use staging. Report access failures as unavailable, not passed. Remote inspection is allowed via the configured access; automated candidate staging mutation belongs to the configured test drive. If stagingDeployment.enabled is true, explicitly requested shared-stage deployment is a separate supervisor deploy_staging operation, outside authoring playbooks. Analysis cannot deploy. The staging and deployment playbooks perform installed infrastructure.release target commands with verified checkpoints and recovery; production promotes an exact successful staging release. Participants inspect the receipts; only the engine runs release mutations. The legacy shared-stage operation remains available for its explicitly requested scope. Do not reinterpret a shared deployment request as an isolated candidate test. Local tooling restrictions still apply.
 Committing the live checkout is an operator/supervisor project action (checkpoint.sh), never something a participant runs from a worktree: author in the worktree and let delivery and integration carry the candidate.${brokerBrief(infra)}`
 }

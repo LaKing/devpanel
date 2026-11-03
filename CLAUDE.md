@@ -245,7 +245,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   seat fence with an allow-listed environment (`local-enforced`); an SSH test drive whose commands all declare
   `kind: candidate | privileged` runs each candidate command as the unit user in its own transient unit inside a
   bubblewrap allow-list (candidate dir, read-only /usr /etc /sys, empty home plus `testDrive.confinement` paths;
-  `network`, `service`, `join` = nsenter into the running service's fence, `unprivilegedPorts`) and each
+  `network`, `service` (with `startedMarker`, started only when the unit is active and that file exists, within `startedTimeoutSeconds`), `join` = nsenter into the running service's fence, `unprivilegedPorts`) and each
   privileged one with the candidate masked; the launch bookkeeping lives in `<candidate>.control`; two engine
   probes decide `result.confinement.level` (`remote-enforced`, else `remote-unconfined` — labelled, never refused).
   The unit user and home are the project's `testDrive.confinement`, else the host settings'; there is no built-in

@@ -25,7 +25,7 @@ export const unitVariable = (id) => 'DEVPANEL_UNIT_' + String(id).toUpperCase().
  *                       empty home with only declared toolchain paths, and the
  *                       candidate directory. `network` keeps the host network
  *                       (otherwise PrivateNetwork), `service` leaves the unit
- *                       running, `join` enters a running candidate service's
+ *                       running (`startedMarker`: startedRule), `join` enters a running candidate service's
  *                       user, mount and network namespaces (its exact fenced
  *                       view; joinPrelude), `unprivilegedPorts` sets
  *                       the port floor inside a private network with a fixed
@@ -176,6 +176,63 @@ function execution (remoteDir, command, { units = {}, confinement = {} } = {}) {
   return { properties: [`--property=WorkingDirectory=${remoteDir}`, ...env], argv: `/bin/sh -c ${literal(command.run)}` }
 }
 
+/*
+ * The started rule (docs/project-infrastructure.md "When a service counts as
+ * started"): systemd-run returns once the unit is up, which says nothing about
+ * what the service has written. A service declaring `startedMarker` counts as
+ * started only when its unit is active and that file, relative to the candidate
+ * directory, exists; the start command fails, naming the marker and the bound,
+ * when the unit ends first or the bound passes. Read by the launcher as the SSH
+ * account: the fence binds the candidate directory at the same path. A link is
+ * not a marker, and one the candidate already holds would prove nothing.
+ */
+export const DEFAULT_STARTED_TIMEOUT_SECONDS = 120
+const declaresStarted = (command) => command.kind === 'candidate' && command.service === true && Boolean(command.startedMarker)
+
+// What the launcher's own waits can take before the unit is up: the launch lock
+// and the registration loop, 30 s each.
+const LAUNCH_ALLOWANCE_SECONDS = 60
+
+/**
+ * How long the engine lets a command's launcher run. `timeoutSeconds` covers the
+ * launch; the marker's bound comes on top, so the launcher always gets to say why
+ * a service did not start instead of being killed in silence.
+ */
+export function commandTimeoutSeconds (command) {
+  const timeout = command.timeoutSeconds ?? 900
+  return declaresStarted(command) ? timeout + Number(command.startedTimeoutSeconds ?? DEFAULT_STARTED_TIMEOUT_SECONDS) + LAUNCH_ALLOWANCE_SECONDS : timeout
+}
+
+function startedRule (remoteDir, command, unit) {
+  const file = quote(`${remoteDir}/${command.startedMarker}`)
+  const bound = Number(command.startedTimeoutSeconds ?? DEFAULT_STARTED_TIMEOUT_SECONDS)
+  const notStarted = `devpanel-started: service ${command.id} did not start: `
+  const marker = `marker ${command.startedMarker}`
+  return {
+    before: `if [[ -e ${file} || -L ${file} ]]; then
+  echo ${quote(`${notStarted}${marker} already exists before the start, so it cannot show the service wrote it (bound ${bound} s not waited)`)} >&2
+  exit 1
+fi`,
+    // From the moment the unit is up. Nanoseconds: bash's SECONDS is whole seconds.
+    after: `deadline=$(($(date +%s%N)+${bound}000000000))
+while :; do
+  state=$(systemctl "\${manager[@]}" show ${quote(unit)} -p ActiveState --value) || state=unreadable
+  seen=missing
+  if [[ -f ${file} && ! -L ${file} ]]; then seen=present; fi
+  if [[ "$state" == active && "$seen" == present ]]; then break; fi
+  if [[ "$state" == inactive || "$state" == failed ]]; then
+    echo ${quote(`${notStarted}its unit is `)}"$state"${quote(` and ${marker} is `)}"$seen"${quote(` (bound ${bound} s)`)} >&2
+    exit 1
+  fi
+  if (($(date +%s%N) >= deadline)); then
+    echo ${quote(`${notStarted}${marker} is `)}"$seen"${quote(` after the bound of ${bound} s and its unit is `)}"$state" >&2
+    exit 1
+  fi
+  sleep 0.2
+done`
+  }
+}
+
 // A cgroup, not the SSH connection, owns each remote command. A launch lock
 // closes the cancel-before-registration race. A retained cancel marker prevents
 // a delayed original shell from starting work after cancellation was confirmed.
@@ -184,6 +241,7 @@ export function managedRemoteCommand (remoteDir, command, finalizer = false, opt
   const control = options.control ?? remoteDir
   const service = command.kind === 'candidate' && command.service === true
   const { properties, argv, prelude = ':' } = execution(remoteDir, command, options)
+  const started = declaresStarted(command) ? startedRule(remoteDir, command, unit) : { before: ':', after: ':' }
   // A smoke that may be continued (`keepSeconds`) outlives its keep window, so a
   // claim within it leaves the service at least what a fresh drive has after the
   // same commands; a running unit's limit is not extended.
@@ -195,6 +253,7 @@ flock -w 30 9
 ${finalizer ? ':' : `test ! -e ${quote(control + '/.cancelled')}`}
 test ! -e ${quote(control + '/.registration-uncertain')}
 ${prelude}
+${started.before}
 printf '%s\\n' ${quote(unit)} >> ${quote(control + (service ? '/.services' : '/.units'))}
 # Durable uncertainty precedes submission: an SSH disconnect may kill this
 # launcher while the manager is still registering its request.
@@ -223,13 +282,16 @@ else
   # completion is enough to clear uncertainty without observing registration.
   if wait "$client"; then
     rm ${quote(control + '/.registration-uncertain')}
+    flock -u 9
+    ${started.after}
     exit 0
   else
     exit $?
   fi
 fi
 flock -u 9
-wait "$client"`)
+wait "$client"
+${started.after}`)
 }
 
 const STOP_UNIT = `  [[ "$unit" =~ ^devpanel-check-[a-f0-9]{24}$ ]] || exit 1

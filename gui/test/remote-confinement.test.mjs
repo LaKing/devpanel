@@ -10,7 +10,7 @@ import { continuationPlan, tierTarget } from '../server/runtime/baseline-cache.m
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { confinedCommandErrors, stagingTarget } from '../server/infrastructure.mjs'
-import { managedRemoteCommand, unitName, controlDir, confinementLevel, probeCommands, candidateFence } from '../server/runtime/remote-check-process.mjs'
+import { managedRemoteCommand, commandTimeoutSeconds, unitName, controlDir, confinementLevel, probeCommands, candidateFence } from '../server/runtime/remote-check-process.mjs'
 
 export const name = '0e — remote check commands: candidate code in an allow-list unit, privileged commands blind to it'
 
@@ -39,6 +39,14 @@ export default async function (t) {
     t.ok('a join must name an earlier private service', confinedCommandErrors({ commands: [c('r', { kind: 'candidate', join: 's' }), c('s', { kind: 'candidate', service: true })] }).some((e) => /join must name an earlier/.test(e)))
     t.ok('joining a networked service is refused', confinedCommandErrors({ commands: [c('s', { kind: 'candidate', service: true, network: true }), c('r', { kind: 'candidate', join: 's' })] }).some((e) => /join must name/.test(e)))
     t.ok('low ports need a private network', confinedCommandErrors({ commands: [c('s', { kind: 'candidate', network: true, unprivilegedPorts: true })] }).some((e) => /private network/.test(e)))
+    t.eq('a service with a started marker and a bound is accepted', confinedCommandErrors({ commands: [c('s', { kind: 'candidate', service: true, startedMarker: '.pid', startedTimeoutSeconds: 30, timeoutSeconds: 60 })] }), [])
+    t.ok('a started marker on anything but a service is refused', confinedCommandErrors({ commands: [c('s', { kind: 'candidate', startedMarker: '.pid' })] }).some((e) => /startedMarker applies to a service/.test(e)))
+    t.ok('a bound without a marker is refused', confinedCommandErrors({ commands: [c('s', { kind: 'candidate', service: true, startedTimeoutSeconds: 30 })] }).some((e) => /none is declared/.test(e)))
+    t.eq('a bound above the command timeout is accepted: the engine adds it to the timeout', [confinedCommandErrors({ commands: [c('s', { kind: 'candidate', service: true, startedMarker: '.pid', timeoutSeconds: 60 })] }), commandTimeoutSeconds({ id: 's', kind: 'candidate', service: true, startedMarker: '.pid', timeoutSeconds: 60, startedTimeoutSeconds: 200 }) > 260], [[], true])
+    t.eq('any other command keeps its timeout', [commandTimeoutSeconds({ id: 's', kind: 'candidate', service: true, timeoutSeconds: 60 }), commandTimeoutSeconds({ id: 'r', kind: 'candidate' })], [60, 900])
+    const markerPattern = new RegExp(JSON.parse(await fs.readFile(new URL('../../schemas/playbook.schema.json', import.meta.url), 'utf8')).$defs.checkTarget.properties.commands.items.properties.startedMarker.pattern)
+    t.ok('a marker is a plain relative path', ['.devpanel-service-pid', 'run/pid', 'a/.b'].every((m) => markerPattern.test(m)))
+    t.ok('never absolute, never out of the candidate, never quoted shell', ['/etc/passwd', '../x', 'a/../b', '.', 'a/./b', 'a//b', 'a/', "a'b", '$(x)'].every((m) => !markerPattern.test(m)))
     t.ok('confinement without kinds is refused', confinedCommandErrors({ commands: [c('a')], confinement: { user: 'svc' } }).some((e) => /no command declares a kind/.test(e)))
     const target = stagingTarget({ staging: { ssh: { hostRef: 'ssh-config:x', workdir: '/opt' }, projectRoot: '/opt/app' }, testDrive: { commands: [c('a', { kind: 'candidate' })], confinement: { user: 'svc', home: '/var/svc', readOnly: ['/var/svc/.nvm'] } } })
     t.ok('the staging target carries the confinement and the project root', target.confinement?.readOnly?.[0] === '/var/svc/.nvm' && target.projectRoot === '/opt/app')
@@ -221,6 +229,19 @@ export default async function (t) {
       t.eq('executing the later command only', full.continuedFrom?.ran, ['deep'])
       t.eq('labelled remote-enforced', full.confinement?.level, 'remote-enforced', JSON.stringify(full.confinement))
       t.eq('the normal end took the instance', (await fs.readdir(workdir)).length, 0)
+    }
+
+    t.section('3c. a marker written late inside the real fence is seen by the launcher outside it, before a joining readiness runs')
+    {
+      const workdir = await temp('rc-remote-')
+      const runDir = await temp('rc-run-')
+      const commands = [
+        { id: 'start', kind: 'candidate', service: true, startedMarker: 'run/pid', startedTimeoutSeconds: 30, run: 'sleep 2; exec /bin/sh app.sh' },
+        { id: 'ready', kind: 'candidate', join: 'start', run: 'kill -0 "$(cat run/pid)"' }
+      ]
+      const result = await check({ kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, commands, confinement: { user, home } }, runDir)
+      t.eq('the drive passed', result.result, 'passed', result.error ?? JSON.stringify(result.commands.filter((c) => !c.passed)))
+      t.ok('the start waited for the marker', result.commands[0].durationMs >= 1900, String(result.commands[0].durationMs))
     }
 
     t.section('4. candidate code cannot reach the control directory, the home or the tree above')

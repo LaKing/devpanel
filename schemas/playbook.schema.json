@@ -430,6 +430,17 @@
                 "default": 1800,
                 "description": "service only: the unit's RuntimeMaxSec."
               },
+              "startedMarker": {
+                "type": "string",
+                "pattern": "^(?!\\.\\.?(/|$))(?!.*/\\.\\.?(/|$))[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$",
+                "description": "service only: a file, relative to the candidate directory, that the service writes when it has started. The start command then passes only when the unit is active and this file exists, and fails naming the marker and the bound otherwise, so a command after it never races the service's own first writes. Absent: the service counts as started once its unit is up. See docs/project-infrastructure.md \"When a service counts as started\"."
+              },
+              "startedTimeoutSeconds": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 120,
+                "description": "startedMarker only: how long the start command waits for the marker, from when the unit is up. It comes on top of timeoutSeconds, which covers the launch."
+              },
               "needs": {
                 "type": "array",
                 "uniqueItems": true,

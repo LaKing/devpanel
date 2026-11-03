@@ -62,7 +62,8 @@ not by the command text (step 0e of the seat-access fence):
   The staging instance, `/root`, other `/srv` entries and the SSH account's
   keys are absent. Options: `network: true` keeps the host network (dependency
   installation; otherwise `PrivateNetwork`); `service: true` starts it and
-  returns (the application), `lifetimeSeconds` bounds it; `join: <service id>`
+  returns (the application), `lifetimeSeconds` bounds it, `startedMarker` says
+  when it counts as started (below); `join: <service id>`
   enters that running service's own user and mount namespaces (with
   `nsenter`, targeting the pid the launcher reads from systemd, never one the
   candidate wrote) and its private network (`JoinsNamespaceOf`), so readiness
@@ -125,6 +126,58 @@ the fence (macOS) they are `local-refused` and do not run, unless the install
 opted in to unfenced operation (`DEVPANEL_UNFENCED=acknowledged`,
 `install-on-osx.sh`): then `local-unconfined`, with that reason
 (`runtime/confinement-policy.mjs`).
+
+### When a service counts as started
+
+`service: true` returns once systemd has the unit up, which says nothing about
+what the service has written yet. A readiness command that reads a file the
+service writes can run first and fail for that reason alone. The rule for that:
+**a service command that declares `startedMarker` counts as started only when its
+unit is active and the marker file exists.** The start command itself waits, so
+readiness and every later command run after that point.
+
+```yaml
+- id: start
+  kind: candidate
+  service: true
+  startedMarker: .devpanel-service-pid   # relative to the candidate directory
+  startedTimeoutSeconds: 120             # the bound, from when the unit is up; 120 is the default
+  run: echo $$ > .devpanel-service-pid; exec node app.mjs
+```
+
+What a project must declare or do to be covered:
+
+- Declare `startedMarker` on the `service: true` command and have the service
+  write that file, as a regular file (a link does not count), inside the candidate
+  directory. The engine reads it from outside the fence, as the SSH account, at the
+  same path.
+- Keep the marker out of the candidate's own files: one that exists before the
+  start fails it, because it could not show the service wrote it.
+- A service without `startedMarker` is not covered and behaves as before: it counts
+  as started once its unit is up, so its readiness must tolerate the wait itself.
+
+When the bound passes without the marker, or the unit ends first, the **start
+command fails**: its exit is 1, and the last line of its record's `stderr` and of
+its log's stderr is `devpanel-started: service <id> did not start: …`, naming the
+marker, the bound and the unit's state. Readiness is not run against it: it is
+recorded in `result.skipped`, under the ordinary rule for commands after a failed
+required one (`needs start, which failed` when it declares `needs`). The failure
+counts like any failed check, so `retryFailed` applies.
+
+The bound is its own: `timeoutSeconds` covers the launch, and the engine lets the
+start command run for `timeoutSeconds`, the bound and 60 s more, so a short
+`timeoutSeconds` cannot end the wait before the command says why. A launch that
+stalls past all of that is an ordinary timeout (`timedOut`), with no marker named.
+
+A `required: false` service that fails this rule fails nothing by itself, but what
+declares it, through `needs` or `join`, is skipped rather than run against a service
+that never started. If such a skipped command is required, the drive fails. A
+command that declares neither still runs, so declare the dependency.
+
+A full drive that continues a smoke's instance does not wait again. The smoke's
+start passed under this rule, its record is carried, and the claim proves the
+service is that same start (`InvocationID`). A start the smoke did not run is run by
+the full drive, under the same rule.
 
 ### Tiers: a smoke beside the reviews, the full drive after approval
 

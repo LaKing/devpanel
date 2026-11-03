@@ -88,6 +88,60 @@ export default async function (t) {
   const left = async (target) => fs.readdir(target.ssh.workdir)
 
   try {
+    t.section('a service that writes its started marker late: the start waits, and readiness never races it')
+    {
+      const MARKER = '.devpanel-service-pid'
+      const writesAfter = (seconds) => `echo start >> ${executedFile}; { sleep ${seconds}; echo $$ > ${MARKER}; } & exec sleep 120`
+      const readiness = cmd('readiness', `cat ${MARKER}`)
+      const driveOf = async (commands, extra) => { const dir = await temp('cc-run-'); const target = await targetOf(commands, [], extra); const result = await drive(target, dir); return { dir, target, result, log: (id) => fs.readFile(path.join(dir, result.dir, `${id}.log`), 'utf8') } }
+
+      const race = await driveOf([service('start', { run: writesAfter(60) }), readiness])
+      t.eq('without a declared marker the same service loses the race: readiness fails on the missing file', [race.result.commands[0].passed, race.result.commands[1].passed, /No such file/.test(race.result.commands[1].stderr)], [true, false, true], JSON.stringify(race.result.commands))
+
+      const late = await driveOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 30, run: writesAfter(2) }), readiness])
+      t.eq('with it the drive proceeds past the start and readiness', [late.result.result, ...late.result.commands.map((c) => c.passed)], ['passed', true, true], late.result.error ?? JSON.stringify(late.result.commands))
+      t.ok('the start command waited for the marker', late.result.commands[0].durationMs >= 1900, String(late.result.commands[0].durationMs))
+      t.eq('nothing of the rule is in a good start\'s output', /devpanel-started/.test(await late.log('start')), false)
+
+      const never = await driveOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 1 }), readiness, cmd('after', 'true', { needs: ['start'] })], { finallyCommands: [cmd('logs')] })
+      const said = 'devpanel-started: service start did not start: marker .devpanel-service-pid is missing after the bound of 1 s and its unit is active'
+      t.eq('a service that never writes it fails the drive', never.result.result, 'failed', never.result.error)
+      const failed = never.result.commands.find((c) => c.id === 'start')
+      t.eq('at the start command', [failed.passed, failed.exitCode, failed.timedOut], [false, 1, false])
+      t.ok('whose record names the marker and the bound', failed.stderr.includes(said), failed.stderr)
+      t.ok('as does its log', (await never.log('start')).includes(said))
+      t.eq('readiness never ran', never.result.commands.map((c) => c.id), ['start', 'logs'])
+      t.eq('and is recorded as skipped because of the start, also when it declares needs', never.result.skipped, [{ id: 'readiness', required: true, reason: 'an earlier required command failed' }, { id: 'after', required: true, reason: 'needs start, which failed' }])
+      t.eq('the failed start\'s service is stopped and the candidate removed', await left(never.target), [])
+
+      const tight = await driveOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 1, timeoutSeconds: 2 }), readiness])
+      const tightStart = tight.result.commands[0]
+      t.eq('a timeout barely above the bound cannot cut the wait short', [tightStart.passed, tightStart.exitCode, tightStart.timedOut], [false, 1, false], JSON.stringify(tightStart))
+      t.ok('the diagnostic is on its record and in its log', tightStart.stderr.includes(said) && (await tight.log('start')).includes(said), tightStart.stderr)
+      t.ok('and the bound was honoured, not cut short', tightStart.durationMs >= 1000, String(tightStart.durationMs))
+      const shortTimeout = await driveOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 30, timeoutSeconds: 1, run: writesAfter(2) }), readiness])
+      t.eq('a marker later than timeoutSeconds but within the bound still starts', [shortTimeout.result.result, ...shortTimeout.result.commands.map((c) => c.passed)], ['passed', true, true], JSON.stringify(shortTimeout.result.commands))
+
+      await forget()
+      const optional = await driveOf([service('start', { required: false, startedMarker: MARKER, startedTimeoutSeconds: 1 }), { ...readiness, join: 'start' }, cmd('plain', 'true', { required: false })])
+      const optionalStart = optional.result.commands[0]
+      t.ok('an optional service that never writes it carries the diagnostic on its record and log', !optionalStart.passed && optionalStart.stderr.includes(said) && (await optional.log('start')).includes(said), optionalStart.stderr)
+      t.eq('a joining readiness is skipped, naming the start, and never executed', [optional.result.skipped, (await executed()).filter((id) => id === 'readiness')], [[{ id: 'readiness', required: true, reason: 'needs start, which failed' }, { id: 'plain', required: false, reason: 'an earlier required command failed' }], []])
+      t.eq('a required command skipped behind it fails the drive, rather than passing unrun', optional.result.result, 'failed')
+      const optionalAll = await driveOf([service('start', { required: false, startedMarker: MARKER, startedTimeoutSeconds: 1 }), cmd('needer', `cat ${MARKER}`, { required: false, needs: ['start'] }), cmd('independent')])
+      t.eq('with only optional dependents, the others still run and the drive stands', [optionalAll.result.result, optionalAll.result.commands.map((c) => c.id), optionalAll.result.skipped.map((s) => s.id)], ['passed', ['start', 'independent'], ['needer']], JSON.stringify(optionalAll.result.commands))
+
+      const ended = await driveOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 60, run: 'exit 3' }), readiness])
+      t.ok('a unit that ends first fails at once, naming the marker and the bound', ended.result.commands[0].durationMs < 30000 && ended.result.commands[0].stderr.includes('its unit is inactive and marker .devpanel-service-pid is missing (bound 60 s)'), JSON.stringify(ended.result.commands[0]))
+
+      const stale = await driveOf([service('start', { startedMarker: 'source.txt' }), readiness])
+      t.ok('a marker the candidate already holds proves nothing and fails the start', stale.result.result === 'failed' && stale.result.commands[0].stderr.includes('marker source.txt already exists before the start'), JSON.stringify(stale.result.commands[0]))
+
+      const target = await targetOf([service('start', { startedMarker: MARKER, startedTimeoutSeconds: 30, run: writesAfter(1) }), readiness, cmd('deep', `cat ${MARKER}`)], ['start', 'readiness'])
+      const { smoke, full, ran } = await smokeThenFull(target)
+      t.eq('a continued full drive carries the start the smoke proved, without starting it again', [full.result, full.commands.find((c) => c.id === 'start').fromSmoke, ran], ['passed', smoke.dir, ['deep']], full.error)
+    }
+
     t.section('a prefix tier: only the commands after the smoke run, on its instance')
     {
       const target = await targetOf([cmd('prepare'), service(), cmd('readiness'), cmd('deep')], ['prepare', 'start', 'readiness'], { finallyCommands: [cmd('logs')] })

@@ -1,4 +1,4 @@
-import { managedRemoteCommand, stopRemoteCommands, controlDir, unitName, probeCommands, confinementLevel, withConfinementDefaults, stopNamedUnits, readServiceIdentity, armInstanceExpiry, discardInstanceCommand, claimInstance, reopenInstance } from './remote-check-process.mjs'
+import { managedRemoteCommand, commandTimeoutSeconds, stopRemoteCommands, controlDir, unitName, probeCommands, confinementLevel, withConfinementDefaults, stopNamedUnits, readServiceIdentity, armInstanceExpiry, discardInstanceCommand, claimInstance, reopenInstance } from './remote-check-process.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
@@ -194,10 +194,15 @@ async function nextIndex (checksDir) {
  * After a required command failed, a later command runs only when it declares
  * `needs` (an empty list: independent) and every need — plus the service it
  * joins — ran and passed. Without `needs` it is skipped, as before; every skip
- * is recorded in `result.skipped` with its reason.
+ * is recorded in `result.skipped` with its reason. A service that did not meet its
+ * started marker takes down what declares it (`needs`, `join`) even when the
+ * service itself is optional: those commands would only fail on what it never wrote.
  */
 function skipReason (command, ran, failed) {
-  if (!failed) return null
+  if (!failed) {
+    const notStarted = [...(command.needs ?? []), ...(command.join ? [command.join] : [])].find((id) => { const c = ran.find((r) => r.id === id); return c?.startedMarker && !c.passed })
+    return notStarted ? `needs ${notStarted}, which failed` : null
+  }
   if (!Array.isArray(command.needs)) return 'an earlier required command failed'
   const needs = [...new Set([...command.needs, ...(command.join ? [command.join] : [])])]
   const unmet = needs.find((id) => ran.find((c) => c.id === id)?.passed !== true)
@@ -209,7 +214,11 @@ async function runCommandSet ({ commands, result, signal, run }) {
   for (const command of commands ?? []) {
     if (signal?.aborted) break
     const reason = skipReason(command, result.commands, failed)
-    if (reason) { (result.skipped ??= []).push({ id: command.id, required: command.required !== false, reason }); continue }
+    if (reason) {
+      (result.skipped ??= []).push({ id: command.id, required: command.required !== false, reason })
+      if (command.required !== false) failed = true
+      continue
+    }
     result.commands.push(await run(command))
     if (!result.commands.at(-1).passed && command.required !== false) failed = true
   }
@@ -217,7 +226,8 @@ async function runCommandSet ({ commands, result, signal, run }) {
 
 function judge (result) {
   const required = result.commands.filter((c) => c.required !== false)
-  result.result = required.every((c) => c.passed) ? 'passed' : 'failed'
+  // A required command skipped behind an optional service is not a pass.
+  result.result = required.every((c) => c.passed) && !(result.skipped ?? []).some((s) => s.required) ? 'passed' : 'failed'
 }
 
 /**
@@ -597,10 +607,10 @@ export function resultLines (text, { maxLines = 200, maxWidth = 300 } = {}) {
 async function runOne ({ command, cwd, dir, clock, signal, spawn }) {
   const started = clock.now()
   const log = path.join(dir, `${command.id}.log`)
-  const timeoutMs = (command.timeoutSeconds ?? 900) * 1000
+  const timeoutMs = commandTimeoutSeconds(command) * 1000
   const timeout = AbortSignal.timeout(timeoutMs)
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
-  const record = { id: command.id, ...(command.kind ? { kind: command.kind } : {}), run: command.run, required: command.required !== false, exitCode: null, signal: null, timedOut: false, durationMs: null, log: path.basename(log), passed: false }
+  const record = { id: command.id, ...(command.kind ? { kind: command.kind } : {}), run: command.run, required: command.required !== false, ...(command.kind === 'candidate' && command.service === true && command.startedMarker ? { startedMarker: command.startedMarker } : {}), exitCode: null, signal: null, timedOut: false, durationMs: null, log: path.basename(log), passed: false }
   try {
     const { command: cmd, args, remoteTimeout, env } = spawn(command)
     const out = await runProcess({ command: cmd, args, cwd: cwd ?? undefined, signal: combined, maxBuffer: 16 * 1024 * 1024, ...(env ? { env } : {}) })

@@ -297,7 +297,10 @@ armed before the instance counts as kept. Continuing is proved on the target
 under the launch lock: the timer still waiting (then disarmed), both directories
 present, each service `active` with the `InvocationID` recorded when it was kept,
 and the listing showing no modified, deleted or reappeared candidate path. The
-rebuild and fingerprint of the revision happen as for any drive.
+rebuild and fingerprint of the revision happen as for any drive. A service's
+`startedMarker` is not waited for again: the carried start passed under that rule,
+and the `InvocationID` proves it is the same start (project-infrastructure.md "When
+a service counts as started").
 
 A continued drive walks the whole `commands` list in declared order under the
 ordinary skip rules, and only does not execute what the smoke ran: that record is
