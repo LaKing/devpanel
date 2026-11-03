@@ -25,6 +25,7 @@ import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
+import { driveSlotWaitMs } from './run-metrics.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
@@ -48,6 +49,7 @@ export function harnessUnavailable (harnesses, id) {
 
 /** One check attempt as kept on the check that replaced or outlived it (check-log.mjs reads its logs). */
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
+  ...(c.driveSlot ? { driveSlot: c.driveSlot } : {}),
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log, ...(x.fromSmoke ? { fromSmoke: x.fromSmoke } : {}) })),
   ...(c.continuedFrom ? { continuedFrom: c.continuedFrom } : {}), ...(c.continuation ? { continuation: c.continuation } : {}) })
@@ -903,6 +905,8 @@ const render = (template, ctx) =>
   })
 
 /** Why endIntegrity quarantines a writer's failed turn: its own partial work, nothing unauthorized. */
+// How soon an armed deadline looks again while a drive's wait holds it still.
+const DEADLINE_RECHECK_MIN_MS = 1000
 const PARTIAL_CHANGES = 'unsuccessful invocation left partial source or Git changes'
 const NL =String.fromCharCode(10)
 
@@ -969,6 +973,7 @@ export class Engine {
     this.hooks = hooks
     this.emit = emit
     this.controller = new AbortController()
+    this.openDriveWaits ??= new Map()
     this.workspaceReleasedAt = null
     this.invocationStoppedAt = null
   }
@@ -1294,10 +1299,38 @@ export class Engine {
   armDeadline () {
     const minutes = this.run.budgets.limits?.wallClockMinutes
     if (!minutes) return () => {}
-    const remaining = Date.parse(this.run.startedAt) + ((this.run.inputRetrySuspendedMs ?? 0) + (this.run.checkRefreshSuspendedMs ?? 0) + (this.run.controlSuspendedMs ?? 0)) + minutes * 60_000 - this.clock.now()
-    return this.clock.after(remaining, () => {
-      if (!this.controller.signal.aborted) this.cancel('deadline')
-    })
+    const left = () => Date.parse(this.run.startedAt) + this.wallClockExcusedMs() + minutes * 60_000 - this.clock.now()
+    let disarm = () => {}, disarmed = false
+    // Asked again when it fires: a drive that began waiting for a slot after this
+    // was armed moves the deadline out, and an open wait holds it still.
+    const arm = (after) => {
+      disarm = this.clock.after(after, () => {
+        if (disarmed || this.controller.signal.aborted) return
+        const remaining = left()
+        if (remaining > 0) arm(Math.max(remaining, DEADLINE_RECHECK_MIN_MS))
+        else this.cancel('deadline')
+      })
+    }
+    arm(left())
+    return () => { disarmed = true; disarm() }
+  }
+
+  /** What the wall-clock budget does not count: time stopped, and time a drive waited for a slot, a wait in progress included. */
+  wallClockExcusedMs () {
+    const open = [...this.openDriveWaits.values()]
+    return (this.run.inputRetrySuspendedMs ?? 0) + (this.run.checkRefreshSuspendedMs ?? 0) + (this.run.controlSuspendedMs ?? 0) + driveSlotWaitMs(this.run, { open, now: this.clock.now() })
+  }
+
+  /** A drive's wait for a slot on its staging host begins or ends (drive-slots.mjs). */
+  async noteDriveWait ({ phase, id, host, reason, from, to, dir }) {
+    if (phase === 'start') {
+      this.openDriveWaits.set(id, { from: Date.parse(from) })
+      await this.persist({ type: 'checks-waiting', host, reason, dir })
+      return
+    }
+    this.openDriveWaits.delete(id)
+    ;(this.run.driveSlotWaits ??= []).push({ host, from, to, dir })
+    await this.persist({ type: 'checks-wait-ended', host, dir })
   }
 
   /**
@@ -1841,7 +1874,8 @@ export class Engine {
       clock: this.clock,
       signal: this.controller.signal,
       platform: this.platform,
-      runId: this.runId
+      runId: this.runId,
+      onDriveWait: (wait) => this.noteDriveWait(wait)
     }
     // The baseline: the same target (of a tier: the same tier) on the base
     // commit (the source revision), once per run and target, reused by later
@@ -2049,7 +2083,7 @@ export class Engine {
     const target = tierTarget(configured, configured.tiers ? tier : null)
     let result
     try {
-      result = await runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, dirName, variant: { patchFile } })
+      result = await runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), dirName, variant: { patchFile } })
     } catch (error) {
       result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
     }
@@ -2705,7 +2739,7 @@ export class Engine {
     const stopped = stoppedAt ?? this.run.pause?.at ?? this.run.endedAt ?? events.filter(e => ['budget-exhausted', 'failed', 'cancelled', 'finished'].includes(e.type)).at(-1)?.at
     if (!stopped || !Number.isFinite(Date.parse(stopped))) throw Object.assign(new Error('No reliable stop time is recorded for this run.'), { status: 409 })
     const suspendedMs = Math.max(0, this.clock.now() - Date.parse(stopped))
-    const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - (this.run.controlSuspendedMs ?? 0) - (this.run.inputRetrySuspendedMs ?? 0) - (this.run.checkRefreshSuspendedMs ?? 0) - suspendedMs
+    const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - this.wallClockExcusedMs() - suspendedMs
     if ((limits.wallClockMinutes && elapsedMs >= limits.wallClockMinutes * 60000) ||
         (limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
         (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens)) {
@@ -2763,6 +2797,7 @@ export class Engine {
     this.run.endedAt = null
     this.run.failure = null
     this.controller = new AbortController()
+    this.openDriveWaits ??= new Map()
     await this.persist({ type: 'operator-resumed', ...entry })
     return entry
   }
@@ -3700,7 +3735,7 @@ export class Engine {
     // used.costUnknownSteps and cannot be capped; the closure report says so.
     // maxCostUsd is reporting metadata, not evidence of provider quota exhaustion.
     if (limits.wallClockMinutes) {
-      const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - ((this.run.inputRetrySuspendedMs ?? 0) + (this.run.checkRefreshSuspendedMs ?? 0) + (this.run.controlSuspendedMs ?? 0))
+      const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - this.wallClockExcusedMs()
       if (elapsedMs >= limits.wallClockMinutes * 60_000) return 'wallClockMinutes'
     }
     return null

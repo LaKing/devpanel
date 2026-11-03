@@ -113,7 +113,7 @@ const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
       <v-text-field v-model="maxCalls" type="number" label="Model calls (runaway guard)" variant="outlined" density="compact" hint="Includes action-result and repair turns." persistent-hint min="1" max="2000" />
       <v-text-field v-model="maxStartsPerIssue" type="number" label="Run starts per issue" variant="outlined" density="compact" hint="Failed launch attempts count too." persistent-hint min="1" max="20" />
       <v-text-field v-model="maxRuns" type="number" label="Run starts in total" variant="outlined" density="compact" hint="Across all issues in this session." persistent-hint min="1" max="200" />
-      <v-text-field v-model="maxConcurrent" type="number" label="Concurrent issue runs" variant="outlined" density="compact" hint="Includes pending launches; one run per project." persistent-hint min="1" max="10" />
+      <v-text-field v-model="maxConcurrent" type="number" label="Concurrent issue runs" variant="outlined" density="compact" hint="Includes pending launches; several issues of one project may run at once." persistent-hint min="1" max="10" />
      </div>
      <v-checkbox class="archive-option" v-model="allowArchive" label="Allow the supervisor to archive issues" color="primary" density="compact" hide-details />
     </section>

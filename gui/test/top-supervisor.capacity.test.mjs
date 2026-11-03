@@ -117,7 +117,7 @@ export default async function (t) {
   {
     const h = await setup({ rows: [issue('a', { openedOn: '2026-02-01' }), issue('b', { openedOn: '2026-01-01' })], holders: { [P]: { issueId: 'other', runId: 'rx' } } })
     await h.begin(1)
-    t.eq('both wait for the project', h.prompts[0].readyQueue.rows.map((r) => r.blockedBy[0].kind), ['project-busy', 'project-busy'])
+    t.eq('both wait for the checkout', h.prompts[0].readyQueue.rows.map((r) => r.blockedBy[0].kind), ['checkout-held', 'checkout-held'])
     await polls()
     t.eq('still held: no wake', h.prompts.length, 1)
     delete h.holders[P]
@@ -125,7 +125,7 @@ export default async function (t) {
     const event = h.prompts[1].event
     t.eq('it is woken', event.type, 'capacity-freed')
     t.eq('with the next ready issue', event.next.id, 'b')
-    t.eq('saying what freed', event.freed, [{ project: P, reason: 'project-released', holder: { issueId: 'other', runId: 'rx' } }])
+    t.eq('saying what freed', event.freed, [{ project: P, reason: 'checkout-released', holder: { issueId: 'other', runId: 'rx' } }])
     t.eq('and the queue beside it', h.prompts[1].readyQueue.rows.map((r) => r.state), ['ready', 'ready'])
     await polls()
     t.eq('once per release', h.prompts.length, 2)
@@ -257,11 +257,11 @@ export default async function (t) {
   t.section('capacity-wake: admission stays authoritative, and a refused re-run is offered when capacity frees')
   {
     const h = await setup({ rows: [issue('d', { latestRun: { runId: 'old', status: 'blocked', live: false } })] })
-    h.startRefusal = Object.assign(new Error('a run is already active on this project (issue x); wait for it to finish'), { status: 409, started: false, retryable: true })
+    h.startRefusal = Object.assign(new Error('this run cannot share the project with the live run of issue x; wait for it to finish'), { status: 409, started: false, retryable: true })
     h.starting = 'd'
     h.script.push({ type: 'preview', project: P, issueId: 'd', playbook: 'x' })
     await h.begin(3)
-    t.ok('the queue said nothing was in the way; the start is refused all the same', /already active on this project/.test(h.prompts.at(-1).event.result?.error ?? ''), JSON.stringify(h.prompts.at(-1).event))
+    t.ok('the queue said nothing was in the way; the start is refused all the same', /cannot share the project/.test(h.prompts.at(-1).event.result?.error ?? ''), JSON.stringify(h.prompts.at(-1).event))
     h.holders[P] = { issueId: 'x', runId: 'rx' }
     await polls()
     delete h.holders[P]

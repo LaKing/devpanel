@@ -8,7 +8,7 @@ import { concurrentStarts } from './supervisor-starts.mjs'
 /*
  * What the top-level supervisor could start next, read for it by the engine.
  *
- * Without this it assembled the answer from separate reads, or found out by trying: a busy project, an open
+ * Without this it assembled the answer from separate reads, or found out by trying: a held checkout, an open
  * prerequisite and a full concurrency limit were each learned from a refused start. The queue reads the same
  * facts admission reads, so it says what admission would say, and it is an observation: start_run re-checks
  * everything, and a start that loses a race is still refused.
@@ -28,7 +28,7 @@ const DISPLAY_ROWS = 30
 // Which rows the display cap keeps first; shown in queue order all the same.
 const STATE_RANK = { running: 0, ready: 1, blocked: 2, decide: 3 }
 // What a wake can announce the end of. Everything else is ended by a person, or by the model's own act.
-const CAPACITY_BLOCKS = ['project-busy', 'dependency']
+const CAPACITY_BLOCKS = ['checkout-held', 'dependency']
 const CAPACITY_PANEL = ['concurrency', 'spending-window']
 
 const until = (event, at = null) => ({ event, at })
@@ -83,7 +83,7 @@ async function rowOf (project, issue, { state, holders, reportLevels, lookup }) 
   const startsUsed = state.startsByIssue?.[key] ?? 0
   if (state.limits?.maxStartsPerIssue != null && startsUsed >= state.limits.maxStartsPerIssue) blocks.push({ kind: 'start-limit', used: startsUsed, limit: state.limits.maxStartsPerIssue, until: until('an operator raises maxStartsPerIssue on Start or begins a New session') })
   const holder = holders[project] ?? null
-  if (holder && holder.issueId !== issue.id) blocks.push({ kind: 'project-busy', issueId: holder.issueId, runId: holder.runId ?? null, until: until('that run settles') })
+  if (holder && holder.issueId !== issue.id) blocks.push({ kind: 'checkout-held', issueId: holder.issueId, runId: holder.runId ?? null, until: until('that run settles') })
 
   let rowState
   if (latest?.live) {
@@ -127,7 +127,7 @@ function inDependencyOrder (members, focus) {
  * work on all of them, so a display limit never hides an issue from a wake.
  *
  * @param issuesByProject  {project: rows}, as issues.listIssues lists them, for every project on the panel
- * @param holders          {project: {issueId, runId} | null}, supervisor.projectHolder
+ * @param holders          {project: {issueId, runId} | null}, supervisor.checkoutHolder: a live in-place run. Another issue's ordinary run blocks nothing.
  * @param reportLevels     {project/id: any | assess | none}, for the issues with a report
  * @param ownedIssues      project/id of issues with an open owned run: always in the queue, as in splitByCampaign
  * @param refused          {project/id: at}: starts refused as occupied, so an issue with an ended run was asked for
@@ -202,7 +202,7 @@ export function freedSince (previous, queue, { refused = {} } = {}) {
   for (const row of queue.rows) {
     if (!eligible(row, refused)) continue
     const kinds = previous.rows[keyOf(row.project, row.id)] ?? []
-    if (kinds.includes('project-busy')) add(row.project, 'project-released', previous.holders?.[row.project] ?? null)
+    if (kinds.includes('checkout-held')) add(row.project, 'checkout-released', previous.holders?.[row.project] ?? null)
     if (kinds.includes('dependency')) add(row.project, 'dependency-settled')
     if (previous.panel.includes('concurrency')) add(row.project, 'concurrency-freed')
     if (previous.panel.includes('spending-window')) add(row.project, 'spending-window-rolled')

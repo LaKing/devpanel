@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fingerprint } from './fingerprint.mjs'
-import { acquire } from './lock.mjs'
+import { acquireSourceLocks, releaseSourceLocks } from './source-lock.mjs'
 import { writeJson } from './persistence.mjs'
 import { systemClock } from './clock.mjs'
 import { compositionPaths, nestedFiles, streamGit } from './working-tree.mjs'
@@ -103,12 +103,12 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
   const unsupported = changed.find(p => materialized.some(root => p === root || p.startsWith(root + '/') || root.startsWith(p + '/')))
   if (unsupported) return applyToOwners({ workspace, baseline, revision, candidate, receipt, runDir, clock, hooks, sourceTarget, readDestination })
 
-  let lock
+  let locks = []
   const file = path.join(runDir, 'source-application.json')
   try {
     const target = await sourceTarget(workspace.source.path)
     if (target.path !== workspace.source.path || target.repository !== workspace.source.repository) return refuse('source-drift', `The destination repository changed. ${remedy}`)
-    lock = await acquire(path.join(target.repository, 'devpanel-source-delivery.lock'), { purpose: 'source-delivery', runId: path.basename(runDir), clock })
+    locks = await acquireSourceLocks([target.repository], { purpose: 'source-delivery', runId: path.basename(runDir), clock, waitMs: hooks.sourceLockWaitMs })
     if (JSON.stringify(await sourceTarget(target.path)) !== JSON.stringify(target)) return refuse('source-drift', `The source changed while acquiring its lock. ${remedy}`)
     for (const link of workspace.symlinks?.escaping ?? []) {
       if (!materialized.includes(link.path)) continue
@@ -193,6 +193,6 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     if (error.simulatedCrash) throw error
     return refuse(application.state === 'applying' ? 'recovery-required' : 'failed', `${error.message}. ${remedy}`)
   } finally {
-    await lock?.release()
+    await releaseSourceLocks(locks)
   }
 }

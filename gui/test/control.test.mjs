@@ -40,8 +40,8 @@ export default async function (t) {
     return run && !LIVE_STATUSES.includes(run.status) && !owned ? run : null
   }, { label: 'the run to settle' })
 
-  // ------------------------------------------------- 0. one live run per project
-  t.section('0. a project holds one live run at a time')
+  // ------------------------------------------------- 0. one live run per issue
+  t.section('0. two issues of one project run at once; one issue holds one live run')
   {
     await stage.setControl({ delayMs: 1500 })
     const first = await stage.createIssue('First on the project')
@@ -49,11 +49,10 @@ export default async function (t) {
     const a = await stage.request(runsRoute(first.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
     t.eq('the first starts', a.status, 201)
     const b = await stage.request(runsRoute(second.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
-    t.eq('a second issue on the same project is refused while it runs', b.status, 409)
-    t.ok('naming the issue that holds it', (b.body.error ?? '').includes(first.id), b.body.error)
+    t.eq('a second issue on the same project starts beside it', b.status, 201, b.body.error)
+    const c = await stage.request(runsRoute(first.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
+    t.eq('a second start on the same issue is refused', c.status, 409)
     await settledRun(first.id)
-    const c = await stage.request(runsRoute(second.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
-    t.eq('and accepted once it settled', c.status, 201)
     await settledRun(second.id)
     await stage.setControl({ delayMs: 0 })
   }
@@ -134,9 +133,8 @@ export default async function (t) {
     const overlapping = await stage.request(runsRoute(neighbour.id), {
       method: 'POST', body: JSON.stringify({ playbook: 'implementation' })
     })
-    t.eq('a different issue in the same project cannot overlap', overlapping.status, 409)
-    t.ok('project conflict explains waiting', /project.*wait/.test(overlapping.body.error), overlapping.body.error)
-    t.eq('the refused project overlap creates no run', (await stage.runs(neighbour.id)).length, 0)
+    t.eq('a different issue in the same project starts beside it', overlapping.status, 201, overlapping.body.error)
+    t.eq('with a run of its own', (await stage.runs(neighbour.id)).length, 1)
 
     const accepted = first.status === 201 ? first : second
     const runId = accepted.body.runId

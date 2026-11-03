@@ -250,7 +250,7 @@ export default async function (t) {
       t.eq('exactly once', finishes(events), 1)
       const run = await record(s.f, s.runId)
       t.eq('no attempt, marker recorded as not run', [run.reconciliations?.length ?? 0, run.autoReconcile?.state, reconcilePending(run)], [0, 'not-run', false])
-      t.ok('the reason names the busy project', /already active on this project/.test(run.autoReconcile.reason), run.autoReconcile.reason)
+      t.ok('the reason names the run it cannot share the project with', /cannot share the project/.test(run.autoReconcile.reason), run.autoReconcile.reason)
       t.ok('the journal comes first', types(events).indexOf('reconcile-not-run') >= 0 && types(events).indexOf('reconcile-not-run') < types(events).indexOf('run-finished'), types(events).join(' '))
       t.ok('the explanation says it did not run and offers Reconcile', shows(run, 'The automatic reconcile did not run') && shows(run, 'Reconcile delivery'), JSON.stringify(explainRun(run)))
       t.ok('and Reconcile is still an action', supportedActions(run).includes('reconcile-delivery'))

@@ -1169,7 +1169,7 @@ time: the fingerprint is re-derived, approvals must still name it, delivery must
 still rebuild it. Finalizing can therefore only complete what was already earned,
 never bypass a condition; a run that still fails stays blocked with the new
 reason, and every attempt is recorded under `run.finalizations`. It takes the
-same exclusivity as a start (one live run per project, ownership through the
+same exclusivity as a start (one live run per issue, ownership through the
 lock) and the worktree is settled afterwards by the same disposal rules.
 
 ### Reconciling a delivery with drifted source
@@ -1199,7 +1199,7 @@ detail) no `run-finished` is emitted, the top-level supervisor is not woken,
 "automatic reconcile running; do not land by hand". The engine's own `finished`
 journal event still fires; readers ask the record. The decision releases them:
 an accepted or refused attempt clears the marker in its own write and is announced
-as any end. An attempt that never ran (the project busy, finalize refused, the
+as any end. An attempt that never ran (a run it cannot share the project with, finalize refused, the
 policy changed, the lock held) is written `{state: 'not-run', reason, at}` under
 the issue's lock and then announced. That write re-reads the record, so it leaves
 alone a marker someone else decided or re-marked, and it retries on a held lock
@@ -1467,21 +1467,42 @@ through them are not captured. Playbook and run may override. The scan for
 escaping links traverses everything but `.git`: a link under `node_modules` or
 any other path the fingerprint ignores still reaches outside the worktree.
 
-Within a run the author is the sole writer. One run per issue does not prevent two issues touching the same
+Within a run the author is the sole writer. Two issues of one project may run at once and touch the same
 project, which is what the per-run worktree is for. Non-Git projects cannot be
 isolated; the default is to block rather than let an author loose on a live tree.
 
 ## Locking
 
-Two locks, both carrying owner identity — pid, boot id, process start time, host.
+Locks carry owner identity — pid, boot id, process start time, host.
 
-- **Run lock** — one active run per issue. Above it, the run supervisor allows
-  one live run per **project**: a second issue on the same project is refused
-  with 409 while another is starting or running, in this process or, judged by
-  a live lock owner, in another. Two candidates cut from one base commit would
-  be two patches that conflict at integration. Runs of different projects may write
-  one file through linked collections; that is reported and recorded, never refused
-  (`pathOverlap`, `run.startOverlap`; top-level-supervisor.md "Readiness").
+- **Run lock** — one live run per issue. Several issues of one project may run at
+  once. Their candidates may conflict at delivery, which is handled there
+  (drift beside the patch is `composed`, on its own paths `source-drift`), and runs
+  that may write one file are reported and recorded, never refused (`pathOverlap`,
+  `run.startOverlap`; top-level-supervisor.md "Readiness"). Two kinds of run stay
+  apart (409, retryable, in this process or, judged by a live lock owner, in
+  another; `run-exclusivity.mjs`): a live in-place run holds the checkout, so nothing
+  starts, answers or finalizes beside it, and two release-tactic runs of a project,
+  because a run's verifiers and its restore come after the release lock is gone.
+- **Delivery lock** — `devpanel-source-delivery.lock` in a repository's Git common
+  directory, taken in sorted order (`runtime/source-lock.mjs`). A delivery holds it
+  while writing. A base snapshot that reads the live tree (`working-tree`, or
+  materialized links) holds the lock of every repository it reads while reading,
+  so it never captures a half-applied delivery: the checkout's, the owners behind
+  its links, repositories inside a granted tree, and `nestedRepositories: include`
+  ones. Both wait for the other, up to 15 minutes, and a stop ends a snapshot's wait
+  (`run.workspace.base.snapshotLock`). A repository the snapshot reads whose lock
+  cannot be taken, or a `.git` entry git does not take for one, refuses the snapshot
+  (`SNAPSHOT_LOCK_UNAVAILABLE`, before preflight where it can be read then): this
+  account needs write access to that Git directory, or the path left out, or a base
+  that reads no live tree. One found only while reading refuses `MOVING_WORKTREE`.
+  Files in no repository stay unlocked, since a delivery writes only into a repository.
+- **Drive slots** — a remote test drive holds one of
+  `testDrive.maxConcurrentDrives` slots of its staging host while it runs; over the
+  cap it waits and is never failed for waiting (project-infrastructure.md "How many
+  drives a host runs"). The wait is on `result.driveSlot` and `run.driveSlotWaits`,
+  and the wall-clock budget does not count it, a wait in progress included: an armed
+  deadline looks again when it fires. Local checks take no slot.
 - **Step-allocation lock** — taken by *every* step-creating path, including manual
   creation through the API. Retry-on-`EEXIST` is not sufficient here: two
   concurrent creates with different slugs both succeed and both take the same
@@ -1563,8 +1584,7 @@ while one is there no new or resumed in-place run of the project starts (409
 Abandoning, deleting or archiving the run does not lift it; a proof or an
 acknowledgement does, and every lift is appended to the file's history. Once the
 issue is deleted or packed by archiving, both work from the barrier entry's own
-metadata (issue, run, tag). Worktree runs are not barred, and one live run per
-project is unchanged. After a lost owner, a tag that scans complete and clean is
+metadata (issue, run, tag). Worktree runs are not barred. After a lost owner, a tag that scans complete and clean is
 proved at once and bars nothing (on darwin as `mechanism: 'unproved'`); a
 surviving tagged process, a scan short of complete, or a scan that throws bars
 the checkout. The run records are the authority and the file follows them: each
@@ -1929,7 +1949,7 @@ scripts, frames or remote image requests into the authenticated panel.
 
 A run should finish without a person.
 When it cannot, the question comes first, from triage, and the run **ends** rather
-than pausing on the project's single run slot.
+than pausing, with its issue's one live run held for a person.
 
 `triageResult.autonomy` is required: `verdict` is `autonomous`,
 `needs-owner-input` (with 1–5 `questions`, each with a `category` — `owner-gate`,
@@ -2398,15 +2418,16 @@ ordinary resume. It is that same resume with no `budgets`, so limits are unchang
 every refusal applies; its `resumeHistory` entry reads `actor: service`,
 `origin: service-restart`, and it clears the mark. It makes one attempt per mark: a
 refused run (a limit already exhausted, a missing workspace, an unproved cleanup, a
-newer run of the issue, an occupied project) is not started, stays cancelled and
+newer run of the issue, a live run it cannot share the project with) is not started, stays cancelled and
 marked, and carries the reason on `run.autoResumeRefused` and in its explanation until
-a person's resume clears both. The newest mark goes first, so a project's one slot goes
-to what the last shutdown stopped. A mark left while the setting was off is resumed at
+a person's resume clears both. The newest mark goes first, so where two runs cannot share a
+project, what the last shutdown stopped is the one that resumes. A mark left while the setting was off is resumed at
 the first start with it on, unless a newer run of the issue exists.
 
 It reserves nothing and counts no start: like a panel resume, it draws on no
-top-level supervisor or spending allowance, and concurrency is only the one live run
-per project. What a run that misses the grace period gets is unchanged: it is still
+top-level supervisor or spending allowance, and concurrency is only what any answer
+must meet (one live run per issue, and none beside a run it cannot share the project
+with; "Locking"). What a run that misses the grace period gets is unchanged: it is still
 `stopping` when the process exits, carries no mark, and the next start's reconcile makes
 it `recovery-required`, with no automatic resume.
 
@@ -2418,7 +2439,7 @@ is not attempted.
 
 `POST …/runs/:runId/resume` continues that same run, including cleanly stopped,
 failed, budget-blocked, round-exhausted and protocol-repair-exhausted runs with
-retained, unchanged workspaces. It takes the usual issue lock and project slot,
+retained, unchanged workspaces. It takes the usual issue lock and passes the usual admission ("Locking"),
 checks the journal and integrity checkpoint, and preserves native sessions,
 completed steps, findings, checks and usage. It never reruns preflight, except for
 a run a shutdown stopped before it had a workspace (below). A pending

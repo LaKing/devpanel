@@ -104,6 +104,7 @@ neutral default, which names no installation:
 | `proxyLogin.usersDir` | none: a login name is attribution only | the reverse proxy's users directory; `{hostname}` is replaced by the host's name (`DEVPANEL_USERS_DIR` wins) |
 | `proxyLogin.digestFiles` | `[".hash"]` | files in a user's directory holding a SHA-512 hex digest that admits |
 | `projectActions.headerMarkers` | none | marker words read in script headers (`# <MARKER> key: value`) besides `DEVPANEL` |
+| `testDrive.maxConcurrentDrives` | 2 | how many remote test drives one staging host runs at a time, counted across projects; a drive over it waits (project-infrastructure.md "How many drives a host runs") |
 | `testDrive.confinement` | none: a `kind: candidate` command needs the project's own | `{user, home}` of candidate commands when the project's `testDrive.confinement` omits them |
 | `selection.allowedHomePaths` | none: the whole home is forbidden | directories inside the home (`~/work`) where an allowed root, tooling mount or materialized target is not refused for being in the home; every other forbidden root still applies, and an entry that is, contains or lies in a login or key entry of the home (`.ssh`, `.config`, `.claude`, … `runtime/private-paths.mjs`) is refused |
 | `harnesses.disabled` | none | runtimes this host does not have (`codex`, `gemini`): their roster entries are left out, and a playbook naming one fails resolution saying so (override it in `playbooks/`) |

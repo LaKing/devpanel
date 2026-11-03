@@ -99,7 +99,7 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
       digestFiles: data.proxyLogin?.digestFiles ?? DEFAULT_DIGEST_FILES
     },
     projectActions: { headerMarkers: ['DEVPANEL', ...(data.projectActions?.headerMarkers ?? []).filter((m) => m !== 'DEVPANEL')] },
-    testDrive: { confinement: { user: data.testDrive?.confinement?.user ?? null, home: data.testDrive?.confinement?.home ?? null } },
+    testDrive: { maxConcurrentDrives: data.testDrive?.maxConcurrentDrives ?? 2, confinement: { user: data.testDrive?.confinement?.user ?? null, home: data.testDrive?.confinement?.home ?? null } },
     selection: { forbiddenPrefixes: data.selection?.forbiddenPrefixes ?? DEFAULT_FORBIDDEN_PREFIXES, allowedHomePaths: (data.selection?.allowedHomePaths ?? []).map(expandHome) },
     harnesses: { disabled: data.harnesses?.disabled ?? [] },
     fence: { readOnly: (data.fence?.readOnly ?? []).map(expandHome) },

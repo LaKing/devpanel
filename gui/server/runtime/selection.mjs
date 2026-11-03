@@ -175,8 +175,10 @@ export async function ruleSources (owner, relTarget) {
  * followed to their file, or recursed into as a target of their own), and
  * returns the owners and rule records it relied on. `authorize(owner, resolved)`
  * throws to refuse; delivery passes none, since launch already authorized.
+ * `onRepository(dir)` hears of a repository whose files a granted tree with no
+ * owner carries; the owners returned do not name it.
  */
-export async function walkSelection ({ linkPath, resolved, consumerExcludes = [], authorize = null, onFile, onSkip = () => {} }) {
+export async function walkSelection ({ linkPath, resolved, consumerExcludes = [], authorize = null, onFile, onSkip = () => {}, onRepository = null }) {
   const owners = []
   const excluded = (rel) => consumerExcludes.some((pattern) => path.matchesGlob(rel, pattern) || path.matchesGlob(rel, `${pattern}/**`))
 
@@ -212,7 +214,10 @@ export async function walkSelection ({ linkPath, resolved, consumerExcludes = []
       // links inside are not followed.
       owners.push({ path: consumerRel, owner: null, target: real, rules: {} })
       const walk = async (dir, rel) => {
-        for (const entry of (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+        const entries = await fs.readdir(dir, { withFileTypes: true })
+        // A repository inside the grant: its files are read below, and a delivery could be writing them.
+        if (onRepository && entries.some((entry) => entry.name === '.git')) await onRepository(dir)
+        for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
           const dest = `${rel}/${entry.name}`
           if (entry.name === '.git' || excluded(dest)) continue
           if (entry.isDirectory()) await walk(path.join(dir, entry.name), dest)

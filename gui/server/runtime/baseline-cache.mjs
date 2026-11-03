@@ -153,7 +153,9 @@ export async function adoptBaseline ({ dir, identity, runDir, dirName }) {
     await fs.rm(dest, { recursive: true, force: true }).catch(() => {})
     return null
   }
-  return { ...stored.check, dir: path.relative(runDir, dest),
+  // The wait was that drive's, in another run: nothing here waited.
+  const { driveSlot: _waited, ...check } = stored.check
+  return { ...check, dir: path.relative(runDir, dest),
     reused: { key: identity.key, entry: path.join('.baselines', identity.key), fromRun: stored.fromRun, fromDir: stored.check.dir, capturedAt: stored.check.capturedAt ?? stored.check.at, storedAt: stored.storedAt } }
 }
 

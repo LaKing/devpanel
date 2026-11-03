@@ -251,6 +251,31 @@ store. A hit saves the base drive, which runs beside the candidate's: it
 lightens staging, and shortens wall time only where the candidate was waiting
 for the base.
 
+### How many drives a host runs
+
+A staging host's CPU and memory are shared: each drive boots a full instance, and
+projects may share a host. `testDrive.maxConcurrentDrives` in the host settings
+(default 2) is how many drives one host runs at a time, counted across projects and
+processes. A drive over it waits, is never failed for waiting, and can be stopped. Every
+drive counts: candidate and base, smoke and full, a retry, a diagnostic drive. A base reused
+from the cache is not a drive, a kept smoke instance holds no slot while it waits for its
+full drive, and local checks are not capped. The wait is on the check result
+(`driveSlot`), counted as check waiting in run metrics (`driveSlotWaitMs`) and not
+charged to the wall-clock budget.
+
+A host is what SSH itself would dial: the `hostname` of `ssh -G` for the target's
+reference, read once per drive, so two aliases of one `HostName` share a count. DNS is not
+consulted: a name and its IP, or a `CNAME`, are two hosts unless the config gives them one
+`HostName`. Every connection of the drive is then pinned with `-o HostName=`, so a reference
+or alias changed mid-drive cannot send it to a host it is not counted on; the alias's user,
+port, identity and proxy still apply. Two things end a drive `unavailable` before it connects:
+
+- `ssh -G` still failing after 5 minutes of retries (a wrapper named by
+  `DEVPANEL_SSH_BIN` must answer it).
+- Pinning would change the connection. `Match host <alias>` stops matching once the
+  hostname is fixed, so the settings it holds would be lost; the error names them. Use
+  `Match originalhost <alias>`, or move the rule below the `Host` block that sets `HostName`.
+
 ### One application snapshot per run
 
 `DEVPANEL_RUN_ID` is the run's id. Every check command receives it: local and

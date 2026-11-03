@@ -127,10 +127,14 @@ playbook budgets. Reported supervisor cost belongs to the current conversation;
 New session archives it, and missing costs remain unknown. Issue-run spending is
 recorded on those runs.
 
-Concurrency defaults to three. Raising it allows work across separate projects;
-the panel server refuses overlapping issue runs in the same project, including
-preflight and stopping. This guard covers both browser and supervisor launches
-within that server; standalone engine callers are not coordinated by this guard.
+Concurrency defaults to three, and may mean several issues of one project: the
+invariant is one live run per issue, including preflight and stopping. The resources
+those runs share have their own guards: deliveries and base snapshots take turns on
+each repository's delivery lock, and remote test drives wait for a slot per staging
+host (`testDrive.maxConcurrentDrives`). The panel server refuses a run beside a live
+in-place run, or a staging or deployment run beside another of its project
+(execution-contract.md "Locking"). This covers both browser and supervisor launches
+within that server; standalone engine callers are not coordinated by it.
 Model calls count supervisor turns, including processing action results.
 Run starts count launch attempts, including retries, rather than distinct issues.
 
@@ -639,7 +643,7 @@ time only when one is known, and null otherwise; nothing is estimated.
 | Kind | Names | Until | `at` |
 | --- | --- | --- | --- |
 | `dependency` | the open prerequisites | each gets a disposition or is archived | null |
-| `project-busy` | the holder's issue and run | that run settles (a wall-clock budget is a limit, and pauses suspend it) | null |
+| `checkout-held` | the issue and run of the live in-place run holding the checkout | that run settles (a wall-clock budget is a limit, and pauses suspend it) | null |
 | `own-run` | the run, its status | it settles, or its question is answered | null |
 | `owner-input` | the run | the owner answers on the issue page | null |
 | `report-trust` | | an operator starts it from the panel (a report the supervisor may only assess stays `ready`, with `allowedPlaybooks`) | null |
@@ -658,12 +662,12 @@ previews are not in the queue: they need a playbook and git, so `readiness` and
 
 ### When capacity frees
 
-The poll reads each project's holder by the test a start is refused on
-(`supervisor.projectHolder`: this process's runs and starts, then a live run with a live
-lock owner, however it was started), so it sees runs the supervisor does not own. If an
-issue that waited at the last reading for a project, a concurrency slot, a spending
-window or a prerequisite could start now, a `capacity-freed` event wakes the supervisor,
-with `freed` (`project-released`, `concurrency-freed`, `spending-window-rolled`,
+The poll reads which live in-place run holds each project's checkout, by the test a start
+is refused on (`supervisor.checkoutHolder`: a live run with a live lock owner, however it
+was started, and this process's own), so it sees runs the supervisor does not own. Another
+issue's ordinary run holds nothing. If an issue that waited at the last reading for a
+checkout, a concurrency slot, a spending window or a prerequisite could start now, a
+`capacity-freed` event wakes the supervisor, with `freed` (`checkout-released`, `concurrency-freed`, `spending-window-rolled`,
 `dependency-settled`) and `next`. It never goes through the wake filter, which can hold a
 resolved ending for 15 minutes; what the filter holds rides along. An event already queued
 in that poll carries it as `capacityFreed` instead of costing a second call. It is an offer:
@@ -764,10 +768,10 @@ before these conditions changed is not evidence that a run is launchable now.
 
 A reading naming an issue, and a preview, also carry `pathOverlap`
 (`runtime/path-overlap.mjs`): whether this candidate's expected files are being
-touched by another project's live run. Both sides are compared at the real file a
-delivery would write, through symlinks, so a run of the owning project and a third
-project writing into the same owner both count (`relation`: `owner-live`,
-`co-writer`, `candidate-owns`); `workspace.related` plays no part, since it only
+touched by another live run, of another issue of its project or of another project.
+Both sides are compared at the real file a delivery would write, through symlinks, so
+a run of the owning project and a third project writing into the same owner both count
+(`relation`: `same-project`, `owner-live`, `co-writer`, `candidate-owns`); `workspace.related` plays no part, since it only
 grants read-only snapshots. Expected paths come from the issue's newest earlier
 run: its retained worktree, its patch, else the paths its plan names (`via: plan`,
 which a plan that only mentions a file can match; an absolute path counts through
@@ -781,8 +785,7 @@ lists shown stop at 30 (`more`). `unknown` is not an all-clear, and `possible` n
 links can reach.
 
 It is not a prerequisite and refuses nothing: `baselineReady` and
-`configurationReady` do not hear of it, and one live run per project stays the only
-admission rule. Every start reads it again, and a start with `overlap` or `unknown`
+`configurationReady` do not hear of it, and it is no admission rule. Every start reads it again, and a start with `overlap` or `unknown`
 goes ahead with the reading on `run.startOverlap` (with `by`: `operator` or
 `supervisor`) and in its response. The supervisor is told to prefer other ready
 work, or wait for the named run, unless the issue is urgent; an operator sees a

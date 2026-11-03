@@ -523,7 +523,7 @@ async function start (override = false) {
             <p v-for="pre in outcomes" :key="pre.kind" class="readiness-note">{{ pre.detail }}</p>
           </v-alert>
           <!-- Informs, never disables Start: the operator decides. -->
-          <v-alert v-if="overlapWarning" type="warning" variant="tonal" density="compact" class="mt-3" title="Another project's run touches these files">
+          <v-alert v-if="overlapWarning" type="warning" variant="tonal" density="compact" class="mt-3" title="Another run touches these files">
             <p class="readiness-note">{{ overlapWarning.detail }}</p>
           </v-alert>
           <!-- Open by default: the third column is the place to read what the

@@ -75,7 +75,9 @@ export async function acquire (file, {
   // — the engine and an API request can both want a number — so callers queue
   // rather than fail. Zero means fail immediately, which is what a run lock wants.
   waitMs = 0,
-  pollMs = 10
+  pollMs = 10,
+  // Stops a wait behind a live owner: a stopped run must not sit in the queue.
+  signal = null
 } = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const owner = await currentOwner(runId, { platform })
@@ -107,6 +109,7 @@ export async function acquire (file, {
   // for a fail-fast caller: the winner either holds the lock by then or is gone.
   const contendedUntil = Date.now() + Math.max(waitMs, TAKEOVER_CONTENTION_MS)
   for (;;) {
+    if (signal?.aborted) throw abortedWait(file)
     if (await createWith(file, record)) return handle
 
     const { held, liveness } = await examine(file, platform)
@@ -123,6 +126,7 @@ export async function acquire (file, {
 }
 
 const TAKEOVER_CONTENTION_MS = 1000
+const abortedWait = (file) => Object.assign(new Error(`cancelled while waiting for ${path.basename(file)}`), { name: 'AbortError' })
 /*
  * A lock file that does not parse. Locks are now published complete (link of a
  * written temp file), so this is only ever one left by the earlier open-then-

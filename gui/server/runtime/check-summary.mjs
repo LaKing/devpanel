@@ -10,6 +10,8 @@ export function checkSummary (check, fullEvidence = null) {
     // A smoke result answers whether the revision boots; only the full drive counts for closure.
     ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.' : 'Full drive: the result closure counts.' } : {}),
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
+    // durationMs includes this: how long the drive waited for a slot on its staging host (drive-slots.mjs).
+    ...(check.driveSlot?.waitMs ? { driveSlot: check.driveSlot } : {}),
     // Not a drive of this revision: the approved revision's result, carried over inert drift (engine.reconcileDelivery).
     ...(check.carriedFrom ? { carriedFrom: check.carriedFrom, carriedBecause: check.carriedBecause ?? null } : {}),
     // Run on the smoke's instance rather than from scratch: still the full drive closure counts.

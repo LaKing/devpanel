@@ -28,6 +28,7 @@ import * as store from './store.mjs'
 import { GIT_OUTPUT_LIMIT, classifyUntracked, describeBlocking, gitRead, includeNested, nestedRepositories, snapshotPathspec, statusCounts } from './working-tree.mjs'
 import { runProcess } from './process.mjs'
 import { applyToSource, sourceTarget, bindSourceOwners } from './source-delivery.mjs'
+import { holdSnapshotLocks } from './source-lock.mjs'
 import { carryForward } from './carry-forward.mjs'
 import { publishCandidate } from './publication.mjs'
 
@@ -311,7 +312,21 @@ async function withinCheckout (projectPath, patterns) {
 
 export const gitWorktreeProvider = {
   isolation: 'git-worktree',
-  async create ({ projectPath, runId, root, policy = {} }) {
+  /**
+   * What reads the live tree (a working-tree snapshot, materialized links) does so
+   * holding the delivery lock of every repository it reads, so it never captures a
+   * half-applied delivery, waiting for one in progress (source-lock.mjs).
+   */
+  async create ({ projectPath, runId, root, policy = {}, signal = null, clock = systemClock, discover }) {
+    const readsLiveTree = policy.base === 'working-tree' || policy.symlinks === 'materialize'
+    const guard = readsLiveTree ? await holdSnapshotLocks({ projectPath, policy, runId, clock, signal, discover }) : null
+    try {
+      return await gitWorktreeProvider.cut({ projectPath, runId, root, policy, guard })
+    } finally {
+      await guard?.release()
+    }
+  },
+  async cut ({ projectPath, runId, root, policy, guard }) {
     const git = (args, opts = {}) => run('git', ['-C', projectPath, ...args], { ...BIG, ...opts })
     // The panel's own Git store (git-store.mjs), when the host keeps one: the
     // snapshot's objects and refs and the worktree's registration go there, and
@@ -413,7 +428,7 @@ export const gitWorktreeProvider = {
         }
         if (nestedRoots.length) {
           nested = await includeNested({ projectPath, nested: nestedRoots, excludes: [...checkoutExcludes, ...checkoutMounts], env, exec: runProcess,
-            git: (args, opts) => git(args, opts) })
+            git: (args, opts) => git(args, opts), onRepository: (rel) => guard?.confirm(path.join(projectPath, rel)) })
         }
         // A path excluded from the snapshot but present in HEAD would otherwise
         // survive through read-tree; the base must not carry what it excludes.
@@ -494,7 +509,9 @@ export const gitWorktreeProvider = {
             const files = []
             const resolved = await fs.realpath(path.join(projectPath, l.path))
             const owners = await walkSelection({ linkPath: l.path, resolved, consumerExcludes: [...excludes, ...toolingMounts], authorize,
-              onFile: (rel, full) => { files.push([rel, full]) }, onSkip: (rel, why) => { record.skipped.push({ path: rel, reason: why }) } })
+              onFile: (rel, full) => { files.push([rel, full]) }, onSkip: (rel, why) => { record.skipped.push({ path: rel, reason: why }) },
+              onRepository: (dir) => guard?.confirm(dir) })
+            for (const { owner } of owners) if (owner) await guard?.confirm(owner)
             plans.push({ link: l, files, directory: (await fs.stat(resolved)).isDirectory() })
             record.owners.push(...owners)
           }
@@ -552,6 +569,10 @@ export const gitWorktreeProvider = {
       }
     }
 
+    // The live tree has been read: nothing below looks at it again, and building
+    // the run's private repositories must not keep a delivery waiting.
+    await guard?.release()
+
     // Recorded now, before any seat has run: later host Git calls name this
     // directory instead of discovering it through the worktree's `.git` entry,
     // and integrity compares that entry against what was written here.
@@ -578,7 +599,7 @@ export const gitWorktreeProvider = {
       gitEntry,
       ...(repository ? { repository, sourceBase } : {}),
       isolation: 'git-worktree',
-      base: { policy: kind, ref, headCommit, snapshotRef, dirtyPaths, untrackedPaths, excludes, ...(selection ? { selection: SELECTION_RULE } : {}), ...(sourceRevision ? { sourceRevision } : {}), ...(nested.length ? { nested } : {}) },
+      base: { policy: kind, ref, headCommit, snapshotRef, dirtyPaths, untrackedPaths, excludes, ...(selection ? { selection: SELECTION_RULE } : {}), ...(sourceRevision ? { sourceRevision } : {}), ...(nested.length ? { nested } : {}), ...(guard ? { snapshotLock: guard.record } : {}) },
       // Left out of every fingerprint of this worktree (workspaceProjection).
       ...(toolingMounts.length ? { toolingMounts } : {}),
       fenceStubs: [...FENCE_STUBS],
@@ -728,7 +749,7 @@ export async function reserveRun ({
     run.status = status
     // The host it runs on, and what that host cannot do (platform.mjs).
     run.host = platform.describe()
-    // What another project's live run was touching as this start went ahead (path-overlap.mjs).
+    // What another live run was touching as this start went ahead (path-overlap.mjs).
     if (startOverlap) run.startOverlap = startOverlap
     // A run on a host without the fence, under the install's opt-in, says so
     // from its first record (confinement-policy.mjs; result.md, the run page).
@@ -832,7 +853,9 @@ export async function provisionRun (reservation, {
   deliveryProvider = null,
   configRoot,
   availability = null,
-  platform = hostPlatform()
+  platform = hostPlatform(),
+  // Stops a wait for a delivery lock: a stopped run must not sit in that queue.
+  signal = null
 }) {
   const { runId, runLock, run, issuePath, clock } = reservation
   projectPath = await fs.realpath(projectPath)
@@ -850,7 +873,7 @@ export async function provisionRun (reservation, {
   }
   if (!staged && reservation.resolution.resolved.workspace.isolation === 'in-place') workspaceProvider = inPlaceProvider
   const workspace = await workspaceProvider.create({
-    projectPath, runId, root: path.join(issuePath, 'runs'),
+    projectPath, runId, root: path.join(issuePath, 'runs'), signal, clock,
     policy: { ...reservation.resolution.resolved.workspace, selection: reservation.resolution.resolved.fence?.selection ?? 0, repository: reservation.resolution.resolved.fence?.repository ?? 0,
       // The issue lives at <issue root>/<project>/<issue>: the project names its store.
       store: gitStoreDir(path.basename(path.dirname(issuePath))), nested: hostSettings().nestedRepositories }

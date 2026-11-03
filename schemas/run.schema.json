@@ -14,6 +14,21 @@
   ],
   "additionalProperties": false,
   "properties": {
+    "driveSlotWaits": {
+      "type": "array",
+      "description": "Waits for a test-drive slot on a staging host (runtime/drive-slots.mjs), resolving its name included. Excused from the wall-clock budget and reported as driveSlotWaitMs.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "to"],
+        "properties": {
+          "host": { "type": ["string", "null"] },
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "dir": { "type": ["string", "null"] }
+        }
+      }
+    },
     "runId": {
       "type": "string"
     },
@@ -230,6 +245,17 @@
           "additionalProperties": false,
           "description": "How the base commit was chosen.",
           "properties": {
+            "snapshotLock": {
+              "type": "object",
+              "description": "The delivery locks this snapshot held while reading the live tree (runtime/source-lock.mjs): the repositories' Git common directories, how long it waited for them, and what it read that lies in no repository.",
+              "additionalProperties": false,
+              "required": ["repositories", "waitMs"],
+              "properties": {
+                "repositories": { "type": "array", "items": { "type": "string" } },
+                "waitMs": { "type": "integer", "minimum": 0 },
+                "noRepository": { "type": "array", "items": { "type": "string" } }
+              }
+            },
             "policy": {
               "enum": [
                 "head",

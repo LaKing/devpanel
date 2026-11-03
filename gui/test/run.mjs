@@ -38,6 +38,10 @@ const PROJECTS = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-projects-'))
 await fs.mkdir(path.join(PROJECTS, 'devpanel-project'))
 process.env.DEVPANEL_PROJECTS_DIR = PROJECTS
 
+// Nor the host's test-drive slots: a suite that names no issue root would otherwise
+// count against, and write into, the checkout's issues/ (runtime/drive-slots.mjs).
+process.env.DEVPANEL_DRIVE_SLOTS_DIR = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-drive-slots-'))
+
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // runner.test.mjs points this at its fixture suites.
 const SUITES = path.resolve(process.env.DEVPANEL_TEST_SUITES ?? HERE)

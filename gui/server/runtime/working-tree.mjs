@@ -240,7 +240,7 @@ export async function nestedRepositories ({ projectPath, git }) {
  * checkout: [{ rel, full, link, exec }]. A repository nested in it in turn is
  * read the same way. Paths matching `excludes` (globs, as the snapshot's) are left out.
  */
-export async function nestedFiles ({ projectPath, root, excludes = [], run }) {
+export async function nestedFiles ({ projectPath, root, excludes = [], run, onRepository = null }) {
   const out = []
   const listed = (await run(['-C', path.join(projectPath, root), 'ls-files', '--cached', '--others', '--exclude-standard', '-z'])).split(NUL).filter(Boolean)
   for (const name of [...new Set(listed)].sort()) {
@@ -250,7 +250,10 @@ export async function nestedFiles ({ projectPath, root, excludes = [], run }) {
     const stat = await fs.lstat(full).catch(() => null)
     if (!stat) continue   // tracked there, deleted on disk: absent, as the outer snapshot treats its own
     if (stat.isDirectory()) {
-      if (await fs.lstat(path.join(full, '.git')).then(() => true, () => false)) out.push(...await nestedFiles({ projectPath, root: rel, excludes, run }))
+      if (await fs.lstat(path.join(full, '.git')).then(() => true, () => false)) {
+        await onRepository?.(rel)
+        out.push(...await nestedFiles({ projectPath, root: rel, excludes, run, onRepository }))
+      }
       continue
     }
     if (stat.isSymbolicLink()) out.push({ rel, full, link: true, exec: false })
@@ -276,7 +279,7 @@ const nestedBlocking = (files) => files.flatMap((f) => f.special
  * files, as blobs written where `env` sends objects. `runProcess`-shaped
  * `exec` (stdin), `git` bound to the outer checkout and `env`.
  */
-export async function includeNested ({ projectPath, nested, excludes, git, exec, env }) {
+export async function includeNested ({ projectPath, nested, excludes, git, exec, env, onRepository = null }) {
   const record = []
   // runProcess keeps the TAIL of an output over its limit, which would read here
   // as a repository with fewer files.
@@ -287,7 +290,8 @@ export async function includeNested ({ projectPath, nested, excludes, git, exec,
   })
   for (const root of nested) {
     const head = (await plain(['-C', path.join(projectPath, root), 'rev-parse', '-q', '--verify', 'HEAD']).catch(() => '')).trim() || null
-    const files = await nestedFiles({ projectPath, root, excludes, run: plain })
+    await onRepository?.(root)
+    const files = await nestedFiles({ projectPath, root, excludes, run: plain, onRepository })
     const blocking = nestedBlocking(files)
     if (blocking.length) throw Object.assign(new Error(`${describeBlocking(blocking)}. It is inside nested repository ${root}, which nestedRepositories: include snapshots as it is.`), { code: 'UNREADABLE_WORKTREE', blocking })
     await git(['update-index', '--force-remove', '--', root], { env })

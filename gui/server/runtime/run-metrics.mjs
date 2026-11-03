@@ -65,6 +65,16 @@ function checkIntervals (run) {
 }
 
 /**
+ * How long this run's drives waited for a slot on their staging host, as a union:
+ * concurrent base and candidate waits count once. `open` is what is still waiting
+ * ({ from: ms }), which only the running engine knows; it counts until `now`.
+ */
+export function driveSlotWaitMs (run, { open = [], now = null } = {}) {
+  const closed = (run.driveSlotWaits ?? []).map((w) => interval(ms(w.from), ms(w.to)))
+  return unionMs([...closed, ...open.map((w) => interval(w.from, now))])
+}
+
+/**
  * Time, five ways that add up to the elapsed time:
  *  - agentMs        turns of every non-operator seat, asked → answered, as a union: concurrent
  *                   reviewers of one round count once (`seatMs` is their sum, the seats' own time)
@@ -75,6 +85,8 @@ function checkIntervals (run) {
  *
  * `checksMs` is all check time, beside the split rather than in it: checks run
  * beside reviews, so most of it may lie inside agent time already.
+ * `driveSlotWaitMs` is the part of it spent waiting for a slot on a staging host,
+ * not driving: a drive's interval runs from before that wait.
  *
  * Waits and suspensions are built as INTERVALS and unioned, because the record
  * writes the same wait in two places: a decision step spans ask → answer, and
@@ -144,7 +156,7 @@ function timeSplit (run, now) {
   const checksAloneMs = checksMs - overlapMs(checks, [...seatTurns, ...waits, ...suspensions.filter(Boolean)])
   const remainder = elapsedMs == null ? null : elapsedMs - agentMs - operatorWaitMs - suspendedMs - checksAloneMs
   return {
-    elapsedMs, agentMs, seatMs, operatorWaitMs, suspendedMs, checksMs, waitingForChecksMs,
+    elapsedMs, agentMs, seatMs, operatorWaitMs, suspendedMs, checksMs, waitingForChecksMs, driveSlotWaitMs: driveSlotWaitMs(run),
     otherMs: remainder == null ? null : Math.max(0, remainder),
     // A negative remainder means the parts exceed the whole: the record is
     // inconsistent and the split must not be trusted for this run.
@@ -153,7 +165,7 @@ function timeSplit (run, now) {
     waitsInControlTotalMs,
     unknownSteps,
     basis,
-    means: 'agent turns, waits on a question and suspensions are disjoint intervals unioned from the record (seatMs is the seats\' own time summed: concurrent reviewers each count); checksMs is the union of every recorded check run (overlap with seat turns counted once), waitingForChecksMs the part of it during which no seat turn ran, and otherMs excludes that part; a turn still in flight counts as a seat turn until now, and the engine\'s work between check runs stays in otherMs; overlappingSuspensionMs is recorded suspension that lay inside a wait and was counted as the wait; waitsInControlTotalMs is answered waiting the engine also folded into controlSuspendedMs, counted here once as waiting; suspendedMs "inferred" means an older record carried only a total; inconsistentMs > 0 means the parts exceed the elapsed time'
+    means: 'agent turns, waits on a question and suspensions are disjoint intervals unioned from the record (seatMs is the seats\' own time summed: concurrent reviewers each count); checksMs is the union of every recorded check run (overlap with seat turns counted once), waitingForChecksMs the part of it during which no seat turn ran, and otherMs excludes that part; driveSlotWaitMs is the check time spent waiting for a slot on a staging host, inside checksMs and, where no seat turn ran, inside waitingForChecksMs; a turn still in flight counts as a seat turn until now, and the engine\'s work between check runs stays in otherMs; overlappingSuspensionMs is recorded suspension that lay inside a wait and was counted as the wait; waitsInControlTotalMs is answered waiting the engine also folded into controlSuspendedMs, counted here once as waiting; suspendedMs "inferred" means an older record carried only a total; inconsistentMs > 0 means the parts exceed the elapsed time'
   }
 }
 
@@ -369,7 +381,7 @@ export function seatMetrics (run, role) {
  */
 export function emptyMetricsTotals () {
   return {
-    measured: 0, agentMs: 0, seatMs: 0, operatorWaitMs: 0, suspendedMs: 0, checksMs: 0, waitingForChecksMs: 0, inconsistent: 0,
+    measured: 0, agentMs: 0, seatMs: 0, operatorWaitMs: 0, suspendedMs: 0, checksMs: 0, waitingForChecksMs: 0, driveSlotWaitMs: 0, inconsistent: 0,
     cycleRestarts: 0, inferredRestarts: 0, ignoredRestartRequests: 0, closureReturns: 0, regressionsAfterApproval: 0,
     planReviewRoundExecutions: { total: 0, counted: 0 },
     seat: null
@@ -386,6 +398,7 @@ export function absorbMetrics (into, run, { role = null } = {}) {
   into.suspendedMs += m.time.suspendedMs
   into.checksMs += m.time.checksMs
   into.waitingForChecksMs += m.time.waitingForChecksMs
+  into.driveSlotWaitMs += m.time.driveSlotWaitMs
   if (m.time.inconsistentMs > 0) into.inconsistent++
   into.cycleRestarts += m.rounds.cycleRestarts
   if (m.rounds.restartsInferred > 0) into.inferredRestarts++
@@ -412,6 +425,7 @@ export function reportMetrics (totals) {
     meanOperatorWaitMs: mean(totals.operatorWaitMs, totals.measured),
     meanChecksMs: mean(totals.checksMs, totals.measured),
     meanWaitingForChecksMs: mean(totals.waitingForChecksMs, totals.measured),
+    meanDriveSlotWaitMs: mean(totals.driveSlotWaitMs, totals.measured),
     planReviewRoundExecutions: { ...exec, mean: exec.counted ? Math.round((exec.total / exec.counted) * 10) / 10 : null },
     seat: totals.seat ? { ...totals.seat, meanAgentMs: mean(totals.seat.agentMs, totals.measured) } : null,
     means: totals.seat

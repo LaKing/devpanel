@@ -183,7 +183,10 @@ export default async function (t) {
       deployments: [{ id: 'production', ssh: { hostRef: 'ssh-config:production.invalid', workdir: '/srv' }, projectRoot: '/opt/production', files: {} }],
       testDrive: { commands: [{ id: 'candidate', run: 'true' }] } } }))
     const savedSsh = process.env.DEVPANEL_SSH_BIN
-    process.env.DEVPANEL_SSH_BIN = '/bin/false'
+    // Answers the `ssh -G` a drive reads its host with, and connects nowhere.
+    const noSsh = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'broker-ssh-')), 'ssh')
+    await fs.writeFile(noSsh, '#!/bin/sh\nif [ "$1" = -G ]; then echo "hostname stage.invalid"; exit 0; fi\nexit 1\n', { mode: 0o755 })
+    process.env.DEVPANEL_SSH_BIN = noSsh
     try {
       const engine = await startRun({ playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id }, issuePath: f.issuePath, projectPath: f.projectPath,
         configRoot: f.configRoot, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery })

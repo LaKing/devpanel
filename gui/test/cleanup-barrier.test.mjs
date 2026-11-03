@@ -61,7 +61,7 @@ export default async function (t) {
     t.eq('another issue\'s in-place start is refused', [refused?.status, refused?.code], [409, 'CLEANUP_BARRIER'])
     t.ok('naming the run that holds it', refused?.message.includes(first.runId), refused?.message)
     const worktree = await start(b)
-    t.ok('a worktree start on the project is admitted (projectBusy is unchanged)', Boolean(worktree.runId))
+    t.ok('a worktree start on the project is admitted (the barrier bars in-place starts only)', Boolean(worktree.runId))
     await releaseWorkspace(worktree)
   }
 

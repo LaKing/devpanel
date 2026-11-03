@@ -162,8 +162,8 @@ A run finishes without a person, or does not start
 (execution-contract.md "Asking the owner before any work starts"). Every triage records
 `autonomy.verdict`: `autonomous`, `needs-owner-input` (at most five questions in
 the owner's terms, each with a recommendation) or `too-large` (a proposed split).
-Anything but `autonomous` ends the run after triage (`to: ask-owner`) and frees
-the slot; the owner answers on the issue page, and the answers start a fresh run
+Anything but `autonomous` ends the run after triage (`to: ask-owner`), so nothing
+stays live for it; the owner answers on the issue page, and the answers start a fresh run
 or the split becomes new issues. During a run the coordinator decides technical
 choices itself and records them as `assumptions`; `operatorRequest` remains for
 live-checkout work, a stop the issue itself asked for (`owner-gate`),

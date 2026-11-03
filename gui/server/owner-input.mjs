@@ -9,8 +9,8 @@ import { setIssueDependencies } from './issue-dependencies.mjs'
  * The owner's answer to a triage that would not start work (run.ownerInput).
  *
  * Triage judged that one run could not finish the issue without its owner, so
- * the run ended after that one turn instead of pausing on the project's run
- * slot. Answering it is three things, in this order:
+ * the run ended after that one turn instead of pausing, with its issue's one live
+ * run held for a person. Answering it is three things, in this order:
  *
  *   1. the answer is recorded on the run, under the run lock, exactly once;
  *   2. it becomes material the next run reads: a human note on the issue with
@@ -79,8 +79,8 @@ export function createOwnerInput ({ issues, supervisor, configRoot }) {
         })
         record.createdIssues.push(created.id)
       }
-      // A chain rather than per-part order: the split contract states only an order, and with one live run per
-      // project a chain costs no parallelism. People and the supervisor may loosen it with set_dependencies.
+      // A chain rather than per-part order: the split contract states only an order. It runs the parts one after
+      // another even though a project may run several issues at once; people and the supervisor may loosen it with set_dependencies.
       for (let i = 1; i < record.createdIssues.length; i++) {
         await setIssueDependencies(project, record.createdIssues[i], {
           dependsOn: [record.createdIssues[i - 1]], by: 'operator',

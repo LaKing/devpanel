@@ -222,6 +222,7 @@ export default async function (t) {
       const plan = continuationPlan(target)
       const smoke = await check({ ...tierTarget(target, 'smoke') }, runDir, { keep: { seconds: plan.keepSeconds } })
       t.ok('the smoke kept its instance', Boolean(smoke.kept), smoke.instanceNotKept ?? smoke.error)
+      t.eq('and records the host it runs on', smoke.kept.host, 'shim')
       const instance = { ...smoke.kept, revision: fp.fingerprint }
       const full = await check(tierTarget(target, 'full'), runDir, { continueFrom: { instance, smoke, plan } })
       t.eq('the full drive passed', full.result, 'passed', full.error ?? JSON.stringify(full.commands.filter((c) => !c.passed)))

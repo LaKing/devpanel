@@ -313,18 +313,79 @@ export default async function (t) {
   t.eq('the durable journal says the same', [journal.state, journal.owners.every(o => o.state === 'complete'), journal.fingerprint], ['complete', true, again.fingerprint])
   const locked = await owned()
   const ownerLock = await acquire(path.join(locked.workspace.symlinks.owners[0].owner.repository, 'devpanel-source-delivery.lock'), { purpose: 'test' })
-  try { t.eq('owner lock prevents delivery', (await locked.deliver()).application.verified, false) } finally { await ownerLock.release() }
+  try { t.eq('owner lock prevents delivery', (await locked.deliver({ sourceLockWaitMs: 0 })).application.verified, false) } finally { await ownerLock.release() }
   t.eq('delivery succeeds after owner unlock', (await locked.deliver()).application.verified, true)
 
   t.section('destination oracle and repository lock control retry')
   const pending = await primitive({ edit: dir => fs.writeFile(path.join(dir, 'source.txt'), 'approved') })
   const lock = await acquire(path.join(pending.workspace.source.repository, 'devpanel-source-delivery.lock'), { purpose: 'test' })
-  try { t.eq('locked destination not written', (await pending.deliver()).application.verified, false) } finally { await lock.release() }
+  try { t.eq('locked destination not written', (await pending.deliver({ sourceLockWaitMs: 0 })).application.verified, false) } finally { await lock.release() }
   await fs.writeFile(path.join(pending.args.runDir, 'source-application.json'), JSON.stringify({ path: pending.f.projectPath, revision: pending.args.revision, state: 'applying' }))
   t.eq('base means not applied: retry succeeds', (await pending.deliver()).application.verified, true)
   await fs.writeFile(path.join(pending.f.projectPath, 'source.txt'), 'intervening edit')
   t.eq('third state needs recovery', (await pending.deliver()).application.state, 'recovery-required')
   t.eq('intervening edit preserved', await fs.readFile(path.join(pending.f.projectPath, 'source.txt'), 'utf8'), 'intervening edit')
+
+  t.section('a delivery waits for the lock, and two on one checkout both complete')
+  {
+    const waiting = await primitive({ edit: dir => fs.writeFile(path.join(dir, 'source.txt'), 'first approved') })
+    const beside = await primitive({ edit: dir => fs.writeFile(path.join(dir, 'other.txt'), 'second approved') })
+    const heldLock = await acquire(path.join(waiting.workspace.source.repository, 'devpanel-source-delivery.lock'), { purpose: 'test' })
+    let settled = false
+    const delivering = waiting.deliver().finally(() => { settled = true })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    t.eq('it waits behind a held lock', settled, false)
+    await heldLock.release()
+    t.eq('and delivers once it is free', (await delivering).application.verified, true)
+    t.eq('the patch is applied', await fs.readFile(path.join(waiting.f.projectPath, 'source.txt'), 'utf8'), 'first approved')
+    t.eq('another run on its own checkout is not held up', (await beside.deliver()).application.verified, true)
+
+    const a = await primitive({ edit: dir => fs.writeFile(path.join(dir, 'a.txt'), 'a') })
+    const second = await gitWorktreeProvider.create({ projectPath: a.f.projectPath, runId: 'source-test-2', root: a.f.issuePath, policy: { base: 'working-tree' } })
+    const secondBaseline = await baselineOf(second.path)
+    await fs.writeFile(path.join(second.path, 'b.txt'), 'b')
+    const secondFp = await fingerprint(second.path, { baseline: secondBaseline, baseCommit: second.baseCommit })
+    const secondDir = path.join(a.f.issuePath, 'delivery-2')
+    await fs.mkdir(path.join(secondDir, 'artifacts'), { recursive: true })
+    const secondArgs = { workspace: second, workspacePath: second.path, baseCommit: second.baseCommit, baseline: secondBaseline, fingerprint: secondFp, revision: secondFp.fingerprint, runDir: secondDir }
+    const secondReceipt = await worktreeDiffDelivery.deliver({ ...secondArgs, action: 'worktree-diff' })
+    const [one, two] = await Promise.all([a.deliver(), applyToSource({ ...secondArgs, receipt: secondReceipt })])
+    t.eq('two deliveries into one checkout both complete', [one.application.state, two.application.state], ['complete', 'complete'], JSON.stringify([one.application.error, two.application.error]))
+    t.eq('with both patches in place', [await fs.readFile(path.join(a.f.projectPath, 'a.txt'), 'utf8'), await fs.readFile(path.join(a.f.projectPath, 'b.txt'), 'utf8')], ['a', 'b'])
+  }
+
+  t.section('a snapshot waits for a delivery in progress, and holds the whole patch')
+  {
+    const delivery = await primitive({ edit: async (dir) => {
+      await fs.writeFile(path.join(dir, 'source.txt'), 'whole patch, first file')
+      await fs.writeFile(path.join(dir, 'later.txt'), 'whole patch, second file')
+    } })
+    let snapshot = null, snapshotSettled = false
+    const finished = await delivery.deliver({ beforeApply: async () => {
+      snapshot = gitWorktreeProvider.create({ projectPath: delivery.f.projectPath, runId: 'source-snapshot', root: delivery.f.issuePath, policy: { base: 'working-tree' } }).finally(() => { snapshotSettled = true })
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      t.eq('the snapshot does not finish while the delivery holds the lock', snapshotSettled, false)
+    } })
+    t.eq('the delivery completes', finished.application.state, 'complete', finished.application.error)
+    const cut = await snapshot
+    t.eq('the snapshot waited for all of it', [await git(cut.path, 'show', 'HEAD:source.txt'), await git(cut.path, 'show', 'HEAD:later.txt')], ['whole patch, first file', 'whole patch, second file'])
+    t.eq('and says which lock it held', cut.base.snapshotLock.repositories, [delivery.workspace.source.repository])
+  }
+
+  t.section('a snapshot refuses when it cannot hold the lock of what it reads')
+  {
+    const denied = await engineFixture()
+    if (process.getuid?.() === 0) t.skip('as root chmod does not bind')
+    else {
+      const gitDir = path.join(denied.projectPath, '.git')
+      await fs.chmod(gitDir, 0o555)
+      try {
+        const refused = await gitWorktreeProvider.create({ projectPath: denied.projectPath, runId: 'denied', root: denied.issuePath, policy: { base: 'working-tree' } }).then(() => null, (error) => error)
+        t.eq('it is refused, with no snapshot', refused?.code, 'SNAPSHOT_LOCK_UNAVAILABLE')
+        t.ok('naming the remedy', /write access/.test(refused?.message ?? ''), refused?.message)
+      } finally { await fs.chmod(gitDir, 0o755) }
+    }
+  }
 
   t.section('a mutation between apply and verification never resolves')
   const raced = await primitive({ edit: dir => fs.writeFile(path.join(dir, 'source.txt'), 'approved') })

@@ -264,6 +264,14 @@ export default async (t) => {
     t.eq('waitingForChecksMs leaves out the two minutes an author turn ran beside the check', time.waitingForChecksMs, (10 + 8) * 60_000)
     t.eq('and otherMs no longer holds that check time', time.otherMs, 40 * 60_000 - 15 * 60_000 - 18 * 60_000)
     t.eq('the parts still fit the whole', time.inconsistentMs, 0)
+
+    const waited = runMetrics({ status: 'completed', startedAt: at(0), endedAt: at(30), steps: [],
+      checkResults: [{ revision: 'r', result: 'passed', at: at(0), durationMs: 20 * 60_000, driveSlot: { host: 'h', cap: 2, waitMs: 6 * 60_000, waitedFrom: at(1) } }],
+      baselineChecks: [{ result: 'passed', at: at(0), durationMs: 20 * 60_000 }],
+      driveSlotWaits: [{ host: 'h', from: at(1), to: at(7), dir: 'checks/001' }, { host: 'h', from: at(3), to: at(9), dir: 'checks/base' }] }).time
+    t.eq('a drive\'s wait for a slot is reported, concurrent waits once', waited.driveSlotWaitMs, 8 * 60_000)
+    t.eq('and is check waiting, inside the check\'s own interval', [waited.checksMs, waited.waitingForChecksMs], [20 * 60_000, 20 * 60_000])
+    t.eq('not suspension', waited.suspendedMs, 0)
     const m = runMetrics(run)
     t.eq('one check failed on a revision approved when it started, recorded by the engine', [m.regressionsAfterApproval, m.regressionsBasis], [1, 'recorded'])
     const baselineOnly = { ...run, checkHistory: [run.checkHistory[0], { ...run.checkHistory[1], gating: 'passed' }] }

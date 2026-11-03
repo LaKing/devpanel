@@ -10,10 +10,10 @@ import { priorRuns, stepText } from './prior-runs.mjs'
 import * as store from './store.mjs'
 
 /*
- * Would this candidate write files another project's live run is also touching?
+ * Would this candidate write files another live run is also touching?
  *
- * One live run per project does not stop two projects editing one file: an
- * application's linked collection (`@…-modules -> <projects-root>/framework/…`)
+ * Other issues of the same project may run beside it, and two projects can edit
+ * one file: an application's linked collection (`@…-modules -> <projects-root>/framework/…`)
  * delivers into the framework's checkout, and whichever run delivers second finds
  * its paths drifted. So both sides are reduced to where a delivery would really
  * land, and compared there. `workspace.related` plays no part: it grants read-only
@@ -202,7 +202,7 @@ function entriesOf (live, matches, { project, ownerOf }) {
   return [...byOwner].map(([ownerProject, files]) => ({
     project: live.project, issueId: live.issueId, runId: live.runId, status: live.status, delivery: live.delivery, ownerProject,
     // A third project writing into the owner is the same hazard as the owner's own run.
-    relation: ownerProject === project ? 'candidate-owns' : ownerProject === live.project ? 'owner-live' : 'co-writer',
+    relation: live.project === project ? 'same-project' : ownerProject === project ? 'candidate-owns' : ownerProject === live.project ? 'owner-live' : 'co-writer',
     ...list(files)
   }))
 }
@@ -213,7 +213,7 @@ const describe = (entry) => `${entry.project} (run ${entry.runId} of issue ${ent
 function detailOf ({ state, expected, overlaps, possible, uncompared }) {
   const unread = `${expected.incomplete.length ? ` Expected files not fully read: ${expected.incomplete.join('; ')}.` : ''}${uncompared.length ? ` Not compared: ${uncompared.map((u) => `${u.project}${u.runId ? ` (run ${u.runId})` : ''}: ${u.reason}`).join('; ')}.` : ''}`
   if (state === 'overlap') return `This candidate's expected files, from the ${expected.source === 'plan' ? 'plan' : 'previous revision'} of run ${expected.fromRun}, are also being touched: ${overlaps.map(describe).join('; ')}. Whichever delivers second may find its paths drifted. The start is not refused.${unread}`
-  if (state === 'none') return expected.known ? 'No other project\'s live run touches this candidate\'s expected files.' : 'No other project has a live run that delivers.'
+  if (state === 'none') return expected.known ? 'No other live run touches this candidate\'s expected files.' : 'No other run that delivers is live.'
   const first = expected.known ? `This candidate's expected files, from run ${expected.fromRun}, match nothing that could be read.` : 'This candidate\'s expected files are unknown: no earlier run of this issue has a plan or a revision. This is not an all-clear.'
   return `${first}${possible.length ? ` It could reach files other runs are touching: ${possible.map(describe).join('; ')}.` : ''}${unread} The start is not refused.`
 }
@@ -256,12 +256,13 @@ export function createPathOverlap ({ listProjects, listIssues }) {
 
       const overlaps = [], possible = [], uncompared = []
       let liveRuns = 0
-      for (const other of projects) {
-        if (other.id === project) continue
+      for (const other of roots) {
         let rows
         try { rows = await listIssues(other.id) } catch (error) { uncompared.push({ project: other.id, issueId: null, runId: null, reason: `its issues could not be listed: ${error.message}` }); continue }
         for (const row of rows) {
           if (!row.latestRun?.live) continue
+          // This candidate's own issue; every other issue of its project may be touching the same files.
+          if (other.id === project && issuePath && path.resolve(row.path) === path.resolve(issuePath)) continue
           const { runId, status } = row.latestRun
           const run = await store.readRun(row.path, runId).catch(() => null)
           if (!run) { liveRuns++; uncompared.push({ project: other.id, issueId: row.id, runId, reason: 'its record could not be read' }); continue }
@@ -281,7 +282,7 @@ export function createPathOverlap ({ listProjects, listIssues }) {
       const summary = { known: expected.known, source: expected.source, fromRun: expected.fromRun, count: expected.paths.length, incomplete: expected.gaps }
       return { state, observedAt, expected: summary, overlaps, possible, uncompared, detail: detailOf({ state, expected: summary, overlaps, possible, uncompared }) }
     } catch (error) {
-      return { state: 'unavailable', ...empty, detail: `The overlap with other projects' live runs could not be read: ${error.message}` }
+      return { state: 'unavailable', ...empty, detail: `The overlap with other live runs could not be read: ${error.message}` }
     }
   }
 }

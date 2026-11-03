@@ -95,12 +95,12 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    setDependencies:a=>mutate(()=>setIssueDependencies(a.project,a.issueId,{dependsOn:a.dependsOn,reason:a.reason,by:'supervisor'})),
    openDependencies:async a=>openDependencies(await issues.getIssue(a.project,a.issueId)),
    reportStartRefusal:async a=>reportStartRefusal(await issues.getIssue(a.project,a.issueId),a.playbook),
-   // What the ready queue cannot read off the listings: who holds each project, by the test a start is refused on, and how far a report's trust reaches.
+   // What the ready queue cannot read off the listings: which live run holds each project's checkout, by the test a start is refused on, and how far a report's trust reaches.
    readyQueueFacts:async issuesByProject=>{
     const holders={},reportLevels={}
     let reporters=null
     for(const [project,rows] of Object.entries(issuesByProject)){
-     holders[project]=await supervisor.projectHolder(project,rows)
+     holders[project]=await supervisor.checkoutHolder(project,rows)
      for(const issue of rows)if(issue.report){reporters??=await readReporters();reportLevels[`${project}/${issue.id}`]=await reportStartLevel(issue,{reporters})}
     }
     return {holders,reportLevels}

@@ -13,7 +13,7 @@ import { createSupervisor } from '../server/supervisor.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
 import { engineFixture, cleanupFixtures } from './fakes/fixture.mjs'
 
-export const name = 'path overlap — a candidate\'s expected files against other projects\' live runs'
+export const name = 'path overlap — a candidate\'s expected files against other live runs'
 
 const P = 'devpanel-project'
 const NL = String.fromCharCode(10)
@@ -263,12 +263,23 @@ export default async function (t) {
       t.eq('nor one that delivers nothing', (await inspector({ 'framework-project': [analysis] })({ project: 'app-project', projectPath: app, issuePath: candidate })).state, 'none')
 
       const own = await liveRow(root, 'app-project', app, (w) => fs.writeFile(path.join(w, 'app.mjs'), 'export const app = 2\n'))
-      t.eq('nor one of the candidate\'s own project: admission decides that', (await inspector({ 'app-project': [own] })({ project: 'app-project', projectPath: app, issuePath: candidate })).state, 'none')
+      t.eq('another issue of the candidate\'s own project does: it may run beside it', (await inspector({ 'app-project': [own] })({ project: 'app-project', projectPath: app, issuePath: candidate })).state, 'overlap')
 
       t.eq('a configuration that delivers nothing is not applicable', (await withOwner({ project: 'app-project', projectPath: app, issuePath: candidate, deliveryAction: 'none' })).state, 'not-applicable')
       const broken = createPathOverlap({ listProjects: async () => { throw new Error('no listing') }, listIssues: async () => [] })
       const failed = await broken({ project: 'app-project', projectPath: app, issuePath: candidate })
       t.eq('a failure is unavailable, never thrown', [failed.state, /no listing/.test(failed.detail)], ['unavailable', true])
+    }
+
+    t.section('another issue of the same project: its live run counts, its own issue does not')
+    {
+      const sameProject = await liveRow(root, 'app-project', app, async (worktree) => { await fs.writeFile(path.join(worktree, 'app.mjs'), 'changed by another issue') })
+      const reading = await inspector({ 'app-project': [sameProject] })({ project: 'app-project', projectPath: app, issuePath: candidate })
+      t.eq('it overlaps', reading.state, 'overlap', reading.detail)
+      t.eq('named as the same project', [reading.overlaps[0].project, reading.overlaps[0].relation], ['app-project', 'same-project'])
+      t.eq('on the file they share', pathsOf(reading.overlaps[0]), ['app.mjs'])
+      const own = await inspector({ 'app-project': [sameProject] })({ project: 'app-project', projectPath: app, issuePath: sameProject.path })
+      t.eq('a candidate is not compared with its own issue\'s run', own.overlaps.length, 0, own.detail)
     }
 
     t.section('a third project writing into the same owner, and the owner as the candidate')

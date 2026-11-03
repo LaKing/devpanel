@@ -1,6 +1,9 @@
+import { constants as fsConstants } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import { hostSettings } from './config/host-settings.mjs'
+import { snapshotLockError, snapshotRepositories, unidentifiedMessage } from './runtime/source-lock.mjs'
 import { inspectLaunchState } from './supervisor-launch-state.mjs'
 import { streamGit } from './runtime/working-tree.mjs'
 
@@ -11,7 +14,7 @@ import { streamGit } from './runtime/working-tree.mjs'
  * money. Returns null when nothing refuses, or { code, message } in the same
  * words provisioning would use.
  */
-export async function launchPreconditions ({ projectPath, workspace = {}, configHash = null, listLimit }) {
+export async function launchPreconditions ({ projectPath, workspace = {}, configHash = null, listLimit, selection = 0 }) {
   if (workspace.isolation === 'in-place') return null   // the checkout is the workspace; no base is cut
   const state = await inspectLaunchState({ projectPath, workspace, configHash, listLimit })
   if (state.code === 'DIRTY_BASE' || state.code === 'UNREADABLE_WORKTREE' || state.code === 'GIT_OUTPUT_LIMIT') {
@@ -34,6 +37,26 @@ export async function launchPreconditions ({ projectPath, workspace = {}, config
         message: `${escaping.length} symlink(s) in the checkout point outside it (${escaping.slice(0, 3).map((l) => `${l.path} -> ${l.target}`).join(', ')}${escaping.length > 3 ? ', …' : ''}). A write through such a link changes a live file the candidate does not record. Choose symlinks "materialize" to copy their targets into the worktree, or "allow" to accept that. (Checked before preflight: nothing was spent.)`
       }
     }
+  }
+  return snapshotLockRefusal({ projectPath, workspace, selection })
+}
+
+/**
+ * A snapshot that could not hold the delivery lock of a repository it reads.
+ * The walk is the one provisioning makes; if it cannot be made here, provisioning
+ * decides and says why.
+ */
+async function snapshotLockRefusal ({ projectPath, workspace, selection }) {
+  if (workspace.base !== 'working-tree' && workspace.symlinks !== 'materialize') return null
+  let found
+  try { found = await snapshotRepositories(projectPath, { ...workspace, selection, nested: hostSettings().nestedRepositories }) } catch { return null }
+  const nothingSpent = (detail) => {
+    const { code, message } = snapshotLockError(detail)
+    return { code, message: `${message} (Checked before preflight: nothing was spent.)` }
+  }
+  if (found.unidentified.length) return nothingSpent(unidentifiedMessage(found.unidentified))
+  for (const repository of found.repositories) {
+    try { await fs.access(repository, fsConstants.W_OK) } catch { return nothingSpent(`this account cannot write to ${repository}, so it cannot hold the lock a delivery there uses.`) }
   }
   return null
 }

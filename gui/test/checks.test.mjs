@@ -1,4 +1,4 @@
-import { installRemoteManager } from './fakes/remote-manager.mjs'
+import { installRemoteManager, SSH_ANSWERS_G } from './fakes/remote-manager.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -269,7 +269,7 @@ export default async function (t) {
     // A shim that plants a stray fixture right after extraction, as a stale or
     // shared directory would carry.
     await fs.writeFile(shim, [
-      '#!/bin/sh', 'for last; do :; done',
+      '#!/bin/sh', SSH_ANSWERS_G, 'for last; do :; done',
       'out=$(/bin/sh -c "$last"); rc=$?', 'printf "%s\\n" "$out"',
       'case "$last" in *"tar -C "*) d=$(printf "%s" "$last" | sed -n "s/.*tar -C \x27\\([^\x27]*\\)\x27.*/\\1/p"); [ -n "$d" ] && printf "stale" > "$d/fixture.txt";; esac',
       'exit $rc'

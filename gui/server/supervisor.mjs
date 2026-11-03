@@ -28,6 +28,7 @@ import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from '.
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
 import { LockHeld, ownerLiveness, withLock } from './runtime/lock.mjs'
+import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf } from './run-exclusivity.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
 import { terminatePids } from './runtime/process.mjs'
 import { openCleanup, noteLostTags, proveEntries, cleanupRefusal, readBarrier, liftBarrierEntries, syncBarrier, unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
@@ -230,17 +231,10 @@ export function createSupervisor ({
     const k = key(project, issueId)
 
     // Two guards, because they fail differently: this one catches a double-click
-    // in one process, the run lock catches a second process.
+    // in one process, the run lock catches a second process. One live run per
+    // issue; other issues of the project may run beside it (run-exclusivity.mjs).
     if (starting.has(k)) throw occupied('a run is already being started for this issue')
     if (active.has(k)) throw occupied('a run is already active for this issue', { runId: active.get(k).runId })
-    // Reserve synchronously, before any I/O, so different issues in one project
-    // cannot race each other through preflight. All panel and supervisor starts
-    // share this guard; stopping still owns its slot until drive settles.
-    const holder = [...active.values()].find((run) => run.project === project)?.issueId ??
-      [...starting].find((id) => id.startsWith(`${project}/`))?.slice(project.length + 1) ?? null
-    if (holder) {
-      throw occupied(`a run is already active on this project (issue ${holder}); wait for it to finish`, { issueId: holder })
-    }
     starting.add(k)
 
     let reservation
@@ -249,14 +243,6 @@ export function createSupervisor ({
     let pregateRecord = null
     let startOverlap = null
     try { await admission(project, async () => {
-      // The synchronous guard above covers this process. A run driven by
-      // ANOTHER process shows only in persisted state: a live run on any other
-      // issue of this project whose lock owner is still alive blocks too. Two
-      // candidates cut from one base commit are two patches that conflict at
-      // integration, and nothing reviews that.
-      const busy = await projectBusy(project, issueId)
-      if (busy) throw occupied(`a run is already active on this project (issue ${busy.issueId}); wait for it to finish`, { runId: busy.runId, issueId: busy.issueId })
-
       const issue = await issues.getIssue(project, issueId)
       if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
       inquiryAdmission(issue, { playbookId, runOptions })
@@ -267,6 +253,9 @@ export function createSupervisor ({
       // leaves no failed run behind.
       const resolution = await resolvePlaybook(playbookId, { root, runOptions, projectId: project })
       if (resolution.ok) {
+        // Admission serializes reservations, so what this reads cannot race another start.
+        const holder = await exclusiveHolder(project, issueId, exclusivityOf(resolution.resolved))
+        if (holder) throw occupied(conflictMessage(holder), holder)
         for (const [role, participant] of Object.entries(resolution.resolved.participants)) {
           const cooling = await availability.check(participant.model.id)
           if (cooling) throw occupied(`model ${participant.model.id} (${role}) is exhausted until ${cooling.exhaustedUntil}${cooling.assumed ? ' (assumed hold)' : ''}: ${cooling.reason}${cooling.runId ? ` (observed in run ${cooling.runId})` : ''}. Wait, choose another model, or clear the record.`, { availability: cooling })
@@ -285,7 +274,7 @@ export function createSupervisor ({
         // stays the authority. Read here too because provisioning happens after
         // the paid preflight: 13 runs died with 0 steps on a dirty checkout or an
         // escaping link, each after paying to probe its models first.
-        const blocked = await launchPreconditions({ projectPath, workspace: resolution.resolved.workspace ?? {}, configHash: resolution.resolved.configHash })
+        const blocked = await launchPreconditions({ projectPath, workspace: resolution.resolved.workspace ?? {}, configHash: resolution.resolved.configHash, selection: resolution.resolved.fence?.selection ?? 0 })
         if (blocked) throw Object.assign(err(422, blocked.message, { code: blocked.code }), { started: false, retryable: false, class: 'environment' })
       }
       // The Triage pre-gate: asked before anything is reserved, so a hold leaves
@@ -366,34 +355,41 @@ export function createSupervisor ({
   }
 
   /**
-   * Is another issue of this project being driven by some other process? From
-   * persisted live runs whose lock owner is alive. A run persisted as live with
-   * a dead owner is recovery work, not a running run, and does not block.
+   * Which other issue's run of this project a run of kind `mine` cannot run beside
+   * (run-exclusivity.mjs). From persisted live runs whose lock owner is alive, however
+   * they were started, and this process's own, which include a finalize of a blocked
+   * run. A run persisted as live with a dead owner is recovery work, not a running run,
+   * and does not block.
    */
-  async function projectBusy (project, exceptIssueId, listed = null) {
+  async function exclusiveHolder (project, exceptIssueId, mine, listed = null) {
     let list = listed ?? []
-    if (!listed) try { list = await issues.listIssues(project) } catch { return null }
+    if (!listed) try { list = await issues.listIssues(project) } catch { list = [] }
+    const conflictOf = async (issuePath, runId) => conflicts(mine, exclusivityOf(await store.readSnapshot(issuePath, runId).catch(() => null)))
+    const seen = new Set()
     for (const issue of list) {
       if (issue.id === exceptIssueId) continue
       const latest = issue.latestRun
       if (!latest?.live) continue
       const owner = await lockOwner(issue.path, latest.runId)
-      if (owner.forThisRun && held(owner)) return { runId: latest.runId, issueId: issue.id }
+      if (!owner.forThisRun || !held(owner)) continue
+      seen.add(latest.runId)
+      if (await conflictOf(issue.path, latest.runId)) return { runId: latest.runId, issueId: issue.id }
+    }
+    for (const record of active.values()) {
+      if (record.project !== project || record.issueId === exceptIssueId || seen.has(record.runId)) continue
+      if (await conflictOf(record.issuePath, record.runId)) return { runId: record.runId, issueId: record.issueId }
     }
     return null
   }
 
   /**
-   * Who holds this project now, by the same two tests a start is refused on (start() above): this
-   * process's own runs and starts, then a live run with a live lock owner, however it was started.
-   * Read-only, and it takes a listing the caller already has. An observation: start() decides.
+   * The run holding this project's checkout now, which no start can run beside: a live
+   * in-place run, by the test a start is refused on. Another issue's ordinary run holds
+   * nothing. Read-only, and it takes a listing the caller already has. An observation:
+   * start() decides, and a release run's refusal needs a playbook this cannot know.
    */
-  async function projectHolder (project, listed = null) {
-    const running = [...active.values()].find((run) => run.project === project)
-    if (running) return { issueId: running.issueId, runId: running.runId ?? null }
-    const starts = [...starting].find((id) => id.startsWith(`${project}/`))
-    if (starts) return { issueId: starts.slice(project.length + 1), runId: null }
-    return projectBusy(project, null, listed)
+  function checkoutHolder (project, listed = null) {
+    return exclusiveHolder(project, null, NOT_EXCLUSIVE, listed)
   }
 
   /** Preflight, provision, run, settle. Everything after the response is sent. */
@@ -447,26 +443,30 @@ export function createSupervisor ({
       }
 
       if (record.controller.signal.aborted) {
-        if (record.stoppedBy && reservation.run.pauseRequested) {
-          await pauseReservation(reservation)
-          return
-        }
-        if (record.stoppedBy) reservation.run.stoppedBy = record.stoppedBy
-        await abandonReservation(reservation, { status: 'cancelled' })
+        await settleStopped(record)
         return
       }
 
       // ---- provisioning ----
-      const engine = await provisionRun(reservation, {
-        projectPath, projectAlias,
-        harnesses,
-        stepStore: { create: (options) => issues.createStep(project, issueId, options) },
-        workspaceProvider: gitWorktreeProvider,
-        deliveryProvider: worktreeDiffDelivery,
-        configRoot: root,
-        availability,
-        emit: (event) => emit?.({ ...event, project, issueId, runId: record.runId })
-      })
+      let engine
+      try {
+        engine = await provisionRun(reservation, {
+          projectPath, projectAlias,
+          harnesses,
+          stepStore: { create: (options) => issues.createStep(project, issueId, options) },
+          workspaceProvider: gitWorktreeProvider,
+          deliveryProvider: worktreeDiffDelivery,
+          configRoot: root,
+          availability,
+          signal: record.controller.signal,
+          emit: (event) => emit?.({ ...event, project, issueId, runId: record.runId })
+        })
+      } catch (error) {
+        // Stopped while its base snapshot waited for a delivery: nothing exists yet.
+        if (error.name !== 'AbortError' || !record.controller.signal.aborted) throw error
+        await settleStopped(record)
+        return
+      }
 
       await driveEngine(record, engine)
     } catch (error) {
@@ -476,6 +476,16 @@ export function createSupervisor ({
       active.delete(k)
       await announceEnd(project, issueId, record.runId)
     }
+  }
+
+  /** A reservation stopped before any workspace exists: paused if a pause was asked for, else cancelled. */
+  async function settleStopped ({ reservation, stoppedBy }) {
+    if (stoppedBy && reservation.run.pauseRequested) {
+      await pauseReservation(reservation)
+      return
+    }
+    if (stoppedBy) reservation.run.stoppedBy = stoppedBy
+    await abandonReservation(reservation, { status: 'cancelled' })
   }
 
   /** The agent phase proper, shared by a fresh start and a resume after a decision. */
@@ -508,24 +518,22 @@ export function createSupervisor ({
    *
    * The answer is recorded by the engine as an operator step before anything
    * resumes, so a crash right after leaves the decision on disk. The same
-   * one-live-run-per-project rule applies as for a start.
+   * exclusivity applies as for a start: one live run per issue, and none beside
+   * a run this one cannot share the project with.
    */
   async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false, acceptCheck = null }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
-    const holder = [...active.values()].find((run) => run.project === project)?.issueId ??
-      [...starting].find((id) => id.startsWith(`${project}/`))?.slice(project.length + 1) ?? null
-    if (holder) throw err(409, `a run is already active on this project (issue ${holder}); wait for it to finish`, { issueId: holder })
     starting.add(k)
     let engine = null
     try {
       let issue
       await admission(project, async () => {
-        const busy = await projectBusy(project, issueId)
-        if (busy) throw err(409, `a run is already active on this project (issue ${busy.issueId}); wait for it to finish`, { runId: busy.runId, issueId: busy.issueId })
         issue = await issues.getIssue(project, issueId)
         if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
+        const holder = await exclusiveHolder(project, issueId, exclusivityOf(await store.readSnapshot(issue.path, runId).catch(() => null)))
+        if (holder) throw err(409, conflictMessage(holder), holder)
         inquiryAdmission(issue)
         const harnesses = await loadHarnesses()
         engine = await resumeRun({
@@ -1174,7 +1182,7 @@ export function createSupervisor ({
 
   /**
    * Evaluate closure again for a run that stopped at delivery. Same exclusivity
-   * as a start or an answer: one live run per project, ownership taken through
+   * as a start or an answer: one live run per issue, ownership taken through
    * the lock, the worktree settled afterwards by the same rules as any finish.
    * `reconcile` first merges the approved patch onto the drifted source under
    * the project's current `workspace.reconcile` policy (engine.reconcileDelivery).
@@ -1185,18 +1193,15 @@ export function createSupervisor ({
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
-    const holder = [...active.values()].find((run) => run.project === project)?.issueId ??
-      [...starting].find((id) => id.startsWith(`${project}/`))?.slice(project.length + 1) ?? null
-    if (holder) throw err(409, `a run is already active on this project (issue ${holder}); wait for it to finish`, { issueId: holder })
     starting.add(k)
     let engine = null
     try {
       let issue
       await admission(project, async () => {
-        const busy = await projectBusy(project, issueId)
-        if (busy) throw err(409, `a run is already active on this project (issue ${busy.issueId}); wait for it to finish`, { runId: busy.runId, issueId: busy.issueId })
         issue = await issues.getIssue(project, issueId)
         if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
+        const holder = await exclusiveHolder(project, issueId, exclusivityOf(await store.readSnapshot(issue.path, runId).catch(() => null)))
+        if (holder) throw err(409, conflictMessage(holder), holder)
         inquiryAdmission(issue)
         const harnesses = await loadHarnesses()
         engine = await resumeRun({
@@ -1803,7 +1808,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, projectHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**
@@ -1861,7 +1866,7 @@ function refusalOf (result) {
 
 /** Map internal failures onto answers a caller can act on. */
 function translate (error) {
-  if (error instanceof LockHeld) return occupied('another run already holds this issue')
+  if (error instanceof LockHeld) return occupied(path.basename(error.file) === '.admission.lock' ? 'other starts on this project are still being admitted; try again shortly' : 'another run already holds this issue')
   // The refusal names what was unproven. A generic message would leave the
   // operator with a button that fails for no stated reason.
   if (error.message?.startsWith('refusing to launch')) return err(422, error.message)

@@ -364,24 +364,26 @@ export default async function (t) {
     await fs.writeFile(control, JSON.stringify({ ...JSON.parse(await fs.readFile(control, 'utf8')), probeDelayMs: ms }))
   }
 
-  t.section('10c. a busy project refuses the same start repeatedly, and admits it once the project frees')
+  t.section('10c. two issues of one project run at once; one issue holds one live run, in this process and in another')
   {
     const s = await supervisorOver(null)
     const issueId = s.f.issue.id
     const second = await s.f.issues.createIssue('devpanel-project', { input: 'Another issue of the same project' })
+    const third = await s.f.issues.createIssue('devpanel-project', { input: 'A third issue of the same project' })
     try {
       await holdPreflight(60000)
       const holding = await s.start()
       const state = gateState()
       const { gate, launched } = await gateOver(s, state)
-      for (let n = 0; n < 4; n++) {
-        const refused = await refusal(() => gate.start(previewOf(second.id)))
-        t.ok(`refusal ${n + 1} names the busy project`, /already active on this project/.test(refused?.message ?? ''), refused?.message)
-        t.eq('and is marked', [refused?.status, refused?.started, refused?.retryable], [409, false, true])
-      }
-      t.eq('nothing is recorded in failedLaunches', state.failedLaunches, {})
-      t.eq('no launch reservation or slot is held', state.launches.filter((a) => ['reserved', 'uncertain'].includes(a.status)).length, 0)
-      t.eq('no start was used, past both caps', [state.starts, JSON.stringify(state.startsByIssue)], [0, '{}'])
+      const beside = await gate.start(previewOf(second.id))
+      t.ok('a supervisor start of another issue is admitted beside it', Boolean(beside?.runId), JSON.stringify(beside))
+      t.eq('as a real launch', launched.length, 1)
+      t.eq('charged once', [state.starts, state.startsByIssue[`devpanel-project/${second.id}`]], [1, 1])
+      t.ok('both are live', s.supervisor.isActive('devpanel-project', issueId) && s.supervisor.isActive('devpanel-project', second.id))
+
+      const { launchReadiness } = await import('../server/supervisor-readiness.mjs')
+      const reading = await launchReadiness({ project: 'devpanel-project', issueId: third.id, projectPath: s.projectPath, inspect: async () => null })
+      t.eq('readiness does not report the project blocked by them', reading.baselineReady, true)
 
       const again = await refusal(() => s.start())
       t.eq('the holding issue itself refuses as active, marked', [/already active for this issue/.test(again?.message ?? ''), again?.started, again?.retryable], [true, false, true])
@@ -389,22 +391,77 @@ export default async function (t) {
       // A second process sees the run only in persisted state: its lock owner.
       const { createSupervisor } = await import('../server/supervisor.mjs')
       const other = createSupervisor({ issues: s.f.issues, harnessDir: path.join(s.f.configRoot, 'harness'), projectsDir: path.join(s.f.issuesDir, 'projects'), configRoot: s.f.configRoot })
-      const persisted = await refusal(() => other.start({ project: 'devpanel-project', issueId: second.id, playbookId: 'implementation', configRoot: s.f.configRoot }))
-      t.eq('another process\'s run on the project refuses the same way', [/already active on this project/.test(persisted?.message ?? ''), persisted?.started, persisted?.retryable], [true, false, true])
-      t.eq('what the ready queue reads agrees: this process names the holder', [(await s.supervisor.projectHolder('devpanel-project'))?.issueId, (await s.supervisor.projectHolder('devpanel-project'))?.runId], [issueId, holding.runId])
-      t.eq('and so does another process, from the lock', (await other.projectHolder('devpanel-project'))?.issueId, issueId)
-      const listed = await s.f.issues.listIssues('devpanel-project')
-      t.eq('from a listing it already has', (await other.projectHolder('devpanel-project', listed))?.issueId, issueId)
+      const persisted = await refusal(() => other.start({ project: 'devpanel-project', issueId, playbookId: 'implementation', configRoot: s.f.configRoot }))
+      t.eq('another process cannot start the same issue', [persisted?.message, persisted?.status, persisted?.started, persisted?.retryable], ['another run already holds this issue', 409, false, true])
+      const elsewhere = await other.start({ project: 'devpanel-project', issueId: third.id, playbookId: 'implementation', configRoot: s.f.configRoot })
+      t.ok('and can start a third issue beside them', Boolean(elsewhere?.runId))
 
+      for (const [label, args] of [['an answer', {}], ['a continue', { continueRun: true }]]) {
+        const asked = { project: 'devpanel-project', issueId, runId: holding.runId, text: 'go on', ...args }
+        const here = await refusal(() => s.supervisor.answer(asked))
+        t.eq(`${label} on a live issue is refused here`, [here?.status, /already active for this issue/.test(here?.message ?? '')], [409, true], here?.message)
+        const there = await refusal(() => other.answer(asked))
+        t.eq(`and from another process`, there?.status, 409, there?.message)
+      }
+      t.eq('an ordinary run holds no checkout', [await s.supervisor.checkoutHolder('devpanel-project'), await other.checkoutHolder('devpanel-project')], [null, null])
+
+      for (const [who, id, runId] of [[s.supervisor, issueId, holding.runId], [s.supervisor, second.id, beside.runId], [other, third.id, elsewhere.runId]]) {
+        await who.stop({ project: 'devpanel-project', issueId: id, runId })
+      }
+      await s.supervisor.settle()
+      await other.settle()
+    } finally { await holdPreflight(0); await s.supervisor.settle() }
+  }
+
+  t.section('10c-2. an in-place run holds the checkout: nothing starts or answers beside it, and it starts beside nothing')
+  {
+    const s = await supervisorOver(null)
+    const issueId = s.f.issue.id
+    const second = await s.f.issues.createIssue('devpanel-project', { input: 'Beside an in-place run' })
+    const { resolvePlaybook } = await import('../server/config/load.mjs')
+    const runOptions = { isolation: 'in-place' }
+    const { resolved } = await resolvePlaybook('implementation', { root: s.f.configRoot, runOptions, projectId: 'devpanel-project' })
+    const inPlace = { runOptions, expectConfigHash: resolved.configHash }
+    const { createSupervisor } = await import('../server/supervisor.mjs')
+    const other = createSupervisor({ issues: s.f.issues, harnessDir: path.join(s.f.configRoot, 'harness'), projectsDir: path.join(s.f.issuesDir, 'projects'), configRoot: s.f.configRoot })
+    try {
+      await holdPreflight(60000)
+      const holding = await s.start(inPlace)
+      for (const [label, who] of [['here', s.supervisor], ['in another process', other]]) {
+        const refused = await refusal(() => who.start({ project: 'devpanel-project', issueId: second.id, playbookId: 'implementation', configRoot: s.f.configRoot }))
+        t.eq(`a worktree start beside it is refused ${label}, naming the issue`, [/cannot share the project/.test(refused?.message ?? ''), refused?.message.includes(issueId), refused?.status, refused?.started, refused?.retryable], [true, true, 409, false, true], refused?.message)
+      }
+      const answered = await refusal(() => s.supervisor.answer({ project: 'devpanel-project', issueId: second.id, runId: 'none-such', text: 'go on' }))
+      t.eq('an answer on another issue is refused beside it', [answered?.status, /cannot share the project/.test(answered?.message ?? '')], [409, true], answered?.message)
+      t.eq('the ready queue names the holder here', [(await s.supervisor.checkoutHolder('devpanel-project'))?.issueId, (await s.supervisor.checkoutHolder('devpanel-project'))?.runId], [issueId, holding.runId])
+      t.eq('and in another process, from the lock', (await other.checkoutHolder('devpanel-project'))?.issueId, issueId)
+      const listed = await s.f.issues.listIssues('devpanel-project')
+      t.eq('from a listing it already has', (await other.checkoutHolder('devpanel-project', listed))?.issueId, issueId)
       await s.supervisor.stop({ project: 'devpanel-project', issueId, runId: holding.runId })
       await s.supervisor.settle()
-      await holdPreflight(0)
-      t.eq('once the project frees, no holder either', [await s.supervisor.projectHolder('devpanel-project'), await other.projectHolder('devpanel-project')], [null, null])
-      const result = await gate.start(previewOf(second.id))
-      t.ok('once the project frees the identical start is admitted', Boolean(result?.runId))
-      t.eq('as a real launch', launched.length, 1)
-      t.eq('charged once', [state.starts, state.startsByIssue[`devpanel-project/${second.id}`]], [1, 1])
+      t.eq('once it settles there is no holder', await other.checkoutHolder('devpanel-project'), null)
+
+      const worktree = await s.start()
+      const refused = await refusal(() => s.supervisor.start({ project: 'devpanel-project', issueId: second.id, playbookId: 'implementation', configRoot: s.f.configRoot, ...inPlace }))
+      t.eq('an in-place start beside a live run is refused', [/cannot share the project/.test(refused?.message ?? ''), refused?.status], [true, 409], refused?.message)
+      await s.supervisor.stop({ project: 'devpanel-project', issueId, runId: worktree.runId })
+      await s.supervisor.settle()
     } finally { await holdPreflight(0); await s.supervisor.settle() }
+  }
+
+  t.section('10c-3. which runs cannot share a project')
+  {
+    const { conflicts, exclusivityOf, NOT_EXCLUSIVE } = await import('../server/run-exclusivity.mjs')
+    const coding = exclusivityOf({ tactic: 'implementation', workspace: {} })
+    const inPlace = exclusivityOf({ tactic: 'implementation', workspace: { isolation: 'in-place' } })
+    const staging = exclusivityOf({ tactic: 'staging', workspace: {} })
+    const deployment = exclusivityOf({ tactic: 'deployment', workspace: {} })
+    t.eq('two coding runs share it', conflicts(coding, coding), false)
+    t.eq('a release run beside a coding run shares it', conflicts(staging, coding), false)
+    t.eq('two release runs do not', [conflicts(staging, staging), conflicts(staging, deployment)], [true, true])
+    t.eq('an in-place run shares it with nothing', [conflicts(inPlace, coding), conflicts(coding, inPlace), conflicts(inPlace, staging)], [true, true, true])
+    t.eq('a run whose configuration cannot be read is treated as a conflict', conflicts(coding, exclusivityOf(null)), true)
+    t.eq('the checkout holder reading sees only in-place runs', [conflicts(NOT_EXCLUSIVE, staging), conflicts(NOT_EXCLUSIVE, inPlace)], [false, true])
   }
 
   t.section('10d. the other occupancy refusals of a start are marked')

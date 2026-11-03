@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { fingerprint } from './fingerprint.mjs'
-import { acquire } from './lock.mjs'
+import { acquireSourceLocks, releaseSourceLocks } from './source-lock.mjs'
 import { writeJson } from './persistence.mjs'
 
 const exec = promisify(execFile)
@@ -69,7 +69,7 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
   let application = { path: workspace.source.path, revision, verified: false, fingerprint: null, state: 'not-applied', error: null, owners: [] }
   const finish = () => ({ ...receipt, application })
   const refuse = (state, message) => { application = { ...application, state, error: message }; return finish() }
-  const locks = []
+  let locks = []
   let temporary, rebuilt
   const journal = path.join(runDir, 'source-application.json')
   try {
@@ -101,7 +101,7 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     }
     const routeList = [...routes.values()].sort((a, b) => a.path.localeCompare(b.path))
     const repositories = [...new Set([source.repository, ...routeList.map(r => r.repository)])].sort()
-    for (const repository of repositories) locks.push(await acquire(path.join(repository, 'devpanel-source-delivery.lock'), { purpose: 'source-delivery', runId: path.basename(runDir), clock }))
+    locks = await acquireSourceLocks(repositories, { purpose: 'source-delivery', runId: path.basename(runDir), clock, waitMs: hooks.sourceLockWaitMs })
     const snapshots = new Map()
     for (const route of [{ path: source.path, repository: source.repository }, ...routeList]) {
       const current = await sourceTarget(route.path)
@@ -225,6 +225,6 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
   } finally {
     if (rebuilt) await exec('git', [...reconstructionRepository(workspace), 'worktree', 'remove', '--force', rebuilt]).catch(() => {})
     if (temporary) await fs.rm(temporary, { recursive: true, force: true }).catch(() => {})
-    for (const lock of locks.reverse()) await lock.release()
+    await releaseSourceLocks(locks)
   }
 }

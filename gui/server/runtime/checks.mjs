@@ -6,7 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { systemClock } from './clock.mjs'
-import { sshConnection, shellQuote } from './ssh.mjs'
+import { pinConnection, sshConnection, shellQuote } from './ssh.mjs'
+import { holdDriveSlot } from './drive-slots.mjs'
 import { fingerprint, treeIdentity } from './fingerprint.mjs'
 import { runProcess } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
@@ -73,7 +74,11 @@ export async function runChecks ({
   // rebuild once it is proved to be the revision. The result then names no
   // revision, only `ofRevision`: it is evidence about a variant, and nothing
   // bound to a fingerprint can read it.
-  variant = null
+  variant = null,
+  // Told as a wait for a test-drive slot begins and ends (drive-slots.mjs).
+  onDriveWait = null,
+  // Injected by tests: the slot directory and how long resolving and polling take.
+  driveTiming = {}
 }) {
   const startedAt = clock.now()
   const dir = path.join(runDir, 'checks', dirName ?? String(await nextIndex(path.join(runDir, 'checks'))).padStart(3, '0'))
@@ -127,7 +132,12 @@ export async function runChecks ({
     if (target.kind === 'local') {
       await runCommandsLocally({ target, cwd: rebuilt, dir, result, clock, signal, platform, runId })
     } else {
-      await runCommandsOverSsh({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId })
+      const drive = await holdDriveSlot({ target, result, clock, runId, signal, onWait: onDriveWait, ...driveTiming })
+      try {
+        await runCommandsOverSsh({ connection: drive.connection, host: drive.host, target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId })
+      } finally {
+        await drive.release()
+      }
     }
 
     // 3. The candidate must still BE the revision. A command that edits a
@@ -355,16 +365,19 @@ async function sha256File (file) {
 }
 
 /** Remove a kept smoke instance, with its own bound: the run's signal may already be aborted. */
-export async function discardInstance ({ target, instance, signal = AbortSignal.timeout(90000) }) {
+export async function discardInstance ({ target, instance, connection = null, signal = AbortSignal.timeout(90000) }) {
   try {
-    const { command, args } = await sshConnection(target.ssh)
+    // To the host the instance runs on, whatever the reference says now.
+    const reached = connection ?? await sshConnection(target.ssh)
+    const { command, args } = instance.host ? pinConnection(reached, instance.host) : reached
     const removed = await runProcess({ command, args: [...args, discardInstanceCommand(instance.remoteDir, { control: controlDir(instance.remoteDir) })], signal })
     return { passed: removed.code === 0 && !removed.cancelled, exitCode: removed.code, stderr: removed.stderr?.slice(0, 2000) }
   } catch (error) { return { passed: false, error: error.message } }
 }
 
-async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null, runId = null }) {
-  const { command: SSH, args: sshArgs } = await sshConnection(target.ssh)
+async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null, runId = null }) {
+  // Pinned to the host whose slot this drive holds: every invocation below uses it.
+  const { command: SSH, args: sshArgs } = connection
   // A directory that is ours alone: named for the revision AND a fresh random
   // suffix, created without -p so an existing one is an error, never reused.
   // Only a proved kept instance is another drive's directory (claim, below).
@@ -407,13 +420,14 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
     const { instance, smoke, plan } = continueFrom
     const fresh = { remoteDir, control }
     const refuse = async (reason, detail) => {
-      const discarded = await discardInstance({ target, instance })
+      const discarded = await discardInstance({ target, instance, connection })
       result.continuation = { continued: false, reason, detail, discarded }
       await Promise.all(plan.smokeRun.flatMap((id) => [`${id}.log`, `${id}.stdout`].map((f) => fs.rm(path.join(dir, f), { force: true }))))
       ;({ remoteDir, control } = fresh)
       materialized.detail = null
       return null
     }
+    if (instance.host && instance.host !== host) return refuse('host-changed', `the instance runs on ${instance.host} and this drive holds a slot on ${host}`)
     const smokeDir = path.join(runDir, smoke.dir)
     try {
       for (const id of plan.smokeRun) for (const file of [`${id}.log`, `${id}.stdout`]) await fs.copyFile(path.join(smokeDir, file), path.join(dir, file))
@@ -579,7 +593,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, mater
     if (armed.code !== 0) return `its expiry timer could not be armed: ${armed.stderr?.slice(0, 200)}`
     materialized.remoteEntries = listed
     materialized.cleanup = { deferred: true, remoteDir }
-    result.kept = { remoteDir, services: unitsOf.map((u) => ({ ...u, invocationId: identity.get(u.unit).id })), keptAt: clock.iso(), keepSeconds: keep.seconds, expiresAt: new Date(clock.now() + keep.seconds * 1000).toISOString() }
+    result.kept = { remoteDir, host, services: unitsOf.map((u) => ({ ...u, invocationId: identity.get(u.unit).id })), keptAt: clock.iso(), keepSeconds: keep.seconds, expiresAt: new Date(clock.now() + keep.seconds * 1000).toISOString() }
     return null
   }
   if (keep) {
