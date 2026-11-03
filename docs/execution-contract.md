@@ -2082,7 +2082,7 @@ is recorded with the evidence it was read from (`run.failures[]`):
 | --- | --- | --- |
 | `rate-limit`, `transient`, `output-limit` | yes, up to `retryPolicy.maxAttempts` (default 3), after `baseDelaySeconds`·2ⁿ capped at `maxDelaySeconds`, or the provider's own retry-after | the turn is re-invoked with a fresh invocation id |
 | `quota` | with a compatible replacement | the model is recorded in the host-wide availability store with the provider's reset instant, or a default hold marked `assumed`; later starts naming it are refused (409) until then |
-| `auth`, `environment`, `runtime` | no | the run fails with `run.failure` naming the class |
+| `auth`, `environment`, `refusal`, `runtime` | no | the run fails with `run.failure` naming the class |
 
 A Claude turn records its login's shared credential file (inode, size, mtime;
 a content hash compares but is never kept) as it starts and again when it
@@ -2094,6 +2094,19 @@ file is a change as well; its retry fails as `auth` against a file unchanged
 since that retry began). A seat's single-file bind keeps the inode it was
 launched with, so a refresh by another process is invisible to a running turn.
 Unchanged, it stays `auth`, and no auth failure touches model availability.
+
+**A content refusal.** A turn the provider refused on its content is `refusal`.
+Only a whole line in the provider's own words counts, the one wording on record
+(Codex's), so a model's text quoting it does not; it may arrive on stderr or in the
+stream's error events. That line, whole, is the failure's `message`. Nothing is
+retried, the decision provider is not asked and model availability is untouched.
+The explanation quotes it and leaves the choice to a person: Resume once, or start
+a new run with another model for that seat (`runOptions.participants`; a resume
+keeps the run's seats). Nothing rewrites the prompt or switches the model.
+A refused turn that left changes is quarantined as any other failed turn, and
+`run.failure` carries the refusal beside the quarantine: Resume is refused until a
+person records a disposition (`resolve-integrity`), and one that reopens the run
+sends the turn again once, on a fresh session, and clears `run.failure`.
 
 **The output limit.** A turn that ends on the model's output token limit is
 `output-limit`. Only a whole line in the runtime's own words counts, so a model's

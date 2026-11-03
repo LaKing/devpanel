@@ -3059,6 +3059,9 @@ export class Engine {
     this.run.failures = this.run.failures ?? []
     this.run.failures.push(record)
     if (this.run.recovery) this.run.recovery.cause = { class: classified.class, message: classified.message }
+    // A refusal is the operator's to read and decide on, edits or not: its words go on
+    // the run beside the quarantine, which still decides what comes next (the blocked ending).
+    if (classified.class === 'refusal') this.run.failure = { class: classified.class, message: classified.message, role, stepId: step.id, invocationId: pending.invocationId, retries: 0, availability: null }
     // A writer out of output with its retries spent (a retry that would run kept
     // its edits, and a held cleanup is not spent): the run has failed, whatever
     // its last attempt left. Those edits stay quarantined, which is what keeps

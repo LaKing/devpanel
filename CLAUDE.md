@@ -598,7 +598,7 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   bounded wait (`retryPolicy`, default 3 attempts, 30 s doubling, 10 min cap, provider retry-after honoured);
   `quota` records the model in the host-wide availability store (`issues/.availability.json`) and later starts
   naming it are refused until the recorded reset (the Model availability page at `/models`, `GET/POST/DELETE
-  /api/availability[/:model]`, shows every roster model's record and lets an operator clear or hold one); `auth`, `environment` and `runtime` fail the run with
+  /api/availability[/:model]`, shows every roster model's record and lets an operator clear or hold one); `auth`, `environment`, `refusal` (a provider refusing the turn's content, quoted verbatim; a person resumes once or changes the seat) and `runtime` fail the run with
   `run.failure` on record. Nothing is retried silently: every attempt is in `run.failures`.
 - Audit steps use strategy-owned templates (`audit-plan.md`, `audit-implementation.md`, `audit-draft.md`); the
   coordinator's handoff is context, never the whole prompt. The implementation auditor receives `revision.diff`,

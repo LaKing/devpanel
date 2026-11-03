@@ -1,3 +1,5 @@
+import { classifyFailure } from '../server/runtime/failure.mjs'
+import { ProcessError } from '../server/runtime/process.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 
 export default async function (t) {
@@ -36,6 +38,24 @@ export default async function (t) {
   t.ok('retries spent with quarantined edits: the headline names the limit', /output token limit/.test(limitedWithEdits.headline), limitedWithEdits.headline)
   t.ok('and neither a crash nor a refusing provider nor an interruption', !/crashed|refusing|Interrupted/.test(`${limitedWithEdits.headline} ${limitedWithEdits.detail} ${limitedWithEdits.next}`))
   t.ok('and the next step is the decision on those edits', /not accepted/.test(limitedWithEdits.next), limitedWithEdits.next)
+  const REFUSED = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you're doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying."
+  const refusedRun = { status: 'failed', failure: { ...classifyFailure(new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stderr: `Reading prompt from stdin...\nERROR codex_core::session: failed to record rollout items: thread 01a1a1a6-647b-7f53-a095-1343c8eaff2c not found\n${REFUSED}` })), role: 'auditor-1', retries: 0 },
+    integrity: { status: 'clear' }, preflight: { state: 'passed' }, workspace: { path: '/w', state: 'retained' }, participants: { 'auditor-1': { state: 'ready' } } }
+  const refused = explainRun(refusedRun)
+  t.eq('a refusal says the provider refused the content', refused.headline, "Stopped: the provider refused the content of reviewer 1's turn")
+  t.ok('and nothing says it crashed', !/crash/i.test(JSON.stringify(refused)), JSON.stringify(refused))
+  t.eq('it quotes the provider whole, not the exit line', refused.cause, REFUSED)
+  t.eq('it names both choices', refused.next, 'Resume once to send the turn again, or start a new run with a different model for that seat.')
+  t.ok('and leaves them to a person', /your decision/.test(refused.detail), refused.detail)
+  t.eq('Resume refused: it is not offered, only the change of seat', explainRun({ ...refusedRun, workspace: { state: 'removed' } }).next, 'Resume is not available for this run; start a new run with a different model for that seat.')
+  const refusedQuarantine = { ...refusedRun, status: 'blocked', blockedReason: 'recovery-required', recovery: { required: true },
+    integrity: { status: 'quarantined', latest: { reason: 'role made unauthorized source or Git changes', writesCode: false, outcome: 'failed', changes: { changed: true, head: false } } } }
+  const auditorEdits = explainRun(refusedQuarantine)
+  t.eq('quarantined: a refusal is still what it says', auditorEdits.headline, "Stopped: the provider refused the content of reviewer 1's turn, and the turn left changes that need a recovery decision")
+  t.eq('and it quotes the provider', auditorEdits.cause, REFUSED)
+  t.ok('an edit that may not be kept is not offered as kept', !/keep/i.test(auditorEdits.next) && /restore the changes or abandon/.test(auditorEdits.next), auditorEdits.next)
+  const abandonedRefusal = explainRun({ ...refusedRun, blockedReason: 'integrity-abandoned', integrity: { status: 'abandoned' } })
+  t.eq('abandoned afterwards: only the change of seat is left', abandonedRefusal.next, 'Resume is not available for this run; start a new run with a different model for that seat.')
   t.eq('a quota failure names the model', explainRun({ status: 'failed', failure: { class: 'quota', availability: { modelId: 'gpt-6' } } }).headline, 'Stopped: gpt-6 reached its usage limit')
 
   t.section('blocked runs explain the first unmet condition')

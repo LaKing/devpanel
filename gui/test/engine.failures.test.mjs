@@ -6,11 +6,16 @@ import { classifyFailure, backoffMs, parseRetryAfter, createAvailabilityStore } 
 import { codexErrors } from '../../harness/codex.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { ProcessError } from '../server/runtime/process.mjs'
+import { resumeUnavailable } from '../server/runtime/run-control.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 
 const NL = String.fromCharCode(10)
+
+// The recorded sample: run.failures[] of a resumed audit turn on gpt-6.1-sol.
+const REFUSED = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. If you're doing authorized security work that requires more cyber permissive safeguards, apply for Daybreak access via https://platform.openai.com/settings/organization/status-and-access before retrying."
+const CODEX_NOISE = ['Reading prompt from stdin...', 'ERROR codex_core::session: failed to record rollout items: thread 01a1a1a6-647b-7f53-a095-1343c8eaff2c not found'].join(NL)
 
 export default async (t) => {
   t.section('1. runtime failures are classified from the runtime\'s own words')
@@ -35,6 +40,26 @@ export default async (t) => {
     t.eq('replaced under the turn, transient and retried once, at once', `${rotated.class}:${rotated.retryable}:${rotated.maxRetries}:${rotated.retryAfterMs}`, 'transient:true:1:0')
     t.eq('with the change on the classification', rotated.credentials?.how, 'replaced')
     t.eq('a removed file is a change too: transient', c('claude exited 1', { stdout: expired, credentials: { changed: true, how: 'removed' } }).class, 'transient')
+  }
+
+  t.section('1b. a provider content refusal is its own class, with its words as the message')
+  {
+    const c = (detail) => classifyFailure(new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, ...detail }))
+    const viaStderr = c({ stderr: [CODEX_NOISE, REFUSED].join(NL) })
+    t.eq('the sample on stderr is a refusal', viaStderr.class, 'refusal')
+    t.eq('not retryable', viaStderr.retryable, false)
+    t.eq('its words verbatim, not the exit line', viaStderr.message, REFUSED)
+    t.ok('the exit line stays in the evidence', viaStderr.evidence.startsWith('codex exited 1'), viaStderr.evidence)
+    const stream = JSON.stringify({ type: 'turn.failed', error: { message: REFUSED } })
+    const viaStream = c({ stderr: CODEX_NOISE, stdout: codexErrors(stream) })
+    t.eq('in the stream\'s error events, the same', `${viaStream.class}:${viaStream.message}`, `refusal:${REFUSED}`)
+    t.eq('as the error\'s own message, the same', classifyFailure(new Error(REFUSED)).class, 'refusal')
+
+    const quoting = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: REFUSED } })
+    t.eq('a model quoting it in a raw stream is not one', c({ stdout: quoting }).class, 'runtime')
+    t.eq('nor through the adapter, which keeps only error events', c({ stdout: codexErrors(quoting) }).class, 'runtime')
+    t.eq('nor inside a longer line', c({ stderr: `the issue says: ${REFUSED}` }).class, 'runtime')
+    t.eq('an unrelated failure keeps its first line', c({ stderr: 'something odd happened' }).message, 'codex exited 1')
   }
 
   t.section('2. retry-after is honoured, else exponential backoff with a cap')
@@ -123,6 +148,137 @@ export default async (t) => {
     t.eq('three retries, then the fourth failure ended it', engine.run.failures.length, 4)
     t.eq('with the class on the run', engine.run.failure?.class, 'transient')
     t.eq('and the retry count', engine.run.failure?.retries, 3)
+    await releaseWorkspace(engine)
+  }
+
+  t.section('5a. a refusal is recorded once and stops the run; the next move is a person\'s')
+  {
+    const f = await engineFixture()
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-refusal-'))
+    const availability = createAvailabilityStore(path.join(dir, 'availability.json'))
+    let refusals = 0
+    let refuse = true
+    const invoke = async (args) => {
+      if (args.meta.stepId === 'implement' && refuse) {
+        refusals++
+        throw new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stderr: [CODEX_NOISE, REFUSED].join(NL), invocationId: args.meta.invocationId })
+      }
+      return f.fake.invoke(args)
+    }
+    const engine = await startRun({
+      playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke } }, stepStore: f.stepStore,
+      workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+    })
+    engine.availability = availability
+    let advised = 0
+    engine.failureAdvisor = async () => { advised++; return { class: 'transient', record: {} } }
+    const before = f.clock.now()
+    let thrown = null
+    try { await engine.drive() } catch (error) { thrown = error }
+    t.ok('the run failed on it', thrown?.kind === 'runtime-error', thrown?.message)
+    t.eq('the turn was invoked once', refusals, 1)
+    t.eq('with no wait', f.clock.now(), before)
+    t.eq('the advisory provider was not asked', advised, 0)
+    t.eq('one attempt on run.failures, not retried', engine.run.failures.map((x) => `${x.class}:${x.retried}`), ['refusal:false'])
+    t.eq('run.failures carries the provider\'s words', engine.run.failures[0].message, REFUSED)
+    t.eq('run.failure carries the class', engine.run.failure?.class, 'refusal')
+    t.eq('and the provider\'s words', engine.run.failure?.message, REFUSED)
+    const model = engine.snapshot.participants.implementer.model.id
+    t.eq('the model stays available', await availability.check(model), null)
+    t.eq('the store holds nothing', await availability.all(), [])
+    t.eq('the record carries no availability', engine.run.failure?.availability, null)
+    t.eq('the seat keeps its model', engine.run.modelOverrides, undefined)
+
+    // What the supervisor does with the error drive threw (failRecord).
+    Object.assign(engine.run, { status: 'failed', blockedReason: thrown.message, outcome: 'unresolved', endedAt: f.clock.iso() })
+    const told = explainRun(engine.run)
+    t.ok('the explanation of the real record says refused', /provider refused the content/.test(told.headline), told.headline)
+    t.eq('and quotes the provider', told.cause, REFUSED)
+    t.ok('and offers Resume, which this record allows', /^Resume once/.test(told.next), told.next)
+
+    refuse = false
+    await engine.resumeExecution({})
+    t.eq('Resume clears the failure', engine.run.failure, null)
+    await engine.drive()
+    t.ok('and sends the turn again: it is past the refusal', engine.run.steps.some((s) => s.stepId === 'implement'))
+    t.eq('the refused attempt stays on record', engine.run.failures.map((x) => x.class), ['refusal'])
+    await releaseWorkspace(engine)
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+
+  t.section('5a-bis. a refused writer turn that left edits: the refusal on record, the recovery decision still required')
+  {
+    const f = await engineFixture()
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-refusal-'))
+    const availability = createAvailabilityStore(path.join(dir, 'availability.json'))
+    let refusals = 0
+    let refuse = true
+    const invoke = async (args) => {
+      if (args.meta.stepId === 'implement' && refuse) {
+        refusals++
+        await fs.writeFile(path.join(args.cwd, 'partial.txt'), 'half done\n')
+        throw new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stderr: [CODEX_NOISE, REFUSED].join(NL), invocationId: args.meta.invocationId })
+      }
+      return f.fake.invoke(args)
+    }
+    const engine = await startRun({
+      playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke } }, stepStore: f.stepStore,
+      workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+    })
+    engine.availability = availability
+    let advised = 0
+    engine.failureAdvisor = async () => { advised++; return { class: 'transient', record: {} } }
+    const before = f.clock.now()
+    await engine.drive()
+    t.eq('the quarantine still ends it', `${engine.run.status}:${engine.run.blockedReason}:${engine.run.integrity.status}`, 'blocked:recovery-required:quarantined')
+    t.eq('the turn was invoked once', refusals, 1)
+    t.eq('with no wait', f.clock.now(), before)
+    t.eq('the advisory provider was not asked', advised, 0)
+    t.eq('one attempt on run.failures, not retried', engine.run.failures.map((x) => `${x.class}:${x.retried}:${x.quarantined}`), ['refusal:false:true'])
+    t.eq('run.failures carries the provider\'s words', engine.run.failures[0].message, REFUSED)
+    t.eq('run.failure carries the class', engine.run.failure?.class, 'refusal')
+    t.eq('and the provider\'s words', engine.run.failure?.message, REFUSED)
+    t.eq('the store holds nothing', await availability.all(), [])
+    t.eq('the seat keeps its model', engine.run.modelOverrides, undefined)
+    t.ok('the edits are preserved on disk', await fs.access(path.join(engine.run.workspace.path, 'partial.txt')).then(() => true, () => false))
+
+    const told = explainRun(engine.run)
+    t.ok('the explanation says refused', /provider refused the content of the implementer's turn/.test(told.headline), told.headline)
+    t.ok('nothing says it crashed', !/crash/i.test(JSON.stringify(told)), JSON.stringify(told))
+    t.eq('it quotes the provider', told.cause, REFUSED)
+    t.ok('it requires the recovery decision', /keep the partial edits, restore them, or abandon/.test(told.next), told.next)
+    t.ok('and says how Resume behaves', /Resume is refused until you record that decision/.test(told.next), told.next)
+    t.ok('and how to change the seat', /different model for that seat/.test(told.next), told.next)
+    t.ok('Resume really is refused', Boolean(resumeUnavailable(engine.run)))
+
+    await engine.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: engine.run.integrity.latest.stateHash, reason: 'inspected', actor: 'operator' })
+    t.eq('a disposition reopens the run', `${engine.run.status}:${engine.run.integrity.status}`, 'pending:clear')
+    t.eq('without the failure it answered', engine.run.failure, null)
+    refuse = false
+    await engine.drive()
+    t.ok('and the turn is sent again', engine.run.steps.some((s) => s.stepId === 'implement'))
+    t.eq('the refused attempt stays on record', engine.run.failures.map((x) => x.class), ['refusal'])
+    await releaseWorkspace(engine)
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+  {
+    const f = await engineFixture()
+    const invoke = async (args) => {
+      if (args.meta.stepId !== 'implement') return f.fake.invoke(args)
+      await fs.writeFile(path.join(args.cwd, 'partial.txt'), 'half done\n')
+      throw new ProcessError('codex exited 1', { kind: 'runtime-error', code: 1, stderr: 'something odd happened', invocationId: args.meta.invocationId })
+    }
+    const engine = await startRun({
+      playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke } }, stepStore: f.stepStore,
+      workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+    })
+    await engine.drive()
+    t.eq('another class leaves run.failure unset, as before', engine.run.failure ?? null, null)
+    t.eq('and its record is the same class', engine.run.failures.map((x) => x.class), ['runtime'])
+    t.eq('and the generic recovery words', explainRun(engine.run).headline, 'Stopped: a turn left source changes that need a recovery decision')
     await releaseWorkspace(engine)
   }
 

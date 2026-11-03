@@ -179,6 +179,14 @@ function failed (run) {
         return { headline: `Stopped: ${who} ran out of output on the model's output token limit`, detail: f.retries ? `Retried ${plural(f.retries, 'time')} first.` : null, cause: said || null, next: run.integrity?.status === 'quarantined'
           ? "Its last attempt's source edits were not accepted. Inspect the retained workspace, then keep them, restore them, or abandon the run; a narrower task or a lower effort for that seat leaves more room for the answer."
           : 'Resume the run or start a new one; a narrower task or a lower effort for that seat leaves more room for the answer.' }
+      case 'refusal':
+        return { headline: `Stopped: the provider refused the content of ${who}'s turn`,
+          detail: "It was not retried and the model stays available. What happens next is your decision: nothing rewrites the prompt or switches the seat's model on its own.",
+          // Whole: the provider's words run past firstLine's limit, and they are the evidence.
+          cause: f.message || null,
+          next: resumeUnavailable(run)
+            ? 'Resume is not available for this run; start a new run with a different model for that seat.'
+            : 'Resume once to send the turn again, or start a new run with a different model for that seat.' }
       case 'environment':
         return { headline: `Stopped: ${who}'s AI tool could not run on this host`, cause: said || null, next: 'Fix the host problem named above, then start a new run.' }
       default:
@@ -629,6 +637,14 @@ function blocked (run, outputs, kept) {
   switch (reason) {
     case 'recovery-required':
     case 'owner-lost':
+      if (run.failure?.class === 'refusal' && run.integrity?.status === 'quarantined' && !run.journal?.recoveryRequired) {
+        const latest = run.integrity.latest
+        const keepable = latest?.writesCode && latest.outcome !== 'completed' && latest.changes && !latest.changes.head
+        return { ...base, headline: `Stopped: the provider refused the content of ${ROLE(run.failure.role)}'s turn, and the turn left changes that need a recovery decision`,
+          detail: "It was not retried and the model stays available. What happens next is your decision: nothing rewrites the prompt or switches the seat's model on its own.",
+          cause: run.failure.message || null,
+          next: `Inspect the retained workspace, then ${keepable ? 'keep the partial edits, restore them,' : 'restore the changes'} or abandon the run. Resume is refused until you record that decision; ${keepable ? 'keeping or restoring' : 'restoring'} sends the turn again once, on a fresh session. To change the seat, abandon the run and start a new one with a different model for that seat.` }
+      }
       // A source-integrity quarantine is a turn that ended with changes nobody
       // vouched for, not a restart; its cause is the turn's own failure.
       if (run.integrity?.status === 'quarantined' && !run.journal?.recoveryRequired && run.integrity.latest?.changes?.changed) {

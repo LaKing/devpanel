@@ -1157,7 +1157,7 @@
     },
     "failures": {
       "type": "array",
-      "description": "Every runtime failure, classified (rate-limit, quota, auth, environment, transient, output-limit, runtime), with whether it was retried and the evidence it was read from.",
+      "description": "Every runtime failure, classified (rate-limit, quota, auth, environment, transient, output-limit, refusal, runtime), with whether it was retried and the evidence it was read from.",
       "items": {
         "type": "object",
         "additionalProperties": true
