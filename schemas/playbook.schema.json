@@ -536,6 +536,18 @@
                 "pattern": "^[a-z0-9-]+$"
               },
               "description": "Ids of commands and finallyCommands that make the smoke tier. It runs on every recorded revision beside the reviews, and a failure sends the author another round. The full tier is the whole target, run once on the approved revision; only it counts for closure. Implies timing: approved."
+            },
+            "continueSmoke": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether the full drive continues the smoke's running instance when it can be proved unchanged: it executes only the commands the smoke did not run, in declared order, then every finalizer. Set false when a command declared before a smoke service is one the service depends on at boot or needs it down, or when a smoke finalizer changes application data."
+            },
+            "keepSeconds": {
+              "type": "integer",
+              "minimum": 60,
+              "maximum": 7200,
+              "default": 1800,
+              "description": "How long a passing smoke's instance waits for the full drive before a timer on the target removes it. Past it the full drive runs from scratch."
             }
           }
         },

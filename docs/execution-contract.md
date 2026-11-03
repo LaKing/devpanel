@@ -284,6 +284,57 @@ smoke never stands in for the full drive. `checksOnlyBlock` reads the newest
 check of either tier, so a smoke failure on an approved revision is a
 checks-only stop, and refresh-checks reruns the full drive.
 
+The full drive of an SSH target **continues** its smoke's running instance when
+the smoke passed the gate on its first attempt and has a service
+(`continuationPlan`, baseline-cache.mjs; `tiers.continueSmoke: false` opts out).
+The smoke then leaves its services and candidate running (`result.kept`, then
+`run.keptInstance`, persisted so a restart can still continue), having proved no
+command unit remains, its services active and its candidate unchanged; anything
+short of that takes the ordinary end, with the reason in `instanceNotKept`. Its
+services are started with `lifetimeSeconds + tiers.keepSeconds` (default 1800),
+and a transient timer on the target removes the instance after `keepSeconds`,
+armed before the instance counts as kept. Continuing is proved on the target
+under the launch lock: the timer still waiting (then disarmed), both directories
+present, each service `active` with the `InvocationID` recorded when it was kept,
+and the listing showing no modified, deleted or reappeared candidate path. The
+rebuild and fingerprint of the revision happen as for any drive.
+
+A continued drive walks the whole `commands` list in declared order under the
+ordinary skip rules, and only does not execute what the smoke ran: that record is
+carried (`fromSmoke`) with its log and stdout, so comparison, gating and closure,
+none of which read `continuedFrom`, get what a fresh drive with those outcomes
+would leave. After a failure, a smoke command a fresh drive would have skipped
+reads as not run: it is in `result.skipped`, its smoke log is named in
+`continuedFrom.notCounted`, and a skipped smoke service is stopped before the
+finalizers. Every finalizer runs. The base drive stays a from-scratch drive.
+`continuedFrom` also lists `smokeRun`, `ran`, `outOfPosition`,
+`declaredBeforeServices`, `smokeRunDurationMs` and `keptForMs`; `durationMs` is what
+this drive really ran. A continued report command leaves no second line in the
+selftest history: one execution is one line.
+
+Any failed proof discards the instance and the same drive runs from scratch,
+recording `continuation: {continued: false, reason, detail}`, as does a full drive
+with nothing to continue. Reasons: `opted-out`, `local-target`, `no-service`,
+`smoke-not-kept`, `smoke-retried`, `refresh`, `retry`, `revision-changed`,
+`target-changed`, `expired`, `instance-gone`, `service-not-active`,
+`unit-identity-changed`, `candidate-changed`, `unreadable`. Only the first attempt
+keeps or continues: every retry runs from scratch, a refresh and a reconciled
+candidate's revalidation too. A kept instance is discarded when the planner wants
+anything but the full drive or another review of the round, when the smoke did not
+pass the gate, and when `drive()` ends however it ended (`run.discardedInstances`
+and an `instance-discarded` event; a failed discard decides nothing and leaves the
+timer armed). A panel that never returns leaves it to the timer.
+
+**Limitation (recorded decision).** A command declared before a smoke service runs
+after that service started, so the service never saw its effect. If the service
+depends on it at boot, or it needs the service down, the later commands test a
+service the declared order would not have produced; validation sees shell text and
+cannot tell. A false failure corrects itself through the from-scratch retry; a
+false pass does not, and counts as a full result. Such commands are named in
+`continuedFrom.declaredBeforeServices`, in preview and to the auditors; an affected
+target sets `tiers.continueSmoke: false`. A finalizer also runs for real, so one
+that does not `join` can read files a skipped smoke service wrote.
+
 A **failed** check runs again on the same revision before it counts
 (`target.retryFailed`, default 1, 0 to 3). Each earlier attempt is kept on the
 result as `attempts`, a `checks-retry` event is written, and a pass after a

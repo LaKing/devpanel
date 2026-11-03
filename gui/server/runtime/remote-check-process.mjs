@@ -184,7 +184,10 @@ export function managedRemoteCommand (remoteDir, command, finalizer = false, opt
   const control = options.control ?? remoteDir
   const service = command.kind === 'candidate' && command.service === true
   const { properties, argv, prelude = ':' } = execution(remoteDir, command, options)
-  const lifetime = service ? Number(command.lifetimeSeconds ?? 1800) : Number(command.timeoutSeconds ?? 900)
+  // A smoke that may be continued (`keepSeconds`) outlives its keep window, so a
+  // claim within it leaves the service at least what a fresh drive has after the
+  // same commands; a running unit's limit is not extended.
+  const lifetime = service ? Number(command.lifetimeSeconds ?? 1800) + Number(options.keepSeconds ?? 0) : Number(command.timeoutSeconds ?? 900)
   return bash(`set -euo pipefail
 ${manager}
 exec 9>${quote(control + '/.launch.lock')}
@@ -229,6 +232,14 @@ flock -u 9
 wait "$client"`)
 }
 
+const STOP_UNIT = `  [[ "$unit" =~ ^devpanel-check-[a-f0-9]{24}$ ]] || exit 1
+  if [[ $(systemctl "\${manager[@]}" show "$unit" -p LoadState --value) != not-found ]]; then
+    systemctl "\${manager[@]}" --no-ask-password stop "$unit"
+    state=$(systemctl "\${manager[@]}" show "$unit" -p ActiveState --value)
+    [[ "$state" == inactive || "$state" == failed ]] || exit 1
+    [[ $(systemctl "\${manager[@]}" show "$unit" -p MainPID --value) == 0 ]] || exit 1
+  fi`
+
 /**
  * Stop the run's command units. Service units (a started application) are
  * stopped only when `services` is set: the first stop precedes the finalizers,
@@ -243,16 +254,97 @@ flock -w 35 9
 : > ${quote(control + '/.cancelled')}
 for list in ${lists.join(' ')}; do if [[ ! -e "$list" ]]; then : > "$list"; fi; done
 cat ${lists.join(' ')} | while IFS= read -r unit; do
-  [[ "$unit" =~ ^devpanel-check-[a-f0-9]{24}$ ]] || exit 1
-  if [[ $(systemctl "\${manager[@]}" show "$unit" -p LoadState --value) != not-found ]]; then
-    systemctl "\${manager[@]}" --no-ask-password stop "$unit"
-    state=$(systemctl "\${manager[@]}" show "$unit" -p ActiveState --value)
-    [[ "$state" == inactive || "$state" == failed ]] || exit 1
-    [[ $(systemctl "\${manager[@]}" show "$unit" -p MainPID --value) == 0 ]] || exit 1
-  fi
+${STOP_UNIT}
 done
 test ! -e ${quote(control + '/.registration-uncertain')}
 printf 'Remote command cgroups stopped and registration fenced.\\n'`)
+}
+
+/*
+ * A kept instance: a smoke drive's services and candidate left running for the
+ * full drive of the same revision (execution-contract.md, tiers). An expiry timer
+ * armed before the instance counts as kept removes it without the panel, so a
+ * panel that never returns leaves nothing behind.
+ */
+export const expiryUnit = (remoteDir) => unitName(remoteDir, 'devpanel-instance-expiry')
+
+/** Stop these units by name, under the launch lock: smoke services a fresh drive would not have started. */
+export function stopNamedUnits (remoteDir, { control = remoteDir, units = [] } = {}) {
+  return bash(`set -euo pipefail
+${manager}
+exec 9>${quote(control + '/.launch.lock')}
+flock -w 35 9
+for unit in ${units.map(quote).join(' ')}; do
+${STOP_UNIT}
+done`)
+}
+
+/** `<unit>\t<ActiveState>\t<InvocationID>` per unit: systemd's identity of one start of a unit. */
+export function readServiceIdentity (units) {
+  return bash(`set -euo pipefail
+${manager}
+for unit in ${units.map(quote).join(' ')}; do
+  [[ "$unit" =~ ^devpanel-check-[a-f0-9]{24}$ ]] || exit 1
+  printf '%s\\t%s\\t%s\\n' "$unit" "$(systemctl "\${manager[@]}" show "$unit" -p ActiveState --value)" "$(systemctl "\${manager[@]}" show "$unit" -p InvocationID --value)"
+done`)
+}
+
+// Termination first, as a drive's own cleanup: a candidate is never removed from
+// under a process that could not be stopped. A control directory already gone
+// means there is nothing left to stop.
+const removeInstance = (remoteDir, control) => `if [[ -d ${quote(control)} ]]; then ${stopRemoteCommands(remoteDir, { control })} || exit 1; fi
+rm -rf ${quote(remoteDir)} ${quote(control)} ${quote(remoteDir + '.tar')}`
+
+export function armInstanceExpiry (remoteDir, { control = remoteDir, seconds }) {
+  const removal = `set -uo pipefail\n${manager}\n${removeInstance(remoteDir, control)}`
+  return bash(`set -euo pipefail
+${manager}
+systemd-run "\${manager[@]}" --no-ask-password --quiet --collect --on-active=${Number(seconds)}s --unit=${quote(expiryUnit(remoteDir))} --property=WorkingDirectory=/ /bin/bash -c ${literal(removal)}`)
+}
+
+const disarm = (remoteDir) => `systemctl "\${manager[@]}" --no-ask-password stop ${quote(expiryUnit(remoteDir) + '.timer')} 2>/dev/null || true
+systemctl "\${manager[@]}" --no-ask-password stop ${quote(expiryUnit(remoteDir) + '.service')} 2>/dev/null || true`
+
+/** Remove a kept instance, disarming its timer only once it is gone: a failure leaves the timer to do it. */
+export function discardInstanceCommand (remoteDir, { control = remoteDir } = {}) {
+  return bash(`set -uo pipefail
+${manager}
+${removeInstance(remoteDir, control)} || exit 1
+${disarm(remoteDir)}`)
+}
+
+/**
+ * Disarm the expiry and prove the instance is the one that was kept: prints
+ * `devpanel-claim: ok`, or `devpanel-claim: <reason> <detail>` for an instance
+ * that cannot be continued. A timer no longer waiting has fired, so its removal
+ * may be under way: that instance has expired, whatever else still stands.
+ */
+export function claimInstance (remoteDir, { control = remoteDir, services = [] } = {}) {
+  const timer = quote(expiryUnit(remoteDir) + '.timer')
+  const proofs = services.map(({ unit, invocationId }) => `state=$(systemctl "\${manager[@]}" show ${quote(unit)} -p ActiveState --value)
+[[ "$state" == active ]] || refuse service-not-active ${quote(unit + ' is')} "$state"
+[[ "$(systemctl "\${manager[@]}" show ${quote(unit)} -p InvocationID --value)" == ${quote(invocationId)} ]] || refuse unit-identity-changed ${quote(unit + ' was started again')}`).join('\n')
+  return bash(`set -uo pipefail
+${manager}
+refuse () { printf 'devpanel-claim: %s\\n' "$*"; exit 0; }
+[[ "$(systemctl "\${manager[@]}" show ${timer} -p SubState --value)" == waiting ]] || refuse expired 'its keep window ended'
+${disarm(remoteDir)}
+[[ "$(systemctl "\${manager[@]}" show ${timer} -p SubState --value)" != waiting ]] || refuse unreadable 'the expiry timer could not be disarmed'
+[[ -d ${quote(remoteDir)} && -d ${quote(control)} ]] || refuse instance-gone 'the candidate or control directory is gone'
+exec 9>${quote(control + '/.launch.lock')}
+flock -w 35 9 || refuse unreadable 'the launch lock could not be taken'
+test ! -e ${quote(control + '/.registration-uncertain')} || refuse unreadable 'a command registration is uncertain'
+${proofs}
+printf 'devpanel-claim: ok\\n'`)
+}
+
+/** Open a proved instance to commands again: the smoke's last stop left its cancel marker. */
+export function reopenInstance (remoteDir, { control = remoteDir } = {}) {
+  return bash(`set -euo pipefail
+exec 9>${quote(control + '/.launch.lock')}
+flock -w 35 9
+test ! -e ${quote(control + '/.registration-uncertain')}
+rm -f ${quote(control + '/.cancelled')}`)
 }
 
 /**

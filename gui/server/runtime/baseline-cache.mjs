@@ -43,6 +43,34 @@ export function tierTarget (target, tier) {
   return { ...rest, tier: 'smoke', commands: keep(rest.commands), ...(rest.finallyCommands ? { finallyCommands: keep(rest.finallyCommands) } : {}) }
 }
 
+/*
+ * What a full drive does on its smoke drive's running instance: the target's
+ * commands the smoke did not run, in declared order, then every finalizer. A
+ * command declared before a smoke command runs out of position, and one declared
+ * before a smoke service runs after that service started, so the service never
+ * saw its effect: recorded and warned about, never refused (the limitation is in
+ * docs/project-infrastructure.md "Tiers"; `tiers.continueSmoke: false` opts out).
+ */
+export function continuationPlan (target) {
+  const smoke = target?.tiers?.smoke
+  if (!smoke) return null
+  const commands = target.commands ?? []
+  const inSmoke = (c) => smoke.includes(c.id)
+  const isService = (c) => c.kind === 'candidate' && c.service === true
+  const outOfPosition = []
+  const declaredBeforeServices = []
+  commands.forEach((c, i) => {
+    if (inSmoke(c)) return
+    const after = commands.slice(i + 1).filter(inSmoke)
+    if (!after.length) return
+    outOfPosition.push({ id: c.id, declaredBefore: after.map((a) => a.id) })
+    if (after.some(isService)) declaredBeforeServices.push(c.id)
+  })
+  const services = commands.filter((c) => inSmoke(c) && isService(c)).map((c) => c.id)
+  const refusal = target.tiers.continueSmoke === false ? 'opted-out' : target.kind !== 'ssh' ? 'local-target' : !services.length ? 'no-service' : null
+  return { smokeRun: commands.filter(inSmoke).map((c) => c.id), run: commands.filter((c) => !inSmoke(c)).map((c) => c.id), outOfPosition, declaredBeforeServices, services, refusal, keepSeconds: target.tiers.keepSeconds ?? 1800 }
+}
+
 /** issues/<project>/.baselines: beside the project's issues, never inside a run. */
 export const baselinesDir = (issuePath) => path.join(path.dirname(issuePath), '.baselines')
 

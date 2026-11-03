@@ -1,4 +1,4 @@
-import { managedRemoteCommand, stopRemoteCommands, controlDir, unitName, probeCommands, confinementLevel, withConfinementDefaults } from './remote-check-process.mjs'
+import { managedRemoteCommand, stopRemoteCommands, controlDir, unitName, probeCommands, confinementLevel, withConfinementDefaults, stopNamedUnits, readServiceIdentity, armInstanceExpiry, discardInstanceCommand, claimInstance, reopenInstance } from './remote-check-process.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
@@ -58,7 +58,13 @@ export async function runChecks ({
   base = false,
   dirName = null,
   // The host's OS (platform.mjs): decides whether local commands may run at all.
-  platform = hostPlatform()
+  platform = hostPlatform(),
+  // A smoke that may be continued: `{ seconds }`, its keep window. A passing drive
+  // then leaves its instance running and says so in `result.kept`.
+  keep = null,
+  // A full drive that continues a kept smoke: `{ instance, smoke, plan }`. A proof
+  // that fails discards the instance and this drive runs from scratch, saying why.
+  continueFrom = null
 }) {
   const startedAt = clock.now()
   const dir = path.join(runDir, 'checks', dirName ?? String(await nextIndex(path.join(runDir, 'checks'))).padStart(3, '0'))
@@ -107,7 +113,7 @@ export async function runChecks ({
     if (target.kind === 'local') {
       await runCommandsLocally({ target, cwd: rebuilt, dir, result, clock, signal, platform })
     } else {
-      await runCommandsOverSsh({ target, rebuilt, dir, result, materialized, clock, signal, candidateEntries: check.entries })
+      await runCommandsOverSsh({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom })
     }
 
     // 3. The candidate must still BE the revision. A command that edits a
@@ -280,14 +286,24 @@ async function sha256File (file) {
   return hash.digest('hex')
 }
 
-async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized, clock, signal, candidateEntries }) {
+/** Remove a kept smoke instance, with its own bound: the run's signal may already be aborted. */
+export async function discardInstance ({ target, instance, signal = AbortSignal.timeout(90000) }) {
+  try {
+    const { command, args } = await sshConnection(target.ssh)
+    const removed = await runProcess({ command, args: [...args, discardInstanceCommand(instance.remoteDir, { control: controlDir(instance.remoteDir) })], signal })
+    return { passed: removed.code === 0 && !removed.cancelled, exitCode: removed.code, stderr: removed.stderr?.slice(0, 2000) }
+  } catch (error) { return { passed: false, error: error.message } }
+}
+
+async function runCommandsOverSsh ({ target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null }) {
   const { command: SSH, args: sshArgs } = await sshConnection(target.ssh)
   // A directory that is ours alone: named for the revision AND a fresh random
   // suffix, created without -p so an existing one is an error, never reused.
-  const remoteDir = `${target.ssh.workdir.replace(/\/+$/, '')}/devpanel-check-${sha256(result.revision ?? `base:${result.baseCommit}`).slice(0, 12)}-${crypto.randomBytes(6).toString('hex')}`
+  // Only a proved kept instance is another drive's directory (claim, below).
+  let remoteDir = `${target.ssh.workdir.replace(/\/+$/, '')}/devpanel-check-${sha256(result.revision ?? `base:${result.baseCommit}`).slice(0, 12)}-${crypto.randomBytes(6).toString('hex')}`
   // The engine's launch bookkeeping lives beside the candidate, owned by the
   // SSH account alone: candidate code can neither forge nor erase it (R8-4).
-  const control = controlDir(remoteDir)
+  let control = controlDir(remoteDir)
   const structured = confinementLevel(target) === 'structured'
   // The unit user and home: the project's, else the host settings'. A candidate
   // command without them is refused here, before anything is sent.
@@ -297,36 +313,6 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized,
   const hasCandidates = [...(target.commands ?? []), ...(target.finallyCommands ?? [])].some((c) => c.kind === 'candidate')
   if (hasCandidates && (!confinement.user || !confinement.home)) {
     throw new Error('the test drive has kind: candidate commands but no unit user and home: set testDrive.confinement.user and .home in the project, or testDrive.confinement in the host settings')
-  }
-
-  // Archive the verified reconstruction; prove the bytes arrived intact.
-  const archive = path.join(dir, 'candidate.tar')
-  const tar = await runProcess({ command: 'tar', args: ['-C', rebuilt, '--exclude=.git', '-cf', archive, '.'], signal })
-  if (tar.code !== 0) throw new Error(`tar failed: ${tar.stderr.slice(0, 200)}`)
-  // Hashed and sent as streams: the archive of a large candidate is hundreds of
-  // megabytes, and reading it whole into memory for each check spiked the
-  // server's RSS (and cannot work past 2 GiB). The bytes go to stdin as bytes;
-  // no string round-trip re-encodes them.
-  const localHash = await sha256File(archive)
-  materialized.archiveSha256 = localHash
-  materialized.archiveBytes = (await fs.stat(archive)).size
-  let upload
-  try {
-    upload = await runProcess({
-      command: SSH, args: [...sshArgs, `mkdir ${shellQuote(remoteDir)} && mkdir -m 0700 ${shellQuote(control)} && cat > ${shellQuote(remoteDir + '.tar')} && sha256sum ${shellQuote(remoteDir + '.tar')} | cut -d' ' -f1 && tar -C ${shellQuote(remoteDir)} -xf ${shellQuote(remoteDir + '.tar')} && rm -f ${shellQuote(remoteDir + '.tar')}`],
-      stdin: createReadStream(archive), signal
-    })
-  } finally {
-    // Only its hash is evidence; a local copy kept per check grows without
-    // bound. The candidate is rebuildable from base + patch.
-    await fs.rm(archive, { force: true })
-  }
-  if (upload.code !== 0) throw new Error(`upload failed: ${upload.stderr.slice(0, 300)}`)
-  const remoteHash = upload.stdout.trim().split(NL)[0]
-  materialized.remoteSha256 = remoteHash
-  if (remoteHash !== localHash) {
-    materialized.verified = false
-    throw new Error('archive hash on arrival differs from the archive sent; the result would not be bound to the revision')
   }
 
   // What is on the far side, as entries comparable to the fingerprint: sha256
@@ -346,23 +332,97 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized,
     if (!materialized.cleanup.passed) throw new Error(`staging cleanup failed; candidate or archive may remain at ${remoteDir} and ${remoteDir}.tar`)
   }
 
-  // Before any command: the remote directory must contain exactly the
-  // candidate — nothing missing, nothing extra. A stale or pre-populated
-  // directory would let a fixture that is not in the candidate make a test pass.
-  const arrived = await listRemote()
-  const before = arrived ? compareCandidate(candidateEntries, arrived) : null
-  materialized.beforeCommands = before ? { modified: before.modified.length, deleted: before.deleted.length, added: before.added.length, reappeared: before.reappeared.length } : null
-  if (!before || before.modified.length || before.deleted.length || before.added.length || before.reappeared.length) {
-    materialized.verified = false
-    await cleanup()
-    const extra = before ? [...before.added, ...before.modified, ...before.deleted, ...before.reappeared] : []
-    throw new Error(`the remote candidate differs from the revision before any command ran${extra.length ? ` (${extra.slice(0, 5).join(', ')})` : ''}; the directory is not a faithful copy`)
+  // A kept smoke instance becomes this drive's only when all of it is proved: the
+  // service units are the same starts, the candidate is still the revision. The
+  // smoke's logs are copied first, so a claim never leaves records without them.
+  const claim = async () => {
+    const { instance, smoke, plan } = continueFrom
+    const fresh = { remoteDir, control }
+    const refuse = async (reason, detail) => {
+      const discarded = await discardInstance({ target, instance })
+      result.continuation = { continued: false, reason, detail, discarded }
+      await Promise.all(plan.smokeRun.flatMap((id) => [`${id}.log`, `${id}.stdout`].map((f) => fs.rm(path.join(dir, f), { force: true }))))
+      ;({ remoteDir, control } = fresh)
+      materialized.detail = null
+      return null
+    }
+    const smokeDir = path.join(runDir, smoke.dir)
+    try {
+      for (const id of plan.smokeRun) for (const file of [`${id}.log`, `${id}.stdout`]) await fs.copyFile(path.join(smokeDir, file), path.join(dir, file))
+    } catch (error) { return refuse('unreadable', `the smoke's logs could not be copied: ${error.message}`) }
+    remoteDir = instance.remoteDir
+    control = controlDir(remoteDir)
+    const bound = signal ? AbortSignal.any([signal, AbortSignal.timeout(90000)]) : AbortSignal.timeout(90000)
+    const claimed = await runProcess({ command: SSH, args: [...sshArgs, claimInstance(remoteDir, { control, services: instance.services })], signal: bound })
+    if (claimed.code !== 0 || claimed.cancelled) return refuse('unreadable', `the claim could not run: ${claimed.stderr?.slice(0, 300) ?? `exit ${claimed.code}`}`)
+    const said = claimed.stdout.split(NL).find((l) => l.startsWith('devpanel-claim: '))?.slice('devpanel-claim: '.length) ?? 'unreadable the claim said nothing'
+    if (said !== 'ok') {
+      const space = said.indexOf(' ')
+      return refuse(space < 0 ? said : said.slice(0, space), space < 0 ? null : said.slice(space + 1))
+    }
+    const listed = await listRemote()
+    if (!listed) return refuse('unreadable', materialized.detail)
+    const drift = compareCandidate(candidateEntries, listed)
+    const bad = [...drift.modified, ...drift.deleted, ...drift.reappeared]
+    if (bad.length) return refuse('candidate-changed', `the instance no longer holds the revision (${bad.slice(0, 5).join(', ')}${bad.length > 5 ? ', …' : ''})`)
+    const reopened = await runProcess({ command: SSH, args: [...sshArgs, reopenInstance(remoteDir, { control })], signal: bound })
+    if (reopened.code !== 0 || reopened.cancelled) return refuse('unreadable', `the instance could not be reopened: ${reopened.stderr?.slice(0, 300) ?? ''}`)
+    materialized.method = 'smoke-instance'
+    materialized.detail = null
+    materialized.beforeCommands = { modified: 0, deleted: 0, added: drift.added.length, reappeared: 0 }
+    return new Map(smoke.commands.filter((c) => plan.smokeRun.includes(c.id)).map((c) => [c.id, { ...c, fromSmoke: smoke.dir }]))
+  }
+  const carried = continueFrom ? await claim() : null
+
+  if (!carried) {
+    // Archive the verified reconstruction; prove the bytes arrived intact.
+    const archive = path.join(dir, 'candidate.tar')
+    const tar = await runProcess({ command: 'tar', args: ['-C', rebuilt, '--exclude=.git', '-cf', archive, '.'], signal })
+    if (tar.code !== 0) throw new Error(`tar failed: ${tar.stderr.slice(0, 200)}`)
+    // Hashed and sent as streams: the archive of a large candidate is hundreds of
+    // megabytes, and reading it whole into memory for each check spiked the
+    // server's RSS (and cannot work past 2 GiB). The bytes go to stdin as bytes;
+    // no string round-trip re-encodes them.
+    const localHash = await sha256File(archive)
+    materialized.archiveSha256 = localHash
+    materialized.archiveBytes = (await fs.stat(archive)).size
+    let upload
+    try {
+      upload = await runProcess({
+        command: SSH, args: [...sshArgs, `mkdir ${shellQuote(remoteDir)} && mkdir -m 0700 ${shellQuote(control)} && cat > ${shellQuote(remoteDir + '.tar')} && sha256sum ${shellQuote(remoteDir + '.tar')} | cut -d' ' -f1 && tar -C ${shellQuote(remoteDir)} -xf ${shellQuote(remoteDir + '.tar')} && rm -f ${shellQuote(remoteDir + '.tar')}`],
+        stdin: createReadStream(archive), signal
+      })
+    } finally {
+      // Only its hash is evidence; a local copy kept per check grows without
+      // bound. The candidate is rebuildable from base + patch.
+      await fs.rm(archive, { force: true })
+    }
+    if (upload.code !== 0) throw new Error(`upload failed: ${upload.stderr.slice(0, 300)}`)
+    const remoteHash = upload.stdout.trim().split(NL)[0]
+    materialized.remoteSha256 = remoteHash
+    if (remoteHash !== localHash) {
+      materialized.verified = false
+      throw new Error('archive hash on arrival differs from the archive sent; the result would not be bound to the revision')
+    }
+
+    // Before any command: the remote directory must contain exactly the
+    // candidate — nothing missing, nothing extra. A stale or pre-populated
+    // directory would let a fixture that is not in the candidate make a test pass.
+    const arrived = await listRemote()
+    const before = arrived ? compareCandidate(candidateEntries, arrived) : null
+    materialized.beforeCommands = before ? { modified: before.modified.length, deleted: before.deleted.length, added: before.added.length, reappeared: before.reappeared.length } : null
+    if (!before || before.modified.length || before.deleted.length || before.added.length || before.reappeared.length) {
+      materialized.verified = false
+      await cleanup()
+      const extra = before ? [...before.added, ...before.modified, ...before.deleted, ...before.reappeared] : []
+      throw new Error(`the remote candidate differs from the revision before any command ran${extra.length ? ` (${extra.slice(0, 5).join(', ')})` : ''}; the directory is not a faithful copy`)
+    }
   }
 
   const finalizerIds=new Set((target.finallyCommands??[]).map(c=>c.id))
   const all = [...(target.commands ?? []), ...(target.finallyCommands ?? [])]
   const units = Object.fromEntries(all.filter(c => c.kind === 'candidate').map(c => [c.id, unitName(remoteDir, c.id)]))
-  const options = { control, units, confinement }
+  const options = { control, units, confinement, keepSeconds: keep?.seconds ?? 0 }
   const remoteSpawn = c => ({command:SSH,remoteTimeout:true,args:[...sshArgs,managedRemoteCommand(remoteDir,c,finalizerIds.has(c.id),options)]})
   const stop = async({ services = true } = {})=>{
     try {
@@ -376,7 +436,7 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized,
     // the verified candidate is handed to it. Ownership is not in the
     // fingerprint (modes are), so arrival evidence is unaffected.
     const user = hasCandidates ? confinement.user : undefined
-    if (hasCandidates) {
+    if (hasCandidates && !carried) {
       const own = await runProcess({ command: SSH, args: [...sshArgs, `if [ "$(id -u)" = 0 ]; then chown -R -h ${shellQuote(user + ':')} ${shellQuote(remoteDir)}; fi`], signal })
       if (own.code !== 0) throw new Error(`could not hand the candidate to ${user}: ${own.stderr.slice(0, 200)}`)
     }
@@ -393,8 +453,30 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized,
       : { level: 'remote-enforced', user, probe: probe.map(p => ({ id: p.id, passed: p.passed, log: p.log })) }
   }
   try {
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => runOne({ command, cwd: null, dir, clock, signal, spawn: remoteSpawn }) })
+    // A continued drive walks the same declared order under the same skip rules
+    // and only does not execute what the smoke ran, so comparison and gating
+    // read the records a fresh drive with these outcomes would leave: a smoke
+    // command a fresh drive would have skipped reads as not run.
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? runOne({ command, cwd: null, dir, clock, signal, spawn: remoteSpawn }) })
   } finally {
+    if (carried) {
+      const { instance, smoke, plan } = continueFrom
+      const counted = new Set(result.commands.map((c) => c.id))
+      const notCounted = plan.smokeRun.filter((id) => !counted.has(id))
+      await Promise.all(notCounted.flatMap((id) => [`${id}.log`, `${id}.stdout`].map((f) => fs.rm(path.join(dir, f), { force: true }))))
+      result.continuedFrom = { dir: smoke.dir, revision: instance.revision, remoteDir, services: instance.services,
+        smokeRun: plan.smokeRun.filter((id) => counted.has(id)), ran: result.commands.filter((c) => !c.fromSmoke).map((c) => c.id),
+        outOfPosition: plan.outOfPosition, declaredBeforeServices: plan.declaredBeforeServices,
+        notCounted: notCounted.map((id) => ({ id, reason: (result.skipped ?? []).find((s) => s.id === id)?.reason ?? 'the drive ended before it', dir: smoke.dir, log: `${id}.log` })),
+        smokeRunDurationMs: result.commands.filter((c) => c.fromSmoke).reduce((sum, c) => sum + (c.durationMs ?? 0), 0),
+        keptForMs: Math.max(0, clock.now() - Date.parse(instance.keptAt)) }
+      // A fresh drive would not have started these: a finalizer must not find them.
+      const skippedServices = plan.services.filter((id) => notCounted.includes(id)).map((id) => unitName(remoteDir, id))
+      if (skippedServices.length) {
+        const stopped = await runProcess({ command: SSH, args: [...sshArgs, stopNamedUnits(remoteDir, { control, units: skippedServices })], signal: AbortSignal.timeout(60000) }).catch((error) => ({ code: null, stderr: error.message }))
+        materialized.skippedServicesStopped = { units: skippedServices, confirmed: stopped.code === 0 && !stopped.cancelled, stderr: stopped.stderr?.slice(-2000) }
+      }
+    }
     // Services (the started application) outlive this stop: a finalizer may
     // still need them (a report collector). The final stop takes them too.
     await stop({ services: false })
@@ -403,6 +485,39 @@ async function runCommandsOverSsh ({ target, rebuilt, dir, result, materialized,
     for (const command of target.finallyCommands ?? []) {
       result.commands.push(await runOne({ command, cwd: null, dir, clock, spawn: remoteSpawn }))
     }
+  }
+  // A smoke that passed leaves its instance for the full drive. Anything short of
+  // an instance proved quiet, listed and armed takes the ordinary end below, so
+  // keeping never changes what the smoke's own result says.
+  const keepInstance = async () => {
+    const services = (target.commands ?? []).filter((c) => c.kind === 'candidate' && c.service === true)
+    if (signal?.aborted) return 'the drive was cancelled'
+    if (!services.length) return 'it has no service'
+    const unsettled = result.commands.find((c) => c.required !== false && !c.passed)?.id ?? result.commands.find((c) => c.exitCode === null || c.timedOut || c.signal)?.id
+    if (unsettled || result.skipped?.length) return `${unsettled ?? result.skipped[0].id} did not finish normally`
+    await stop({ services: false })
+    if (!materialized.remoteTermination?.confirmed) return 'its commands could not be proved stopped'
+    const unitsOf = services.map((c) => ({ id: c.id, unit: unitName(remoteDir, c.id) }))
+    const read = await runProcess({ command: SSH, args: [...sshArgs, readServiceIdentity(unitsOf.map((u) => u.unit))], signal: AbortSignal.timeout(60000) })
+    if (read.code !== 0) return `its services could not be read: ${read.stderr?.slice(0, 200)}`
+    const identity = new Map(read.stdout.split(NL).filter(Boolean).map((l) => { const [unit, state, id] = l.split('\t'); return [unit, { state, id }] }))
+    const down = unitsOf.find((u) => identity.get(u.unit)?.state !== 'active' || !identity.get(u.unit)?.id)
+    if (down) return `service ${down.id} is not active`
+    const listed = await listRemote()
+    if (!listed) return 'its candidate could not be listed with the service running'
+    const drift = compareCandidate(candidateEntries, listed)
+    if (drift.modified.length || drift.deleted.length || drift.reappeared.length) return 'its commands changed the candidate'
+    const armed = await runProcess({ command: SSH, args: [...sshArgs, armInstanceExpiry(remoteDir, { control, seconds: keep.seconds })], signal: AbortSignal.timeout(60000) })
+    if (armed.code !== 0) return `its expiry timer could not be armed: ${armed.stderr?.slice(0, 200)}`
+    materialized.remoteEntries = listed
+    materialized.cleanup = { deferred: true, remoteDir }
+    result.kept = { remoteDir, services: unitsOf.map((u) => ({ ...u, invocationId: identity.get(u.unit).id })), keptAt: clock.iso(), keepSeconds: keep.seconds, expiresAt: new Date(clock.now() + keep.seconds * 1000).toISOString() }
+    return null
+  }
+  if (keep) {
+    const notKept = await keepInstance()
+    if (!notKept) { judge(result); return }
+    result.instanceNotKept = notKept
   }
   await stop()
   materialized.remoteEntries = await listRemote(signal?.aborted ? AbortSignal.timeout(30000) : signal)

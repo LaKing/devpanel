@@ -24,8 +24,8 @@ import { captureIntegrity, integrityChanges, readIntegrity, writeIntegrity } fro
 import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
 import { extractOutput, describeContract } from './structured-output.mjs'
-import { runChecks, compareWithBaseline } from './checks.mjs'
-import { baselineCacheFor, tierTarget } from './baseline-cache.mjs'
+import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
+import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
@@ -48,7 +48,8 @@ export function harnessUnavailable (harnesses, id) {
 /** One check attempt as kept on the check that replaced or outlived it (check-log.mjs reads its logs). */
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
-  commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log })) })
+  commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log, ...(x.fromSmoke ? { fromSmoke: x.fromSmoke } : {}) })),
+  ...(c.continuedFrom ? { continuedFrom: c.continuedFrom } : {}), ...(c.continuation ? { continuation: c.continuation } : {}) })
 /** What a step keeps of which drive it was asked about, and which one its prompt quoted (plan()). */
 const recheckFields = ({ recheckDrive, reconcileNotice, checksSeen }) => ({ ...(recheckDrive ? { recheckDrive } : {}), ...(reconcileNotice ? { reconcileNotice } : {}), ...(checksSeen ? { checksSeen } : {}) })
 const targetKeyOf = (target) => crypto.createHash('sha256').update(JSON.stringify(target)).digest('hex')
@@ -1684,8 +1685,24 @@ export class Engine {
     // metrics count the failures that came after agreement.
     const afterApproval = this.run.approvals.some((a) => a.revision === current)
     const tierOf = level ? { tier: level } : {}
+    // An instance kept for another revision has nothing left to continue.
+    const stale = this.run.keptInstance && this.run.keptInstance.revision !== current
+    if (stale) await this.discardKeptInstance('revision-changed')
+    const instance = level ? await this.instanceDecision({ configured, level, target, force, overrideTarget, current, stale }) : {}
     await this.persist({ type: 'checks-started', revision: current, target: target.kind, ...tierOf, step: step?.number ?? null })
-    const result = await this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory })
+    const result = await this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory, keep: instance.keep ?? null, continueFrom: instance.continueFrom ?? null })
+    // Why this full drive ran from scratch; the attempts say so when a retry replaced the drive that knew.
+    if (level === 'full' && !result.continuedFrom) {
+      const replaced = result.attempts?.find((a) => a.continuedFrom)
+      result.continuation ??= instance.refused ?? result.attempts?.find((a) => a.continuation)?.continuation ?? (replaced ? { continued: false, reason: 'retry', detail: `the drive that continued the smoke (${replaced.dir}) did not stand, and a retry always runs from scratch` } : undefined)
+      if (!result.continuation) delete result.continuation
+    }
+    // A smoke's instance waits for the full drive only if the gate passed it.
+    if (result.kept) {
+      const kept = { ...result.kept, revision: current, smokeDir: result.dir, targetKey: targetKeyOf(target) }
+      if (gatingResult(result, this.run) === 'passed') this.run.keptInstance = kept
+      else await this.discardInstanceRecord(kept, 'smoke-gate')
+    }
     // What later revisions' retry decisions read (selftest-retry.mjs). A failure a retry
     // cleared is instability, not a reproduction: only a standing one counts.
     const retryEvidence = { targetKey: targetKeyOf(target), reproduced: reproducedSelftests(result),
@@ -1699,8 +1716,55 @@ export class Engine {
       // stays measurable after a later revision drops this from checkResults.
       runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence,
       // Survives a new revision, so the next audit still reads what the gate passed over.
-      ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}) })
-    await this.persist({ type: 'checks', revision: current, ...tierOf, result: result.result, commands: result.commands?.length ?? 0 })
+      ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}),
+      ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}) })
+    await this.persist({ type: 'checks', revision: current, ...tierOf, result: result.result, commands: result.commands?.length ?? 0,
+      ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}) })
+  }
+
+  /**
+   * What one tier's drive does about a kept instance: a smoke may keep its own
+   * (`keep`), a full drive continues the one kept for it (`continueFrom`) or says
+   * why it runs from scratch (`refused`). Only what the panel can tell here is
+   * decided here; the rest is proved on the staging host (checks.mjs).
+   */
+  async instanceDecision ({ configured, level, target, force, overrideTarget, current, stale }) {
+    const plan = continuationPlan(configured)
+    if (!plan) return {}
+    if (level === 'smoke') return !force && !overrideTarget && !plan.refusal ? { keep: { seconds: plan.keepSeconds } } : {}
+    const refuse = (reason, detail = null) => ({ refused: { continued: false, reason, detail } })
+    if (force || overrideTarget || this.run.checkRefresh) { await this.discardKeptInstance('refresh'); return refuse('refresh', 'Refresh checks always runs from scratch') }
+    if (plan.refusal) return refuse(plan.refusal)
+    if (stale) return refuse('revision-changed', 'the instance was kept for another revision')
+    const kept = this.run.keptInstance
+    if (!kept) {
+      const smoke = this.run.checkResults.filter((c) => c.revision === current && c.tier === 'smoke').at(-1)
+      if (smoke?.attempts?.length) return refuse('smoke-retried', 'its smoke needed a retry, so this drive proves its commands again')
+      const discarded = (this.run.discardedInstances ?? []).filter((d) => d.revision === current).at(-1)
+      return refuse('smoke-not-kept', smoke?.instanceNotKept ?? (discarded ? `it was discarded: ${discarded.reason}` : smoke ? `its smoke was ${smoke.result}` : 'this revision has no smoke result'))
+    }
+    if (kept.targetKey !== targetKeyOf(tierTarget(configured, 'smoke'))) { await this.discardKeptInstance('target-changed'); return refuse('target-changed', 'the smoke was driven under another definition') }
+    const smoke = this.run.checkResults.find((c) => c.dir === kept.smokeDir)
+    if (!smoke) { await this.discardKeptInstance('smoke-record-missing'); return refuse('unreadable', `no record of the smoke in ${kept.smokeDir}`) }
+    // Cleared before the claim changes anything on the host: from here it is this drive's.
+    this.run.keptInstance = null
+    await this.persist()
+    return { continueFrom: { instance: kept, smoke, plan } }
+  }
+
+  /** Remove the kept instance, when nothing will continue it. Its failure decides nothing: the expiry timer stays armed. */
+  async discardKeptInstance (reason) {
+    const kept = this.run.keptInstance
+    if (!kept) return
+    this.run.keptInstance = null
+    await this.discardInstanceRecord(kept, reason)
+  }
+
+  async discardInstanceRecord (kept, reason) {
+    const outcome = await discardInstance({ target: this.run.checkRefresh?.target ?? this.snapshot.checks.target, instance: kept })
+    const record = { remoteDir: kept.remoteDir, revision: kept.revision, reason, at: this.clock.iso(), ...outcome }
+    ;(this.run.discardedInstances ??= []).push(record)
+    await this.persist({ type: 'instance-discarded', ...record })
   }
 
   /**
@@ -1709,7 +1773,7 @@ export class Engine {
    * by the revision checks and a reconciled candidate's revalidation (which
    * passes no `history`: another base, so no earlier revision speaks for it).
    */
-  async checkCandidate ({ target, revision: current, fingerprint: fp, baseCommit, baseline, workspacePath, history = [] }) {
+  async checkCandidate ({ target, revision: current, fingerprint: fp, baseCommit, baseline, workspacePath, history = [], keep = null, continueFrom = null }) {
     const common = {
       target,
       baseCommit,
@@ -1762,7 +1826,8 @@ export class Engine {
       return (await cache?.lookup(name)) ?? runChecks({ ...common, revision: null, base: true, dirName: name })
     }
     const [first, early] = await Promise.all([
-      runChecks({ ...common, revision: current, fingerprint: fp }),
+      // Only the first attempt keeps or continues an instance: every retry proves the commands again.
+      runChecks({ ...common, revision: current, fingerprint: fp, keep, continueFrom }),
       (async () => {
         const found = await resolveKnown()
         if (found) return { known: found }
@@ -1828,7 +1893,15 @@ export class Engine {
     // A base from another run of the same key says so to every reader.
     if (base?.reused && result.baselineComparison) result.baselineComparison.reused = base.reused
     return retryNewSelftestFailures({ result, limit: Number.isInteger(target.retryFailed) ? target.retryFailed : 1, aborted: () => this.controller.signal.aborted,
-      rerun: () => runChecks({ ...common, revision: current, fingerprint: fp }), record: attemptRecord, persist: (event) => this.persist(event), earlier,
+      rerun: async () => {
+        // The first drive's instance has no use now: this one starts from scratch and keeps nothing.
+        if (result.kept) {
+          const kept = { ...result.kept, revision: current }
+          delete result.kept
+          await this.discardInstanceRecord(kept, 'selftest-retry')
+        }
+        return runChecks({ ...common, revision: current, fingerprint: fp })
+      }, record: attemptRecord, persist: (event) => this.persist(event), earlier,
       compare: async (retry) => {
         const comparison = base && base.result !== 'unavailable' ? await compareWithBaseline({ runDir: common.runDir, baseline: base, candidate: retry }) : { ...(result.baselineComparison ?? {}) }
         const again = await compareSelftestReports({ runDir: common.runDir, target, base, candidate: retry, sourceRevision, unstable: await stability.prepare({ check: retry, revision: current, fp, workspacePath, baseCommit }) })
@@ -3233,6 +3306,9 @@ export class Engine {
         await this.settleChecks()
         continue
       }
+      // A kept smoke instance waits only for the full drive of its round: anything
+      // but that drive or another review of the round means nothing will continue it.
+      if (this.run.keptInstance && !this.checksInFlight && next.kind !== 'checks' && !concurrentReview(next)) await this.discardKeptInstance('no-full-drive-follows')
       if (next.kind === 'terminal') {
         if (await this.finish(next) === 'returned') continue
         break
@@ -3304,6 +3380,7 @@ export class Engine {
       // A failed runtime cannot leave an unaccepted release looking complete.
       // Injected crash tests model process death: recovery must remain explicit.
       if (!error.injected) {
+        await this.discardKeptInstance('run-ended').catch(() => {})
         try { await this.recoverUnacceptedRelease(error.message) }
         catch (recoveryError) {
           error.recoveryError = recoveryError.message
@@ -3313,6 +3390,8 @@ export class Engine {
       throw error
     }
     await this.settleChecks()
+    // However the drive ended: a pause has no time limit, and nothing here waits on staging.
+    await this.discardKeptInstance('run-ended')
     if (['blocked','failed','cancelled'].includes(this.run.status) || (this.run.status === 'completed' && this.run.outcome !== 'resolved')) await this.recoverUnacceptedRelease(`Run ended ${this.run.status}/${this.run.outcome}`)
     return this.run
   }

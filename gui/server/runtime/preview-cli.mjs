@@ -7,6 +7,7 @@
  * Side-effect free: nothing is invoked, probed, locked or created.
  */
 import { previewRun, symbolic } from './preview.mjs'
+import { continuationPlan } from './baseline-cache.mjs'
 import { projectPath } from '../project-path.mjs'
 
 const args = process.argv.slice(2)
@@ -98,6 +99,13 @@ if (p.checks.target?.tiers) {
   const ids = [...(p.checks.target.commands ?? []), ...(p.checks.target.finallyCommands ?? [])].map((x) => x.id)
   console.log(`  ${c.dim}smoke${c.off}      every revision, beside the reviews: ${p.checks.target.tiers.smoke.join(', ')}`)
   console.log(`  ${c.dim}full${c.off}       once, on the approved revision; closure counts only this: ${ids.join(', ')}`)
+  const continuing = continuationPlan(p.checks.target)
+  if (continuing.refusal) console.log(`  ${c.dim}continue${c.off}   no: the full drive runs from scratch (${continuing.refusal})`)
+  else {
+    console.log(`  ${c.dim}continue${c.off}   the full drive continues the smoke's running instance, kept ${continuing.keepSeconds}s: skips ${continuing.smokeRun.join(', ')}; runs ${continuing.run.join(', ') || 'no command'}, then every finalizer`)
+    if (continuing.outOfPosition.length) console.log(`  ${c.dim}order${c.off}      out of declared position: ${continuing.outOfPosition.map((o) => `${o.id} (declared before ${o.declaredBefore.join(', ')})`).join('; ')}`)
+    if (continuing.declaredBeforeServices.length) console.log(`  ${c.yellow}warning${c.off}    ${continuing.declaredBeforeServices.join(', ')} will run after the service started: if the service depends on it at boot, or it needs the service down, set tiers.continueSmoke: false or declare it later`)
+  }
 } else if (p.checks.target) console.log(`  ${c.dim}timing${c.off}     ${p.checks.target.timing ?? 'every-revision'}`)
 if (p.checks.target?.baselineCache) {
   const b = p.checks.target.baselineCache

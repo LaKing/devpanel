@@ -41,7 +41,7 @@ is an example. A project file declares infrastructure only: it does not authoriz
 | `testDrive.commands` | Ordered `{id, run, timeoutSeconds, required}` commands run in the verified candidate on staging. At least one must be required. |
 | `testDrive.finallyCommands` | Optional ordered log collection and process cleanup. Attempted even on command failure or cancellation, each with its own timeout. Command ids must be unique across both lists. |
 | `testDrive.timing` | `approved` (default): a revision is test-driven only after every reviewer approved it, so the ~20 minute drive is not spent on revisions sent back anyway. `every-revision`: each revision, beside its reviews. |
-| `testDrive.tiers` | `{smoke: [ids]}`: the smoke tier runs on every revision beside the reviews, the full drive once on the approved revision; only the full drive counts for closure. See "Tiers" below. |
+| `testDrive.tiers` | `{smoke: [ids], continueSmoke, keepSeconds}`: the smoke tier runs on every revision beside the reviews, the full drive once on the approved revision, continuing the smoke's running instance (`continueSmoke: false` opts out; `keepSeconds` is how long it waits); only the full drive counts for closure. See "Tiers" below. |
 | `testDrive.baselineCache` | `{stagingFiles, environment, maxEntries, maxAgeDays}`: reuse each tier's base drive across runs on an exact key. See "Baseline cache" below. |
 | `testDrive.retryFailed` | How often a failed drive runs again on the same revision before the failure counts (default 1, 0 to 3). A pass after a failure is recorded as `flaky`. A passing drive gated only by new selftest failures runs once more too (when this is at least 1). Neither runs when an earlier revision of the run already reproduced the failure (execution-contract.md). |
 | `testDrive.notes` | Prerequisites, intended coverage, fixture choices, and limitations. |
@@ -142,6 +142,28 @@ smoke never stands in for it. Every command a smoke command `needs` or `join`s
 must be in the smoke tier; `tiers` with `timing: every-revision` is refused.
 Each tier has its own base drive (`compareBaseline`), so the first smoke never
 waits for a full base drive. Check records and events carry `tier`.
+
+The full drive does not repeat the smoke. When the smoke passed and its service
+is proved still running and unchanged, the full drive **continues that instance**:
+it executes only the target's commands the smoke did not run, in declared order,
+then every finalizer, and records `continuedFrom`. The smoke's instance waits up to
+`tiers.keepSeconds` (default 1800, 60 to 7200; its services get that much longer a
+life), removed by a timer on the staging host if the panel never comes back. Any
+failed proof runs from scratch and records why in `continuation`. It is still the
+full drive: closure and the baseline comparison treat it like any other, and a
+failed one retries from scratch. execution-contract.md has the proofs and reasons.
+
+**Limitation.** A command declared before a smoke service (say `lint` between
+`prepare` and `start`, with `lint` outside the smoke) runs after the service started,
+so the service never sees its effect. That is harmless for a command that only reads
+the candidate. If the service depends on it at boot (fixtures it loads at start), or
+it needs the service down (a migration holding the data directory), the later
+commands test a service the declared order would not have produced, and a false pass
+counts as a full result. Validation cannot tell, so `npm run preview` warns and the
+record names it (`declaredBeforeServices`). For such a target, declare the command
+later or set `tiers.continueSmoke: false`, which is also the choice when a smoke
+finalizer changes application data: a smoke's finalizers run before the commands that
+continue.
 
 ### Baseline cache: one base drive per exact key, across runs
 

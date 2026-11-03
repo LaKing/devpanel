@@ -1,10 +1,12 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { engineFixture, scriptFor, blocking } from './fakes/fixture.mjs'
-import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
+import { engineFixture, scriptFor, blocking, simulateProcessDeath } from './fakes/fixture.mjs'
+import { installRemoteManager } from './fakes/remote-manager.mjs'
+import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents, runDir } from '../server/runtime/store.mjs'
+import { classifyTest, historyDir, readDrives, recordDrive } from '../server/runtime/selftest-history.mjs'
 
 export const name = 'check tiers — a smoke beside the reviews, the full drive once after approval, and only the full drive closes; a base drive reused across runs'
 
@@ -16,11 +18,11 @@ const revision = (p) => (p.match(/Current revision: (sha256:[a-f0-9]{64})/) ?? [
  * `reject` get a blocking finding from the reviewer. `f` reuses a fixture for
  * a second run on the same issue and checkout.
  */
-async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null, onRound = null }) {
+async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null, onRound = null, target = null, onAudit = null, hooks = null, beforeRun = null }) {
   // The fixture's harness keeps the script it was made with; a later run on
   // the same fixture reaches its own engine and reviews through `state`.
   const state = f?.state ?? { engine: null, log: [], reject }
-  Object.assign(state, { log: [], reject, onRound })
+  Object.assign(state, { log: [], reject, onRound, onAudit })
   const script = async (turn) => {
     const { stepId, role, round, prompt } = turn
     if (stepId.startsWith('brief')) return fence({ targetRole: 'worker', prompt: 'Do the work.', windowDecision: 'keep' })
@@ -30,6 +32,7 @@ async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null,
       return fence({ summary: 'Implemented', basedOnRevision: revision(prompt) })
     }
     if (stepId.startsWith('audit-')) {
+      await state.onAudit?.(round, state)
       state.log.push({ role, round, revision: revision(prompt), checksRunning: Boolean(state.engine.checksInFlight) })
       if (state.reject.has(round)) return fence({ verdict: 'changes-needed', artifactRevision: revision(prompt), findings: [blocking(`${role}-${round}`)], priorFindings: [] })
       return fence({ verdict: 'approved', artifactRevision: revision(prompt), findings: [], priorFindings: [] })
@@ -40,9 +43,11 @@ async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null,
   if (!f) {
     f = await engineFixture({ playbook: 'implementation', script })
     f.state = state
-    await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
-      `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n${extra}    tiers:\n      smoke: [boot]\n    commands:\n      - id: boot\n        run: ${JSON.stringify(boot)}\n      - id: deep\n        run: ${JSON.stringify(deep)}\n`)
+    await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'), target
+      ? `\nchecks: ${JSON.stringify({ requirement: 'required', target })}\n`
+      : `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n${extra}    tiers:\n      smoke: [boot]\n    commands:\n      - id: boot\n        run: ${JSON.stringify(boot)}\n      - id: deep\n        run: ${JSON.stringify(deep)}\n`)
   }
+  await beforeRun?.(f)
   const runOptions = { participants: { 'auditor-1': { model: 'gpt-6-astra' } } }
   const resolved = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, projectId: 'devpanel-project' })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
@@ -51,7 +56,8 @@ async function scenario ({ boot, deep, reject = new Set(), extra = '', f = null,
     issuePath: f.issuePath, projectPath: f.projectPath, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider,
     configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery, runOptions
   })
-  await engine.drive()
+  if (hooks) Object.assign(engine.hooks, hooks)
+  await (hooks ? engine.drive().catch(() => {}) : engine.drive())
   const { events } = await readEvents(f.issuePath, engine.runId)
   return { engine, log: state.log, events, f }
 }
@@ -83,6 +89,7 @@ export default async function (t) {
     const closing = engine.run.checkResults.filter((c) => c.revision === second)
     t.eq('the closing revision holds a smoke and a full result', closing.map((c) => c.tier), ['smoke', 'full'])
     t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
+    t.eq('a local target has no instance to continue, and says so', closing.find((c) => c.tier === 'full')?.continuation?.reason, 'local-target')
     await releaseWorkspace(engine)
   }
 
@@ -204,5 +211,255 @@ export default async function (t) {
     t.ok('and nothing is marked reused', three.engine.run.baselineChecks.every((b) => !b.reused))
     await releaseWorkspace(three.engine)
     await fs.rm(dir, { recursive: true, force: true })
+  }
+
+  /*
+   * The whole engine on an SSH target, through the fake service manager without
+   * the fence (check-continuation.test.mjs has the drive's own cases). Every
+   * command says it ran, outside the candidate; `workdir` empty means nothing was
+   * left on the host.
+   */
+  const sshDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-tier-ssh-')))
+  const managerEnv = await installRemoteManager(sshDir)
+  await fs.mkdir(path.join(sshDir, 'units'))
+  await fs.writeFile(path.join(sshDir, 'units', 'no-fence'), '')
+  await fs.writeFile(path.join(sshDir, 'ssh'), ['#!/bin/sh', managerEnv, 'for last; do :; done', 'exec /bin/sh -c "$last"'].join('\n') + '\n', { mode: 0o755 })
+  const saved = { bin: process.env.DEVPANEL_SSH_BIN, host: process.env.CHECK_TEST_HOST }
+  process.env.DEVPANEL_SSH_BIN = path.join(sshDir, 'ssh')
+  process.env.CHECK_TEST_HOST = 'shim'
+  const executedFile = path.join(sshDir, 'executed')
+  const executed = async () => (await fs.readFile(executedFile, 'utf8').catch(() => '')).split('\n').filter(Boolean)
+  const cmd = (id, run = 'true', extra = {}) => ({ id, kind: 'candidate', run: `echo ${id} >> ${executedFile}; ${run}`, ...extra })
+  const service = { id: 'start', kind: 'candidate', service: true, run: `echo start >> ${executedFile}; exec sleep 120` }
+  const sshTarget = async (commands, smoke, { retryFailed = 0, tiers = {}, ...rest } = {}) => {
+    await fs.rm(executedFile, { force: true })
+    const workdir = await fs.realpath(await fs.mkdtemp(path.join(sshDir, 'remote-')))
+    return { kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, retryFailed, confinement: { user: os.userInfo().username, home: os.homedir() }, tiers: { smoke, ...tiers }, commands, ...rest }
+  }
+  const STANDARD = [cmd('prepare'), service, cmd('ready'), cmd('deep')]
+  const SMOKE = ['prepare', 'start', 'ready']
+  const left = (target) => fs.readdir(target.ssh.workdir)
+  const fullOf = (engine) => engine.run.checkResults.filter((c) => c.tier === 'full').at(-1)
+  const smokeOf = (engine) => engine.run.checkResults.filter((c) => c.tier === 'smoke').at(-1)
+
+  try {
+    t.section('the full drive continues the smoke\'s instance, and closure counts it as the full drive')
+    {
+      const target = await sshTarget(STANDARD, SMOKE)
+      const { engine, events } = await scenario({ target })
+      t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason} ${JSON.stringify(fullOf(engine)?.continuation)}`)
+      t.eq('each command executed once', await executed(), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('the record states what it continued', fullOf(engine)?.continuedFrom?.dir, smokeOf(engine)?.dir)
+      t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
+      t.eq('the verification is the same as any full drive\'s', fullOf(engine)?.tier, 'full')
+      t.eq('its history says so', engine.run.checkHistory.find((h) => h.tier === 'full')?.continuedFrom, smokeOf(engine)?.dir)
+      t.eq('its event says so', events.find((e) => e.type === 'checks' && e.tier === 'full')?.continuedFrom, smokeOf(engine)?.dir)
+      t.eq('the instance is no longer held', engine.run.keptInstance, null)
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine)
+    }
+
+    t.section('a passing non-prefix tier continues and closes')
+    {
+      const target = await sshTarget([cmd('prepare'), cmd('lint'), service, cmd('ready'), cmd('deep')], SMOKE)
+      const { engine } = await scenario({ target })
+      t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+      t.eq('the command outside the smoke ran on the instance', await executed(), ['prepare', 'start', 'ready', 'lint', 'deep'])
+      t.eq('and is on the record as out of position', fullOf(engine)?.continuedFrom?.declaredBeforeServices, ['lint'])
+      t.eq('closure saw the passing full drive', engine.run.closure?.conditions?.checksSatisfied, true)
+      await releaseWorkspace(engine)
+    }
+
+    t.section('a rejected revision\'s instance is discarded before the author\'s next turn; the approved one is continued')
+    {
+      const target = await sshTarget(STANDARD, SMOKE)
+      let leftAtAuthor = null
+      const { engine, events } = await scenario({ target, reject: new Set([0]), onRound: async (round) => { if (round === 1) leftAtAuthor = await left(target) } })
+      const [first, second] = engine.run.revisions.map((r) => r.fingerprint)
+      t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+      t.eq('the rejected instance was gone when the author worked', leftAtAuthor, [])
+      t.eq('discarded for that reason', engine.run.discardedInstances?.map((d) => [d.revision, d.reason, d.passed]), [[first, 'no-full-drive-follows', true]])
+      t.ok('with an event', events.some((e) => e.type === 'instance-discarded' && e.revision === first))
+      t.eq('the full drive continued the approved revision\'s smoke', [fullOf(engine)?.revision, fullOf(engine)?.continuedFrom?.dir], [second, smokeOf(engine)?.dir])
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine)
+    }
+
+    t.section('a cancelled run discards its instance')
+    {
+      const target = await sshTarget(STANDARD, SMOKE)
+      let held = null
+      // The smoke has finished and kept its instance when the operator cancels.
+      const { engine } = await scenario({ target, hooks: {}, onAudit: async (round, state) => {
+        await state.engine.checksInFlight
+        held = state.engine.run.keptInstance
+        state.engine.cancel('test')
+      } })
+      t.ok('an instance was held when the run was cancelled', Boolean(held?.remoteDir))
+      t.eq('the run is cancelled', engine.run.status, 'cancelled', `${engine.run.blockedReason}`)
+      t.eq('the instance is not held now', engine.run.keptInstance ?? null, null)
+      t.eq('discarded for the run ending', engine.run.discardedInstances?.map((d) => [d.reason, d.passed]), [['run-ended', true]])
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine).catch(() => {})
+    }
+
+    t.section('a restart: the instance survives on the record, and the proof decides')
+    {
+      const crashing = () => ({ beforeInvoke: async (x) => {
+        if (!Object.values(x.run.participants).some((p) => p.pendingInvocation?.cursor?.stepId?.startsWith('audit-'))) return
+        delete x.hooks.beforeInvoke
+        throw Object.assign(new Error('owner crashed'), { injected: true })
+      } })
+      const crashThenResume = async (tamper = null) => {
+        const target = await sshTarget(STANDARD, SMOKE)
+        const { engine, f } = await scenario({ target, hooks: crashing() })
+        const held = engine.run.keptInstance
+        await simulateProcessDeath(f.issuePath)
+        const resumed = await resumeRun({ issuePath: f.issuePath, runId: engine.runId, harnesses: f.harnesses, stepStore: f.stepStore, clock: f.clock, configRoot: f.configRoot, deliveryProvider: f.delivery, workspaceProvider: f.workspaceProvider, projectPath: f.projectPath })
+        f.state.engine = resumed
+        await resumed.recover()
+        tamper?.(resumed)
+        await resumed.drive()
+        return { target, held, resumed }
+      }
+      {
+        const { target, held, resumed } = await crashThenResume()
+        t.ok('a crash leaves it on the record', Boolean(held?.remoteDir))
+        t.eq('the resumed run completes', resumed.run.status, 'completed', `${resumed.run.blockedReason}`)
+        t.eq('and continues it', fullOf(resumed)?.continuedFrom?.remoteDir, held?.remoteDir)
+        t.eq('nothing is left on the host', await left(target), [])
+        await releaseWorkspace(resumed)
+      }
+      {
+        const { target, resumed } = await crashThenResume((r) => { r.run.keptInstance.targetKey = 'another-definition' })
+        t.eq('another definition: from scratch, saying why', fullOf(resumed)?.continuation?.reason, 'target-changed', JSON.stringify(fullOf(resumed)?.continuation))
+        t.eq('the old instance is gone', await left(target), [])
+        await releaseWorkspace(resumed)
+      }
+      {
+        const { target, resumed } = await crashThenResume((r) => { r.run.keptInstance.revision = 'sha256:another-revision' })
+        t.eq('another revision: from scratch, saying why', fullOf(resumed)?.continuation?.reason, 'revision-changed', JSON.stringify(fullOf(resumed)?.continuation))
+        t.eq('the old instance is gone', await left(target), [])
+        await releaseWorkspace(resumed)
+      }
+    }
+
+    t.section('Refresh checks always runs from scratch')
+    {
+      const target = await sshTarget(STANDARD, SMOKE)
+      const { engine } = await scenario({ target })
+      await fs.rm(executedFile, { force: true })
+      await engine.maybeRunChecks({ force: true, target: engine.snapshot.checks.target })
+      t.eq('says why', fullOf(engine)?.continuation?.reason, 'refresh')
+      t.eq('every command executed', await executed(), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine)
+    }
+
+    t.section('a continued drive that fails is retried from scratch; the fresh result is the one that counts')
+    {
+      const once = path.join(sshDir, 'failed-once')
+      const target = await sshTarget([cmd('prepare'), service, cmd('ready'), cmd('deep', `test -e ${once} || { touch ${once}; exit 1; }`)], SMOKE, { retryFailed: 1 })
+      const { engine } = await scenario({ target })
+      const full = fullOf(engine)
+      t.eq('the run completes on the retry', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+      t.eq('the retry passed, marked flaky', [full?.result, full?.flaky], ['passed', true])
+      t.ok('the attempt that continued is on the record', Boolean(full?.attempts?.[0]?.continuedFrom), JSON.stringify(full?.attempts))
+      t.eq('the record says why this drive ran from scratch', full?.continuation?.reason, 'retry')
+      t.eq('the retry ran in declared order', (await executed()).slice(-4), ['prepare', 'start', 'ready', 'deep'])
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine)
+    }
+
+    t.section('the same scenario as auditor-1\'s, with the default retry: the fresh drive reaches comparison, and the verdict is its own')
+    {
+      const target = await sshTarget([cmd('prepare'), cmd('lint', 'echo lint failed; exit 3'), service, cmd('ready')], SMOKE, { retryFailed: 1, compareBaseline: true })
+      const { engine } = await scenario({ target })
+      const full = engine.run.checkHistory.filter((h) => h.tier === 'full')
+      const record = engine.run.checkResults.filter((c) => c.tier === 'full').at(-1) ?? null
+      t.ok('the run did not close on an inherited failure with commands not run', engine.run.status !== 'completed', `${engine.run.status} ${engine.run.blockedReason}`)
+      t.ok('the gate failed it', full.every((h) => h.gating === 'failed'), JSON.stringify(full))
+      if (record) {
+        t.eq('not made, its later commands not run', [record.baselineComparison?.failures?.verdict, record.baselineComparison?.failures?.notRun], ['not-made', ['start', 'ready']])
+        t.ok('from the drive that ran from scratch', Boolean(record.attempts?.[0]?.continuedFrom) && !record.continuedFrom, JSON.stringify(record.attempts))
+      }
+      await releaseWorkspace(engine).catch(() => {})
+    }
+
+    t.section('new selftest failures on a smoke discard its instance before the second drive')
+    {
+      const collect = 'if ls round-*.txt >/dev/null 2>&1; then r=\'{"test":"core/a","error":"x"}\'; else r=\'{"test":"core/a"}\'; fi; echo "== runtime/selftest.report"; printf \'{"tests":[%s]}\\n\' "$r"'
+      const target = await sshTarget([cmd('prepare'), service, cmd('collect', collect, { report: 'selftest' }), cmd('deep')], ['prepare', 'start', 'collect'], { retryFailed: 1 })
+      const { engine, events } = await scenario({ target })
+      // Which step stopped the retry, when one does: the base, the verdict or the retry itself.
+      const seen = JSON.stringify({ discarded: engine.run.discardedInstances, bases: engine.run.baselineChecks?.map((b) => [b.dir, b.result, b.error]), smoke: smokeOf(engine)?.baselineComparison?.selftest && { verdict: smokeOf(engine).baselineComparison.selftest.verdict, reason: smokeOf(engine).baselineComparison.selftest.reason }, retries: events.filter((e) => e.type.startsWith('checks-retry')) })
+      t.ok('the base it compared with could be driven', engine.run.baselineChecks?.some((b) => b.result === 'passed'), seen)
+      t.ok('the second drive ran for new selftest failures', events.some((e) => e.type === 'checks-retry' && e.reason === 'new-selftest-failures'), seen)
+      t.ok('the first drive\'s instance was discarded for the rerun', engine.run.discardedInstances?.some((d) => d.reason === 'selftest-retry'), seen)
+      t.eq('no instance is held', engine.run.keptInstance ?? null, null)
+      t.eq('nothing is left on the host', await left(target), [])
+      await releaseWorkspace(engine).catch(() => {})
+    }
+
+    t.section('a carried report stays one observation through the retry path, and a later failure is classified as it would be')
+    {
+      const once = path.join(sshDir, 'failed-once-report')
+      const report = 'echo "== runtime/selftest.report"; printf \'{"tests":[{"test":"core/a"}]}\\n\''
+      const target = await sshTarget([cmd('prepare'), service, cmd('collect', report, { report: 'selftest' }), cmd('deep', `test -e ${once} || { touch ${once}; exit 1; }`)], ['prepare', 'start', 'collect'], { retryFailed: 1 })
+      // A failure and two passes on one tree: two more passes keep it unstable, a third would expire it (EXPIRY_PASSES).
+      const seeds = [{ failed: ['core/a'] }, { passed: ['core/a'] }, { passed: ['core/a'] }]
+      const { engine, f } = await scenario({ target, beforeRun: async (fixture) => {
+        for (const [i, outcome] of seeds.entries()) {
+          await recordDrive(historyDir(fixture.issuePath), { id: `seed-${i}`, at: new Date(fixture.clock.now() - 86400000 + i * 1000).toISOString(), runId: 'seed', issueId: 'another-issue', kind: 'candidate', treeIdentity: 'seed-tree', targetKey: 'seed-key', revision: 'seed', baseCommit: 'seed', tier: null, dir: `checks/seed-${i}`, changedPaths: [], commands: [{ command: 'collect', failed: [], passed: [], asNew: [], ...outcome }] }, { now: fixture.clock.now() })
+        }
+      } })
+      const full = fullOf(engine)
+      const attempt = full?.attempts?.[0]
+      const drives = await readDrives(historyDir(f.issuePath))
+      t.eq('the run completes on the fresh retry', [engine.run.status, full?.flaky], ['completed', true], `${engine.run.blockedReason}`)
+      t.eq('the attempt that continued keeps the report\'s provenance', attempt?.commands?.find((c) => c.id === 'collect')?.fromSmoke, smokeOf(engine)?.dir)
+      t.eq('and leaves no line in the history: it ran no report', drives.filter((d) => d.dir === attempt?.dir), [])
+      t.eq('one line per execution: the smoke\'s and the retry\'s', drives.filter((d) => d.runId === engine.runId).map((d) => d.dir), [smokeOf(engine)?.dir, full?.dir])
+      const later = classifyTest({ drives, command: 'collect', test: 'core/a', now: f.clock.now() })
+      t.eq('so a later failure of the test still reads as unstable', later?.routes, ['same-bytes'], JSON.stringify(later))
+      t.eq('with the passes that really happened', later?.passesSinceLastFailure, 4)
+      await releaseWorkspace(engine)
+    }
+
+    t.section('tiers.continueSmoke: false runs the full drive from scratch and keeps nothing')
+    {
+      const target = await sshTarget(STANDARD, SMOKE, { tiers: { continueSmoke: false } })
+      const { engine } = await scenario({ target })
+      t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+      t.eq('says why', fullOf(engine)?.continuation?.reason, 'opted-out')
+      t.eq('every smoke command ran twice', await executed(), ['prepare', 'start', 'ready', 'prepare', 'start', 'ready', 'deep'])
+      t.ok('the smoke kept nothing', !smokeOf(engine)?.kept)
+      await releaseWorkspace(engine)
+    }
+
+    t.section('the base drive stays a from-scratch drive of the whole target, and the comparison reads every command')
+    {
+      const target = await sshTarget(STANDARD, SMOKE, { compareBaseline: true })
+      const { engine } = await scenario({ target })
+      const count = (list, id) => list.filter((x) => x === id).length
+      const ran = await executed()
+      t.eq('the run completes', engine.run.status, 'completed', `${engine.run.blockedReason}`)
+      t.ok('it continued', Boolean(fullOf(engine)?.continuedFrom), JSON.stringify(fullOf(engine)?.continuation))
+      t.eq('prepare: the smoke, its base and the full tier\'s base; not the continued drive', count(ran, 'prepare'), 3)
+      t.eq('deep: the continued drive and the full tier\'s base', count(ran, 'deep'), 2)
+      t.eq('every command compared with the base', fullOf(engine)?.baselineComparison?.unchanged, ['prepare', 'start', 'ready', 'deep'])
+      t.eq('no base drive left anything behind', await left(target), [])
+      await releaseWorkspace(engine)
+    }
+  } finally {
+    process.env.DEVPANEL_SSH_BIN = saved.bin; process.env.CHECK_TEST_HOST = saved.host
+    if (saved.bin === undefined) delete process.env.DEVPANEL_SSH_BIN
+    if (saved.host === undefined) delete process.env.CHECK_TEST_HOST
+    for (const name of await fs.readdir(path.join(sshDir, 'units')).catch(() => [])) {
+      if (!name.endsWith('.json')) continue
+      const { pid } = JSON.parse(await fs.readFile(path.join(sshDir, 'units', name), 'utf8').catch(() => '{}'))
+      if (pid) { try { process.kill(-pid, 'SIGKILL') } catch {} }
+    }
+    await fs.rm(sshDir, { recursive: true, force: true })
   }
 }

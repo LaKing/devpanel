@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
 import { runChecks } from '../server/runtime/checks.mjs'
+import { continuationPlan, tierTarget } from '../server/runtime/baseline-cache.mjs'
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { confinedCommandErrors, stagingTarget } from '../server/infrastructure.mjs'
@@ -162,7 +163,7 @@ export default async function (t) {
   const home = os.homedir()
   // The unit user is the account running the suite: the fake service manager runs every unit as it.
   const user = os.userInfo().username
-  const check = async (target, runDir) => runChecks({ target, revision: fp.fingerprint, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, runDir })
+  const check = async (target, runDir, extra = {}) => runChecks({ target, revision: fp.fingerprint, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, runDir, ...extra })
   const invocations = async () => (await fs.readFile(path.join(shimDir, 'units', 'invocations.jsonl'), 'utf8')).trim().split(NL).map((l) => JSON.parse(l))
   try {
     t.section('3. a structured test drive runs, fenced, and the probe proves it')
@@ -198,6 +199,28 @@ export default async function (t) {
       const states = await Promise.all(units.filter((u) => u.endsWith('.json')).map(async (u) => JSON.parse(await fs.readFile(path.join(shimDir, 'units', u), 'utf8'))))
       const alive = (p) => fs.readFile(`/proc/${p}/stat`, 'utf8').then((s) => !s.slice(s.lastIndexOf(')') + 2).startsWith('Z'), () => false)
       t.ok('every unit, the service included, is stopped', (await Promise.all(states.map((s) => s.pid ? alive(s.pid) : false))).every((a) => !a))
+    }
+
+    t.section('3b. a full drive continues the smoke\'s instance inside the real fence: a later command joins the service still running')
+    {
+      const workdir = await temp('rc-remote-')
+      const runDir = await temp('rc-run-')
+      const target = { kind: 'ssh', ssh: { hostRef: 'env:CHECK_TEST_HOST', workdir }, confinement: { user, home }, tiers: { smoke: ['start', 'ready'] }, finallyCommands: [],
+        commands: [
+          { id: 'start', kind: 'candidate', service: true, run: 'exec /bin/sh app.sh' },
+          { id: 'ready', kind: 'candidate', join: 'start', run: 'for i in $(seq 50); do test -s run/state && break; sleep 0.1; done; test "$(cat run/state)" = up' },
+          { id: 'deep', kind: 'candidate', join: 'start', run: 'kill -0 "$(cat run/pid)"; test "$(cat run/state)" = up' }
+        ] }
+      const plan = continuationPlan(target)
+      const smoke = await check({ ...tierTarget(target, 'smoke') }, runDir, { keep: { seconds: plan.keepSeconds } })
+      t.ok('the smoke kept its instance', Boolean(smoke.kept), smoke.instanceNotKept ?? smoke.error)
+      const instance = { ...smoke.kept, revision: fp.fingerprint }
+      const full = await check(tierTarget(target, 'full'), runDir, { continueFrom: { instance, smoke, plan } })
+      t.eq('the full drive passed', full.result, 'passed', full.error ?? JSON.stringify(full.commands.filter((c) => !c.passed)))
+      t.eq('on the smoke\'s directory', full.continuedFrom?.remoteDir, instance.remoteDir)
+      t.eq('executing the later command only', full.continuedFrom?.ran, ['deep'])
+      t.eq('labelled remote-enforced', full.confinement?.level, 'remote-enforced', JSON.stringify(full.confinement))
+      t.eq('the normal end took the instance', (await fs.readdir(workdir)).length, 0)
     }
 
     t.section('4. candidate code cannot reach the control directory, the home or the tree above')

@@ -312,7 +312,9 @@ export function openStability ({ issuePath, runId, target, targetKey, clock, run
     async record ({ check, kind, revision = null, baseCommit, fp = null, selftest = null, treeIdentity = null }) {
       if (!reports) return
       try {
-        const outcomes = await readOutcomes({ runDir, check, target })
+        // A report carried from the smoke (checks.mjs `fromSmoke`) is the smoke's
+        // execution, already on the ledger: one run of a test is one line.
+        const outcomes = await readOutcomes({ runDir, check: { ...check, commands: (check.commands ?? []).filter((c) => !c.fromSmoke) }, target })
         if (!outcomes.length) return
         const asNew = [...(selftest?.newFailures ?? []), ...(selftest?.unstable ?? []).filter((u) => u.comparedNew)]
         const origin = check.reused?.fromRun ?? runId

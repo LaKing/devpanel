@@ -168,6 +168,10 @@ export default async function (t) {
     t.eq('smoke commands', smoke.commands.map((c) => c.id), ['prepare', 'start', 'readiness'])
     t.eq('smoke finalizers', smoke.finallyCommands.map((c) => c.id), ['collect-journal'])
     t.eq('the full tier keeps every command', tierTarget(tiered, 'full').commands.length + tierTarget(tiered, 'full').finallyCommands.length, 6)
+    // A target's hash and a baseline's key are taken from these: setting the new options moves neither.
+    const withOptions = { ...tiered, tiers: { ...tiered.tiers, continueSmoke: false, keepSeconds: 60 } }
+    t.eq('continueSmoke and keepSeconds are not in the smoke tier\'s definition', JSON.stringify(tierTarget(withOptions, 'smoke')), JSON.stringify(tierTarget(tiered, 'smoke')))
+    t.eq('nor in the full tier\'s', JSON.stringify(tierTarget(withOptions, 'full')), JSON.stringify(tierTarget(tiered, 'full')))
     t.ok('each tier is a different target definition', JSON.stringify(smoke) !== JSON.stringify(tierTarget(tiered, 'full')) && smoke.tier === 'smoke')
     t.eq('an untiered target is unchanged', tierTarget(target, 'full'), target)
     t.eq('a valid smoke tier has no errors', tierErrors(tiered), [])

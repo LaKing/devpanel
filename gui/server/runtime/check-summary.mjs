@@ -12,6 +12,9 @@ export function checkSummary (check, fullEvidence = null) {
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
     // Not a drive of this revision: the approved revision's result, carried over inert drift (engine.reconcileDelivery).
     ...(check.carriedFrom ? { carriedFrom: check.carriedFrom, carriedBecause: check.carriedBecause ?? null } : {}),
+    // Run on the smoke's instance rather than from scratch: still the full drive closure counts.
+    ...(check.continuedFrom ? { continuedFrom: check.continuedFrom, continuedNote: `This full drive continued the smoke's running instance (${check.continuedFrom.dir}): it executed ${check.continuedFrom.ran.join(', ') || 'no command'} and the finalizers, and the records marked fromSmoke are the smoke's.${check.continuedFrom.declaredBeforeServices.length ? ` ${check.continuedFrom.declaredBeforeServices.join(', ')} ran after the service started, though declared before it, so the service never saw their effect: judge whether this drive's evidence still answers for what depends on them.` : ''}${check.continuedFrom.notCounted.length ? ` ${check.continuedFrom.notCounted.map((c) => c.id).join(', ')} read as not run, as in a fresh drive, although a smoke log exists (notCounted).` : ''}` } : {}),
+    ...(check.continuation ? { continuation: check.continuation } : {}),
     materialization: m ? { method: m.method, verified: m.verified, detail: clip(m.detail), archiveSha256: m.archiveSha256,
       remoteSha256: m.remoteSha256, remoteEntryCount: m.remoteEntryCount ?? m.remoteEntries?.length ?? null,
       beforeCommands: m.beforeCommands, afterCommands: m.afterCommands,
@@ -22,7 +25,7 @@ export function checkSummary (check, fullEvidence = null) {
       stdout: clip(c.stdout), stderr: clip(c.stderr), error: clip(c.error),
       // Every PASS/FAIL-style line of the whole output (checks.mjs resultLines): the
       // evidence a non-gating selftest collector holds, readable from any seat.
-      ...(c.results ? { results: c.results } : {}) })),
+      ...(c.results ? { results: c.results } : {}), ...(c.fromSmoke ? { fromSmoke: c.fromSmoke } : {}) })),
     commandCount: check.commands?.length ?? 0,
     // Commands that did not run after a required failure: their outcome is unknown.
     ...(check.skipped?.length ? { skipped: check.skipped } : {}),

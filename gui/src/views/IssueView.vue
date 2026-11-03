@@ -1426,7 +1426,7 @@ watch(() => route.query.run, (runId) => {
                 <h3 class="block__sub">Checks</h3>
                 <p class="muted">requirement {{ run.checks?.requirement ?? '—' }} · target {{ run.checks?.target?.kind ?? 'none' }}</p>
                 <div v-for="c in run.checkResults" :key="`${c.revision}:${c.at}`" class="check">
-                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="c.carriedFrom"> · carried from <code>{{ short(c.carriedFrom) }}</code>, no drive</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
+                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="c.carriedFrom"> · carried from <code>{{ short(c.carriedFrom) }}</code>, no drive</template><template v-if="c.continuedFrom"> · continued the smoke's instance</template><template v-else-if="c.continuation"> · from scratch ({{ c.continuation.reason }})</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
                   <p v-if="c.error" class="muted">{{ c.error }}</p>
                   <p v-for="cmd in c.commands ?? []" :key="cmd.id" class="kv kv--indent">
                     <v-icon :icon="cmd.passed ? '$checkCircle' : '$alertCircle'" size="14" :color="cmd.passed ? 'success' : cmd.required ? 'error' : 'warning'" />
