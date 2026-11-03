@@ -93,11 +93,18 @@ export async function reporterForKey (key) {
  * CURRENT reporter record, so tightening a policy or removing a reporter applies to issues already
  * open; a reporter that no longer exists counts as anonymous.
  */
+/** How far the supervisor may act on this issue: `any`, `assess` (ASSESS_PLAYBOOKS only) or `none`. */
+export async function reportStartLevel (issue, { reporters = null } = {}) {
+  const report = issue?.report
+  if (!report) return 'any'
+  const current = report.reporter ? (reporters ?? await readReporters())[report.reporter] : null
+  return report.trust === 'anonymous' || !current ? 'none' : current.policy?.[report.trust] ?? 'none'
+}
+
 export async function reportStartRefusal (issue, playbook, { reporters = null } = {}) {
   const report = issue?.report
   if (!report) return null
-  const current = report.reporter ? (reporters ?? await readReporters())[report.reporter] : null
-  const level = report.trust === 'anonymous' || !current ? 'none' : current.policy?.[report.trust] ?? 'none'
+  const level = await reportStartLevel(issue, { reporters })
   const who = report.reporter ? `reporter ${report.reporter}` : 'an anonymous report'
   if (level === 'any') return null
   if (level === 'assess' && ASSESS_PLAYBOOKS.includes(playbook)) return null

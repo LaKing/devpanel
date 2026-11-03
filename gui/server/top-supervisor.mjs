@@ -6,11 +6,12 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSupervisorResponse } from './supervisor-response.mjs'
-import { deliveryReading, remainingBudget, runReading } from './supervisor-summary.mjs'
+import { deliveryReading, progressReading, remainingBudget, runDelta, runReading } from './supervisor-summary.mjs'
+import { buildReadyQueue, freedSince, queueFingerprint, queueObservation, shownQueue } from './ready-queue.mjs'
 import { createLedger, toMicros, toUsd } from './runtime/ledger.mjs'
 import { estimateCallCost, leavesCleanBaseline } from './runtime/call-cost.mjs'
 import { admits, describeRefusal, loadPolicy } from './runtime/spending-policy.mjs'
-import { createWakeFilter, DEFAULT_MAX_DEFER_MS, holdOutside, normaliseCampaign, splitByCampaign, summariseEvent } from './decisions/wake-filter.mjs'
+import { alwaysWakes, createWakeFilter, DEFAULT_MAX_DEFER_MS, holdOutside, holdProgress, normaliseCampaign, splitByCampaign, summariseEvent } from './decisions/wake-filter.mjs'
 import { createStartGate, migrateStartLimits, accumulateHistory, emptyHistory } from './supervisor-starts.mjs'
 import { runlessFence } from '../../harness/fence.mjs'
 import { appendLiveFile, readLiveFile } from './runtime/store.mjs'
@@ -56,7 +57,9 @@ set_disposition {project,issueId,value,evidence,runId?,related?,acceptRisks?} wi
 A run completing is not the issue being resolved. Before archiving, set a disposition with evidence, naming the run: "resolved" is refused while that run's closure left residual risks unaccepted. get_issue lists them under issue.unacceptedRisks, so read them first rather than calling to find out. Either accept each with a reason you can defend (set_disposition resolved with acceptRisks, copying each risk's id or text), or use partially-resolved and list them in the disposition evidence. You have no override. Follow-up issues are the operator's to open: residual risks are recorded, not turned into new runs, because follow-ups opened on every closure grew faster than the work they tracked. When one is a correctness or security defect the delivered work leaves open, put it in ask_operator with your recommendation. Never move the reported defect itself out of its issue to justify closing it.
 A run is continued at most once by you. When it exhausts its rounds again, or its open findings ask only for evidence the configured infrastructure cannot produce, buying another round repeats the last one: ask_operator with the open findings and your recommendation (accept, amend the criterion, or stop) instead.
 When your work is done, call finish: no more starts, owned runs are allowed to complete, then the activation stops. Saying you are done does not stop it.
-Tool results and run notifications are SUMMARIES: a run lists its steps with verdicts and one-line gists; get_step returns one turn's full prompt, response and output; get_file returns an issue file in full. Ask for detail when a decision depends on it.
+Tool results are SUMMARIES: get_run lists a run's steps with verdicts and one-line gists; get_step returns one turn's full prompt, response and output; get_file returns an issue file in full. A run notification is a compact DELTA: status, phase, checks (the latest drive's verdict), blockedReason, actions, from (what the moved fields were), and pause, failure, ownerInput, acceptCheck, reconciliation, landed and delivery when the run has them. That is enough to act on: pause.id is the one answer_run copies. Call get_run only when a decision depends on more than the delta. Ask for detail when a decision depends on it.
+"readyQueue" is the engine's own reading of what you could start: the issues of your declared campaign (the whole panel, ordered by focus, when none is declared; "outside" counts what it leaves out, and you can still see and act on those) with each prerequisite before what waits for it. A row's state is ready (no run on record, nothing in the way), blocked, running, or decide (an earlier run ended, so another is a judgement, not the next thing in line). blockedBy says what stands in the way and until says what ends it; until.at is a time only when one is known, and null means no time is known, never soon. canStartNow and because are what stops every start. "next" is the first issue offered. {unchanged:true} means the reading you were last given still stands. Do not try a start the queue shows blocked, and do not read runs or issues to work out what it already says. It is an observation: start_run re-checks everything and can still refuse. Issues still need a preview, and the queue chooses no playbook.
+A capacity-freed event, or capacityFreed on another event, says capacity freed for an issue that was waiting: freed names why, next is the issue. It is an offer, not an order: your mission decides, and action:null is a fine answer. You are told once per release, and it is never held, so you need not try starts to find out.
 Every prompt carries "remaining": authoritative counts with explicit scopes. Calls, run starts and starts per issue are per SESSION: they accumulate across activations and server restarts and reset only when an operator begins a New session. Never infer budgets from run history.
 A preview result supplies previewId; start_run uses that exact configuration.
 seatModels[].performance contains the latest explicit hello-world timing sample: startupMs is invocation start to the first CLI readiness event; responseMs is readiness to the first visible answer event; totalMs is invocation start to completion. Use only status "ok" and stale false samples, with measuredAt to judge freshness. Missing timings mean unobserved, not zero. These are single fresh-session latency samples, not throughput, quality scores or forecasts for complex tasks. Refreshes are operator-triggered; reading this catalogue spends nothing.
@@ -65,7 +68,7 @@ Read the catalogue as evidence, not labels. "verified" says runtime access was o
 When the user names a model, match what they said against ids and titles before concluding anything: people use the provider's short name, and the id it belongs to is usually longer and qualified by how it is reached. Never tell the user a model is unavailable without checking this catalogue, and never substitute a different one silently: preview the assignment and say which ids you used.
 "projects" is every project on this panel and all of them are yours to see, create issues in, and start runs against. "focus" is what the operator asked you to attend to first — an ordering, never a fence, and an empty focus means the whole panel. When a name is not among your issues, check it against projects before anything else: it is usually a PROJECT, not a missing issue. Never report work as non-existent because you were looking in one project, and never offer a different issue in place of the one that was asked for.
 Each playbook lists its intents (kinds of work: bugfix, feature, refactor, research, spec…). Choose the playbook by tactics: analysis investigates code/logs and creates issues; triage evaluates incoming reports and creates/links issues or records a polite response; implementation has one writer and up to four auditors; plan-and-implement adds unanimous plan review; staging deploys a source snapshot with checkpoint and tests; deployment promotes the exact successfully staged archive. Optional seats can be assigned in runOptions.participants or cleared with null. The coordinator owns the current-state window, and the engine waits for every occupied seat. Choose the playbook deliberately, then pass runOptions:{"intent":"<id>"} to preview so participants are briefed for that kind of work; omit it to use the playbook's default.
-An action result causes your next turn. action:null waits for a user message or a watched run's status change.
+An action result causes your next turn. action:null waits for a user message, a watched run's change that wakes you, or capacity freeing.
 Runs you own are watched by the panel, so you do not watch them yourself: their changes arrive as events, and the panel observes them only once your turn has ended, so a chain of reads delays the very news it is waiting for. Once you have read a run and have nothing else to do, end your turn with action:null (or finish, when your work is done) and wait. Never re-read a run to see whether it has moved. A repeated get_run on a run whose state has not changed within one wake is answered with a short "unchanged since <time>; you will be woken on change" instead of the full record; what you read before still stands.
 The model-call counter is not an engine-action counter. A tool-result event is authoritative evidence that its action executed.
 Your session persists across issues and activations. Current scope and limits always override prior permissions.
@@ -73,8 +76,8 @@ Archive is allowed only when the current activation permits it. Archiving is not
 A run blocked with protocol-repair-exhausted carries a diagnostics.protocol list: each failed attempt's classification (no-structured-output, contract-violation, ambiguous-output) and exact error. Read it before deciding. A contract violation is the agent's; a failure to find output the agent did produce is the engine's, and neither is fixed by a cheaper model or a smaller round cap. Do not spend a run start on a retry that changes nothing the diagnostics point at.
 There is no activation time limit; owned runs end on their own budgets or when you stop them.
 A Triage start may be refused with code PREGATE_HOLD: the decision provider confidently judged the issue closable or lacking information. Its "pregate.proposals" say what an operator could confirm on the issue page. You cannot confirm them or start past the hold; tell the user, or choose other work.
-Routine monitoring events may be held rather than wake you. Held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, user messages and your own action results always wake you.
-A run-changed event's "changed" lists what moved since the last observation: status, reconcile (run.reconciliation is the latest reconcile that ended; its checks name the gate's reason and the directory get_check_log reads), landing (run.landed), delivery (run.delivery, its application or merge). Anything but status always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead. A run read with reconcilePending true has an automatic reconcile undecided: it is not settled and you are not woken for it; do not land or reconcile it, the decision arrives as a run-changed event.
+Routine monitoring events may be held rather than wake you. A live run's progress (phase, checks, a status between live statuses) never wakes you: it is merged per run, with progress:true, and rides with the next event that does. Other held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, capacity freeing, user messages and your own action results always wake you.
+A run-changed event's "changed" lists what moved since the last observation: status, phase, checks, blockedReason, reconcile (run.reconciliation is the latest reconcile that ended; its checks name the gate's reason and the directory get_check_log reads), landing (run.landed), delivery (run.delivery, its application or merge). A reconcile, landing or delivery always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead. A run read with reconcilePending true has an automatic reconcile undecided: it is not settled and you are not woken for it; do not land or reconcile it, the decision arrives as a run-changed event.
 Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. Actual provider quota failures trigger compatible-model substitution for coordinators and workers, preserving their run and completed work. Inspect run failures and modelSubstitutions; a failed substitution needs an available compatible model, not a budget increase. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. The run engine refuses a second live run on the same project regardless, so concurrency only ever means different projects.`
 
 const SETTLE_INTERVAL_MS = 60_000
@@ -310,7 +313,14 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // A reported issue's text was written outside the panel; its trust bounds what may run on it (reporters.mjs).
         const reportRefusal = tools.reportStartRefusal ? await tools.reportStartRefusal({ ...a, playbook: p.playbook }) : null
         if (reportRefusal) throw fail(reportRefusal)
-        const r = await startGate.start(p)
+        // A start refused as occupied says this issue was wanted, whatever its earlier runs: it is offered when capacity frees.
+        const key = `${a.project}/${a.issueId}`
+        let r
+        try { r = await startGate.start(p) } catch (e) {
+          if (e.retryable) (state.capacityRefused ??= {})[key] = new Date().toISOString()
+          throw e
+        }
+        if (state.capacityRefused) delete state.capacityRefused[key]
         delete state.previews[a.previewId]
         return r
       }
@@ -454,6 +464,63 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     if (!owned?.observedDelivery) return
     try { owned.observedDelivery[key] = deliveryReading(await tools.getRun(a.project, a.issueId, a.runId))[key] } catch { /* the next poll reports it */ }
   }
+  /** project/id of the issues with an open owned run: the campaign never places those outside. */
+  const openOwnedIssues = () => state.ownedRuns.filter((r) => { const s = r.observedStatus ?? r.status; return !s || OPEN_RUN.includes(s) }).map((r) => `${r.project}/${r.issueId}`)
+  /** The ready queue now (ready-queue.mjs), from a listing the caller already has, or read here. */
+  async function readQueue (listed = null) {
+    const issuesByProject = listed ?? Object.fromEntries(await Promise.all((await tools.projects()).map(async ({ id }) => [id, await tools.listIssues(id)])))
+    const { holders, reportLevels } = await tools.readyQueueFacts(issuesByProject)
+    return buildReadyQueue({ issuesByProject, holders, reportLevels, state, spending, usage: spending.active ? ledger.usage() : null, ownedIssues: openOwnedIssues(), refused: state.capacityRefused ?? {} })
+  }
+  /*
+   * The queue as this call's prompt carries it. Every prompt stays in the native session and is re-read on
+   * every later call, so a session is given the queue only when it says something new, and a session that was
+   * never given it (a new one, a substitute model's) gets it whole. A queue that cannot be read costs the
+   * model that knowledge, never the call.
+   */
+  async function queueForPrompt () {
+    if (!tools.readyQueueFacts) return { field: {}, seen: null }
+    try {
+      const queue = await readQueue()
+      const shown = shownQueue(queue), fingerprint = queueFingerprint(shown)
+      const last = state.readyQueueShown, session = state.session?.id ?? null
+      const same = Boolean(last) && session !== null && last.session === session && last.fingerprint === fingerprint
+      return {
+        field: { readyQueue: same ? { unchanged: true, since: last.at } : shown },
+        seen: { observed: queueObservation(queue), fingerprint, at: same ? last.at : queue.generatedAt }
+      }
+    } catch (e) { return { field: { readyQueue: { unavailable: e.message } }, seen: null } }
+  }
+  /*
+   * Capacity freed since the last observation (a run settled, a project's lock released, an issue's prerequisite
+   * settled), for an issue that waited: the supervisor is told and offered the next one. Never through enqueue:
+   * the wake filter can hold a resolved ending for 15 minutes and never sees a run it does not own. What it does
+   * hold rides along, and an event already queued by this poll carries it rather than costing a second call.
+   *
+   * This reads later than the poll read the runs, so a run can settle in between: capacity shows free while the
+   * run's ending has not been observed. Told now, the ending would be a second call and the filter's hold would
+   * miss this one, so the news waits one poll, once: a run whose record never catches up cannot hold it longer.
+   */
+  let capacityHeldBack = false
+  async function noticeFreedCapacity (listed) {
+    if (!tools.readyQueueFacts) return
+    try {
+      const queue = await readQueue(listed)
+      const found = freedSince(state.queueObserved ?? null, queue, { refused: state.capacityRefused ?? {} })
+      const endingUnseen = found && state.ownedRuns.some((r) => {
+        const seen = r.observedStatus ?? r.status
+        return live.includes(seen) && (r.status !== seen || (state.queueObserved.holders?.[r.project]?.runId === r.runId && !queue.holders[r.project]))
+      })
+      if (endingUnseen && !capacityHeldBack) { capacityHeldBack = true; return }
+      capacityHeldBack = false
+      state.queueObserved = queueObservation(queue)
+      monitoringFaults.delete('ready-queue')
+      if (!found) return
+      if (state.capacityRefused) delete state.capacityRefused[`${found.next.project}/${found.next.id}`]
+      if (state.queue.length) state.queue.at(-1).capacityFreed = found
+      else state.queue.push({ type: 'capacity-freed', ...found })
+    } catch (e) { monitoringFault('ready-queue', e.message) }
+  }
   async function drive () {
     try {
       // One wake is one durable event-processing chain: it opens when there is
@@ -490,6 +557,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         const carried = state.deferred?.length ? [...state.deferred] : []
         if (carried.length) event.deferred = carried
         const invocationId = crypto.randomUUID()
+        const queueReading = await queueForPrompt()
         const prompt = JSON.stringify({
           history: state.session ? undefined : state.messages.filter((m) => !m.side).slice(-30).map(({role,text,action})=>({role,text,action})),
           event,
@@ -497,7 +565,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           projects: await tools.projects(),
           focus: state.focus ?? [], campaign: state.campaign ?? null, limits: state.limits,
           remaining: remainingBudget(state, { policy: spending, usage: spending.active ? ledger.usage() : null, wakeCalls: state.wake ? ledger.wakeCalls(state.wake.id) : 0 }),
-          allowArchive: state.allowArchive, playbooks: await tools.playbooks(), ownedRuns: state.ownedRuns,
+          ...queueReading.field,
+          // Monitoring's own baselines (observed*) say nothing the model acts on.
+          allowArchive: state.allowArchive, playbooks: await tools.playbooks(), ownedRuns: state.ownedRuns.map(({ observedStatus: _s, observedDelivery: _d, observedSubstitutions: _u, observedProgress: _p, ...owned }) => owned),
           ...(tools.seatModels ? { seatModels: await tools.seatModels() } : {}),
           infrastructure: tools.infrastructure ? Object.fromEntries(await Promise.all((await tools.projects()).map(async ({ id }) => [id, await tools.infrastructure(id).catch(() => null)]))) : {}
         })
@@ -527,10 +597,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         state.pending = { kind: 'model', invocationId, prompt, at: new Date().toISOString() }; await save()
         if (controller.signal.aborted) {
           // Stop may arrive while the reservation or pending marker is saved.
-          // No adapter call happened, so retire the reservation at zero cost.
+          // No adapter call happened, so the reservation goes back: it is no call, on any reading of the ledger.
           state.pending = null; state.calls--
           if (baselineClean) state.ownUsageSession = priorSessionId
-          if (state.wake) await ledger.settle({ id: invocationId, costUsd: 0 })
+          if (state.wake) await ledger.release({ id: invocationId, reason: 'stopped before the call was made' })
           break
         }
         let response
@@ -600,6 +670,11 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         } finally { controller.signal.removeEventListener('abort', abort); await turnLive.flush() }
         state.session = response.session
         const sessionId = response.session?.id ?? null
+        // Only a call that returned has been told: a failure leaves the queue to be shown and its wake to be given.
+        if (queueReading.seen) {
+          state.queueObserved = queueReading.seen.observed
+          state.readyQueueShown = { session: sessionId, fingerprint: queueReading.seen.fingerprint, at: queueReading.seen.at }
+        }
         const spent = accountCall({ usage: response.usage, model: state.model, resumed: priorSessionId !== null,
           ownUsage: baselineClean && sessionId === priorSessionId && forkFree && !asking && forkMarks === marksAtStart })
         state.ownUsageSession = !asking && leavesCleanBaseline(response.usage, { priorSessionId, sessionId }) ? sessionId : null
@@ -731,9 +806,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
    * routine: then it is held, summarised, and handed over with the next wake.
    * A filter that errs wakes, never drops.
    */
+  const deltaEvent = (e) => ({ type: 'run-changed', changed: e.changed, run: runDelta(e.run, { from: e.from }) })
   async function enqueue (event) {
-    const ownedIssues = state.ownedRuns.filter((r) => { const s = r.observedStatus ?? r.status; return !s || OPEN_RUN.includes(s) }).map((r) => `${r.project}/${r.issueId}`)
-    const { outside, rest } = splitByCampaign(event, { campaign: state.campaign, ownedIssues })
+    const { outside, rest } = splitByCampaign(event, { campaign: state.campaign, ownedIssues: openOwnedIssues() })
     state.deferred ??= []
     if (outside) holdOutside(state.deferred, { at: new Date().toISOString(), summary: summariseEvent(outside), reason: 'outside the declared campaign' })
     if (!rest) return
@@ -741,9 +816,16 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     if (wakeFilter) {
       try { verdict = await wakeFilter.route(rest, { mission: missionText(), focus: state.focus ?? [] }) } catch (error) { verdict = { wake: true, reason: error.message } }
     }
-    if (verdict.wake) { state.queue.push(rest); return }
+    if (verdict.wake) {
+      if (rest.type !== 'run-changed') { state.queue.push(rest); return }
+      // The filter read the whole run; the session keeps its delta, which outdates any progress held for it.
+      state.deferred = state.deferred.filter((d) => !(d.progress && d.event.run.runId === rest.run.runId))
+      state.queue.push(deltaEvent(rest))
+      return
+    }
     if (verdict.outside) { holdOutside(state.deferred, { at: new Date().toISOString(), summary: verdict.summary, decision: verdict.key, reason: verdict.reason }); return }
-    state.deferred.push({ at: new Date().toISOString(), event: verdict.summary, decision: verdict.key, reason: verdict.reason })
+    // The provider was asked about the summary; what is held for the session is what a wake would have said.
+    state.deferred.push({ at: new Date().toISOString(), event: rest.type === 'run-changed' ? deltaEvent(rest) : verdict.summary, decision: verdict.key, reason: verdict.reason })
   }
   // What the operator asked for, verbatim, for the provider to read: the mission and
   // the latest instructions, never a side question or the answer to one.
@@ -786,7 +868,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         const substitutions = current.modelSubstitutions?.length ?? 0
         if (substitutions !== (r.observedSubstitutions ?? 0)) {
           r.observedSubstitutions = substitutions
-          state.queue.push({ type: 'model-substituted', run: current })
+          state.queue.push({ type: 'model-substituted', run: runDelta(current) })
         }
         // An automatic reconcile is undecided: the block is not its ending yet, and the decision arrives as the ordinary change.
         if (current.reconcilePending) continue
@@ -794,18 +876,28 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // delivery is the baseline, not news.
         const delivery = deliveryReading(current)
         const moved = r.observedDelivery ? Object.keys(delivery).filter((k) => delivery[k] !== r.observedDelivery[k]) : []
-        const changed = [...(current.status !== (r.observedStatus ?? r.status) ? ['status'] : []), ...moved]
+        const progress = progressReading(current), before = r.observedProgress
+        const progressed = before ? Object.keys(progress).filter((k) => JSON.stringify(progress[k]) !== JSON.stringify(before[k] ?? null)) : []
+        const wasStatus = r.observedStatus ?? r.status, statusMoved = current.status !== wasStatus
+        const changed = [...(statusMoved ? ['status'] : []), ...moved, ...progressed]
         if (changed.length) {
           r.status = current.status
-          await enqueue({ type: 'run-changed', changed, run: current })
+          const from = { ...(statusMoved ? { status: wasStatus } : {}), ...Object.fromEntries(progressed.map((k) => [k, before[k] ?? null])) }
+          const event = { type: 'run-changed', changed, run: current, from }
+          // A live run moving on decides nothing: it rides with the next wake, unasked and with no timer.
+          if (live.includes(current.status) && (!statusMoved || live.includes(wasStatus)) && !alwaysWakes(event)) holdProgress(state.deferred ??= [], { at: new Date().toISOString(), run: runDelta(current, { from }), changed })
+          else await enqueue(event)
         }
         r.observedStatus = current.status
         r.observedDelivery = delivery
+        r.observedProgress = progress
       }
       // A start gate that cannot read one launch keeps that slot occupied; it must not stop issue observation.
       try { await startGate.refresh(); monitoringFaults.delete('start-gate') } catch (e) { monitoringFault('start-gate', e.message) }
+      const listed = {}
       for (const { id: project } of await tools.projects()) {
         const issues = await tools.listIssues(project)
+        listed[project] = issues
         const fingerprint = JSON.stringify(issues.map(i=>({id:i.id,status:i.status,name:i.name})))
         if (state.observedIssues[project] !== fingerprint) {
           const previous = state.observedIssues[project]
@@ -814,11 +906,12 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         }
       }
       // Nothing routine is held for ever: past the limit, what was deferred wakes on
-      // its own. What is outside the campaign starts no timer; it rides with the next wake.
-      const timed = state.deferred?.find((d) => !d.outside)
+      // its own. What is outside the campaign, or a live run's progress, starts no timer; it rides with the next wake.
+      const timed = state.deferred?.find((d) => !d.outside && !d.progress)
       if (timed && !state.queue.some((e) => e.type === 'deferred-events') && Date.now() - Date.parse(timed.at) >= maxDeferMs) {
         state.queue.push({ type: 'deferred-events', reason: `held for ${Math.round(maxDeferMs / 60000)} minutes without a waking event` })
       }
+      await noticeFreedCapacity(listed)
       monitoringFaults.delete('poll')
       await save(); kick()
     } catch (e) { monitoringFault('poll', e.message); await save() }
@@ -895,6 +988,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       state.model = model; state.focus = focus; state.limits = limits; state.allowArchive = options.allowArchive === true; state.mission = options.message
       state.calls??=0;state.activationStarts=0;state.activationId=crypto.randomUUID();state.previews={};state.reason=null;state.finishing=false;state.status='active'
       state.queue = [{ type:'user',text:options.message }]
+      // A new activation starts its readings over: what the first prompt carries is the baseline.
+      delete state.queueObserved; delete state.readyQueueShown; delete state.capacityRefused
       message('user',options.message)
       await fs.mkdir(path.join(dir,'workspace'),{recursive:true})
       state.observedIssues = Object.fromEntries(await Promise.all((await tools.projects()).map(async ({id:project})=>[project,JSON.stringify((await tools.listIssues(project)).map(i=>({id:i.id,status:i.status,name:i.name})))])))

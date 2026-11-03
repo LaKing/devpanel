@@ -257,10 +257,16 @@ in `omitted` with a `list_issues` pointer. They arrive in `event.deferred` with 
 session keeps them. Any held event leaves `state.deferred` only once a call has returned with it, so a call that never
 started, failed or was stopped leaves it held for the next one. The panel says what is held under Status details.
 
-Never asked, always woken: user messages, action results, format repairs, model substitutions, runs that failed,
-blocked, paused or were cancelled, runs with a failure, pause or pause request, runs completed with any outcome
-other than `resolved`, a `run-changed` whose `changed` names more than `status` (a delivery decided: reconcile,
-landing, application), and any event type the filter does not know. A held event's summary keeps `changed`.
+Never asked, always woken: user messages, action results, format repairs, model substitutions, capacity freeing for an
+issue that waited (`capacity-freed`, top-level-supervisor.md "The ready queue"), runs that failed, blocked, paused or were
+cancelled, runs with a failure, pause or pause request, runs completed with any outcome other than `resolved`, a
+`run-changed` whose `changed` names a delivery key (reconcile, landing, delivery), and any event type the filter does not
+know. A held `run-changed` is kept as the delta a wake would have carried (status, phase, checks, blocked reason, `changed`); the
+provider is shown only a small summary.
+
+Never asked, and never waking: a live run's progress (a phase, a checks verdict, a blocked reason, a status moving between
+live statuses). It is held merged per run with `progress: true` (`holdProgress`), starts no timer and rides with the next
+wake, and a waking event for that run drops it.
 
 ## Failure second opinion (`gui/server/decisions/failure-advisor.mjs`, `runtime/engine.mjs`)
 

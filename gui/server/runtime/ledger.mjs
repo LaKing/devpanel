@@ -77,6 +77,27 @@ const emptyWindow = () => ({
 })
 
 /**
+ * A ledger's text, read without touching the file: its complete lines, and what follows the last newline.
+ * A crash can leave only the final line half-written (`tail`, parsed as `tailEntry` when it is whole anyway);
+ * a terminated line that does not parse is damage, and refused.
+ */
+export function parseLedger (text, file = 'ledger') {
+  const parse = (line) => {
+    try { const entry = JSON.parse(line); return KINDS.includes(entry?.kind) ? entry : null } catch { return null }
+  }
+  const complete = text.lastIndexOf('\n') + 1
+  const entries = []
+  for (const [index, line] of text.slice(0, complete).split('\n').entries()) {
+    if (!line) continue
+    const entry = parse(line)
+    if (!entry) throw new Error(`spending ledger ${file} line ${index + 1} is not a ledger entry; refusing to load (repair or move the file — later entries would otherwise be lost)`)
+    entries.push(entry)
+  }
+  const tail = text.slice(complete)
+  return { entries, complete, tail, tailEntry: tail ? parse(tail) : null }
+}
+
+/**
  * @param file      the .jsonl to append to and replay from
  * @param timezone  window boundaries; only UTC is implemented, and a different
  *                  value is refused rather than silently treated as UTC
@@ -125,21 +146,12 @@ export function createLedger ({ file, clock = { now: () => Date.now(), iso: () =
     // this ledger exists to prevent. A TERMINATED line that does not parse is
     // not a torn write but damage; truncating there would erase every later
     // reservation and fail open, so the ledger refuses to load instead.
-    const complete = text.lastIndexOf('\n') + 1
-    const body = text.slice(0, complete)
-    const tail = text.slice(complete)
-    const parse = (line) => {
-      try { const entry = JSON.parse(line); return KINDS.includes(entry?.kind) ? entry : null } catch { return null }
-    }
-    for (const [index, line] of body.split('\n').entries()) {
-      if (!line) continue
-      const entry = parse(line)
-      if (!entry) throw new Error(`spending ledger ${file} line ${index + 1} is not a ledger entry; refusing to load (repair or move the file — later entries would otherwise be lost)`)
-      apply(entry)
+    const { entries, complete, tail, tailEntry: entry } = parseLedger(text, file)
+    for (const parsed of entries) {
+      apply(parsed)
       lines++
     }
     if (tail) {
-      const entry = parse(tail)
       if (entry) {
         // Complete but unterminated: keep it, and terminate it so the next
         // append does not join it into one unparseable line.

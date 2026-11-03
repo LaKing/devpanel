@@ -58,6 +58,9 @@ npm run --silent selftest-history -- --project <id> [--test <name>]   # recorded
                              # as unstable, with the drives that made them so, as JSON; read-only (tools/selftest-history.mjs)
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
+npm run --silent supervisor-calls -- --from <YYYY-MM-DD> --to <YYYY-MM-DD>   # the top-level supervisor's calls per started run
+                             # for a stated period (inclusive UTC days) as JSON, from the ledger and run records, with what the
+                             # ledger covers; read-only, no session (tools/supervisor-calls.mjs)
 npm run contract             # launches the INSTALLED claude/codex CLIs to prove they still honour
                              # CLAUDE_CONFIG_DIR / CODEX_HOME. Local, read-only, spends nothing — but it
                              # is outside `npm test` because that suite may not reach a real runtime.
@@ -374,7 +377,14 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   that allowance. Settlement happens where the run's outcome is first observed; a definite non-start releases
   with a reason, an uncertain one stays committed. A per-wake refusal ends the chain, never the activation.
 - `supervisor-summary.mjs` — what the top-level supervisor is shown: run, step, preview and issue summaries, plus
-  the authoritative `remaining` budget block. Detail is on demand via `get_step` and `get_file`.
+  the authoritative `remaining` budget block. Detail is on demand via `get_step` and `get_file`. A run change reaches
+  it as `runDelta` (status, phase, checks verdict, blocked reason, what it acts on), `get_run` only for detail; a live
+  run's progress wakes nobody and rides with the next wake (`holdProgress`).
+- `ready-queue.mjs` — what the supervisor could start next, read by the engine and sent in the prompt as `readyQueue`
+  when it says something new: the declared campaign's issues (no campaign: the whole panel) in dependency order, each
+  with `blockedBy[].until {event, at}`; an observation, `start_run` still decides. When an issue that waited could start
+  now (`supervisor.projectHolder` reads a project's lock, owned run or not) a `capacity-freed` event wakes it with `next`,
+  past the wake filter. docs/top-level-supervisor.md "The ready queue".
 - `runtime/run-metrics.mjs` — convergence measurements read off the run record, never stored by the engine:
   round EXECUTIONS per phase ((cycle, round) pairs a seat ran in, with `cycles` and `maxDepth`) beside cycle
   restarts and ignored `restartPlan` requests; the elapsed time split into agent time / operator wait /

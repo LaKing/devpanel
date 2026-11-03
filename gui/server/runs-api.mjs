@@ -254,6 +254,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     currentRevision,
     approvals,
     checkResults,
+    // Every drive's gate verdict: checkResults holds only the current revision's evidence.
+    checkHistory: run.checkHistory ?? [],
     outstandingFindings: run.outstandingFindings ?? [],
     delivery: run.delivery,
     artifactApplication: run.artifactApplication ?? null,

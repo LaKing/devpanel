@@ -145,7 +145,7 @@ export default async function (t) {
     h.records.r1.status = 'blocked'
     await wait(() => h.invocations.some((i) => JSON.parse(i.prompt).event.type === 'run-changed') && h.idle())
     const event = JSON.parse(h.invocations.findLast((i) => JSON.parse(i.prompt).event.type === 'run-changed').prompt).event
-    t.eq('and the change wakes it, with the run in the event', [event.changed, event.run.status, Array.isArray(event.run.steps)], [['status'], 'blocked', true])
+    t.eq('and the change wakes it, with the run\'s delta in the event', [event.changed, event.run.status, event.run.steps, event.run.from], [['status'], 'blocked', undefined, { status: 'running' }])
     await h.close()
   }
 }

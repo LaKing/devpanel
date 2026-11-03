@@ -151,13 +151,13 @@ function deepFreeze (value) {
 }
 
 /** The run records a packed archived issue kept (issue-bundle.mjs), frozen like the others. */
-async function packedRunsOf (project, id) {
+export async function packedRunsOf (project, id) {
   const { ISSUES_DIR } = await import('./issues.js')
   return deepFreeze(await packedRuns(ISSUES_DIR, project, id))
 }
 
 /** Every run.json under an issue, read light: no outputs, no journal. */
-async function runsOf (issuePath) {
+export async function runsOf (issuePath) {
   let names = []
   try {
     names = (await fs.readdir(store.runsDir(issuePath), { withFileTypes: true }))

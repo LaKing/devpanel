@@ -11,7 +11,7 @@ import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
 import { inspectLaunchState } from './supervisor-launch-state.mjs'
 import { buildOverview } from './supervisor-overview.mjs'
 import { setIssueDependencies, openDependencies } from './issue-dependencies.mjs'
-import { reportStartRefusal } from './reporters.mjs'
+import { readReporters, reportStartLevel, reportStartRefusal } from './reporters.mjs'
 import { launchReadiness } from './supervisor-readiness.mjs'
 import { projectPath } from './project-path.mjs'
 import { performanceForModel } from './model-performance.mjs'
@@ -93,6 +93,16 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    setDependencies:a=>mutate(()=>setIssueDependencies(a.project,a.issueId,{dependsOn:a.dependsOn,reason:a.reason,by:'supervisor'})),
    openDependencies:async a=>openDependencies(await issues.getIssue(a.project,a.issueId)),
    reportStartRefusal:async a=>reportStartRefusal(await issues.getIssue(a.project,a.issueId),a.playbook),
+   // What the ready queue cannot read off the listings: who holds each project, by the test a start is refused on, and how far a report's trust reaches.
+   readyQueueFacts:async issuesByProject=>{
+    const holders={},reportLevels={}
+    let reporters=null
+    for(const [project,rows] of Object.entries(issuesByProject)){
+     holders[project]=await supervisor.projectHolder(project,rows)
+     for(const issue of rows)if(issue.report){reporters??=await readReporters();reportLevels[`${project}/${issue.id}`]=await reportStartLevel(issue,{reporters})}
+    }
+    return {holders,reportLevels}
+   },
    readiness:async a=>launchReadiness({...a,projectPath:projectPath(a.project),
     resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState}),
    infrastructure:project=>projectInfrastructure(project,{root:configRoot}),

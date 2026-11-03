@@ -359,9 +359,9 @@ export function createSupervisor ({
    * persisted live runs whose lock owner is alive. A run persisted as live with
    * a dead owner is recovery work, not a running run, and does not block.
    */
-  async function projectBusy (project, exceptIssueId) {
-    let list = []
-    try { list = await issues.listIssues(project) } catch { return null }
+  async function projectBusy (project, exceptIssueId, listed = null) {
+    let list = listed ?? []
+    if (!listed) try { list = await issues.listIssues(project) } catch { return null }
     for (const issue of list) {
       if (issue.id === exceptIssueId) continue
       const latest = issue.latestRun
@@ -370,6 +370,19 @@ export function createSupervisor ({
       if (owner.forThisRun && held(owner)) return { runId: latest.runId, issueId: issue.id }
     }
     return null
+  }
+
+  /**
+   * Who holds this project now, by the same two tests a start is refused on (start() above): this
+   * process's own runs and starts, then a live run with a live lock owner, however it was started.
+   * Read-only, and it takes a listing the caller already has. An observation: start() decides.
+   */
+  async function projectHolder (project, listed = null) {
+    const running = [...active.values()].find((run) => run.project === project)
+    if (running) return { issueId: running.issueId, runId: running.runId ?? null }
+    const starts = [...starting].find((id) => id.startsWith(`${project}/`))
+    if (starts) return { issueId: starts.slice(project.length + 1), runId: null }
+    return projectBusy(project, null, listed)
   }
 
   /** Preflight, provision, run, settle. Everything after the response is sent. */
@@ -1763,7 +1776,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, projectHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**

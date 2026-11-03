@@ -66,6 +66,70 @@ export function runReading (run) {
   return crypto.createHash('sha256').update(JSON.stringify(steady)).digest('hex')
 }
 
+/** The latest check's verdict: the gate's reading of the last drive when the record has one, else its bare result. */
+function checksVerdict (run) {
+  const drive = (run.checkHistory ?? []).at(-1)
+  const check = drive ?? (run.checkResults ?? []).at(-1)
+  if (!check) return null
+  return { revision: check.revision ? check.revision.slice(0, 23) : null, result: check.result ?? null, gating: drive?.gating ?? null, tier: check.tier ?? null, at: check.at ?? null, ...(drive?.inconclusive ? { inconclusive: true } : {}) }
+}
+
+/**
+ * What monitoring compares to learn that a run progressed: each key is a name `run-changed` reports in
+ * `changed`. A packed run's record has no phase or check verdict to read, so those stay out of it and
+ * packing is not read as a change (top-supervisor.mjs poll).
+ */
+export function progressReading (run) {
+  return {
+    ...(run.packed ? {} : {
+      phase: run.phase?.id ? { id: run.phase.id, round: run.phase.round ?? 0 } : null,
+      checks: run.checksVerdict ?? null
+    }),
+    blockedReason: run.blockedReason ?? null
+  }
+}
+
+/**
+ * A run change as the supervisor's session keeps it. Every event stays in the native session and is re-read
+ * on every later call, so this is the run's standing and what the model acts on without another read: what it
+ * must copy into an action (pause.id, acceptCheck) and what it must relay (ownerInput). The steps, metrics,
+ * budgets and diagnostics are `get_run`'s.
+ */
+export function runDelta (run, { from = null } = {}) {
+  const { reconciliation: r, failure, pause, delivery, integration, recovery } = run
+  const latestSubstitution = (run.modelSubstitutions ?? []).at(-1)
+  return {
+    runId: run.runId ?? null,
+    project: run.issue?.project ?? run.project ?? null,
+    issueId: run.issue?.id ?? run.issueId ?? null,
+    playbook: run.playbook?.id ?? null,
+    status: run.status ?? null,
+    outcome: run.outcome ?? null,
+    result: run.result ?? null,
+    resultReason: run.resultReason ?? null,
+    phase: run.phase?.id ? { id: run.phase.id, round: run.phase.round ?? 0 } : null,
+    checks: run.checksVerdict ?? null,
+    blockedReason: run.blockedReason ?? null,
+    actions: run.actions ?? [],
+    ...(from && Object.keys(from).length ? { from } : {}),
+    ...(pause ? { pause: { id: pause.id, question: clip(pause.question, 2000), options: pause.options ?? null, kind: pause.kind ?? null, ...(pause.request ? { request: pause.request } : {}) } } : {}),
+    ...(failure ? { failure: { class: failure.class ?? null, message: clip(failure.message ?? failure.error ?? null, 500) } } : {}),
+    ...(run.ownerInput ? { ownerInput: run.ownerInput } : {}),
+    ...(run.splitSuggestion ? { splitSuggestion: run.splitSuggestion } : {}),
+    ...(run.acceptCheck ? { acceptCheck: run.acceptCheck } : {}),
+    ...(run.checkAcceptanceRequest ? { checkAcceptanceRequest: run.checkAcceptanceRequest } : {}),
+    ...(run.checkAcceptanceRefusal ? { checkAcceptanceRefusal: run.checkAcceptanceRefusal } : {}),
+    ...(r ? { reconciliation: { n: r.n, state: r.state, by: r.by ?? null, endedAt: r.endedAt ?? null, revision: r.revision ?? null, conflicts: r.conflicts ?? [], error: r.error ?? null, ...(r.noDrive ? { noDrive: r.noDrive } : {}), ...(r.checks ? { checks: { dir: r.checks.dir ?? null, result: r.checks.result ?? null, gating: r.checks.gating ?? null, reason: r.checks.reason ?? null } } : {}) } } : {}),
+    ...(run.landed ? { landed: run.landed } : {}),
+    ...(delivery ? { delivery: { action: delivery.action ?? null, completedAt: delivery.completedAt ?? null, verified: delivery.verified ?? null, state: delivery.application?.state ?? null, error: clip(delivery.error ?? null, 500) } } : {}),
+    ...(run.artifactApplication ? { artifactApplication: { state: run.artifactApplication.state ?? null, verified: run.artifactApplication.verified ?? null } } : {}),
+    ...(integration ? { integration: { phase: integration.phase ?? null, targetBranch: integration.targetBranch ?? null, mergeCommit: integration.mergeCommit ?? null, error: clip(integration.error ?? null, 500) } } : {}),
+    ...(recovery?.required ? { recovery: { required: true } } : {}),
+    ...(latestSubstitution ? { substitution: latestSubstitution } : {}),
+    detail: 'A delta. Detail, only when a decision depends on it: get_run {project, issueId, runId}.'
+  }
+}
+
 /** A run of a packed issue, read from its bundle's record (`record` is run.json): no steps, its ending and its delivery. */
 export function summarisePackedRun ({ runId, project, issueId, record }) {
   return { runId, project, issueId, packed: true, actions: [], status: record.status, outcome: record.outcome ?? null, blockedReason: record.blockedReason ?? null,
@@ -130,6 +194,7 @@ export function summariseRun (detail) {
     modelFallbackChecks: (detail.modelFallbackChecks ?? []).map(c => ({ at: c.at, role: c.role, model: c.model, launchReady: c.result?.launchReady })),
     recovery: detail.recovery?.required ? detail.recovery : null,
     phase: detail.phase ?? null,
+    checksVerdict: checksVerdict(detail),
     currentWindow: detail.currentWindow ? {id:detail.currentWindow.id,capturedAt:detail.currentWindow.capturedAt,source:detail.currentWindow.source,coverage:detail.currentWindow.coverage} : null,
     reportDisposition: detail.reportDisposition ? {...detail.reportDisposition,response:clip(detail.reportDisposition.response,3000)} : null,
     release: detail.release ? {runId:detail.release.runId,environment:detail.release.environment,status:detail.release.status,sha256:detail.release.sha256,checkpointVerified:detail.release.checkpointVerified,commands:detail.release.commands.map(c=>({id:c.id,status:c.status,error:c.error??null}))} : null,

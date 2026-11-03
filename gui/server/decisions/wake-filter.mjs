@@ -23,8 +23,12 @@ import { confidentAnswer } from './index.mjs'
  * results of the supervisor's own actions and its format repairs, runs that
  * failed, blocked, paused (an operator request or question) or were cancelled,
  * a run that ended unresolved (budgets, disagreement), a run whose delivery was
- * decided (`changed` names more than its status), and model substitutions after
- * a quota failure.
+ * decided (`changed` names a delivery key), model substitutions after a quota
+ * failure, and capacity freeing for an issue that waited (`capacity-freed`).
+ *
+ * A live run's progress (phase, checks verdict, a status between live statuses) is
+ * never put to the provider and does not wake: monitoring merges it per run
+ * (`holdProgress`) and it rides with the next wake, with no timer of its own.
  */
 
 export const WAKE_PURPOSE = 'wake-filter'
@@ -32,7 +36,9 @@ export const DEFAULT_MAX_DEFER_MS = 15 * 60_000
 const MAX_MISSION_CHARS = 8000
 const MAX_ISSUES = 40
 
-const ALWAYS = ['user', 'tool-result', 'protocol-repair', 'model-substituted', 'deferred-events']
+const ALWAYS = ['user', 'tool-result', 'protocol-repair', 'model-substituted', 'deferred-events', 'capacity-freed']
+// What a run-changed may name without being about its delivery.
+const PROGRESS_KEYS = ['status', 'phase', 'checks', 'blockedReason']
 const ATTENTION_STATUSES = ['failed', 'blocked', 'paused', 'cancelled']
 const MAX_CAMPAIGN_ENTRIES = 50
 const MAX_CAMPAIGN_ENTRY_CHARS = 120
@@ -41,7 +47,7 @@ export function alwaysWakes (event) {
   if (ALWAYS.includes(event?.type)) return true
   if (event?.type === 'run-changed') {
     const run = event.run ?? {}
-    if (event.changed?.some((c) => c !== 'status')) return true
+    if (event.changed?.some((c) => !PROGRESS_KEYS.includes(c))) return true
     if (ATTENTION_STATUSES.includes(run.status)) return true
     if (run.pause || run.failure || run.pauseRequested) return true
     if (run.status === 'completed' && run.outcome !== 'resolved') return true
@@ -138,6 +144,17 @@ export function holdOutside (deferred, { at, summary, decision = null, reason })
   const { removed: _removed, omitted: _omitted, ...rest } = summary
   const event = { ...rest, issues: kept, ...(keptRemoved.length ? { removed: keptRemoved } : {}), ...(omitted ? { omitted, detail: `More changed than is kept here; list_issues {project:"${summary.project}"} lists them all.` } : {}) }
   const entry = { at: held?.at ?? at, lastAt: at, outside: true, changes: (held?.changes ?? 0) + 1, event, decision, reason }
+  if (held) deferred[deferred.indexOf(held)] = entry
+  else deferred.push(entry)
+}
+
+/** Hold a live run's progress, merged into that run's entry: the newest delta wins, keeping the earliest `from` of each field. */
+export function holdProgress (deferred, { at, run, changed }) {
+  const held = deferred.find((d) => d.progress && d.event?.run?.runId === run.runId)
+  const from = { ...(run.from ?? {}), ...(held?.event.run.from ?? {}) }
+  const { from: _from, ...rest } = run
+  const entry = { at: held?.at ?? at, lastAt: at, progress: true, changes: (held?.changes ?? 0) + 1,
+    event: { type: 'run-changed', changed: [...new Set([...(held?.event.changed ?? []), ...changed])], run: { ...rest, ...(Object.keys(from).length ? { from } : {}) } } }
   if (held) deferred[deferred.indexOf(held)] = entry
   else deferred.push(entry)
 }

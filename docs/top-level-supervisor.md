@@ -71,10 +71,11 @@ overview and nothing else; an empty focus means the whole panel. If per-tenant o
 per-repository access control is ever needed, that belongs in an organisation-level
 authorisation policy, not in an activation setting.
 
-`campaign` (`{projects, leaveReporters}`) is what decides wakes, and only those: an
-issue-list change it places outside waits for the next wake, without a provider
-(docs/decisions.md "Wake filter"). It takes nothing out of sight: the supervisor still
-sees every project and can act on any issue. An operator sets it on the Supervisor page
+`campaign` (`{projects, leaveReporters}`) decides wakes and what the ready queue lists,
+and only those: an issue-list change it places outside waits for the next wake, without
+a provider (docs/decisions.md "Wake filter"), and its issues are counted rather than
+listed in the queue ("The ready queue"). It takes nothing out of sight: the supervisor
+still sees every project and can act on any issue. An operator sets it on the Supervisor page
 at any time, since Stop would also stop owned runs; it is sent in every prompt and
 survives Start and New session, and the model has no action to change it. A campaign
 given only as chat text is not declared: those changes wake unless the provider
@@ -177,12 +178,30 @@ monitoring; if it was last seen live, a `run-unreadable` event wakes the
 supervisor to read the issue instead.
 The poll compares a delivery reading as well as the status (`deliveryReading`:
 the latest reconcile that ended, the landing, the delivery's application or
-merge), and `run-changed` says in `changed` which of `status`, `reconcile`,
-`landing` and `delivery` moved. So a refused reconcile or a landing wakes the
-supervisor although the run's status stays the same, and the wake filter never
-holds it. A reconcile still `merging` is not a change: one decision, one wake. A
-run with no stored reading takes its present one as the baseline without waking,
-and a packed run's reading carries the same fields.
+merge) and a progress reading (`progressReading`: phase and round, the latest
+drive's checks verdict, the blocked reason), and `run-changed` says in `changed`
+which of `status`, `reconcile`, `landing`, `delivery`, `phase`, `checks` and
+`blockedReason` moved. So a refused reconcile or a landing wakes the supervisor
+although the run's status stays the same, and the wake filter never holds it. A
+reconcile still `merging` is not a change: one decision, one wake. A run with no
+stored reading takes its present one as the baseline without waking, and a packed
+run's reading carries the delivery fields; it has no phase or verdict to compare.
+
+The event carries the run as a compact delta (`runDelta`), not the whole run:
+status, outcome, result, phase, checks (`{revision, result, gating, tier, at}`),
+blockedReason, actions, `from` (what the moved fields were), and, when the run has
+them, what the model acts on or relays without another read: pause (with the id
+`answer_run` copies), failure, ownerInput, acceptCheck and its request or refusal,
+reconciliation, landed, delivery, integration, recovery, the latest substitution.
+Steps, metrics, budgets and diagnostics are `get_run`'s, which is needed only for
+detail. `model-substituted` carries the same delta.
+
+A live run's progress wakes nobody: a phase, a checks verdict or a status moving
+between live statuses decides nothing the engine is not already handling (a failed
+check goes back to the author). It is not put to the provider and starts no timer;
+it is merged per run in `state.deferred` (`progress: true`, the earliest `from` of
+each field and the newest reading) and rides with the next wake. An event that does
+wake for that run outdates the entry, which is dropped.
 Stopping aborts the supervisor and its owned issue runs, waits for termination,
 and retains conversation history. A normal Start with the same model continues the same session. Changing models
 while stopped creates a new native session seeded with the recent conversation;
@@ -346,7 +365,7 @@ delivery verdict and diagnostics; `get_step {project, issueId, runId, step}`
 returns one turn's full prompt, response and structured output; `get_file
 {project, issueId, step, name}` returns an issue file in full; `get_issue`
 clips reports to 6000 characters and says so; `preview` omits rendered prompt
-bodies. Run-changed notifications carry the same summary. The first live
+bodies. A run-changed notification carries a smaller delta (`runDelta`). The first live
 sessions handed the model 283 KB run views and prompts up to 490 KB; nothing is
 hidden now, only deferred.
 
@@ -572,6 +591,109 @@ and **roster entry**, so "this playbook works" and "this model works in this sea
 answerable rather than inferred. Note that this is per entry, not per account: one
 person using several models is split across rows, and per-account totals would
 need an explicit `byAccount` grouping that does not exist yet.
+
+## The ready queue
+
+What the supervisor could start next is read for it by the engine
+(`gui/server/ready-queue.mjs`) and sent in the prompt as `readyQueue`, so it neither
+assembles the answer from separate reads nor finds out from a refused start. It is
+an **observation**: it reads what admission reads, and `start_run` still re-checks
+everything, so a start that loses a race is refused as before. It chooses no playbook,
+and a preview is still needed. There is no action for it. Every prompt stays in the
+native session, so a session is sent the queue whole only when it says something new,
+and otherwise `{unchanged: true, since}`. A new session or activation gets it whole,
+and a call that failed has not been told. A queue that cannot be read reaches the
+model as `{unavailable: reason}` and does not stop the call.
+
+**Members** are the open, undecided, non-inquiry issues of the declared campaign. With
+no campaign, that is the whole panel, ordered by focus. An issue with an open owned run
+is always in. No code parses the mission. The campaign narrows this reading only:
+`outside` counts what it leaves out, and overview, `list_issues` and `start_run` still
+reach every issue.
+
+**Order** is focus, priority and age as in the overview, then each prerequisite in the
+queue before what waits for it. At most 30 rows are shown, running and ready ones first,
+and `omitted` counts the rest by state. `next` and the capacity wake work on every member,
+so the limit never hides an issue from them.
+
+**A row's state** is `ready` (no run on record, nothing in the way), `blocked`, `running`
+(its latest run is live or paused) or `decide` (an earlier run ended, so another is a
+judgement: it is never offered as next, unless a start of it was refused as occupied).
+
+**What blocks it** is `blockedBy[]`, each `{kind, ..., until: {event, at}}`. `at` is a
+time only when one is known, and null otherwise; nothing is estimated.
+
+| Kind | Names | Until | `at` |
+| --- | --- | --- | --- |
+| `dependency` | the open prerequisites | each gets a disposition or is archived | null |
+| `project-busy` | the holder's issue and run | that run settles (a wall-clock budget is a limit, and pauses suspend it) | null |
+| `own-run` | the run, its status | it settles, or its question is answered | null |
+| `owner-input` | the run | the owner answers on the issue page | null |
+| `report-trust` | | an operator starts it from the panel (a report the supervisor may only assess stays `ready`, with `allowedPlaybooks`) | null |
+| `launch-unresolved` | | an operator reconciles the launch | null |
+| `failed-launch` | the reason; `advisory`, as the guard is keyed on inputs the queue does not read | the inputs change, or an operator authorizes a retry | null |
+| `start-limit` | used, limit | an operator raises `maxStartsPerIssue` or begins a New session | null |
+| `unreadable-run` | the run records | a person establishes what they hold | null |
+
+What stops every start is said once, as `canStartNow` and `because[]`: `finishing`,
+`session-starts`, `concurrency` (a live run settles) and, only where allowances are
+enforced, `spending-window`, the one block with a known time: the next UTC day or month.
+A model's availability has its own time, but belongs to a model and no playbook is
+chosen yet, so `seatModels` says it. Repository faults, base-policy refusals and stale
+previews are not in the queue: they need a playbook and git, so `readiness` and
+`start_run` still say those.
+
+### When capacity frees
+
+The poll reads each project's holder by the test a start is refused on
+(`supervisor.projectHolder`: this process's runs and starts, then a live run with a live
+lock owner, however it was started), so it sees runs the supervisor does not own. If an
+issue that waited at the last reading for a project, a concurrency slot, a spending
+window or a prerequisite could start now, a `capacity-freed` event wakes the supervisor,
+with `freed` (`project-released`, `concurrency-freed`, `spending-window-rolled`,
+`dependency-settled`) and `next`. It never goes through the wake filter, which can hold a
+resolved ending for 15 minutes; what the filter holds rides along. An event already queued
+in that poll carries it as `capacityFreed` instead of costing a second call. It is an offer:
+the mission decides, and `action: null` is a fine answer.
+
+There is no wake when nothing could start (nothing ready, finishing, no starts left), or
+for what a prompt already showed the model, such as its own `set_disposition`: a reading
+in a prompt that returned is the new baseline. The poll runs between turns, so a release
+is learned at worst one turn and one poll later, and the next prompt's queue is current
+anyway. A first reading is a baseline, not news. A run that settles while a poll is under way
+can show its capacity free before its ending has been observed; the news then waits one poll,
+so both arrive in one call. A run's status is written before its lock is released, so its
+ending can also wake first and the release be told by the next poll: one more call, when no
+prompt in between showed it.
+
+### Calls per started run
+
+`npm run --silent supervisor-calls -- --from YYYY-MM-DD --to YYYY-MM-DD` (from `gui/`;
+`gui/tools/supervisor-calls.mjs`) reads the figure for a stated period of inclusive UTC
+days, read-only and without a model session.
+
+- `callsPerStartedRun.of` is the supervisor's own calls: `model-call` reservations in the
+  period, repair and action-result turns included. Side questions and calls that never
+  reached a runtime (`notStarted`: the reservation was released) are counted apart, under
+  `calls`.
+- A limit in older lines: a call Stop kept from reaching the adapter used to be settled at a
+  known cost of 0, rather than released, and such a line reads the same as a real call whose
+  runtime reported a cost of exactly 0. The tool cannot tell them apart, so it leaves both out
+  of `of`, in every period, and counts them as `calls.settledAtZero`: the figure is low by at
+  most that many.
+- `callsPerStartedRun.total` is the runs it started: `run-start` reservations in the period
+  that were settled, or that a run record carries as its `supervisorLaunchId`, archived
+  runs included. A released reservation is `starts.neverStarted`. An outstanding one with no
+  such run is `starts.uncertain`. A refusal before the reservation writes no line. Runs an
+  operator started are not counted. Session counters cannot give this: they count attempts,
+  per session.
+- `ledger.coverage` says what the figure can stand on: `complete`, `partial` or `none`.
+  `perRun` is null when nothing started.
+
+To compare a before and an after, run it for both periods with the same tool, use a period
+only when `ledger.coverage` is `complete` and `starts.started` is above zero, and state both
+periods beside the figures. The ledger is append-only and a New session leaves it alone, so
+an earlier period reads the same later on. A period the ledger does not cover has no figure.
 
 ## Readiness: conditions read now, taking nothing
 
