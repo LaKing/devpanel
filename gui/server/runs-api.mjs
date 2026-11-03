@@ -1,4 +1,4 @@
-import { reconcilePending, refreshFacts, resumeUnavailable } from './runtime/run-control.mjs'
+import { acceptableCheck, reconcilePending, refreshFacts, resumeUnavailable } from './runtime/run-control.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -8,7 +8,7 @@ import * as store from './runtime/store.mjs'
 import { runMetrics } from './runtime/run-metrics.mjs'
 import { supportedActions, LIVE_STATUSES } from './supervisor.mjs'
 import { triageSuggestion } from './runtime/triage-suggestion.mjs'
-import { runResult } from './runtime/run-result.mjs'
+import { refusedAcceptance, runResult } from './runtime/run-result.mjs'
 import { explainRun } from './runtime/run-explanation.mjs'
 import { closureWithAcceptances, readAcceptedRisks } from './runtime/residual-risks.mjs'
 import { ownerLiveness } from './runtime/lock.mjs'
@@ -195,6 +195,10 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     actions,
     // The same list under its older name, for the panel and supervisor sessions that read it.
     supportedActions: actions,
+    // What Accept check result has to name, while it is offered.
+    ...(actions.includes('accept-check-result') ? { acceptCheck: (({ revision, failures, notRun }) => ({ revision, failures, notRun }))(acceptableCheck(run)) } : {}),
+    ...(run.checkAcceptanceRequest ? { checkAcceptanceRequest: run.checkAcceptanceRequest } : {}),
+    ...(refusedAcceptance(run) ? { checkAcceptanceRefusal: refusedAcceptance(run) } : {}),
     recovery: run.recovery,
     abandonment: run.abandonment ? { at: run.abandonment.at, by: run.abandonment.by } : null,
     pause: run.pause ?? null,

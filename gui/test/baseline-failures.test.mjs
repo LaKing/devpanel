@@ -4,7 +4,7 @@ import path from 'node:path'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
-import { checksOnlyBlock } from '../server/runtime/run-control.mjs'
+import { acceptableCheck, checksOnlyBlock } from '../server/runtime/run-control.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
@@ -509,7 +509,9 @@ export default async function (t) {
     t.ok('refresh-checks is offered', checksOnlyBlock(run))
     const said = explainRun(run)
     t.ok('the explanation says inconclusive, not a regression', /did not finish its tests/.test(said.headline) && /Inconclusive, not a regression/.test(said.detail), JSON.stringify(said))
-    t.eq('refresh-checks and continue are offered, resume is not', supportedActions(run), ['continue', 'refresh-checks', 'start-new'])
+    t.eq('refresh-checks, continue and accepting the result are offered, resume is not', supportedActions(run), ['continue', 'refresh-checks', 'accept-check-result', 'start-new'])
+    const named = acceptableCheck(run)
+    t.ok('the candidate\'s failed tests are named, none of them judged', named.failures.length > 0 && named.failures.every((f) => f.basis === 'unjudged') && named.unidentified.length === 0, JSON.stringify(named.failures))
 
     // The drive is fixed: Refresh checks must drive a fresh base, since an unfinished one is never held.
     await fs.writeFile(healed, '')

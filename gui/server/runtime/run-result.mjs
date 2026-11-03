@@ -26,7 +26,32 @@ const REPORT_LABELS = {
   'no-findings': () => 'Report accepted — no findings'
 }
 
+const failureNames = (a) => (a.failures ?? []).map((f) => f.key).join(', ')
+
+/** The accepted check risk in words: which failures, who, and why (engine.acceptCheckResult). */
+export function acceptedRiskWords (a) {
+  const n = a.failures?.length ?? 0
+  return `${a.by} accepted ${n === 1 ? 'a failed check' : `${n} failed checks`} (${failureNames(a)}). Reason: ${a.reason}${a.notRun?.length ? ` Required commands that did not run because of ${n === 1 ? 'it' : 'them'}: ${a.notRun.join(', ')}.` : ''}`
+}
+
+/** An acceptance that was asked for and refused, while that still describes the run; otherwise null. */
+export function refusedAcceptance (run) {
+  const last = run.checkAcceptanceRefusals?.at(-1)
+  return last && !last.closedAt && run.status === 'blocked' && last.revision === run.revisions?.at(-1)?.fingerprint ? last : null
+}
+
 export function runResult (run, outputs) {
+  const result = judgedResult(run, outputs)
+  const accepted = run.closure?.acceptedCheckRisk
+  if (accepted) {
+    const lead = result.result === 'delivered' || result.result === 'artifact-ready' ? result.resultLabel : 'Not delivered'
+    return { ...result, resultLabel: `${lead} — ${accepted.by} accepted check failures ${failureNames(accepted)}. Reason: ${accepted.reason}`, acceptedCheckRisk: accepted }
+  }
+  if (refusedAcceptance(run)) return { ...result, resultLabel: 'Check result not accepted: the coordinator did not confirm' }
+  return result
+}
+
+function judgedResult (run, outputs) {
   if (run.journal?.recoveryRequired) return { result: null, resultReason: 'event-journal-recovery-required' }
   // A person's explicit claim (supervisor.markLanded), never inferred from the
   // source repository; outcome, closure and approvals stay as the engine left them.

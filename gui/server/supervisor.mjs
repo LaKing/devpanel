@@ -1,4 +1,4 @@
-import { continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
+import { acceptCheckUnavailable, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
@@ -471,7 +471,7 @@ export function createSupervisor ({
    * resumes, so a crash right after leaves the decision on disk. The same
    * one-live-run-per-project rule applies as for a start.
    */
-  async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false }) {
+  async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false, acceptCheck = null }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
@@ -517,7 +517,7 @@ export function createSupervisor ({
           return { runId, status: engine.run.status, integrity: engine.run.integrity.status }
         }
       }
-      if (!resume && !recover && !integrity && !retryInput && !refreshChecks && !continueRun && engine.run.status !== 'paused') throw err(409, 'this run is not waiting for a decision')
+      if (!resume && !recover && !integrity && !retryInput && !refreshChecks && !continueRun && !acceptCheck && engine.run.status !== 'paused') throw err(409, 'this run is not waiting for a decision')
       if (recover) {
         const outcome = await engine.recoverOwnerLoss({ budgets, actor, origin })
         if (!outcome.resumed) {
@@ -528,7 +528,7 @@ export function createSupervisor ({
           return { runId, status: engine.run.status, recovered: false, reason: outcome.reason }
         }
       }
-      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
       // The worktree was handed back when the run paused; it is ours again.
       if (engine.run.workspace?.state === 'retained') {
         engine.run.workspace.state = 'active'
@@ -1662,7 +1662,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, settle, reconcile, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, settle, reconcile, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**
@@ -1760,14 +1760,15 @@ function baseActions (run, { active = false, refresh } = {}) {
   if (run.status === 'paused') return run.pause?.kind === 'manual' ? (resumeUnavailable(run) ? ['abandon'] : ['resume', 'abandon']) : ['answer', 'abandon']
   // Stopped only by failed checks on an approved revision: rerunning them is the remedy, beside resume.
   const refreshable = !refreshChecksUnavailable(run, refresh)
-  if (!resumeUnavailable(run)) return refreshable ? ['refresh-checks', 'resume', 'start-new'] : ['resume', 'start-new']
+  const acceptable = !acceptCheckUnavailable(run, refresh)
+  if (!resumeUnavailable(run)) return [...(refreshable ? ['refresh-checks'] : []), ...(acceptable ? ['accept-check-result'] : []), 'resume', 'start-new']
   if (run.status === 'blocked') {
     // Other blockers retain their specific recovery and finalization controls.
     if (run.blockedReason === 'recovery-required' || run.recovery?.required) return ['abandon']
     // Stopped at the hand-off with the approved candidate still on disk: the
     // reviews stand, so closure may be evaluated again once the cause is fixed.
     const continuable = !continueUnavailable(run)
-    if (continuable || refreshable) return [...(continuable ? ['continue'] : []), ...(refreshable ? ['refresh-checks'] : []), 'start-new']
+    if (continuable || refreshable || acceptable) return [...(continuable ? ['continue'] : []), ...(refreshable ? ['refresh-checks'] : []), ...(acceptable ? ['accept-check-result'] : []), 'start-new']
     const finalizable = FINALIZABLE_BLOCKS.includes(run.blockedReason) && run.workspace?.path && run.workspace.state !== 'removed' && run.integrity?.status !== 'quarantined'
     // Refused for drift on the approved patch's own paths: merging it onto the source is the remedy.
     if (finalizable && !reconcileUnavailable(run)) return ['reconcile-delivery', 'finalize', 'start-new']

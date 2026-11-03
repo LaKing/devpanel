@@ -1,4 +1,4 @@
-import { continueUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable } from './run-control.mjs'
+import { acceptableCheck, acceptanceCovers, acceptCheckUnavailable, continueUnavailable, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, supervisorAcceptRefusal } from './run-control.mjs'
 import { describeCommand } from './command-line.mjs'
 import { checkSummary } from './check-summary.mjs'
 import { earlierDrives, reproducedSelftests, retryNewSelftestFailures, sameFailureEarlier } from './selftest-retry.mjs'
@@ -379,6 +379,9 @@ export const continueKey = (phase) => `${phase.id}:continue`
 
 /** The decision key of the engine's automatic return to a review loop (engine.returnToReview). */
 export const returnKey = (phase) => `${phase.id}:return`
+
+/** The decision key of an operator's or supervisor's accept check result (engine.acceptCheckResult). */
+export const acceptCheckKey = (phase) => `${phase.id}:accept-check`
 
 /** Agent turns only: an operator's answer is not an agent step and spends nothing. */
 export const agentSteps = (steps) => steps.filter((s) => s.role !== 'operator')
@@ -1990,9 +1993,13 @@ export class Engine {
       // What the checks established, quoted whatever this turn can read: the
       // gate's verdict, the comparison with the base and the selftest failures.
       if (step.output === 'closureConfirmation' && latestCheck) {
+        const asked = this.run.checkAcceptanceRequest
         append('checks-evidence', JSON.stringify({ revision: latestCheck.revision, result: latestCheck.result, gating: gatingResult(latestCheck, this.run),
           baselineComparison: latestCheck.baselineComparison ?? null,
-          instruction: 'gating is what closure counts: failed blocks it. baselineComparison.selftest names every failed selftest, new against the base or inherited (baselineKnown); a new one is a criterion the change has not met.' }))
+          ...(asked ? { acceptanceRequest: { failures: asked.failures.map((f) => f.key), notRun: asked.notRun, reason: asked.reason, by: asked.by } } : {}),
+          instruction: asked
+            ? `${asked.by} asks to accept the failures in acceptanceRequest and deliver this revision. Nothing is accepted unless this confirmation is met: judge each criterion from the evidence, as always. A named failure alone is not evidence that a criterion is unmet unless the criterion is about it; any failure not named still counts against the change. State the named failures under residualRisks.`
+            : 'gating is what closure counts: failed blocks it. baselineComparison.selftest names every failed selftest, new against the base or inherited (baselineKnown); a new one is a criterion the change has not met.' }))
       }
       // The prohibition and the way round it belong together, and they have to
       // reach the seat that can act on it: every coordinator is coordinationOnly,
@@ -2499,10 +2506,106 @@ export class Engine {
     this.run.status = 'pending'
     this.run.blockedReason = null
     this.run.endedAt = null
+    this.withdrawAcceptance('refresh-checks')
     this.run.closure = null
     for (const [role, p] of Object.entries(this.run.participants)) if (this.snapshot.participants[role].coordinationOnly) { p.session = null; p.readSession = null; p.state = 'uninitialised' }
     await this.persist({ type: 'checks-refresh-requested', revision, target: refreshTarget })
     return { kind: 'checks-refresh', revision }
+  }
+
+  /**
+   * Accept check result and deliver: named failures of the check on an approved
+   * revision do not stop its delivery. The decision is recorded as a step. It is
+   * committed to `closure.acceptedCheckRisk` only once every other closure condition
+   * but delivery is met: here when the closure record already says so; otherwise the
+   * run asks its coordinator for the one confirmation this revision lacks (replay
+   * reads the named revision's checks as passed, for that turn only, checkEvidence)
+   * and closure decides. Absent or declined, nothing is accepted and nothing delivered.
+   * Delivery itself is closeOn's, as for any run.
+   */
+  async acceptCheckResult ({ failures, reason, revision, actor, authority = 'operator' } = {}) {
+    await this.assertJournal()
+    const bad = (message, status = 400) => Object.assign(new Error(message), { status })
+    if (!Array.isArray(failures) || !failures.length || failures.some((f) => typeof f !== 'string' || !f.trim())) throw bad('name the accepted failures')
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000 || /\0/.test(reason)) throw bad('a reason is required')
+    if (typeof actor !== 'string' || !actor.trim()) throw bad('who accepts must be named')
+    if (typeof revision !== 'string' || !revision) throw bad('name the revision being accepted')
+    const refusal = acceptCheckUnavailable(this.run, { tactic: Boolean(this.snapshot.tactic) })
+    if (refusal) throw bad(refusal, 409)
+    const offered = acceptableCheck(this.run)
+    if (revision !== offered.revision) throw bad(`This run's revision is ${offered.revision}, not ${revision}.`, 409)
+    const keys = offered.failures.map((f) => f.key)
+    const missing = keys.filter((k) => !failures.includes(k))
+    const extra = failures.filter((k) => !keys.includes(k))
+    if (missing.length || extra.length) throw bad(`The named failures must be exactly the check's.${missing.length ? ` Not named: ${missing.join(', ')}.` : ''}${extra.length ? ` Not failures of this check: ${extra.join(', ')}.` : ''}`, 409)
+    if (authority !== 'operator') {
+      const beyond = supervisorAcceptRefusal(offered, { minimumVerification: this.snapshot.autoClose?.minimumVerification })
+      if (beyond) throw bad(beyond, 403)
+    }
+    const [confirmationStep = null, confirmationOutput] = this.activeConfirmation()
+    const confirmation = confirmationOutput?.output ?? null
+    const ofThisRevision = confirmation?.revision === revision
+    const confirmed = ofThisRevision && this.coordinatorConfirmed(confirmation, { identities: new Set([revision]), hasCandidate: true })
+    if (ofThisRevision && !confirmed) throw bad('The coordinator did not confirm this revision; its confirmation stands until Continue or Refresh checks replaces it.', 409)
+    const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
+    const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
+    if (current.hash !== checkpoint.hash) throw bad('The retained workspace changed; resolve integrity before accepting.', 409)
+    const byStep = this.run.steps.find((s) => s.number === this.run.revisions.at(-1).byStep)
+    const phase = this.snapshot.phases.find((p) => p.loop && p.id === byStep?.phase)
+    if (!phase) throw bad('No review loop produced this run’s candidate.', 409)
+
+    const at = this.clock.iso()
+    const commit = confirmed && this.run.blockedReason === 'closure-conditions-unmet'
+    const names = keys.join(', ')
+    const answer = commit
+      ? `Accepted the check failures ${names} on revision ${revision}. Reason: ${reason.trim()}`
+      : `Asked to accept the check failures ${names} on revision ${revision}; not committed unless the coordinator confirms this revision. Reason: ${reason.trim()}`
+    const decision = { pauseId: null, key: acceptCheckKey(phase), question: `Accept the check result on revision ${revision} and deliver it.`, options: null, answer, actor: actor.trim(), askedBy: { phase: phase.id, stepId: null, step: byStep.number }, askedAt: this.run.endedAt ?? at, at }
+    const invocationId = `decision-${uuid()}`
+    const response = `# ${authority === 'operator' ? 'Operator' : 'Supervisor'}: accept check result${NL}${NL}${answer}${NL}${NL}Recorded by ${decision.actor} at ${at}.${NL}`
+    const created = await this.stepStore.create({ name: 'accept-check', response, invocationId })
+    this.run.steps.push({
+      number: created.number, slug: created.slug, basedOnRevision: null, stepId: 'decision', role: 'operator', phase: phase.id, round: 0, attempt: 1,
+      invocationId, startedAt: decision.askedAt, endedAt: at, durationMs: null, durationUnknown: null, revision: null, outputRef: null, usage: null, response, decision
+    })
+    const { check } = offered
+    const entry = { revision, failures: offered.failures, notRun: offered.notRun, reason: reason.trim(), by: decision.actor, authority, requestedAt: at, step: created.number, previousBlock: this.run.blockedReason,
+      check: { dir: check.dir ?? null, at: check.at ?? null, result: check.result, gating: gatingResult(check, this.run) } }
+    // A refusal the new decision replaces no longer describes the run.
+    for (const r of this.run.checkAcceptanceRefusals ?? []) r.closedAt ??= at
+    if (commit) {
+      this.run.closure.acceptedCheckRisk = { ...entry, acceptedAt: at, confirmationStep }
+    } else {
+      this.run.checkAcceptanceRequest = entry
+      // A confirmation of another revision says nothing about this one: replay must ask again.
+      this.run.supersededSteps = [...new Set([...(this.run.supersededSteps ?? []), ...this.run.steps.filter((s) => this.outputs[s.number]?.contract === 'closureConfirmation' && this.outputs[s.number]?.output?.revision !== revision).map((s) => s.number)])]
+      for (const [role, p] of Object.entries(this.run.participants)) if (this.snapshot.participants[role].coordinationOnly) { p.session = null; p.readSession = null; p.state = 'uninitialised' }
+    }
+    const stoppedAt = Date.parse(this.run.endedAt ?? at)
+    if (Number.isFinite(stoppedAt)) this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + Math.max(0, this.clock.now() - stoppedAt)
+    this.run.status = 'pending'
+    this.run.blockedReason = null
+    this.run.endedAt = null
+    await this.persist({ type: commit ? 'check-result-accepted' : 'check-acceptance-requested', revision, failures: keys, by: decision.actor, authority, step: created.number })
+    return commit ? { kind: 'check-accepted', accepted: true, revision } : { kind: 'check-acceptance-requested', accepted: false, awaiting: 'coordinator-confirmation', revision }
+  }
+
+  /** An acceptance the run no longer stands on: kept in the history, gone from closure. */
+  withdrawAcceptance (because) {
+    const at = this.clock.iso()
+    for (const r of this.run.checkAcceptanceRefusals ?? []) r.closedAt ??= at
+    const accepted = this.run.closure?.acceptedCheckRisk
+    if (!accepted) return
+    this.run.checkAcceptanceHistory = [...(this.run.checkAcceptanceHistory ?? []), { ...accepted, withdrawnAt: at, withdrawnBecause: because }]
+    delete this.run.closure.acceptedCheckRisk
+  }
+
+  /** The request is refused: nothing was accepted, and the refusal is on the record. */
+  refuseAcceptanceRequest (because, criteria = []) {
+    const { previousBlock, ...request } = this.run.checkAcceptanceRequest
+    delete this.run.checkAcceptanceRequest
+    this.run.checkAcceptanceRefusals = [...(this.run.checkAcceptanceRefusals ?? []), { ...request, refusedAt: this.clock.iso(), because, criteria }]
+    return previousBlock
   }
 
   /**
@@ -2556,6 +2659,7 @@ export class Engine {
     this.run.status = 'pending'
     this.run.blockedReason = null
     this.run.endedAt = null
+    this.withdrawAcceptance('continue')
     this.run.closure = null
     await this.persist({ type: 'operator-continued', ...entry })
     return entry
@@ -2796,11 +2900,15 @@ export class Engine {
   /**
    * Every check outcome this run recorded, for replay: current results plus
    * history, as the gates count them (a failure of baseline-known failures only
-   * counts as passed).
+   * counts as passed). A revision whose check result was accepted, or is being
+   * asked to be, reads as passed here too, so replay goes past the review loop
+   * to the confirmation with no author round. The records stay what ran.
    */
   checkEvidence () {
+    const accepted = this.run.closure?.acceptedCheckRisk?.revision ?? this.run.checkAcceptanceRequest?.revision ?? null
     return [...(this.run.checkHistory ?? []).map((h) => ({ ...h, result: h.gating ?? h.result })),
       ...this.run.checkResults.map((c) => ({ revision: c.revision, ...(c.tier ? { tier: c.tier } : {}), result: gatingResult(c, this.run), ...(inconclusiveBase(c, this.run) ? { inconclusive: true } : {}) }))]
+      .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false } : c)
   }
 
   /** Checks beside reviews unless the strategy keeps them first (`checks.concurrent: false`). */
@@ -3030,6 +3138,19 @@ export class Engine {
       if (this.snapshot.tactic && !await this.applyCoordinatorEffects()) break
       const next = plan(this.snapshot, this.activeSteps(), this.outputs, { checkResults: this.checkEvidence() })
 
+      // An acceptance buys one confirmation of this revision. A replay that wants any
+      // other turn (a re-review awaiting the drive, say) refuses it: no author round, no
+      // new revision, and the run stands where it stopped.
+      if (next.kind === 'turn' && this.run.checkAcceptanceRequest && next.step.output !== 'closureConfirmation') {
+        const previous = this.refuseAcceptanceRequest(`replay needs a ${next.step.id} turn before the coordinator can confirm`)
+        this.run.status = 'blocked'
+        this.run.blockedReason = previous
+        this.run.outcome = 'unresolved'
+        this.run.endedAt = this.clock.iso()
+        await this.persist({ type: 'check-acceptance-refused', stepId: next.step.id })
+        break
+      }
+
       if (next.kind !== 'turn' && this.checksInFlight) {
         await this.settleChecks()
         continue
@@ -3247,6 +3368,8 @@ export class Engine {
     else delete this.run.extensionDenied
     if (result.driveNotRun) this.run.driveNotRun = result.driveNotRun
     else delete this.run.driveNotRun
+    // The loop or the confirmation ended some other way: no valid confirmation, no acceptance.
+    if (result.reason !== 'complete' && this.run.checkAcceptanceRequest) this.refuseAcceptanceRequest(`the run ended (${result.reason}) with no valid confirmation of this revision`)
     if (result.reason === 'complete') {
       // An automatic return reopened the review loop: the run goes on.
       if (await this.evaluateClosure({ mayReturn: true }) === 'returned') return 'returned'
@@ -3294,6 +3417,7 @@ export class Engine {
     for (const a of this.run.approvals) if (a.revision === approvedRevision) { a.revision = fresh.fingerprint; a.migratedFrom = approvedRevision }
     for (const c of this.run.checkResults) if (c.revision === approvedRevision) { c.revision = fresh.fingerprint; c.migratedFrom = approvedRevision }
     for (const step of this.run.steps) if (step.revision === approvedRevision) step.revision = fresh.fingerprint
+    for (const a of [this.run.closure?.acceptedCheckRisk, this.run.checkAcceptanceRequest]) if (a?.revision === approvedRevision) { a.revision = fresh.fingerprint; a.migratedFrom = approvedRevision }
     this.run.revisions.push({ fingerprint: fresh.fingerprint, byStep: recorded.byStep, at, rule: fresh.rule, migratedFrom: approvedRevision, migratedRule: rule })
     await this.persist({ type: 'revision-migrated', from: approvedRevision, to: fresh.fingerprint, rule: fresh.rule, previousRule: rule })
     return true
@@ -3398,8 +3522,11 @@ export class Engine {
         entry.checks = check ? { ...check, gating, reason: gateReason(check, gateRun), error: check.error ?? null }
           : { result: 'not-run', gating, reason: target ? 'the staging drive runs on a reconciled candidate only when checks are required' : 'no check target' }
         const satisfied = requirement === 'none' ? true : requirement === 'optional' ? gating !== 'failed' : gating === 'passed'
+        // A failure the operator accepted on the approved revision stays accepted on its merge; one nobody named does not.
+        const accepted = this.run.closure.acceptedCheckRisk
+        if (!satisfied && check && accepted?.revision === approved.revision && acceptanceCovers(accepted, check, gateRun)) entry.acceptedCheckRisk = true
         // The raw result alone misleads: a drive can pass while a selftest new against the baseline still gates it.
-        if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
+        else if (!satisfied) return await refuse('revalidation-failed', `the checks on the merged candidate did not pass the gate (gating ${gating}; drive result ${check?.result ?? 'not run'}): ${entry.checks.reason}`)
       }
 
       // Accepted: the merged candidate is the run's revision, with the approvals carried.
@@ -3493,6 +3620,18 @@ export class Engine {
     await this.persist({ type: 'closure-returned', ...entry })
   }
 
+  /** The coordinator's closure confirmation in force: `[step, output]`, or empty. */
+  activeConfirmation () {
+    return Object.entries(this.outputs).filter(([number]) => !(this.run.supersededSteps ?? []).includes(number) && (!this.snapshot.tactic || Number(number) > (this.run.windowResetAfter ?? -1)))
+      .filter(([, o]) => o.contract === 'closureConfirmation' && o.valid)
+      .at(-1) ?? []
+  }
+
+  /** The `coordinatorConfirmation` closure condition; accepting a check result reads the same one. */
+  coordinatorConfirmed (confirmation, { identities, hasCandidate }) {
+    return (!this.snapshot.tactic || buildContext(this.snapshot,this.run,this.activeSteps(),this.outputs).acceptanceCriteria.every(c => confirmation?.criteria?.some(r => r.id === c.id && r.met === true))) && (!['staging','deployment'].includes(this.snapshot.tactic) || (this.run.release?.status === 'completed' && effectiveAgentSteps(this.activeSteps()).filter(s => s.role !== 'coordinator').every(s => releaseAssessmentAccepted(this.outputs[s.number])))) && confirmation?.satisfied === true && (hasCandidate ? identities.has(confirmation?.revision) : true)
+  }
+
   /**
    * The five closure conditions, plus the authority to act on the evidence.
    * After an accepted reconciliation (reconcileDelivery) the candidate is the
@@ -3567,7 +3706,8 @@ export class Engine {
     // Failures the unchanged base of the same source revision has too do not
     // block (baseline-known); a new one, or a comparison not made, does.
     // A carried result is judged on the base it was driven on, the run's, not B′.
-    const gating = gatingResult(check, candidate && !check.carriedFrom ? { ...this.run, workspace: ws } : this.run)
+    const gateRun = candidate && !check.carriedFrom ? { ...this.run, workspace: ws } : this.run
+    const gating = gatingResult(check, gateRun)
     const inherited = check.baselineComparison?.failures ?? null
 
     const checksSatisfied =
@@ -3575,9 +3715,14 @@ export class Engine {
         : requirement === 'optional' ? gating !== 'failed'
           : gating === 'passed'
 
-    const [confirmationStep = null, confirmationOutput] = Object.entries(this.outputs).filter(([number]) => !(this.run.supersededSteps ?? []).includes(number) && (!this.snapshot.tactic || Number(number) > (this.run.windowResetAfter ?? -1)))
-      .filter(([, o]) => o.contract === 'closureConfirmation' && o.valid)
-      .at(-1) ?? []
+    // An acceptance speaks for the content it named (or that content merged onto
+    // the source), and only for the failures it named.
+    const acceptanceApplies = (a) => Boolean(a) && gating !== 'passed' && identities.has(a.revision) && acceptanceCovers(a, check, gateRun)
+    const priorAcceptance = this.run.closure?.acceptedCheckRisk ?? null
+    let acceptance = acceptanceApplies(priorAcceptance) ? priorAcceptance : null
+    let acceptedNow = false
+
+    const [confirmationStep = null, confirmationOutput] = this.activeConfirmation()
     const confirmation = confirmationOutput?.output
 
     // A strategy that never fingerprints a candidate (analysis work) has no
@@ -3614,16 +3759,36 @@ export class Engine {
       sameRevisionApproval: Boolean(current) && (this.snapshot.tactic
         ? Object.keys(this.snapshot.participants).filter(role => role.startsWith('auditor-')).every(role => approvals.some(a => a.role === role))
         : approvals.length > 0),
-      checksSatisfied,
+      checksSatisfied: checksSatisfied || Boolean(acceptance),
       noOutstandingBlockingFindings: (this.run.outstandingFindings ?? []).every((f) => !f.blocking),
-      coordinatorConfirmation: (!this.snapshot.tactic || buildContext(this.snapshot,this.run,this.activeSteps(),this.outputs).acceptanceCriteria.every(c => confirmation?.criteria?.some(r => r.id === c.id && r.met === true))) && (!['staging','deployment'].includes(this.snapshot.tactic) || (this.run.release?.status === 'completed' && effectiveAgentSteps(this.activeSteps()).filter(s => s.role !== 'coordinator').every(s => releaseAssessmentAccepted(this.outputs[s.number])))) && confirmation?.satisfied === true && (hasCandidate ? identities.has(confirmation?.revision) : true),
+      coordinatorConfirmation: this.coordinatorConfirmed(confirmation, { identities, hasCandidate }),
       deliveryCompleted: false
+    }
+
+    // Asked to accept: decided here, with every other condition known. Committed only
+    // when all of them but the checks and delivery are met; the record is on the closure
+    // before delivery starts (below). Otherwise it is refused and the checks stay unmet,
+    // which also keeps an unmet confirmation from going back to the author (closureReturn).
+    if (this.run.checkAcceptanceRequest) {
+      const request = this.run.checkAcceptanceRequest
+      const unmet = this.snapshot.completion.requires.filter((c) => !['checksSatisfied', 'deliveryCompleted'].includes(c) && !conditions[c])
+      const covered = !checksSatisfied && !drifted && acceptanceApplies(request)
+      if (!unmet.length && covered) {
+        const { previousBlock: _previous, ...accepted } = request
+        acceptance = { ...accepted, acceptedAt: this.clock.iso(), confirmationStep }
+        acceptedNow = true
+        conditions.checksSatisfied = true
+        delete this.run.checkAcceptanceRequest
+      } else {
+        const criteria = (confirmation?.criteria ?? []).filter((c) => c.met !== true).map((c) => ({ id: c.id, evidence: c.evidence ?? null }))
+        this.refuseAcceptanceRequest(unmet.length ? `closure conditions unmet: ${unmet.join(', ')}` : checksSatisfied ? 'the checks now pass; nothing needs accepting' : 'the check no longer matches the named failures', criteria)
+      }
     }
 
     const verificationLevel = gating === 'passed' ? 'verified' : 'review-only'
     const authorised = this.snapshot.autoClose.minimumVerification === 'review-only'
       ? true
-      : verificationLevel === 'verified'
+      : verificationLevel === 'verified' || Boolean(acceptance)
 
     const preDelivery = this.snapshot.completion.requires
       .filter((c) => c !== 'deliveryCompleted')
@@ -3631,6 +3796,40 @@ export class Engine {
 
     let blockedReason = null
     let notReturned = null
+
+    // Written whole, because a crash during delivery must leave a true record.
+    const reportOnly = this.snapshot.completion.requires.includes('reportDispositionRecorded')
+    const writeClosure = () => {
+      this.run.closure = {
+        revision: reportOnly ? null : current,
+        verificationLevel,
+        ...(this.snapshot.tactic ? { independentAudit: Object.keys(this.snapshot.participants).some(r => r.startsWith('auditor-') || r.startsWith('verifier-')), windowId:this.run.currentWindow?.id ?? null } : {}),
+        authorised,
+        conditions: reportOnly ? Object.fromEntries(this.snapshot.completion.requires.map(key => [key, conditions[key]])) : conditions,
+        drifted,
+        // What the coordinator said remains unfixed or was accepted as-is. Carried
+        // into the record so a closing report cannot quietly treat every finding
+        // as repaired.
+        residualRisks: confirmation?.residualRisks ?? [],
+        // Why an unmet confirmation was not returned to the author.
+        ...(notReturned ? { notReturned } : {}),
+        // The checks as closure counted them, with the inherited-failure comparison.
+        ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
+          ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
+          ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown }) => ({ verdict, reason, newFailures, baselineKnown }))(check.baselineComparison.selftest) } : {}) } } : {}),
+        // What the seat said stopped it, kept where closure explains itself.
+        ...(workerResult ? { workerCompleted: workerResult.completed === true, blockers: workerResult.blockers ?? [], unverified: workerResult.unverified ?? [] } : {}),
+        // Who accepted which check failures on this revision (acceptCheckResult).
+        ...(acceptance ? { acceptedCheckRisk: acceptance } : {}),
+        at: this.clock.iso()
+      }
+    }
+    // An acceptance that no longer applies (the check passes now, the content moved, a failure nobody named).
+    if (priorAcceptance && !acceptance) this.withdrawAcceptance(gating === 'passed' ? 'the check now passes' : 'it no longer describes this check')
+    if (acceptedNow) {
+      writeClosure()
+      await this.persist({ type: 'check-result-accepted', revision: acceptance.revision, failures: acceptance.failures.map((f) => f.key), by: acceptance.by, authority: acceptance.authority, step: acceptance.step })
+    }
 
     if (!preDelivery || !authorised) {
       blockedReason = drifted
@@ -3640,7 +3839,7 @@ export class Engine {
       // Work the author can still do goes back to the author, in this run,
       // instead of ending it (execution-contract.md "The engine returns an
       // unmet confirmation to review").
-      const back = blockedReason === 'closure-conditions-unmet' ? this.closureReturn({ conditions, authorised, confirmation, identities }) : null
+      const back = blockedReason === 'closure-conditions-unmet' && !acceptance ? this.closureReturn({ conditions, authorised, confirmation, identities }) : null
       if (back?.refusal) notReturned = back.refusal
       else if (back && mayReturn) {
         await this.returnToReview({ ...back, confirmationStep })
@@ -3746,28 +3945,7 @@ export class Engine {
       this.run.outcome = 'unresolved'
     }
 
-    const reportOnly = this.snapshot.completion.requires.includes('reportDispositionRecorded')
-    this.run.closure = {
-      revision: reportOnly ? null : current,
-      verificationLevel,
-      ...(this.snapshot.tactic ? { independentAudit: Object.keys(this.snapshot.participants).some(r => r.startsWith('auditor-') || r.startsWith('verifier-')), windowId:this.run.currentWindow?.id ?? null } : {}),
-      authorised,
-      conditions: reportOnly ? Object.fromEntries(this.snapshot.completion.requires.map(key => [key, conditions[key]])) : conditions,
-      drifted,
-      // What the coordinator said remains unfixed or was accepted as-is. Carried
-      // into the record so a closing report cannot quietly treat every finding
-      // as repaired.
-      residualRisks: confirmation?.residualRisks ?? [],
-      // Why an unmet confirmation was not returned to the author.
-      ...(notReturned ? { notReturned } : {}),
-      // The checks as closure counted them, with the inherited-failure comparison.
-      ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
-        ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
-        ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown }) => ({ verdict, reason, newFailures, baselineKnown }))(check.baselineComparison.selftest) } : {}) } } : {}),
-      // What the seat said stopped it, kept where closure explains itself.
-      ...(workerResult ? { workerCompleted: workerResult.completed === true, blockers: workerResult.blockers ?? [], unverified: workerResult.unverified ?? [] } : {}),
-      at: this.clock.iso()
-    }
+    writeClosure()
 
     // An automatic reconcile comes next: on the record in the same write as the
     // block (every caller's `finished` persist), so no reader sees the block without it.

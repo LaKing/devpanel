@@ -4,6 +4,7 @@ const fields = {
   get_check_log: ['project','issueId','runId','check','command'],
   refresh_checks_run: ['project','issueId','runId'],
   reconcile_delivery_run: ['project','issueId','runId'],
+  accept_check_result_run: ['project','issueId','runId','revision','reason'],
   continue_run: ['project','issueId','runId','instruction'],
   retry_input_run: ['project','issueId','runId'],
   recover_run: ['project','issueId','runId'],
@@ -50,12 +51,13 @@ function validate (value) {
       for(const k of ['commit','checkout','landedAt'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
       if(action.commit===undefined&&action.checkout===undefined)throw Error('mark_landed needs commit or checkout')
     }
+    if(action.type==='accept_check_result_run'&&(!Array.isArray(action.failures)||!action.failures.length||action.failures.some(f=>typeof f!=='string'||!f.trim())))throw Error('failures must name the accepted failures, as the run lists them under acceptCheck')
     if(action.type==='ask_operator'){
       for(const k of ['project','issueId'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
       if(action.issueId!==undefined&&action.project===undefined)throw Error('issueId needs its project')
       if(action.options!==undefined&&(!Array.isArray(action.options)||!action.options.length||action.options.length>6||action.options.some(o=>typeof o!=='string'||!o.trim()||o.length>200)))throw Error('options must be 1 to 6 short strings')
     }
-    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
+    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
     if(Object.keys(action).some(k=>!allowed.includes(k)))throw Error('Unexpected action argument')
     for(const k of ['offset','limit'])if(action[k]!==undefined&&(!Number.isSafeInteger(action[k])||action[k]<0))throw Error(`${k} must be a non-negative integer`)
     if(action.stats!==undefined&&action.stats!==true&&action.stats!==false&&(!Array.isArray(action.stats)||action.stats.some(x=>!['byPlaybook','bySeat'].includes(x))))throw Error('stats must be true, false or a list of byPlaybook, bySeat')

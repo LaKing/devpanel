@@ -986,6 +986,10 @@
           },
           "description": "Follow-up issues opened for unaccepted residual risks, by the risk's index in residualRisks. Deduplicated."
         },
+        "acceptedCheckRisk": {
+          "type": "object",
+          "description": "Who accepted which failures of the check on this revision, and why (engine.acceptCheckResult). Present only once every other condition but delivery was met."
+        },
         "independentAudit": {
           "type": "boolean"
         },
@@ -1308,6 +1312,20 @@
     },
     "checkRefresh": {
       "type": "object"
+    },
+    "checkAcceptanceRequest": {
+      "type": "object",
+      "description": "An acceptance asked for and not decided: nothing is accepted until the coordinator confirms this revision."
+    },
+    "checkAcceptanceRefusals": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Requests closure refused: nothing was accepted or delivered."
+    },
+    "checkAcceptanceHistory": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Acceptances withdrawn from closure, with withdrawnAt and withdrawnBecause."
     },
     "checkRefreshHistory": {
       "type": "array"

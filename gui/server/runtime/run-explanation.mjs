@@ -1,5 +1,5 @@
-import { checksOnlyBlock, reconcilePending, reconcileUnavailable } from './run-control.mjs'
-import { runResult } from './run-result.mjs'
+import { acceptCheckUnavailable, checksOnlyBlock, reconcilePending, reconcileUnavailable } from './run-control.mjs'
+import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
 
@@ -315,8 +315,36 @@ export function explainRun (run, { outputs = {}, active = [], ownership = null, 
   return { ...standing, next: [standing.next, choice].filter(Boolean).join(' '), unacceptedRisks: unaccepted }
 }
 
-function explainStanding (run, { outputs, active, ownership }) {
-  if (run.landed) return landed(run, explainStanding({ ...run, landed: undefined }, { outputs, active }))
+/*
+ * The record of an accepted check risk, or of an acceptance asked for and not
+ * (yet) given, whatever else stopped the run. Only closure.acceptedCheckRisk
+ * reads as accepted: a request or a refusal says the opposite.
+ */
+function withAcceptance (run, standing) {
+  const add = (words) => [standing.detail, words].filter(Boolean).join(' ')
+  const accepted = run.closure?.acceptedCheckRisk
+  if (accepted) {
+    const headline = run.status === 'completed' ? `${standing.headline}, with accepted check failures` : standing.headline
+    return { ...standing, headline, detail: add(`${acceptedRiskWords(accepted)} The checks did not pass, so this is not verified.`) }
+  }
+  const asked = run.checkAcceptanceRequest
+  if (asked) {
+    return { ...standing, detail: add(`${asked.by} asked to accept the failed checks ${asked.failures.map((f) => f.key).join(', ')}. Nothing is accepted yet: that waits for the coordinator to confirm this version.`) }
+  }
+  const refused = refusedAcceptance(run)
+  if (refused) {
+    const criteria = refused.criteria?.length ? ` Not confirmed: ${refused.criteria.map((c) => `${c.id}${c.evidence ? ` (${firstLine(c.evidence)})` : ''}`).join(', ')}.` : ''
+    return { ...standing, headline: 'Check result not accepted: the coordinator did not confirm', detail: add(`${refused.by} asked to accept ${refused.failures.map((f) => f.key).join(', ')}; nothing was accepted or delivered, because ${refused.because}.${criteria}`) }
+  }
+  return standing
+}
+
+function explainStanding (run, options) {
+  return withAcceptance(run, standingOf(run, options))
+}
+
+function standingOf (run, { outputs, active, ownership }) {
+  if (run.landed) return landed(run, standingOf({ ...run, landed: undefined }, { outputs, active }))
   const kept = run.workspace?.state === 'retained' ? 'Its workspace and logs are kept.' : 'Its logs are kept.'
 
   // The run lock names an owner whose liveness cannot be proved (lock.mjs):
@@ -492,7 +520,7 @@ function blocked (run, outputs, kept) {
         const check = (run.checkResults ?? []).filter((c) => c.revision === run.revisions?.at(-1)?.fingerprint).at(-1)
         return { ...base, headline: 'Stopped: the reviewers approved, but the automated checks failed',
           detail: `${checkFailureWords(check?.baselineComparison?.failures, check?.commands)}${selftestWords(check?.baselineComparison?.selftest)}${reason === 'checks-failed-unchanged' ? 'The author answered the failure with an unchanged candidate, so another round could only repeat it.' : 'The review loop reached its round limit.'}`,
-          next: `Refresh checks reruns them on this candidate (after a flaky or environmental failure is fixed). ${reason === 'checks-failed-unchanged' ? 'Continue gives the author another round with your instruction.' : 'Resume gives the author one more round.'}` }
+          next: `Refresh checks reruns them on this candidate (after a flaky or environmental failure is fixed). ${reason === 'checks-failed-unchanged' ? 'Continue gives the author another round with your instruction.' : 'Resume gives the author one more round.'}${acceptCheckUnavailable(run) ? '' : ' If these failures are unrelated to this change, Accept check result names them with your reason; once the coordinator confirms this version, it goes through normal delivery.'}` }
       }
       const awaited = reason === 'rounds-exhausted' ? awaitedDriveFailed(run) : null
       if (awaited) {

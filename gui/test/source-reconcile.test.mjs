@@ -21,6 +21,7 @@ import { summariseRun } from '../server/supervisor-summary.mjs'
 import { acquire } from '../server/runtime/lock.mjs'
 import { reconcilePending } from '../server/runtime/run-control.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { runResult } from '../server/runtime/run-result.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 
 const exec = promisify(execFile)
@@ -972,6 +973,43 @@ export default async function (t) {
           await m.release?.()
           await a.release()
         }
+      }
+    }
+
+    t.section('8. an accepted check result: reconcile reruns the checks; named failures stay accepted, a failure nobody named is refused')
+    {
+      const commands = `${COMPATIBLE}      - id: flaky\n        run: "! grep -q fixed server.mjs"\n`
+      const worktree = { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }
+      const accepted = async (source) => {
+        const { f, engine } = await blockedRun({ worktree, source: { 'server.mjs': source }, commands })
+        t.ok('the check stopped it and acceptance is offered', supportedActions(engine.run).includes('accept-check-result'), `${engine.run.blockedReason} ${supportedActions(engine.run)}`)
+        await engine.acceptCheckResult({ failures: ['flaky'], reason: 'unrelated', revision: engine.run.revisions.at(-1).fingerprint, actor: 'alice' })
+        await engine.drive()
+        t.eq('delivery was refused for drift, as it would be', `${engine.run.blockedReason} ${engine.run.delivery?.application?.state}`, 'source-delivery-blocked source-drift')
+        t.eq('the acceptance is on the closure', engine.run.closure.acceptedCheckRisk?.failures.map((x) => x.key), ['flaky'])
+        t.eq('the run does not read as delivered', runResult(engine.run, {}).result, 'incomplete')
+        return { f, engine }
+      }
+      {
+        const { f, engine } = await accepted(lines(10, { 1: 'line 1 elsewhere' }))
+        const approved = engine.run.closure.revision
+        await engine.reconcileDelivery({ policy: {}, actor: 'alice' })
+        const attempt = engine.run.reconciliations.at(-1)
+        t.eq('the checks ran again on the merged candidate', `${attempt.state} ${attempt.checks.result} ${attempt.checks.gating} ${attempt.acceptedCheckRisk}`, 'accepted failed failed true')
+        t.eq('delivered', `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${engine.run.delivery?.error}`)
+        t.eq('the source holds both changes', await read(f, 'server.mjs'), lines(10, { 1: 'line 1 elsewhere', 9: 'line 9 fixed' }))
+        t.eq('the acceptance stays bound to the approved revision', engine.run.closure.acceptedCheckRisk?.revision, approved)
+        t.eq('and it still does not read as verified', engine.run.closure.verificationLevel, 'review-only')
+        t.eq('the result is the delivery', runResult(engine.run, {}).result, 'delivered')
+        await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+      }
+      {
+        const { f, engine } = await accepted(lines(10, { 1: 'line 1 INCOMPATIBLE' }))
+        await engine.reconcileDelivery({ policy: {}, actor: 'alice' })
+        t.eq('a failure nobody named is refused', engine.run.reconciliations.at(-1).state, 'revalidation-failed')
+        t.eq('still blocked as before', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked source-delivery-blocked')
+        t.eq('the source is untouched', await read(f, 'server.mjs'), lines(10, { 1: 'line 1 INCOMPATIBLE' }))
+        await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
       }
     }
   } finally {

@@ -105,6 +105,13 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
     for (const r of risks) lines.push(`- ${r.accepted === false ? '**needs follow-up**: ' : 'accepted: '}${r.description}`)
     lines.push('')
   }
+  const accepted = run.closure?.acceptedCheckRisk
+  if (accepted) {
+    lines.push('## Accepted check failures', '', `${accepted.by} accepted these failures on revision \`${accepted.revision}\`. The checks did not pass, so this is not verified. Reason: ${accepted.reason}`, '')
+    for (const f of accepted.failures ?? []) lines.push(`- \`${f.key}\`${f.message ? ` — ${f.message}` : ''}`)
+    for (const id of accepted.notRun ?? []) lines.push(`- \`${id}\` did not run because of them`)
+    lines.push('')
+  }
   // Failures the unchanged project has too: they did not block this run. Each
   // may deserve an issue of its own; nothing is opened automatically.
   const inherited = run.closure?.checks?.baselineKnown ?? []

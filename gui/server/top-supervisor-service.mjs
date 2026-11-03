@@ -83,7 +83,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
  let service
  try { service=await createTopSupervisor({dir,models,adapter,emit,decisions,
   tools:{
-   retryInput:a=>supervisor.retryInput(a), recover:a=>supervisor.recover(a), refreshChecks:a=>supervisor.refreshChecks(a), reconcileDelivery:a=>supervisor.reconcileDelivery(a), continueRun:a=>supervisor.continueRun(a),
+   retryInput:a=>supervisor.retryInput(a), recover:a=>supervisor.recover(a), refreshChecks:a=>supervisor.refreshChecks(a), acceptCheckResult:a=>supervisor.acceptCheckResult(a), reconcileDelivery:a=>supervisor.reconcileDelivery(a), continueRun:a=>supervisor.continueRun(a),
    availability:supervisor.availability,recordExhausted:a=>supervisor.availability.recordExhausted(a),
    projects:()=>issues.listProjects(),playbooks:()=>listPlaybooks({root:configRoot}),seatModels,
    // Every project on the panel, never a selection: a management reading that

@@ -718,6 +718,14 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/refresh-checks', route(a
   res.status(202).json(await supervisor.refreshChecks({ project, issueId, runId }))
 }))
 
+// Accept named failures of an approved revision's check and deliver it through the normal closure
+// (engine.acceptCheckResult). The authority is the route's, never the request's.
+app.post('/api/projects/:project/issues/:id/runs/:runId/accept-check-result', route(async (req, res) => {
+  const { project, id: issueId, runId } = req.params
+  const { failures, reason, revision, actor } = req.body ?? {}
+  res.status(202).json(await supervisor.acceptCheckResult({ project, issueId, runId, failures, reason, revision, actor: req.actor ?? actor ?? 'operator', authority: 'operator' }))
+}))
+
 app.post('/api/projects/:project/issues/:id/runs/:runId/retry-input', route(async (req, res) => {
   const { project, id: issueId, runId } = req.params
   res.status(202).json(await supervisor.retryInput({ project, issueId, runId }))

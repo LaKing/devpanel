@@ -100,7 +100,8 @@ export function summariseRun (detail) {
         verificationLevel: detail.closure.verificationLevel,
         authorised: detail.closure.authorised,
         conditions: detail.closure.conditions,
-        residualRisks: (detail.closure.residualRisks ?? []).map((r) => ({ id: riskId(r.description), accepted: r.accepted ?? null, ...(r.acceptance ? { acceptance: r.acceptance } : {}), relatesTo: r.relatesTo ?? null, description: clip(r.description, 300) }))
+        residualRisks: (detail.closure.residualRisks ?? []).map((r) => ({ id: riskId(r.description), accepted: r.accepted ?? null, ...(r.acceptance ? { acceptance: r.acceptance } : {}), relatesTo: r.relatesTo ?? null, description: clip(r.description, 300) })),
+        ...(detail.closure.acceptedCheckRisk ? { acceptedCheckRisk: detail.closure.acceptedCheckRisk } : {})
       }
     : null
   return {
@@ -116,6 +117,9 @@ export function summariseRun (detail) {
     landed: detail.landed ?? null,
     reconciliation: decidedReconciliation(detail.reconciliations),
     reconcilePending: detail.reconcilePending === true,
+    ...(detail.acceptCheck ? { acceptCheck: detail.acceptCheck } : {}),
+    ...(detail.checkAcceptanceRequest ? { checkAcceptanceRequest: detail.checkAcceptanceRequest } : {}),
+    ...(detail.checkAcceptanceRefusal ? { checkAcceptanceRefusal: detail.checkAcceptanceRefusal } : {}),
     blockedReason: detail.blockedReason ?? null,
     pause: detail.pause ?? null,
     ownerInput: detail.ownerInput ?? null,

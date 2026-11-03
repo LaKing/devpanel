@@ -745,7 +745,7 @@ candidate retained: `POST …/continue` `{ "instruction": "…", "actor": "…",
 candidate, in the same worktree and sessions, then reviews, checks and closure run
 again. The server adds the closure record and the issue notes written since the run
 began to the recorded decision. Resume does not fit there: replaying an unchanged
-record reaches the same closure. **Refresh checks** (`POST …/refresh-checks`)
+record reaches the same closure. **Accept check result** (`POST …/accept-check-result`, `{failures, reason, revision}`) delivers an approved revision whose named check failures an operator judges unrelated; nothing is accepted until the coordinator has confirmed the revision (execution-contract.md "Accepting a check result and delivering"). **Refresh checks** (`POST …/refresh-checks`)
 reruns the installed checks on the retained candidate of a run stopped at closure,
 or only by failed checks on a revision every auditor approved.
 Recovery and finalization controls remain necessary for uncertain mutations or

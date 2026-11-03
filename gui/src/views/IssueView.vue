@@ -342,6 +342,29 @@ async function refreshChecks () {
   try { await api.refreshChecks(project.value, issueId.value, run.value.runId); await load() }
   catch (error) { actionError.value = error.message } finally { refreshingChecks.value = false }
 }
+/* Named failures of an approved revision's check do not stop its delivery
+   (POST …/accept-check-result). On a stop with no coordinator confirmation the
+   call only asks: nothing is accepted until the coordinator confirms this revision. */
+const canAcceptCheck = computed(() => !issue.value?.archived && (run.value?.supportedActions ?? []).includes('accept-check-result') && Boolean(run.value?.acceptCheck))
+const acceptCheckDialog = ref(false)
+const acceptCheckReason = ref('')
+const acceptingCheck = ref(false)
+function openAcceptCheck () {
+  acceptCheckReason.value = ''
+  actionError.value = ''
+  acceptCheckDialog.value = true
+}
+async function acceptCheckResult () {
+  if (!run.value?.acceptCheck || !acceptCheckReason.value.trim()) return
+  acceptingCheck.value = true
+  actionError.value = ''
+  try {
+    const { revision, failures } = run.value.acceptCheck
+    await api.acceptCheckResult(project.value, issueId.value, run.value.runId, { revision, failures: failures.map((f) => f.key), reason: acceptCheckReason.value.trim(), actor: actorName(answerActor.value) || undefined })
+    acceptCheckDialog.value = false
+    await load()
+  } catch (error) { actionError.value = error.message } finally { acceptingCheck.value = false }
+}
 /* A restart left the run without an owner. Recovery reconciles what was in
    flight from the runtimes' own records and continues only when nothing is
    uncertain; otherwise it says what still needs a person. */
@@ -1053,6 +1076,20 @@ watch(() => route.query.run, (runId) => {
         </v-card>
       </v-dialog>
 
+      <v-dialog v-model="acceptCheckDialog" max-width="560" scrollable>
+        <v-card title="Accept check result and deliver">
+          <v-card-text>
+            <p class="mb-2">Every reviewer approved this version. These failures would no longer stop its delivery; the run will read as not verified, and normal delivery still applies.</p>
+            <ul class="mb-2"><li v-for="f in run?.acceptCheck?.failures ?? []" :key="f.key"><code>{{ f.key }}</code><template v-if="f.message"> — {{ f.message }}</template></li></ul>
+            <p v-if="run?.acceptCheck?.notRun?.length" class="mb-2">Required commands that did not run because of them: <code>{{ run.acceptCheck.notRun.join(', ') }}</code></p>
+            <p class="mb-4">If the coordinator has not confirmed this version, it is asked first, and nothing is accepted or delivered unless it confirms. The run page then says which happened.</p>
+            <v-textarea v-model="acceptCheckReason" label="Why these failures are unrelated to this change" rows="3" density="compact" variant="outlined" />
+            <v-alert v-if="actionError" type="error" variant="tonal">{{ actionError }}</v-alert>
+          </v-card-text>
+          <v-card-actions><v-spacer /><v-btn :disabled="acceptingCheck" @click="acceptCheckDialog = false">Cancel</v-btn><v-btn color="primary" :loading="acceptingCheck" :disabled="!acceptCheckReason.trim()" @click="acceptCheckResult">Accept and deliver</v-btn></v-card-actions>
+        </v-card>
+      </v-dialog>
+
       <v-dialog v-model="resumeDialog" max-width="520">
         <v-card title="Resume this run">
           <v-card-text>
@@ -1148,6 +1185,7 @@ watch(() => route.query.run, (runId) => {
             <v-btn v-if="canResume" size="small" variant="flat" color="primary" :loading="resuming" @click="openResume">Resume run</v-btn>
             <ContinueRun v-if="canContinue" :project="project" :issue-id="issueId" :run="run" @continued="load()" />
             <v-btn v-if="canRefreshChecks" size="small" variant="tonal" color="primary" :loading="refreshingChecks" @click="refreshChecks">Refresh checks</v-btn>
+            <v-btn v-if="canAcceptCheck" size="small" variant="tonal" color="warning" @click="openAcceptCheck">Accept check result…</v-btn>
             <v-btn v-if="canReconcile" size="small" variant="flat" color="primary" :loading="reconciling" @click="reconcileDelivery">Reconcile with source</v-btn>
             <v-btn v-if="canFinalize" size="small" variant="flat" color="primary" :loading="finalizing" @click="finalizeRun">Finalize run</v-btn>
             <v-btn v-if="canRecover" size="small" variant="flat" color="primary" :loading="recovering" @click="recoverRun">Recover run</v-btn>
@@ -1411,6 +1449,7 @@ watch(() => route.query.run, (runId) => {
                 <h3 class="block__sub">Closure</h3>
                 <p v-if="!run.closure" class="muted">Not evaluated.</p>
                 <template v-else>
+                  <p v-if="run.closure.acceptedCheckRisk" class="kv"><span>Accepted check failures</span>{{ run.closure.acceptedCheckRisk.by }} · {{ run.closure.acceptedCheckRisk.failures.map((f) => f.key).join(', ') }} · {{ run.closure.acceptedCheckRisk.reason }}</p>
                   <p class="kv"><span>Verification</span>{{ run.closure.verificationLevel }} · authority {{ run.autoClose?.minimumVerification ?? '—' }}<template v-if="run.closure.independentAudit === false"> · no independent reviewer</template></p>
                   <p v-for="(met, name) in run.closure.conditions" :key="name" class="kv kv--indent">
                     <v-icon :icon="met ? '$checkCircle' : '$alertCircle'" size="14" :color="met ? 'success' : undefined" />

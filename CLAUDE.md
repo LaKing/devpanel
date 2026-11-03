@@ -262,6 +262,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   `<phase>:continue` carrying the instruction, the closure record and the issue notes added since the run began;
   replay counts the loop's last round as not passed and runs one more, then confirms again. Resume would only
   replay to the same closure.
+- Accept check result (`engine.acceptCheckResult`, supervisor `accept_check_result_run`): named failures of the latest full check on an
+  approved revision stop blocking it, recorded on `run.closure.acceptedCheckRisk` only once every other condition but delivery is met (a
+  missing confirmation is asked for first; `run.checkAcceptanceRequest` accepts nothing). `verificationLevel` stays `review-only`; delivery
+  and reconcile are the normal ones, and a failure nobody named is refused. execution-contract.md "Accepting a check result and delivering".
 - The engine returns an unmet confirmation itself (`engine.returnToReview`): the confirmation classifies each unmet
   criterion (`criteria[].unmet`; unclassified is a contract violation). When only the confirmation failed and every
   unmet criterion is `missing-work`/`missing-evidence`, an `implementation`/`plan-and-implement` run records an

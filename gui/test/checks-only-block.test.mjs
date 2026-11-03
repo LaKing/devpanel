@@ -54,7 +54,7 @@ export default async function (t) {
     t.eq('stopped as checks-failed-unchanged', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked checks-failed-unchanged')
     t.eq('after one unchanged answer, not at the round cap', prompts.filter((p) => p.stepId === 'implement').length, 2)
     t.ok('recognised as a checks-only block', checksOnlyBlock(engine.run))
-    t.eq('refresh-checks and continue are offered', supportedActions(engine.run), ['continue', 'refresh-checks', 'start-new'])
+    t.eq('refresh-checks, continue and accepting the result are offered', supportedActions(engine.run), ['continue', 'refresh-checks', 'accept-check-result', 'start-new'])
     const explanation = explainRun(engine.run)
     t.ok('the explanation says the reviewers approved and names the failing check', /reviewers approved/.test(explanation.headline) && /flaky/.test(explanation.detail ?? ''), JSON.stringify(explanation))
 

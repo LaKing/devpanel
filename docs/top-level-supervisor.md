@@ -918,6 +918,16 @@ preview validation and release checkpoints still apply.
 
 Supervisor model calls have no fixed two-minute deadline. Provider latency alone
 must not cancel a healthy management turn; operator Stop still propagates abort.
+`accept_check_result_run {project, issueId, runId, revision, failures, reason}` accepts
+named failures of the check on an approved revision of a run it owns and delivers it
+(execution-contract.md "Accepting a check result and delivering"). The engine enforces
+its authority (`supervisorAcceptRefusal`): named test failures, each new against a
+compared base, at most 3, nothing left not run, on a playbook whose
+`minimumVerification` is `review-only`. A whole command, a timeout, a crash, a suite
+entry, a failure no comparison judged, or a playbook that closes only on passed checks
+changes the agreed rules, so it is the operator's: `ask_operator`. An `accepted: false`
+result accepts nothing yet: the coordinator confirms first, and `checkAcceptanceRefusal`
+says why it did not.
 After an operator installs missing candidate tests, `refresh_checks_run` lets the
 supervisor reassess a retained closure-blocked candidate without another full
 implementation run. Accepted residual risk does not turn an unmet acceptance

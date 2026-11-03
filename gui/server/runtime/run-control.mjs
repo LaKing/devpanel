@@ -1,4 +1,4 @@
-import { gatingResult } from './baseline-failures.mjs'
+import { gatingResult, identifyCheckFailures } from './baseline-failures.mjs'
 
 /*
  * An automatic reconcile applies and is undecided (auto-reconcile.mjs): the marker
@@ -96,6 +96,73 @@ export function refreshChecksUnavailable (run, { tactic = true, target = true } 
 
 /** What refreshChecksUnavailable needs from a run's frozen snapshot; none readable means no refresh. */
 export const refreshFacts = (snapshot) => ({ tactic: Boolean(snapshot?.tactic), target: Boolean(snapshot?.checks?.target) })
+
+/*
+ * Accept check result and deliver (engine.acceptCheckResult): an operator's or
+ * supervisor's decision that named failures of the check on an approved revision
+ * do not stop its delivery. Closure counts only the full drive, so a smoke result
+ * alone identifies nothing. This is the sync gate the action list and the engine
+ * share; what a stop's coordinator confirmation says is the engine's to read.
+ */
+const ACCEPTABLE_BLOCKS = ['closure-conditions-unmet', 'refreshed-checks-failed', 'rounds-exhausted', 'checks-failed-unchanged', 'checks-inconclusive']
+
+/** The revision, and what accepting its latest full check would have to name. */
+export function acceptableCheck (run) {
+  const revision = run.revisions?.at(-1)?.fingerprint ?? null
+  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1) ?? null
+  return { revision, check, ...identifyCheckFailures(check, run) }
+}
+
+export function acceptCheckUnavailable (run, { tactic = true } = {}) {
+  if (run.status !== 'blocked' || !ACCEPTABLE_BLOCKS.includes(run.blockedReason) || !tactic) return 'Only an approved code run stopped by its checks can have a check result accepted.'
+  if (run.release) return 'Use the release recovery or finalization controls for this run.'
+  if (run.landed) return 'This run was already landed by hand.'
+  if (run.abandonment || run.integrity?.status === 'abandoned') return 'This run was abandoned.'
+  if (run.journal?.recoveryRequired || run.recovery?.required || run.integrity?.status !== 'clear') return 'Resolve the run’s recovery or integrity condition first.'
+  if (Object.values(run.participants ?? {}).some(p => p.pendingInvocation || p.state === 'recovery-required')) return 'An invocation still needs recovery.'
+  if (!run.workspace?.path || run.workspace.state === 'removed') return 'The saved workspace is no longer available.'
+  const { revision, unidentified } = acceptableCheck(run)
+  if (!revision) return 'No candidate revision exists.'
+  const auditors = Object.keys(run.participants ?? {}).filter((role) => role.startsWith('auditor-'))
+  const missing = auditors.filter((role) => !(run.approvals ?? []).some((a) => a.role === role && a.revision === revision))
+  if (!auditors.length || missing.length) return `The reviewers did not approve this revision${missing.length ? ` (${missing.join(', ')})` : ''}.`
+  const findings = (run.outstandingFindings ?? []).filter((f) => f.blocking).map((f) => f.id)
+  if (findings.length) return `Blocking findings are outstanding: ${findings.join(', ')}.`
+  if (run.blockedReason === 'closure-conditions-unmet') {
+    const closure = run.closure
+    if (closure?.revision !== revision || closure.drifted) return 'The closure record does not describe this revision.'
+    if (closure.conditions?.checksSatisfied !== false) return 'The checks are not what stopped this run at closure.'
+    const others = Object.entries(closure.conditions).filter(([name, met]) => !met && !['checksSatisfied', 'deliveryCompleted'].includes(name)).map(([name]) => name)
+    if (others.length) return `Other closure conditions are unmet: ${others.join(', ')}.`
+  }
+  if (unidentified.length) return `The check failure is not identified: ${unidentified.join('; ')}.`
+  return null
+}
+
+/** Whether a check's failures are all ones this acceptance named: a failure nobody named was never accepted. */
+export function acceptanceCovers (acceptance, check, run) {
+  const { failures, notRun, unidentified } = identifyCheckFailures(check, run)
+  const named = new Set((acceptance.failures ?? []).map((f) => f.key))
+  return !unidentified.length && failures.every((f) => named.has(f.key)) && notRun.every((id) => (acceptance.notRun ?? []).includes(id))
+}
+
+/*
+ * What the top-level supervisor may accept (docs/top-level-supervisor.md "Accepting a
+ * check result"). Named test failures, each new against a compared base, on a playbook
+ * that already closes on review-only evidence; anything broader changes the agreed
+ * rules and goes to the operator. The limit is a chosen number, not a derived one.
+ */
+export const SUPERVISOR_ACCEPT_LIMIT = 3
+export function supervisorAcceptRefusal ({ failures = [], notRun = [] }, { minimumVerification } = {}) {
+  if (minimumVerification !== 'review-only') return 'This playbook closes only on passed checks; waiving that is the operator\'s decision.'
+  const wide = failures.filter((f) => f.level !== 'test').map((f) => f.key)
+  if (wide.length) return `The supervisor accepts only named test failures, not a whole command, timeout, crash or suite: ${wide.join(', ')}.`
+  const unjudged = failures.filter((f) => f.basis !== 'new').map((f) => f.key)
+  if (unjudged.length) return `The supervisor accepts only failures compared with the base; these were not judged: ${unjudged.join(', ')}.`
+  if (notRun.length) return `Required commands did not run: ${notRun.join(', ')}. Accepting that is the operator's decision.`
+  if (failures.length > SUPERVISOR_ACCEPT_LIMIT) return `The supervisor accepts at most ${SUPERVISOR_ACCEPT_LIMIT} failures; this check has ${failures.length}.`
+  return null
+}
 
 /** Retry input (engine.retryInputFailure): a confirmed input-size rejection on a run with nothing else to settle. */
 export function retryInputUnavailable (run) {

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { startRun, releaseOwnership } from '../server/runtime/launch.mjs'
-import { continueUnavailable, integrateUnavailable, refreshChecksUnavailable, refreshFacts, resumeUnavailable, retryInputUnavailable } from '../server/runtime/run-control.mjs'
+import { acceptCheckUnavailable, continueUnavailable, integrateUnavailable, refreshChecksUnavailable, refreshFacts, resumeUnavailable, retryInputUnavailable } from '../server/runtime/run-control.mjs'
 import { reconcileUnavailable } from '../server/runtime/source-reconcile.mjs'
 import { getRun } from '../server/runs-api.mjs'
 import { summarisePackedRun, summariseRun } from '../server/supervisor-summary.mjs'
@@ -15,6 +15,7 @@ const REFRESH = { tactic: true, target: true }
 const held = { integrity: { status: 'clear' }, workspace: { path: '/w', state: 'retained' }, participants: {}, revisions: [{ fingerprint: 'r1' }] }
 const blockedAt = (blockedReason, extra = {}) => ({ ...held, status: 'blocked', blockedReason, ...extra })
 const approvedFailedCheck = { participants: { 'auditor-1': {} }, approvals: [{ role: 'auditor-1', revision: 'r1' }], checkResults: [{ revision: 'r1', result: 'failed' }] }
+const namedFailure = { revision: 'r1', result: 'failed', commands: [{ id: 'c', required: true, passed: false, exitCode: 1 }] }
 const tooLarge = { status: 'failed', failures: [{ evidence: 'input_too_large', at: '2026-11-01T00:00:00.000Z' }] }
 const committed = { action: 'commit', completedAt: 't', commit: 'c', reconstruction: { verified: true } }
 
@@ -22,6 +23,8 @@ const RECORDS = [
   // The issue's run: only resume applies here (Continue admits closure stops, not exhausted rounds).
   ['rounds exhausted, reviewers not agreed', blockedAt('rounds-exhausted'), REFRESH, ['resume', 'start-new']],
   ['rounds exhausted, checks the only stop', blockedAt('rounds-exhausted', approvedFailedCheck), REFRESH, ['refresh-checks', 'resume', 'start-new']],
+  ['rounds exhausted, a named check failure', blockedAt('rounds-exhausted', { ...approvedFailedCheck, checkResults: [namedFailure] }), REFRESH, ['refresh-checks', 'accept-check-result', 'resume', 'start-new']],
+  ['an unchanged answer to a named check failure', blockedAt('checks-failed-unchanged', { ...approvedFailedCheck, checkResults: [namedFailure] }), REFRESH, ['continue', 'refresh-checks', 'accept-check-result', 'start-new']],
   ['closure unmet', blockedAt('closure-conditions-unmet'), REFRESH, ['continue', 'refresh-checks', 'start-new']],
   ['closure unmet with no revision to check', blockedAt('closure-conditions-unmet', { revisions: [] }), REFRESH, ['start-new']],
   ['closure unmet, a turn still in question', blockedAt('closure-conditions-unmet', { participants: { author: { pendingInvocation: {} } } }), REFRESH, ['abandon']],
@@ -61,6 +64,7 @@ export default async function (t) {
       resume: resumeUnavailable(run),
       continue: continueUnavailable(run),
       'refresh-checks': refreshChecksUnavailable(run, refresh),
+      'accept-check-result': acceptCheckUnavailable(run, refresh),
       'retry-input': retryInputUnavailable(run),
       'reconcile-delivery': reconcileUnavailable(run),
       integrate: integrateUnavailable(run)

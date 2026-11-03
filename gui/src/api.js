@@ -160,6 +160,7 @@ export const api = {
   recoverRun: (project, id, runId, actor) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/recover`, { method: 'POST', body: JSON.stringify({ actor }) }),
   resumeRun: (project, id, runId, budgets = {}, actor) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/resume`, { method: 'POST', body: JSON.stringify({ budgets, actor }) }),
   refreshChecks: (project, id, runId) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/refresh-checks`, { method: 'POST', body: JSON.stringify({}) }),
+  acceptCheckResult: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/accept-check-result`, { method: 'POST', body: JSON.stringify(body) }),
   continueRun: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/continue`, { method: 'POST', body: JSON.stringify(body) }),
   answerRun: (project, id, runId, answer, actor, pauseId) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/answer`, {
     method: 'POST',

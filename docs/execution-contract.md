@@ -2008,6 +2008,42 @@ No criterion is waived. The original snapshot stays immutable; the check target
 and refresh history are separate durable run records.
 
 
+### Accepting a check result and delivering
+
+`POST .../runs/:runId/accept-check-result {failures, reason, revision}` and the
+supervisor's `accept_check_result_run` deliver an approved revision that only its
+check stops, as a recorded decision. `acceptCheckUnavailable` (run-control.mjs) is
+the gate: a tactical code run blocked at closure or stopped by failed checks, every
+occupied auditor's approval of the latest revision, no blocking finding, no other
+closure condition unmet, not already landed. `identifyCheckFailures`
+(baseline-failures.mjs) reads what the latest **full** check must have named: failed
+tests from the comparisons, failed commands with nothing narrower known, and
+required commands they kept from running. A check that did not complete, an
+unreadable report, or a command nothing explains the absence of is not identified
+and refuses. The request must name exactly those failures, and the revision.
+
+The decision is a step. `closure.acceptedCheckRisk` is the only record of a committed
+acceptance, and it exists only once every other condition but delivery is met:
+
+- A recorded confirmation of this revision that is not met refuses the action.
+- A met one with a closure record commits at the action.
+- Otherwise the action records `run.checkAcceptanceRequest` and answers
+  `accepted: false`. Replay reads that revision's checks as passed so the next need
+  is the confirmation; any other turn refuses the request, so no author round or new
+  revision follows. Closure commits the acceptance when the coordinator confirms, and
+  writes it before delivery. Declined, or with no valid confirmation, the request
+  moves to `run.checkAcceptanceRefusals`: nothing is accepted or delivered, and the
+  run does not go back to the author.
+
+`checksSatisfied` and `authorised` are then met, while `verificationLevel` stays
+`review-only` and `closure.checks.gating` stays what ran. Delivery is the same
+closure as any run's, so a refused or unverifiable delivery blocks as it would have.
+Reconcile still reruns the checks on the merged candidate: failures the acceptance
+named stay accepted, and any other is `revalidation-failed`. The inert-drift
+shortcut carries only a passing result, so an accepted run takes a real drive.
+Refresh checks, Continue, a check that now passes, moved content or a failure nobody
+named withdraw it to `run.checkAcceptanceHistory`.
+
 ### The first brief can be written at triage
 
 When a strategy's first coordinator step after triage is a `handoff`, the triage
