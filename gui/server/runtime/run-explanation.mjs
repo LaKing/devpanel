@@ -31,18 +31,19 @@ import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 function driveWords (run) {
   const revision = run.revisions?.at(-1)?.fingerprint
   const entries = (run.checkHistory ?? []).filter((h) => h.revision === revision)
-  const full = entries.filter((h) => h.tier !== 'smoke').at(-1)
-  const smoke = entries.filter((h) => h.tier === 'smoke').at(-1)
+  const full = entries.filter((h) => (h.tier ?? 'full') === 'full').at(-1)
+  const smoke = entries.filter((h) => h.tier === 'smoke' || h.tier === 'targeted').at(-1)
   const smokeFailed = (smoke?.gating ?? smoke?.result) === 'failed'
+  const earlier = smoke?.tier === 'targeted' ? 'targeted tier' : 'smoke'
   if (run.driveNotRun || full?.result === 'not-run') {
     if (run.workspace?.isolation === 'in-place') return ' No drive could run on the last revision: in-place work has no base plus patch to rebuild.'
     return run.driveNotRun?.reason === 'no-drive-configured' ? ' No drive could run on the last revision: this run has none configured.' : ' No drive could run on the last revision.'
   }
   if (full) {
     const outcome = full.gating ?? full.result
-    return ` The full drive ran on the last revision${smokeFailed ? ' after its smoke failed' : ''} and ${outcome === 'unavailable' ? 'was unavailable' : outcome}; the next round's brief carries its result.`
+    return ` The full drive ran on the last revision${smokeFailed ? ` after its ${earlier} failed` : ''} and ${outcome === 'unavailable' ? 'was unavailable' : outcome}; the next round's brief carries its result.`
   }
-  if (smokeFailed) return ' The full drive never ran on the last revision: its smoke failed.'
+  if (smokeFailed) return ` The full drive never ran on the last revision: its ${earlier} failed.`
   return smoke ? ' The full drive never ran on the last revision: its audit held blocking findings that do not wait for it.' : ''
 }
 
@@ -54,10 +55,10 @@ function awaitedDriveFailed (run) {
   const findings = run.outstandingFindings ?? []
   if (!findings.length || !findings.every((f) => f.awaitsCheck === true)) return null
   const revision = run.revisions?.at(-1)?.fingerprint
-  const full = (run.checkHistory ?? []).filter((h) => h.revision === revision && h.tier !== 'smoke').at(-1)
+  const full = (run.checkHistory ?? []).filter((h) => h.revision === revision && (h.tier ?? 'full') === 'full').at(-1)
   const outcome = full?.gating ?? full?.result
   if (!['failed', 'unavailable'].includes(outcome)) return null
-  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && c.tier !== 'smoke').at(-1)
+  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1)
   return { outcome, findings: findings.map((f) => f.id), timedOut: (check?.commands ?? []).filter((c) => c.timedOut).map((c) => c.id) }
 }
 

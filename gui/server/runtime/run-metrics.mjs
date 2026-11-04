@@ -361,6 +361,28 @@ function regressionsAfterApproval (run) {
 }
 
 /**
+ * What the targeted tier did on this run, or null when it never ran: whether a
+ * pass held up on the full drive of the same revision (`run.targetedMisses` is
+ * the engine's record of each that did not).
+ */
+function targetedMetrics (run) {
+  const history = run.checkHistory ?? []
+  const drives = history.filter((h) => h.tier === 'targeted')
+  if (!drives.length) return null
+  const outcome = (h) => h?.gating ?? h?.result
+  const passes = drives.filter((h) => outcome(h) === 'passed')
+  const fullOf = (revision) => history.filter((h) => h.revision === revision && (h.tier ?? 'full') === 'full' && h.result !== 'not-run').at(-1)
+  return {
+    drives: drives.length,
+    passed: passes.length,
+    failed: drives.filter((h) => outcome(h) === 'failed').length,
+    unavailable: drives.filter((h) => outcome(h) === 'unavailable').length,
+    confirmedByFull: passes.filter((h) => outcome(fullOf(h.revision)) === 'passed').length,
+    missedByFull: (run.targetedMisses ?? []).length
+  }
+}
+
+/**
  * @param run      a run record as `run.json` holds it
  * @param outputs  optional: `store.readOutputs()` for the run; without it `findings` is null
  * @param now      for a run still going
@@ -378,6 +400,7 @@ export function runMetrics (run, { outputs = null, now = Date.now() } = {}) {
     repairs: steps.filter((s) => (s.attempt ?? 1) > 1).length
   }
   const regressions = regressionsAfterApproval(run)
+  const targeted = targetedMetrics(run)
   return {
     turns,
     time: timeSplit(run, now),
@@ -386,6 +409,7 @@ export function runMetrics (run, { outputs = null, now = Date.now() } = {}) {
     closureReturns: (run.closureReturns ?? []).length,
     regressionsAfterApproval: regressions.count,
     regressionsBasis: regressions.basis,
+    ...(targeted ? { targeted } : {}),
     means: 'measurements read off the run record, not stored by the engine; compare runs of the same configHash before changing seats, models or strategy; closureReturns counts the engine\'s automatic returns to the author after an unmet closure confirmation; regressionsAfterApproval counts checks that failed (inherited failures included) or whose baseline comparison named new failures, on a revision already approved when they started, and regressionsBasis "inferred" or "mixed" says part of the count comes from an older record that keeps only the current revision\'s checks'
   }
 }
@@ -411,6 +435,7 @@ export function emptyMetricsTotals () {
   return {
     measured: 0, agentMs: 0, seatMs: 0, operatorWaitMs: 0, suspendedMs: 0, checksMs: 0, waitingForChecksMs: 0, driveSlotWaitMs: 0, inconsistent: 0,
     cycleRestarts: 0, inferredRestarts: 0, ignoredRestartRequests: 0, closureReturns: 0, regressionsAfterApproval: 0,
+    targetedDrives: 0, targetedConfirmedByFull: 0, targetedMissedByFull: 0,
     planReviewRoundExecutions: { total: 0, counted: 0 },
     seat: null
   }
@@ -433,6 +458,9 @@ export function absorbMetrics (into, run, { role = null } = {}) {
   into.ignoredRestartRequests += m.rounds.ignoredRestartRequests
   into.closureReturns += m.closureReturns
   into.regressionsAfterApproval += m.regressionsAfterApproval
+  into.targetedDrives += m.targeted?.drives ?? 0
+  into.targetedConfirmedByFull += m.targeted?.confirmedByFull ?? 0
+  into.targetedMissedByFull += m.targeted?.missedByFull ?? 0
   const plan = m.rounds.byPhase['plan-review']
   if (plan) { into.planReviewRoundExecutions.total += plan.roundExecutions; into.planReviewRoundExecutions.counted++ }
   if (role) {

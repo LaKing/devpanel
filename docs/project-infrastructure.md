@@ -41,7 +41,7 @@ is an example. A project file declares infrastructure only: it does not authoriz
 | `testDrive.commands` | Ordered `{id, run, timeoutSeconds, required}` commands run in the verified candidate on staging. At least one must be required. |
 | `testDrive.finallyCommands` | Optional ordered log collection and process cleanup. Attempted even on command failure or cancellation, each with its own timeout. Command ids must be unique across both lists. |
 | `testDrive.timing` | `approved` (default): a revision is test-driven only after every reviewer approved it, so the ~20 minute drive is not spent on revisions sent back anyway. `every-revision`: each revision, beside its reviews. |
-| `testDrive.tiers` | `{smoke: [ids], continueSmoke, keepSeconds}`: the smoke tier runs on every revision beside the reviews, the full drive once on the approved revision, continuing the smoke's running instance (`continueSmoke: false` opts out; `keepSeconds` is how long it waits); only the full drive counts for closure. See "Tiers" below. |
+| `testDrive.tiers` | `{smoke: [ids], continueSmoke, keepSeconds, targeted}`: the smoke tier runs on every revision beside the reviews, the full drive once on the approved revision, continuing the smoke's running instance (`continueSmoke: false` opts out; `keepSeconds` is how long it waits); `targeted` runs named selftests instead of the smoke on a repair revision; only the full drive counts for closure. See "Tiers" and "The targeted tier" below. |
 | `testDrive.baselineCache` | `{stagingFiles, environment, maxEntries, maxAgeDays}`: reuse each tier's base drive across runs on an exact key. See "Baseline cache" below. |
 | `testDrive.retryFailed` | How often a failed drive runs again on the same revision before the failure counts (default 1, 0 to 3). A pass after a failure is recorded as `flaky`. A passing drive gated only by new selftest failures runs once more too (when this is at least 1). Neither runs when an earlier revision of the run already reproduced the failure (execution-contract.md). |
 | `testDrive.notes` | Prerequisites, intended coverage, fixture choices, and limitations. |
@@ -218,6 +218,53 @@ record names it (`declaredBeforeServices`). For such a target, declare the comma
 later or set `tiers.continueSmoke: false`, which is also the choice when a smoke
 finalizer changes application data: a smoke's finalizers run before the commands that
 continue.
+
+### The targeted tier: named selftests on a repair revision
+
+```yaml
+tiers:
+  smoke: [prepare, start, readiness]
+  targeted:
+    command: run-selftests     # keeps its kind, needs, position and timeout; only its `run` is replaced
+    run: "npm run selftest -- --only {{tests}}"
+    always: [prepare, start, readiness, collect-selftest-report]
+    maxTests: 20               # default; more names than this run the smoke instead
+```
+
+When the previous revision's failed drive or an open blocking finding names failing
+tests, the next revision runs `always` and the template, in declared order, instead
+of its smoke, and its audit waits for the result. **Closure still takes only the full
+drive**, so an approved revision still gets one, from scratch: the tier saves a full
+drive on a repair that does not work, and costs a little on one that does. The run
+record and metrics measure that (execution-contract.md "Reviews").
+
+Validation refuses a `command` that is missing, a finalizer, a service or not
+required; an unknown id in `always`; a selected command whose `needs` or `join` is
+outside the tier; a tier with no `report: selftest` command, since the report is what
+proves the named tests ran; and a `run` that is not the template form below.
+
+Test names come from agents and test output, and each is shell-quoted once when the
+template is filled. So validation accepts only a form it can prove keeps them as plain
+arguments, rather than trying to read shell syntax:
+
+```
+command word... {{tests}} word...
+```
+
+- Single spaces separate the words, and `{{tests}}` appears once, as a word of its own.
+- `command` is a literal name or path (letters, digits, `_ . / -`), never a shell
+  builtin or reserved word, and never a program whose purpose is to run its arguments
+  (`env`, `xargs`, `sudo`, `sh`, `bash` and the like, by any path).
+- Every other word uses only letters, digits and `_ @ % + = : , . / -`.
+
+Quotes, expansions (`$HOME` too), redirections, pipes, `;`, comments, assignments before
+the command, `--only={{tests}}` and several lines are all refused. **Anything more
+complex belongs in a script the template calls.**
+
+**The remaining limit:** validation cannot see what a called program does. A script
+that calls `eval`, runs `sh -c "$*"` or builds a command line from its arguments
+defeats the quoting. A program given an option that runs code (`node -e {{tests}}`,
+`find . -exec {{tests}}`) does the same. Pass the names on as `"$@"`.
 
 ### Baseline cache: one base drive per exact key, across runs
 

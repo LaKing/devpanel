@@ -286,6 +286,40 @@ smoke never stands in for the full drive. `checksOnlyBlock` reads the newest
 check of either tier, so a smoke failure on an approved revision is a
 checks-only stop, and refresh-checks reruns the full drive.
 
+A target may also declare **`tiers.targeted`** (`smoke` stays required): named
+selftests on a repair revision, in place of that revision's smoke
+(`runtime/targeted-tier.mjs`). The names come from two records, never from a
+finding's text: the failures an earlier revision's latest drive gated on
+(`checkHistory[].namedFailures`, its new and unjudged selftest failures; when every
+reviewer approved, a failed check is the only open finding there is) and
+`failingTests` on the open blocking findings. A run's first revision is never
+selected, nor is a revision that already has a drive. The decision is made once per
+revision and kept in `run.targetedSelections`, so a restart does not decide again.
+With no name, any unusable one (a suite-level entry, a control character, a leading
+`-`, over 200 characters) or more than `maxTests`, the smoke runs and its record says
+why (`targetedDeclined`): a partial set would not prove the repair.
+
+The audit of that revision waits for the result, which it reads in `checks.latest`
+with `tier: targeted` and `targeted.tests`. A failure is the failed-check path, as a
+smoke's: another author round and no full drive for those bytes, except on the last
+allowed round (`checks.latest.failedTargeted` then keeps it in sight). A passing
+drive whose selftest reports do not show every named test as run is `unavailable`
+(`targeted.missing`): a filter matching nothing proves nothing. **A targeted result
+never counts for closure**: every reader of the closure evidence takes the full tier
+only, so approval still drives the whole target, from scratch, since no smoke kept an
+instance (`continuation.reason: smoke-not-kept`). A targeted drive is a target of its
+own: its `targetKey` holds the filled names, so a pass cannot make a full drive's
+failure read as unstable on the same bytes, and it has no eager base and no
+baseline-cache entry; a base of the same names runs only when a comparison needs it.
+
+When a full drive gates `failed` on a revision whose targeted drive gated `passed`,
+`run.targetedMisses[]` and a `targeted-missed` event name the revision, the targeted
+drive (`dir`, `tests`) and the full drive (`dir`, `reason`, `failures`). Run metrics
+read `targeted` (`drives`, `passed`, `failed`, `unavailable`, `confirmedByFull`,
+`missedByFull`), with totals per group, to measure the trade-off: the tier saves a
+full drive on a repair that does not work, and a repair that works pays for the
+targeted drive and a full drive that cannot continue a smoke.
+
 The full drive of an SSH target **continues** its smoke's running instance when
 the smoke passed the gate on its first attempt and has a service
 (`continuationPlan`, baseline-cache.mjs; `tiers.continueSmoke: false` opts out).

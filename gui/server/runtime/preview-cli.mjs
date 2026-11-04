@@ -98,6 +98,8 @@ console.log(`  ${c.dim}checks${c.off}     requirement=${p.checks.requirement}  t
 if (p.checks.target?.tiers) {
   const ids = [...(p.checks.target.commands ?? []), ...(p.checks.target.finallyCommands ?? [])].map((x) => x.id)
   console.log(`  ${c.dim}smoke${c.off}      every revision, beside the reviews: ${p.checks.target.tiers.smoke.join(', ')}`)
+  const targeted = p.checks.target.tiers.targeted
+  if (targeted) console.log(`  ${c.dim}targeted${c.off}   instead of the smoke, on a repair revision whose failing tests are named: ${targeted.run} (for ${targeted.command}), with ${targeted.always.join(', ') || 'nothing else'}; closure never counts it`)
   console.log(`  ${c.dim}full${c.off}       once, on the approved revision; closure counts only this: ${ids.join(', ')}`)
   const continuing = continuationPlan(p.checks.target)
   if (continuing.refusal) console.log(`  ${c.dim}continue${c.off}   no: the full drive runs from scratch (${continuing.refusal})`)

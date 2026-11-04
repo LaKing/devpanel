@@ -34,10 +34,25 @@ const sha256File = (file) => new Promise((resolve, reject) => {
 })
 const NL = String.fromCharCode(10)
 
-/** The target one tier drives: the smoke commands only, or the whole target. */
-export function tierTarget (target, tier) {
+/**
+ * The target one tier drives: the smoke commands only, the targeted tier's
+ * commands with its template filled, or the whole target. A targeted drive's
+ * key holds its test names, so it keeps no eager base and no cache entry (a base
+ * of the same names runs only when a comparison needs it): many name sets must
+ * not evict the full drive's entries.
+ */
+export function tierTarget (target, tier, tests = []) {
   if (!target?.tiers || !tier) return target
   const { tiers, ...rest } = target
+  if (tier === 'targeted') {
+    const { compareBaseline, baselineCache, ...own } = rest
+    const { command, run, always } = tiers.targeted
+    const named = tests.map(shellQuote).join(' ')
+    const selected = (c) => c.id === command || always.includes(c.id)
+    // A function, so a `$&` in a name is not read as a replacement pattern.
+    const fill = (c) => c.id === command ? { ...c, run: run.replace('{{tests}}', () => named) } : c
+    return { ...own, tier: 'targeted', commands: (own.commands ?? []).filter(selected).map(fill), ...(own.finallyCommands ? { finallyCommands: own.finallyCommands.filter(selected) } : {}) }
+  }
   if (tier !== 'smoke') return { ...rest, tier: 'full' }
   const keep = (list) => (list ?? []).filter((c) => tiers.smoke.includes(c.id))
   return { ...rest, tier: 'smoke', commands: keep(rest.commands), ...(rest.finallyCommands ? { finallyCommands: keep(rest.finallyCommands) } : {}) }

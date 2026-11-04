@@ -564,12 +564,51 @@
               "maximum": 7200,
               "default": 1800,
               "description": "How long a passing smoke's instance waits for the full drive before a timer on the target removes it. Past it the full drive runs from scratch."
+            },
+            "targeted": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "command",
+                "run",
+                "always"
+              ],
+              "description": "Named selftests on a repair revision, in place of its smoke, when the previous revision's failed drive or the open findings name failing tests. The result gates the round as a smoke does and never counts for closure: only the full drive does.",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9-]+$",
+                  "description": "Id of the required, non-service command of the target whose `run` the template replaces; it keeps its kind, needs, position and timeout."
+                },
+                "run": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The command template: `command word... {{tests}} word...`: single spaces between plain words, a literally named program that is no shell builtin and does not exist to run its arguments, and `{{tests}}` once as a word of its own, replaced by the test names, each shell-quoted. Validation refuses anything else, which belongs in a script the template calls. A called program that parses its arguments again defeats that quoting."
+                },
+                "always": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9-]+$"
+                  },
+                  "description": "Ids of the commands and finallyCommands that always run with it, in declared order. Everything the tier's commands need or join, and a `report: selftest` command, must be among them or be the template's own command."
+                },
+                "maxTests": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100,
+                  "default": 20,
+                  "description": "More names than this: the revision runs its smoke."
+                }
+              }
             }
           }
         },
         "tier": {
           "enum": [
             "smoke",
+            "targeted",
             "full"
           ],
           "description": "Set by the engine on the target of one tier's drive; never configured."

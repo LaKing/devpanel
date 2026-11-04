@@ -1,3 +1,5 @@
+import { isSelftestReport } from './runtime/baseline-failures.mjs'
+
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 
 export function infrastructureErrors (infra) {
@@ -52,6 +54,63 @@ export function tierErrors (target) {
     for (const id of [...(c.needs ?? []), ...(c.join ? [c.join] : [])]) if (!smoke.includes(id)) errors.push(`tiers.smoke: ${c.id} needs ${id}, which is not in the smoke tier`)
   }
   if (target.timing === 'every-revision') errors.push('tiers run the full drive on the approved revision; timing: every-revision contradicts them')
+  errors.push(...targetedErrors(target, all))
+  return errors
+}
+
+// Words the shell would treat as anything but a plain word: no quote, expansion, operator, glob, comment or newline can be spelled in them.
+const TEMPLATE_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/
+// The command is a path or a name, and with no `=` it cannot be an assignment that leaves the first name as the command.
+const TEMPLATE_COMMAND = /^[A-Za-z0-9_./][A-Za-z0-9_./-]*$/
+// Shell builtins and reserved words: some evaluate an argument (`eval`, `let`, `test -v 'a[$(x)]'`), and none runs a test suite.
+const SHELL_WORDS = '. alias bg bind break builtin caller case cd command compgen complete compopt continue coproc declare dirs disown do done echo elif else enable esac eval exec exit export false fc fg fi for function getopts hash help history if in jobs kill let local logout mapfile popd printf pushd pwd read readarray readonly return select set shift shopt source suspend test then time times trap true type typeset ulimit umask unalias unset until wait while'.split(' ')
+// Programs whose purpose is to run their arguments.
+const RUNNERS = 'env nohup nice ionice setsid stdbuf timeout sudo doas su xargs chroot flock watch parallel sh bash dash ash zsh ksh fish busybox'.split(' ')
+const NOT_A_TEST_COMMAND = new Set([...SHELL_WORDS, ...RUNNERS])
+
+/**
+ * Why a template is not `command word... {{tests}} word...`, or null. Validation
+ * accepts only this form instead of reading shell syntax: single spaces between
+ * plain words, a literally named command, and `{{tests}}` as a word of its own.
+ * Nothing in it can change how the shell reads the generated quotes, so each name
+ * reaches the command as one argument. A script takes anything more complex. What
+ * a called program does with its arguments cannot be seen from here
+ * (docs/project-infrastructure.md "The targeted tier").
+ */
+function templateProblem (run) {
+  const count = run.split('{{tests}}').length - 1
+  if (count !== 1) return `must hold {{tests}} exactly once, found ${count}`
+  const [command, ...words] = run.split(' ')
+  if (!TEMPLATE_COMMAND.test(command)) return `must start with a literally named command, not ${JSON.stringify(command)}: anything more complex belongs in a script`
+  if (NOT_A_TEST_COMMAND.has(command.slice(command.lastIndexOf('/') + 1))) return `must name a program that takes the tests as arguments; ${command} is a shell word or runs its arguments`
+  for (const word of words) {
+    if (word !== '{{tests}}' && !TEMPLATE_WORD.test(word)) return `must be plain words separated by single spaces, with {{tests}} as a word of its own, not ${JSON.stringify(word)}: anything more complex belongs in a script`
+  }
+  return null
+}
+
+/**
+ * A targeted tier is a subset of the target that must run on its own and must
+ * be able to prove what it ran: its template takes over one required command,
+ * and what it needs or joins is in the tier, with a selftest report among it.
+ */
+function targetedErrors (target, all) {
+  const targeted = target.tiers.targeted
+  if (!targeted) return []
+  const errors = []
+  const command = (target.commands ?? []).find(c => c.id === targeted.command)
+  if (!command) errors.push(`tiers.targeted: ${targeted.command} is not a command of the target (a finalizer cannot take the template)`)
+  else if (command.service === true) errors.push(`tiers.targeted: ${targeted.command} is a service and cannot take the template`)
+  else if (command.required === false) errors.push(`tiers.targeted: ${targeted.command} is not required, so its failure would gate nothing`)
+  for (const id of targeted.always) if (!all.some(c => c.id === id)) errors.push(`tiers.targeted: ${id} is not a command of the target`)
+  const ids = [...targeted.always, targeted.command]
+  const selected = all.filter(c => ids.includes(c.id))
+  for (const c of selected) {
+    for (const id of [...(c.needs ?? []), ...(c.join ? [c.join] : [])]) if (!ids.includes(id)) errors.push(`tiers.targeted: ${c.id} needs ${id}, which is not in the targeted tier`)
+  }
+  if (!selected.some(c => isSelftestReport(c.report))) errors.push('tiers.targeted: no command of the tier declares report: selftest, so nothing could prove the named tests ran')
+  const problem = templateProblem(targeted.run)
+  if (problem) errors.push(`tiers.targeted.run ${problem}`)
   return errors
 }
 

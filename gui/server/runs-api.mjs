@@ -267,6 +267,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     checkResults,
     // Every drive's gate verdict: checkResults holds only the current revision's evidence.
     checkHistory: run.checkHistory ?? [],
+    // Full drives that failed where the targeted tier had passed on the same revision.
+    ...(run.targetedMisses?.length ? { targetedMisses: run.targetedMisses } : {}),
     // Drives of a variant, not of a revision: nothing above counts them.
     diagnosticDrives: run.diagnosticDrives ?? [],
     outstandingFindings: run.outstandingFindings ?? [],

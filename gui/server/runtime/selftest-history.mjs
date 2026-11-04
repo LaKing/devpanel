@@ -338,7 +338,7 @@ export function ignoredSelftests (run) {
   const closing = run?.closure?.checks?.selftest
   if (closing) return closing.unstable ?? []
   const revision = run?.revisions?.at(-1)?.fingerprint
-  const check = (run?.checkResults ?? []).filter((c) => c.revision === revision && c.tier !== 'smoke').at(-1)
+  const check = (run?.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1)
   return check?.baselineComparison?.selftest?.unstable ?? []
 }
 

@@ -504,6 +504,15 @@
               "awaitsCheck": {
                 "type": "boolean",
                 "description": "Set true only when the finding is blocking solely because a criterion needs evidence that the run's configured checks produce (for example the staging test drive) and that has no result for this revision yet, and nothing in the code is wrong. When every substantial finding of a round awaits the checks, the engine runs them on this revision once, even when they otherwise wait for approval, and the same reviewers review it again in the same round with the result. Never for a defect the author can fix."
+              },
+              "failingTests": {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "The exact names of the selftests this finding says fail, as a selftest report names them. Only where the run's checks declare a targeted tier does it change anything: a blocking finding's names are run on the author's next revision."
               }
             }
           }

@@ -8,7 +8,11 @@ export function checkSummary (check, fullEvidence = null) {
   return {
     revision: check.revision, result: check.result, target: check.target, at: check.at,
     // A smoke result answers whether the revision boots; only the full drive counts for closure.
-    ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.' : 'Full drive: the result closure counts.' } : {}),
+    ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
+      : check.tier === 'targeted' ? 'Targeted tier: only the tests named in `targeted.tests` and the commands declared to run with them, not the whole drive. A failure returns the revision to the author; a pass shows those tests only and does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
+        : 'Full drive: the result closure counts.' } : {}),
+    ...(check.targeted ? { targeted: check.targeted } : {}),
+    ...(check.targetedDeclined ? { targetedDeclined: check.targetedDeclined } : {}),
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
     // durationMs includes this: how long the drive waited for a slot on its staging host (drive-slots.mjs).
     ...(check.driveSlot?.waitMs ? { driveSlot: check.driveSlot } : {}),

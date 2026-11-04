@@ -27,6 +27,7 @@ import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
+import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
@@ -1795,10 +1796,13 @@ export class Engine {
     if (!current) return
     const configured = overrideTarget ?? this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
     if (!configured) return
-    // A tiered target runs one tier per call: the full drive unless the smoke is asked for.
-    const level = configured.tiers ? (tier ?? 'full') : null
+    // This revision's targeted decision, when the target declares the tier; a target
+    // refreshed since then may not, and a tier with no names to fill has nothing to run.
+    const selection = configured.tiers?.targeted ? this.run.targetedSelections?.[current] ?? null : null
+    // A tiered target runs one tier per call: the full drive unless the smoke or the targeted tier is asked for.
+    const level = configured.tiers ? ((tier === 'targeted' && !selection?.tests ? 'smoke' : tier) ?? 'full') : null
     if (!force && this.run.checkResults.some((c) => c.revision === current && (c.tier ?? null) === level)) return
-    const target = tierTarget(configured, level)
+    const target = tierTarget(configured, level, selection?.tests)
     const step = [...this.run.steps].reverse().find((s) => s.revision === current)
     const fp = await fingerprint(this.run.workspace.path, { baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), clock: this.clock, projection: workspaceProjection(this.run.workspace) })
     if (fp.fingerprint !== current) return   // the workspace moved on; nothing to check yet
@@ -1806,12 +1810,22 @@ export class Engine {
     // metrics count the failures that came after agreement.
     const afterApproval = this.run.approvals.some((a) => a.revision === current)
     const tierOf = level ? { tier: level } : {}
+    const namedTests = level === 'targeted' ? { tests: selection.tests } : {}
     // An instance kept for another revision has nothing left to continue.
     const stale = this.run.keptInstance && this.run.keptInstance.revision !== current
     if (stale) await this.discardKeptInstance('revision-changed')
     const instance = level ? await this.instanceDecision({ configured, level, target, force, overrideTarget, current, stale }) : {}
-    await this.persist({ type: 'checks-started', revision: current, target: target.kind, ...tierOf, step: step?.number ?? null })
+    await this.persist({ type: 'checks-started', revision: current, target: target.kind, ...tierOf, ...namedTests, step: step?.number ?? null })
     const result = await this.whileChecking(() => this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory, keep: instance.keep ?? null, continueFrom: instance.continueFrom ?? null }))
+    if (level === 'targeted') {
+      // A filter that matched nothing passes: only a report naming every test proves the drive ran them.
+      const missing = await missingNamedTests({ runDir: store.runDir(this.issuePath, this.runId), target, check: result, tests: selection.tests })
+      result.targeted = { command: configured.tiers.targeted.command, tests: selection.tests, always: configured.tiers.targeted.always, sources: selection.sources, missing }
+      if (missing.length && result.result === 'passed') {
+        result.result = 'unavailable'
+        result.error = `the targeted drive passed, but its selftest report does not show these named tests as run: ${missing.join(', ')}`
+      }
+    } else if (level === 'smoke' && selection?.declined) result.targetedDeclined = selection.declined
     // Why this full drive ran from scratch; the attempts say so when a retry replaced the drive that knew.
     if (level === 'full' && !result.continuedFrom) {
       const replaced = result.attempts?.find((a) => a.continuedFrom)
@@ -1838,9 +1852,25 @@ export class Engine {
       runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence,
       // Survives a new revision, so the next audit still reads what the gate passed over.
       ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}),
+      ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}),
+      ...(result.targeted ? { targeted: result.targeted } : {}), ...(result.targetedDeclined ? { targetedDeclined: result.targetedDeclined } : {}),
+      // Survives a new revision, so the next one's targeted decision can read what failed.
+      ...(configured.tiers?.targeted && namedFailuresOf(result).length ? { namedFailures: namedFailuresOf(result) } : {}) })
+    await this.persist({ type: 'checks', revision: current, ...tierOf, ...namedTests, result: result.result, commands: result.commands?.length ?? 0,
       ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}) })
-    await this.persist({ type: 'checks', revision: current, ...tierOf, result: result.result, commands: result.commands?.length ?? 0,
-      ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}) })
+    if (level === 'full') await this.recordTargetedMiss(result, current)
+  }
+
+  /** A full drive that failed where the targeted tier passed on the same bytes: what the tier's trade-off is measured by. */
+  async recordTargetedMiss (full, revision) {
+    if (gatingResult(full, this.run) !== 'failed' || inconclusiveBase(full, this.run)) return
+    const targeted = (this.run.checkHistory ?? []).filter((h) => h.revision === revision && h.tier === 'targeted' && h.gating === 'passed').at(-1)
+    if (!targeted) return
+    const miss = { revision, at: this.clock.iso(),
+      targeted: { dir: targeted.dir, at: targeted.at, result: targeted.result, gating: targeted.gating, tests: targeted.targeted?.tests ?? [] },
+      full: { dir: full.dir, at: full.at, result: full.result, gating: 'failed', reason: gateReason(full, this.run), failures: namedFailuresOf(full) } }
+    ;(this.run.targetedMisses ??= []).push(miss)
+    await this.persist({ type: 'targeted-missed', ...miss })
   }
 
   /**
@@ -1850,6 +1880,7 @@ export class Engine {
    * decided here; the rest is proved on the staging host (checks.mjs).
    */
   async instanceDecision ({ configured, level, target, force, overrideTarget, current, stale }) {
+    if (level === 'targeted') return {}
     const plan = continuationPlan(configured)
     if (!plan) return {}
     if (level === 'smoke') return !force && !overrideTarget && !plan.refusal ? { keep: { seconds: plan.keepSeconds } } : {}
@@ -1860,6 +1891,7 @@ export class Engine {
     const kept = this.run.keptInstance
     if (!kept) {
       const smoke = this.run.checkResults.filter((c) => c.revision === current && c.tier === 'smoke').at(-1)
+      if (!smoke && this.run.checkResults.some((c) => c.revision === current && c.tier === 'targeted')) return refuse('smoke-not-kept', 'this revision ran the targeted tier instead of its smoke')
       if (smoke?.attempts?.length) return refuse('smoke-retried', 'its smoke needed a retry, so this drive proves its commands again')
       const discarded = (this.run.discardedInstances ?? []).filter((d) => d.revision === current).at(-1)
       return refuse('smoke-not-kept', smoke?.instanceNotKept ?? (discarded ? `it was discarded: ${discarded.reason}` : smoke ? `its smoke was ${smoke.result}` : 'this revision has no smoke result'))
@@ -2197,6 +2229,8 @@ export class Engine {
       // A passed drive is the latest on a revision whose smoke failed (the last allowed round): the failure stays in sight.
       const failedSmoke = isFull(latestCheck) ? this.run.checkResults.filter((c) => c.revision === latestCheck.revision && c.tier === 'smoke').at(-1) : null
       if (failedSmoke && gatingResult(failedSmoke, this.run) === 'failed') ctx.checks.latest.failedSmoke = checkSummary(failedSmoke)
+      const failedTargeted = isFull(latestCheck) ? this.run.checkResults.filter((c) => c.revision === latestCheck.revision && c.tier === 'targeted').at(-1) : null
+      if (failedTargeted && gatingResult(failedTargeted, this.run) === 'failed') ctx.checks.latest.failedTargeted = checkSummary(failedTargeted)
       if (this.run.checkRefresh) ctx.checks.refresh = { requestedAt: this.run.checkRefresh.requestedAt, completedAt: this.run.checkRefresh.completedAt, instruction: 'The operator installed and ran updated checks. Earlier decisions saying those checks cannot run are superseded by this evidence. Reassess every criterion honestly; do not turn a skipped test into a pass.' }
     }
     // Checks that wait for approval: every seat is told so, or a criterion only
@@ -2208,6 +2242,7 @@ export class Engine {
         timing: 'approved', kind: target.kind, commands: (target.commands ?? []).map((c) => c.id),
         instruction: 'These checks (for example the staging test drive) run only on a revision every reviewer approved, on a revision whose every substantial finding is marked `awaitsCheck`, or on the revision of the last allowed round when any finding is so marked (once per revision); their result then gates the round and closure. Brief: name the acceptance criteria only these checks can prove, and those triage flagged with `outsideChecks` as beyond them. Author: finish the code for them and do not hand over an unchanged revision to wait for the checks. Auditor: when the only thing still blocking is evidence these checks produce and this revision has no result yet, keep that finding blocking with `awaitsCheck: true`; the engine runs them and asks you to review the same revision again in this round with their result. When other findings stand beside it and this is the last allowed round, they run with no re-review: the next round is told their result.'
       } }
+      if (target.tiers?.targeted) ctx.checks.latest.timing.instruction += ' Auditor: a blocking finding that says selftests fail names them in `failingTests`, exactly as the report names them; the author\'s next revision then runs those tests (the targeted tier) before its audit, instead of its smoke. That result is shown to you and never counts for closure.'
       // The revision's own drive has not run, and revision pruning dropped the last
       // one from checkResults: the next audit still sees what it said.
       const current = this.run.revisions.at(-1)?.fingerprint ?? null
@@ -3331,7 +3366,8 @@ export class Engine {
     const level = this.snapshot.checks?.target?.tiers ? (tier ?? 'full') : null
     if (!current || this.run.checkResults.some((c) => c.revision === current && (c.tier ?? null) === level)) return null
     this.checksRevision = current
-    const running = this.whileChecking(() => this.maybeRunChecks({ tier })).finally(() => { this.checksInFlight = null; this.checksRevision = null })
+    this.checksTier = tier
+    const running = this.whileChecking(() => this.maybeRunChecks({ tier })).finally(() => { this.checksInFlight = null; this.checksRevision = null; this.checksTier = null })
     running.catch(() => { /* surfaced by settleChecks */ })
     this.checksInFlight = running
     return running
@@ -3340,11 +3376,30 @@ export class Engine {
   /**
    * What runs as soon as a revision exists: the target (tier null), or only
    * its smoke tier when the full drive waits for approval; null when all of
-   * it waits (`timing: approved` without tiers).
+   * it waits (`timing: approved` without tiers). A repair revision whose failing
+   * tests are named runs the targeted tier instead of its smoke.
    */
   earlyChecks (phase) {
     if (!deferredIn(this.snapshot, phase)) return { tier: null }
-    return tiered(this.snapshot) ? { tier: 'smoke' } : null
+    if (!tiered(this.snapshot)) return null
+    return this.targetedDecision()?.tests ? { tier: 'targeted' } : { tier: 'smoke' }
+  }
+
+  /**
+   * The current revision's targeted decision, made once and kept on the record:
+   * reviews update what it reads, so a restart must not decide again. A revision
+   * that already has a drive (an author answering with the same bytes) has had its checks.
+   */
+  targetedDecision () {
+    const target = this.run.checkRefresh?.target ?? this.snapshot.checks?.target
+    const current = this.run.revisions.at(-1)?.fingerprint ?? null
+    if (!target?.tiers?.targeted || !current) return null
+    const held = this.run.targetedSelections?.[current]
+    if (held) return held
+    if ([...(this.run.checkHistory ?? []), ...this.run.checkResults].some((c) => c.revision === current)) return null
+    const selection = selectTargeted({ target, run: this.run, revision: current })
+    if (selection) (this.run.targetedSelections ??= {})[current] = selection
+    return selection
   }
 
   /** Wait for background checks; their failure is the run's, as when they ran inline. */
@@ -3623,12 +3678,17 @@ export class Engine {
       // brief or confirmation, closure — decides with their result in hand, so
       // it waits for them and plans again (a failed check changes the round).
       if (await this.adoptTriageHandoff(next)) continue
-      if (this.checksInFlight && !(this.concurrentChecks() && concurrentReview(next))) {
+      // A targeted result is what its audit is there to read, so that audit waits for it.
+      if (this.checksInFlight && !(this.concurrentChecks() && concurrentReview(next) && this.checksTier !== 'targeted')) {
         await this.settleChecks()
         continue
       }
       const early = this.earlyChecks(next.phase)
       if (this.concurrentChecks() && concurrentReview(next) && early) this.startChecks(early.tier)   // e.g. lost to a restart
+      if (this.checksInFlight && this.checksTier === 'targeted') {
+        await this.settleChecks()
+        if (this.controller.signal.aborted) continue
+      }
       const batch = this.reviewBatch(next)
       const outcome = batch.length === 1 ? await this.runTurn(next) : await this.runConcurrently(batch)
       if (this.checksInFlight && concurrentReview(next)) await this.settleChecks()
@@ -3640,9 +3700,11 @@ export class Engine {
       // `checks.latest` names a result for the revision it is reviewing.
       // Not while the author is asking for a diagnostic drive: this revision is not its answer yet.
       const asking = this.outputs[this.run.steps.at(-1)?.number]?.output?.diagnosticDrive
-      if (next.step.recordsRevision && early && !asking) {
-        if (this.concurrentChecks()) this.startChecks(early.tier)
-        else await this.maybeRunChecks({ tier: early.tier })
+      // Read again: the revision this turn recorded did not exist when `early` was.
+      const recorded = next.step.recordsRevision && !asking ? this.earlyChecks(next.phase) : null
+      if (recorded) {
+        if (this.concurrentChecks()) this.startChecks(recorded.tier)
+        else await this.maybeRunChecks({ tier: recorded.tier })
       }
     }
     } catch (error) {
