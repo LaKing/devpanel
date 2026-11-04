@@ -68,6 +68,51 @@ export default async function (t) {
     t.ok('a length violation names the actual length and how much to cut', /\/prompt must NOT have more than 2400 characters \(it has 2950; shorten by at least 550\)/.test(long.error), long.error)
   }
 
+  t.section('5a. the last repair of a handoff may miss the limit by a little, while converging')
+  {
+    const handoff = (n, extra = {}) => fence(JSON.stringify({ targetRole: 'author', prompt: 'x'.repeat(n), ...extra }))
+    const attempt = (n) => ({ output: { prompt: 'x'.repeat(n) } })
+    const judge = (text, earlier, contract = 'handoff') => extractOutput(text, contract, { root, lastRepairOf: earlier })
+
+    const landed = await judge(handoff(2402), [attempt(2700), attempt(2450)])
+    t.eq('the recorded 2402-character case is accepted', landed.valid, true, landed.error)
+    t.eq('and says what was tolerated', landed.tolerated, { path: '/prompt', limit: 2400, length: 2402, lengths: [2700, 2450, 2402] })
+    t.eq('the prompt is not cut', landed.output.prompt.length, 2402)
+    t.eq('the tolerance edge is accepted', (await judge(handoff(2520), [attempt(2700)])).valid, true)
+    t.eq('an attempt without a prompt is no measurement', (await judge(handoff(2402), [{ output: null }, attempt(2450)])).valid, true)
+
+    const refused = async (label, text, earlier, contract) => {
+      const r = await judge(text, earlier, contract)
+      t.eq(label, `${r.valid}/${r.classification}/${r.tolerated ?? null}`, 'false/contract-violation/null', r.error)
+      return r
+    }
+    await refused('one past the tolerance', handoff(2521), [attempt(2700)])
+    await refused('far over the limit, though shrinking', handoff(3000), [attempt(4000), attempt(3500)])
+    await refused('no shrinking: the same length again', handoff(2402), [attempt(2410), attempt(2402)])
+    await refused('no shrinking: it grew and came back', handoff(2402), [attempt(2410), attempt(2420)])
+    await refused('nothing to compare with', handoff(2402), [{ output: null }])
+    await refused('another violation beside the length', handoff(2402, { extra: true }), [attempt(2450)])
+    const triage = { fit: true, issuePresent: true, reasoning: 'r', autonomy: { verdict: 'autonomous', reason: 'r' }, acceptanceCriteria: [{ id: 'AC1', statement: 's', verifiable: true }], firstHandoff: { targetRole: 'author', prompt: 'x'.repeat(2402), windowDecision: 'keep' } }
+    const first = await refused('firstHandoff is another contract', fence(JSON.stringify(triage)), [{ output: { firstHandoff: { prompt: 'x'.repeat(2450) } } }], 'triageResult')
+    t.ok('and only its length was wrong', /^does not satisfy the triageResult contract — \/firstHandoff\/prompt must NOT have more than 2400 characters/.test(first.error), first.error)
+
+    // The schema counts code points; an emoji is one character and two UTF-16 units.
+    const emoji = '😀'
+    const mixed = (emojis, plain) => emoji.repeat(emojis) + 'x'.repeat(plain)
+    const prompted = (prompt) => fence(JSON.stringify({ targetRole: 'author', prompt }))
+    const earlierMixed = (emojis, plain) => ({ output: { prompt: mixed(emojis, plain) } })
+    await refused('counted in characters [2450, 2450, 2460] does not converge, though its UTF-16 lengths shrink', handoff(2460), [earlierMixed(150, 2300), earlierMixed(50, 2400)])
+    const converging = await judge(prompted(mixed(121, 2281)), [attempt(2700), attempt(2450)])
+    t.eq('a converging 2402 characters in 2523 UTF-16 units is accepted', converging.valid, true, converging.error)
+    t.eq('and is recorded in characters', converging.tolerated, { path: '/prompt', limit: 2400, length: 2402, lengths: [2700, 2450, 2402] })
+    t.eq('the tolerance edge counted in characters is accepted', (await judge(prompted(mixed(200, 2320)), [attempt(2700)])).valid, true)
+    await refused('one past the tolerance counted in characters', prompted(mixed(200, 2321)), [attempt(2700)])
+
+    const notLast = await extractOutput(handoff(2402), 'handoff', { root })
+    t.eq('an attempt with repair left is refused and repaired', notLast.valid, false)
+    t.ok('and told the stated limit', /must NOT have more than 2400 characters \(it has 2402; shorten by at least 2\)/.test(notLast.error), notLast.error)
+  }
+
   t.section('6. no JSON at all is classified as no structured output')
   {
     const r = await extractOutput('I have thoughts but no structured output.', 'handoff', { root })

@@ -1565,8 +1565,13 @@ export class Engine {
     // 2. Structured output.
     if (!this.outputs[created.number]) {
       // Judged by the snapshot's definitions — the same frozen text the turn
-      // was shown — never by whatever the schema file says now.
-      const extracted = await extractOutput(response, cursor.contract, { root: this.configRoot, contracts: this.snapshot.contracts })
+      // was shown — never by whatever the schema file says now. The turn after which
+      // plan() would block also brings its earlier attempts, decided once here and
+      // recorded, so replay and runs already blocked are not judged anew.
+      const lastRepairOf = cursor.attempt > this.snapshot.reviewPolicy.protocolRepair.maxAttempts
+        ? attemptsOf(this.run.steps, cursor.phase, cursor.stepId, cursor.round, cursor.recheck ?? null, cursor.recheckDrive ?? null, cursor.diagnosticOf ?? null).filter((s) => s.attempt < cursor.attempt).map((s) => this.outputs[s.number])
+        : null
+      const extracted = await extractOutput(response, cursor.contract, { root: this.configRoot, contracts: this.snapshot.contracts, lastRepairOf })
       await store.writeOutput(this.issuePath, this.runId, created.number, {
         ...extracted,
         role,

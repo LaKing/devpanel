@@ -346,5 +346,61 @@ export default async function (t) {
     await releaseWorkspace(engine)
   }
 
+  t.section('9. a handoff repair that converges on the prompt limit does not block the run')
+  {
+    const attempts = (run) => run.steps.filter((s) => s.stepId === 'brief-implement').map((s) => s.attempt)
+    const briefing = (sizes, extra = {}) => {
+      const base = scriptFor()
+      return (turn) => turn.stepId === 'brief-implement'
+        ? `Briefing.${NL}${fence({ targetRole: 'implementer', prompt: 'x'.repeat(sizes[turn.attempt - 1]), ...extra })}`
+        : base(turn)
+    }
+
+    const f = await engineFixture({ script: briefing([2700, 2450, 2402]) })
+    const engine = await start(f)
+    const run = await engine.drive()
+    t.eq('the recorded case: three attempts, the last at 2402', attempts(run), [1, 2, 3])
+    t.eq('the run went on and closed', `${run.outcome}/${run.blockedReason ?? null}`, 'resolved/null')
+    const last = run.steps.find((s) => s.stepId === 'brief-implement' && s.attempt === 3)
+    t.eq('the output says what was tolerated', engine.outputs[last.number].tolerated, { path: '/prompt', limit: 2400, length: 2402, lengths: [2700, 2450, 2402] })
+    await releaseWorkspace(engine)
+
+    // Counted in characters, as the schema counts: one emoji is two UTF-16 units.
+    const texts = (prompts) => {
+      const base = scriptFor()
+      return (turn) => turn.stepId === 'brief-implement'
+        ? `Briefing.${NL}${fence({ targetRole: 'implementer', prompt: prompts[turn.attempt - 1] })}`
+        : base(turn)
+    }
+    const mixed = (emojis, plain) => '😀'.repeat(emojis) + 'x'.repeat(plain)
+
+    const fm = await engineFixture({ script: texts(['x'.repeat(2700), 'x'.repeat(2450), mixed(121, 2281)]) })
+    const em = await start(fm)
+    const rm = await em.drive()
+    t.eq('2402 characters in 2523 UTF-16 units: the run went on and closed', `${rm.outcome}/${rm.blockedReason ?? null}`, 'resolved/null')
+    await releaseWorkspace(em)
+
+    const fn = await engineFixture({ script: texts([mixed(150, 2300), mixed(50, 2400), 'x'.repeat(2460)]) })
+    const en = await start(fn)
+    const rn = await en.drive()
+    t.eq('[2450, 2450, 2460] characters: the same attempts', attempts(rn), [1, 2, 3])
+    t.eq('[2450, 2450, 2460] characters: the same block, though UTF-16 lengths shrink', `${rn.status}/${rn.blockedReason}`, 'blocked/protocol-repair-exhausted')
+    await releaseWorkspace(en)
+
+    const blocked = [
+      ['far over the limit', briefing([4000, 3500, 3000])],
+      ['not converging', briefing([2402, 2402, 2402])],
+      ['a short miss with another violation', briefing([2700, 2450, 2402], { extra: true })]
+    ]
+    for (const [label, script] of blocked) {
+      const g = await engineFixture({ script })
+      const e = await start(g)
+      const r = await e.drive()
+      t.eq(`${label}: the same attempts`, attempts(r), [1, 2, 3])
+      t.eq(`${label}: the same block`, `${r.status}/${r.blockedReason}`, 'blocked/protocol-repair-exhausted')
+      await releaseWorkspace(e)
+    }
+  }
+
   await cleanupFixtures()
 }

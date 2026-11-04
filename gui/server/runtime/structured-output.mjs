@@ -149,11 +149,35 @@ export function contractError (value, contract, { ajv, id, defs } = {}) {
   return null
 }
 
+// A model cannot count characters: a repair can converge on a limit and still miss
+// it by a few, and then a paid run blocks over them. The last repair of a handoff may
+// land this share of the limit above it, nothing else about the contract relaxed.
+export const HANDOFF_REPAIR_TOLERANCE = 0.05
+
+/**
+ * Whether the last repair of a handoff missed only by a little, while converging:
+ * the prompt's length is the one violation, within the tolerance, and the prompt
+ * lengths of the attempts (at least two) strictly shrink. The limit is the contract's own,
+ * and lengths are counted as the schema counts them: code points, not UTF-16 units.
+ */
+function toleratedHandoffPrompt (value, earlier, validator) {
+  const limit = validator.ajv?.getSchema(`${validator.id}#/$defs/handoff`)?.schema?.properties?.prompt?.maxLength
+  const { prompt } = value
+  if (typeof limit !== 'number' || typeof prompt !== 'string') return null
+  const characters = [...prompt]
+  if (characters.length <= limit || characters.length > limit * (1 + HANDOFF_REPAIR_TOLERANCE)) return null
+  if (contractError({ ...value, prompt: characters.slice(0, limit).join('') }, 'handoff', validator) !== null) return null
+  const lengths = [...earlier.map((o) => o?.output?.prompt).filter((p) => typeof p === 'string').map((p) => [...p].length), characters.length]
+  if (lengths.length < 2 || !lengths.every((n, i) => i === 0 || n < lengths[i - 1])) return null
+  return { path: '/prompt', limit, length: characters.length, lengths }
+}
+
 /**
  * Extract and validate.
  *
  * Result shape:
  *   valid           whether exactly one contract-compliant object was found
+ *   tolerated       set when a handoff prompt was accepted over its limit (toleratedHandoffPrompt)
  *   output          the object (the closest candidate when invalid, for diagnosis)
  *   error           one sentence a participant can act on
  *   classification  no-structured-output | contract-violation | ambiguous-output
@@ -161,8 +185,10 @@ export function contractError (value, contract, { ajv, id, defs } = {}) {
  *
  * `contracts` is the snapshot's { hash, defs }; when given, validation is
  * compiled from it and the live schema files are not consulted.
+ * `lastRepairOf` is given only on the turn after which the run would block: the
+ * outputs of that turn's earlier attempts, in order.
  */
-export async function extractOutput (text, contract, { root, contracts = null } = {}) {
+export async function extractOutput (text, contract, { root, contracts = null, lastRepairOf = null } = {}) {
   if (!contract) return { valid: true, output: null, contract: null }
   const source = typeof text === 'string' ? text : ''
 
@@ -204,6 +230,8 @@ export async function extractOutput (text, contract, { root, contracts = null } 
   // Nothing fits. Report the candidate that came closest: the last one, since
   // the required block is asked for at the end of the response.
   const last = judged[judged.length - 1]
+  const tolerated = contract === 'handoff' && lastRepairOf && judged.length === 1 ? toleratedHandoffPrompt(last.value, lastRepairOf, validator) : null
+  if (tolerated) return { valid: true, output: last.value, contract, classification: null, tolerated, diagnostics }
   return {
     valid: false,
     output: last.value,

@@ -1823,6 +1823,18 @@ descriptions rendered from the snapshotted schema — and quotes the validator's
 error for the previous attempt. "Could not be read" told the first live authors
 nothing they could write to.
 
+A model cannot count characters, so a repair can converge on a length limit and
+still miss it. One case does not block: on the last attempt repair allows, a
+`handoff` is accepted when its `prompt` is at most 5% over the limit of the run's
+frozen contract, that length is its only violation, and the prompt lengths of the
+step's attempts (at least two) strictly shrink, all counted as the schema counts
+characters (code points). The output carries `tolerated`
+(`limit`, `length`, `lengths`), the prompt is delivered whole, and the participant
+is still told the stated limit. Everything else, a `triageResult`'s `firstHandoff`
+included, is repaired and exhausted as before. The decision is made when the turn
+is committed and recorded, so replay repeats it and a run already blocked is not
+re-judged; its Resume grants a further attempt, which is judged this way.
+
 ## Every named context item is delivered
 
 A step's `context` list is a promise that the participant has those things in
