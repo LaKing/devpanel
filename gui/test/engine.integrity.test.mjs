@@ -11,6 +11,8 @@ import { FENCE_STUBS, fingerprint, workspaceProjection } from '../server/runtime
 import { removeFenceStubs } from '../server/runtime/tooling-mounts.mjs'
 import { candidateDiff } from '../server/runtime/diff.mjs'
 import { integrateRun } from '../server/runtime/integrate.mjs'
+import { getRun } from '../server/runs-api.mjs'
+import { renderResult } from '../server/run-result-step.mjs'
 import { workspaceDisposition, supportedActions } from '../server/supervisor.mjs'
 import { engineFixture, leaveFenceStubs, scriptFor, simulateProcessDeath } from './fakes/fixture.mjs'
 
@@ -634,6 +636,105 @@ export default async function (t) {
     t.ok('the last to end removes them', (await engine.sweepFenceStubs(running)).includes('.mcp.json'))
     t.eq('gone', await onDisk(engine.run.workspace.path), [])
     engine.run.participants['auditor-1'].pendingInvocation = null
+    await releaseWorkspace(engine)
+  }
+
+  t.section('fence stubs: the report names what stands after the sweep, and the run keeps the account across turns')
+  {
+    const f = await engineFixture()
+    await fs.writeFile(path.join(f.projectPath, '.profile'), '')
+    await git(f.projectPath, ['add', '-f', '.profile'])
+    await git(f.projectPath, ['commit', '-qm', 'an empty file the base holds'])
+    const original = f.fake.invoke
+    f.fake.invoke = async (args) => {
+      if (args.meta.stepId === 'implement') await fs.chmod(path.join(args.cwd, '.profile'), 0o444)
+      return original(args)
+    }
+    const engine = await start(f)
+    await engine.drive()
+    const root = engine.run.workspace.path
+    const stub = (rel) => fs.writeFile(path.join(root, rel), '', { mode: 0o444 })
+    const turn = async (role, invocationId, before, during) => {
+      const pending = { invocationId }
+      await before?.()
+      t.ok(`${invocationId} begins`, await engine.beginIntegrity(role, pending))
+      await during?.()
+      t.ok(`${invocationId} ends clear`, await engine.endIntegrity(role, pending, 'completed'))
+      return readIntegrity(engine.integrityDir(), `${invocationId}-after-report`)
+    }
+    const clean = await turn('implementer', 'clean')
+    t.eq('nothing to name: both fields absent, a read-only empty file the base holds included', [Object.hasOwn(clean, 'fenceStubsLeft'), Object.hasOwn(clean, 'fenceStubsRemoved')], [false, false])
+
+    const kept = await turn('implementer', 'kept', () => stub('.gitmodules'), () => stub('.mcp.json'))
+    t.eq('a path found before the turn is named as left', kept.fenceStubsLeft, ['.gitmodules'])
+    t.eq('and the one the turn made as removed', kept.fenceStubsRemoved, ['.mcp.json'])
+    t.ok('it is still on disk', await fs.lstat(path.join(root, '.gitmodules')).then(() => true, () => false))
+    await fs.rm(path.join(root, '.gitmodules'))
+
+    const unlink = fs.unlink
+    fs.unlink = async (file) => {
+      if (file.endsWith('.idea')) throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' })
+      return unlink(file)
+    }
+    let failed
+    try {
+      failed = await turn('implementer', 'failed', null, () => Promise.all(['.idea', '.bashrc'].map(stub)))
+    } finally { fs.unlink = unlink }
+    t.eq('a failed removal is named as left', failed.fenceStubsLeft, ['.idea'])
+    t.eq('and not as removed', failed.fenceStubsRemoved, ['.bashrc'])
+    await fs.rm(path.join(root, '.idea'))
+
+    const running = { invocationId: 'running', fenceStubsPresent: ['.profile'] }
+    engine.run.participants['auditor-1'].pendingInvocation = running
+    const deferred = await turn('implementer', 'deferred', null, () => stub('.zshrc'))
+    t.eq('a sweep left to a running seat says so', [deferred.fenceStubsLeft, deferred.fenceSweepDeferred, Object.hasOwn(deferred, 'fenceStubsRemoved')], [['.zshrc'], true, false])
+    running.integrityBefore = 'deferred-after'
+    t.ok('the running seat ends clear', await engine.endIntegrity('auditor-1', running, 'completed'))
+    engine.run.participants['auditor-1'].pendingInvocation = null
+    const last = await readIntegrity(engine.integrityDir(), 'running-after-report')
+    t.eq('its report says what went', [last.fenceStubsRemoved, Object.hasOwn(last, 'fenceStubsLeft')], [['.zshrc'], false])
+
+    const endings = async (id) => (await readEvents(f.issuePath, engine.runId)).events.filter((e) => e.type === 'turn-integrity' && e.invocationId === id)
+    const late = { invocationId: 'late' }
+    const silent = { invocationId: 'silent' }
+    const partial = { invocationId: 'partial', cursor: { recordsRevision: true } }
+    for (const pending of [late, silent, partial]) t.ok(`${pending.invocationId} begins`, await engine.beginIntegrity('implementer', pending))
+    await stub('.ripgreprc')
+    const { latest, checkpoint } = engine.run.integrity
+    engine.run.integrity.status = 'quarantined'
+    t.eq('a turn ending in a quarantined run is not accepted', await engine.endIntegrity('implementer', late, 'completed'), false)
+    const [ended] = await endings('late')
+    const lateReport = await readIntegrity(engine.integrityDir(), `${ended.after}-report`)
+    t.eq('it writes its report, naming its paths', [lateReport.fenceStubsRemoved, Object.hasOwn(lateReport, 'fenceStubsLeft')], [['.ripgreprc'], false])
+    t.eq('which reads as quarantined', [lateReport.status, lateReport.reason], ['quarantined', 'the run was already quarantined when this turn ended; nothing from it is accepted'])
+    t.eq('and lifts nothing', [engine.run.integrity.status, engine.run.integrity.latest, engine.run.integrity.checkpoint], ['quarantined', latest, checkpoint])
+    t.eq('ending again with nothing new adds no report', [await engine.endIntegrity('implementer', late, 'completed'), (await endings('late')).length], [false, 1])
+    t.eq('with nothing to name the turn is still not accepted', await engine.endIntegrity('implementer', silent, 'completed'), false)
+    const [silentEnd] = await endings('silent')
+    t.eq('and still has a report, both fields absent', [silentEnd.status, Object.hasOwn(silentEnd, 'fenceStubsLeft'), Object.hasOwn(silentEnd, 'fenceStubsRemoved')], ['quarantined', false, false])
+    await fs.writeFile(path.join(root, 'partial.txt'), 'partial\n')
+    t.eq('a killed author\'s partial work is not accepted either', await engine.endIntegrity('implementer', partial, 'failed', 'stopped', { acceptPartial: 'output-limit' }), false)
+    const [partialEnd] = await endings('partial')
+    t.eq('its report accepts nothing', [partialEnd.status, Object.hasOwn(partialEnd, 'partialAccepted')], ['quarantined', false])
+    engine.run.integrity.latest = { ...latest, invocationId: 'own' }
+    t.eq('the quarantine\'s own turn, ended again with nothing new, adds no report', [await engine.endIntegrity('implementer', { invocationId: 'own' }, 'completed'), (await endings('own')).length], [false, 0])
+    engine.run.integrity.latest = latest
+    await fs.rm(path.join(root, 'partial.txt'))
+    const storedQuarantine = (await readRun(f.issuePath, engine.runId)).integrity
+    t.eq('the stored run is still quarantined', storedQuarantine.status, 'quarantined')
+    engine.run.integrity.status = 'clear'
+
+    const stored = await readRun(f.issuePath, engine.runId)
+    const account = stored.integrity.fenceStubs.filter((e) => ['kept', 'failed', 'deferred', 'running', 'late'].includes(e.invocationId))
+    t.eq('the stored account holds every such turn, not only the latest', account.map((e) => e.invocationId), ['kept', 'failed', 'deferred', 'running', 'late'])
+    t.eq('the turn in the quarantined run included', account.at(-1).fenceStubsRemoved, ['.ripgreprc'])
+    t.eq('a turn with nothing to name adds nothing', stored.integrity.fenceStubs.some((e) => e.invocationId === 'clean'), false)
+    const detail = await getRun(f.issuePath, engine.runId, { issues: f.issues, project: 'devpanel-project', issueId: f.issue.id })
+    t.eq('the run detail carries it', detail.integrity.fenceStubs, stored.integrity.fenceStubs)
+    const md = renderResult(stored, {})
+    for (const rel of ['.gitmodules', '.mcp.json', '.idea', '.bashrc', '.zshrc', '.ripgreprc']) t.ok(`result.md names ${rel}`, md.split('## Fence stubs')[1]?.includes(`\`${rel}\``))
+    t.ok('as it last stood', md.includes('`.idea`: still there at the end of implementer\'s turn') && md.includes('`.zshrc`: removed at the end of auditor-1\'s turn'))
+    t.ok('a run with nothing to name has no such section', !renderResult({ ...stored, integrity: { status: 'clear' } }, {}).includes('Fence stubs'))
     await releaseWorkspace(engine)
   }
 

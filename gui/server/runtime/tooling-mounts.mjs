@@ -140,7 +140,8 @@ export async function fenceStubsPresent (worktree, stubs = []) {
  * Remove what the fence left and was not there before the turn: a stub, and an
  * empty directory the list names or that holds a listed path. Nothing else, and
  * never through a link, since the worktree is seat-writable. A failure leaves the
- * path to the projection, which still does not count it. Returns the paths removed.
+ * path to the projection, which still does not count it, and to the turn's report,
+ * which names what stands after this (engine `accountFenceStubs`). Returns the paths removed.
  */
 export async function removeFenceStubs (worktree, stubs = [], present = []) {
   const removed = []

@@ -37,7 +37,9 @@ export const FENCE_STUBS = Object.freeze([
  * each is an empty regular file with no write bit. Any file with bytes or a write bit
  * is a change, and a path the base holds (`held`) never is a stub. Nothing on disk
  * says who made such a file, so one an author made empty and read-only on purpose
- * reads as a stub: an accepted limit (docs/source-integrity.md).
+ * reads as a stub and is not delivered, though its existence or mode may have
+ * mattered: a known loss the owner confirmed, of unmeasured rarity, with every path
+ * it touches kept on the run's record (docs/source-integrity.md).
  */
 export async function fenceStubSet (root, stubs = [], held = null) {
   const files = stubs.filter((rel) => !rel.endsWith('/') && !held?.has(rel))

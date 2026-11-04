@@ -19,7 +19,7 @@ import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { openCleanup, unprovedScan, cleanupEntry, proveEntries, cleanupRefusal, noteLostTags, addBarrierEntries, syncBarrier, readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
 import { ownerLost } from './run-control.mjs'
-import { fingerprint, gitIdentity, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
+import { fenceStubSet, fingerprint, gitIdentity, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity, writeIntegrity } from './integrity.mjs'
 import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
@@ -1132,24 +1132,47 @@ export class Engine {
     this.endedTurns ??= new Set()
     this.endedTurns.add(pending.invocationId)
     const running = Object.values(this.run.participants).some(({ pendingInvocation: other }) => other && other.integrity !== 'not-applicable' && !this.endedTurns.has(other.invocationId))
+    if (running) pending.fenceSweepDeferred = true
     return running ? [] : removeFenceStubs(ws.path, ws.fenceStubs, pending.fenceStubsPresent)
+  }
+
+  /**
+   * What the sweep took and what the projection still leaves out, standing after
+   * it (kept because the turn found it there, a failed removal, a sweep left to a
+   * seat still running: `fenceSweepDeferred`), as report fields, and added to the
+   * run's account across turns (`integrity.fenceStubs`).
+   */
+  async accountFenceStubs (role, pending, fenceStubsRemoved) {
+    const ws = this.run.workspace
+    const fenceStubsLeft = ws?.fenceStubs ? [...await fenceStubSet(ws.path, ws.fenceStubs, this.baseline)] : []
+    if (!fenceStubsRemoved.length && !fenceStubsLeft.length) return {}
+    const fields = {
+      ...(fenceStubsRemoved.length ? { fenceStubsRemoved } : {}),
+      ...(fenceStubsLeft.length ? { fenceStubsLeft, ...(pending.fenceSweepDeferred ? { fenceSweepDeferred: true } : {}) } : {})
+    }
+    if (this.run.integrity) this.run.integrity.fenceStubs = [...(this.run.integrity.fenceStubs ?? []), { role, invocationId: pending.invocationId, at: this.clock.iso(), ...fields }]
+    return fields
   }
 
   async endIntegrity (role, pending, outcome, failure = null, { acceptPartial = null } = {}) {
     if (pending.integrity === 'not-applicable') return this.run.integrity?.status !== 'quarantined'
-    const fenceStubsRemoved = await this.sweepFenceStubs(pending)
-    if (this.run.integrity?.status === 'quarantined') return false
+    const fenceStubs = await this.accountFenceStubs(role, pending, await this.sweepFenceStubs(pending))
+    // A turn ending in a quarantined run still gets its report, under a name of its
+    // own so it overwrites none, and is accepted by nothing: `integrity.latest` and
+    // the checkpoint stay the quarantine's. Ending again with nothing new adds none.
+    const quarantined = this.run.integrity?.status === 'quarantined'
+    if (quarantined && !Object.keys(fenceStubs).length && (pending.quarantinedReport || this.run.integrity.latest?.invocationId === pending.invocationId)) return false
     const report = {
-      role, invocationId: pending.invocationId, outcome, failure, ...(fenceStubsRemoved.length ? { fenceStubsRemoved } : {}),
+      role, invocationId: pending.invocationId, outcome, failure, ...fenceStubs,
       writesCode: this.snapshot.participants[role].writesCode === true && (!this.snapshot.tactic || pending.cursor?.recordsRevision === true),
-      before: pending.integrityBefore ?? null, after: `${pending.invocationId}-after`, at: this.clock.iso()
+      before: pending.integrityBefore ?? null, after: quarantined ? `${pending.invocationId}-quarantined-${uuid()}` : `${pending.invocationId}-after`, at: this.clock.iso()
     }
     try {
       if (!pending.integrityBefore) throw new Error('no pre-invocation integrity baseline exists')
       const before = await readIntegrity(this.integrityDir(), pending.integrityBefore)
       const after = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: before.trackedPaths })
       const previous = this.run.integrity?.latest
-      if (previous?.invocationId === pending.invocationId && previous.status === 'clear') {
+      if (!quarantined && previous?.invocationId === pending.invocationId && previous.status === 'clear') {
         const recorded = await readIntegrity(this.integrityDir(), previous.after)
         if (integrityChanges(recorded, after).changed) report.reason = 'workspace changed after the invocation completed'
         report.after = `${pending.invocationId}-recovery-${uuid()}`
@@ -1162,8 +1185,9 @@ export class Engine {
       if (report.changes.entry) report.reason = 'the worktree\'s .git entry was replaced: its repository link is no longer the one provisioned (engine-git.mjs)'
       else if (report.changes.nested?.length) report.reason = `a repository was created inside the worktree (${report.changes.nested.slice(0, 3).join(', ')}): the host never resolves a repository the engine did not provision`
       else if (head || (!report.writesCode && (paths.length || index))) report.reason = 'role made unauthorized source or Git changes'
-      else if (changed && outcome !== 'completed' && acceptPartial && report.writesCode && !report.reason) report.partialAccepted = { reason: acceptPartial, paths: paths.map((c) => c.path), index }
+      else if (changed && outcome !== 'completed' && acceptPartial && report.writesCode && !report.reason && !quarantined) report.partialAccepted = { reason: acceptPartial, paths: paths.map((c) => c.path), index }
       else if (changed && outcome !== 'completed') report.reason = PARTIAL_CHANGES
+      if (quarantined) report.reason ??= 'the run was already quarantined when this turn ended; nothing from it is accepted'
       report.status = report.reason ? 'quarantined' : 'clear'
     } catch (error) {
       report.status = 'quarantined'
@@ -1171,6 +1195,11 @@ export class Engine {
     }
     report.reportRef = `integrity/${report.after}-report.json`
     await writeIntegrity(this.integrityDir(), `${report.after}-report`, report)
+    if (quarantined) {
+      pending.quarantinedReport = report.reportRef
+      await this.persist({ type: 'turn-integrity', ...report })
+      return false
+    }
     if (report.status === 'quarantined') {
       await this.quarantineIntegrity(report)
       return false

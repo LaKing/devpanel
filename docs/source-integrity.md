@@ -32,10 +32,30 @@ the base does not hold. A file there with bytes or a write bit, even empty, is r
 and delivered. A CLI that binds another path reads as a change: a quarantine naming empty
 files, until the list has it.
 
-Accepted limit: nothing on disk says who made such a file, so a file an author made empty
-and read-only on purpose at a listed path reads as a stub. It is left out of the patch and
-removed at the turn's end. It holds no content, and counting stubs is what can put empty
-files over real ones at delivery. Under the CLI's sandbox a command cannot make one there.
+Known limit, a narrowly bounded semantic loss: nothing on disk says who made such a file,
+so a file an author made empty and read-only on purpose, at a listed path the base does
+not hold, reads as a stub. It is not delivered: the patch, the fingerprint and the
+auditor's diff leave it out. It is removed at the end of the turn that made it; if it was
+already there when the turn began, or its removal fails, it stays on disk, still left out.
+Its existence or its mode may have mattered, and that meaning is lost. How rare a
+deliberate one is has not been measured. Under the CLI's sandbox a command cannot make one
+there. The rule stays because counting stubs is what can put empty files over real ones at
+delivery. The owner confirmed this limit on 2026-11-04, on condition that its cost is
+stated and that every path it touches can be found afterwards.
+
+The record: each turn's report (`integrity/<after>-report.json`, and its `turn-integrity`
+event) names what the sweep took in `fenceStubsRemoved` and, read after the sweep, what the
+projection still leaves out in `fenceStubsLeft`; each field is absent when empty. A seat
+ending beside a running one sweeps nothing, so its `fenceStubsLeft` can include the running
+seat's stubs, marked `fenceSweepDeferred`; the last seat's report says what went. A turn
+that ends in an already quarantined run writes its report too, under its own
+`<invocation>-quarantined-<uuid>` name and with status `quarantined`: it accepts nothing,
+and the quarantine's own report and checkpoint stay in force. The run's account across
+turns holds them all: `integrity.fenceStubs` on the run detail, one entry per turn with
+something to name, and a "Fence stubs" section in the run's `result.md`, path by path
+with the last state recorded. What it cannot show: a run from before the
+account (its reports still name what was removed, and nothing names what stayed), and a
+removal whose owner dies before the record is written.
 
 `writesCode` from the resolved participant owns permission. Authors may edit and
 stage source. Other roles may not change source or the index. Git HEAD/history is

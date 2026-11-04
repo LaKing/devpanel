@@ -139,6 +139,19 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
     for (const f of ignored) lines.push(`- ${ignoredWords(f)}`)
     lines.push('')
   }
+  // Every path the fence-stub rule took out of the change set, across turns (docs/source-integrity.md).
+  const stubTurns = run.integrity?.fenceStubs ?? []
+  if (stubTurns.length) {
+    const paths = new Map()
+    for (const turn of stubTurns) {
+      const at = `${turn.role}'s turn, ${turn.at}`
+      for (const rel of turn.fenceStubsRemoved ?? []) paths.set(rel, { last: `removed at the end of ${at}`, removals: (paths.get(rel)?.removals ?? 0) + 1 })
+      for (const rel of turn.fenceStubsLeft ?? []) paths.set(rel, { last: `still there at the end of ${at}${turn.fenceSweepDeferred ? ' (the sweep waited for a seat still running)' : ''}`, removals: paths.get(rel)?.removals ?? 0 })
+    }
+    lines.push('## Fence stubs', '', 'Paths on the fence\'s list that this run left out of its change set or removed, as last recorded. An empty read-only file an author meant reads the same way (docs/source-integrity.md). Turn by turn: `integrity.fenceStubs` on the run.', '')
+    for (const [rel, { last, removals }] of [...paths].sort(([x], [y]) => x.localeCompare(y))) lines.push(`- \`${rel}\`: ${last}${removals > 1 ? `; removed ${removals} times` : ''}`)
+    lines.push('')
+  }
   if (e.next || e.kept) lines.push('## Next', '', [e.kept, e.next].filter(Boolean).join(' '), '')
   const used = run.budgets?.used ?? {}
   lines.push('## Record', '',
