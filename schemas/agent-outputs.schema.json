@@ -310,7 +310,7 @@
             "recommendation"
           ],
           "additionalProperties": false,
-          "description": "Last resort, rarely right. Work the run cannot do for itself because it belongs to the live checkout (most often a commit of the project's own checkout), an authorization only a person can give, or a verified conflict between requirements that only the person who set them can settle. The engine pauses the run and asks one question. Never for a technical choice (decide it and record it under assumptions), for information a worker can establish, or for a tool missing on this host (use the configured staging infrastructure, or let the check be unavailable), or for a seat's permission to run something its approval layer refuses: no answer can change a seat's tools, and checks are rerun by the engine.",
+          "description": "Last resort, rarely right. Work the run cannot do for itself because it belongs to the live checkout (most often a commit of the project's own checkout), an authorization only a person can give, a question a plan or an audit addresses to the owner on access, security or a documented promise, or a verified conflict between requirements that only the person who set them can settle. The engine pauses the run and asks one question. Never for a technical choice (decide it and record it under assumptions), for information a worker can establish, or for a tool missing on this host (use the configured staging infrastructure, or let the check be unavailable), or for a seat's permission to run something its approval layer refuses: no answer can change a seat's tools, and checks are rerun by the engine.",
           "properties": {
             "question": {
               "type": "string",
@@ -337,7 +337,7 @@
                 "authorization",
                 "requirement-conflict"
               ],
-              "description": "live-checkout: work only the live checkout can take. owner-gate: the issue itself asks the run to stop for the owner at this point (for example after the plan); ask once, approve or revise, with the plan summarised in the owner's terms. authorization: spending, production, destroying data, publishing. requirement-conflict: acceptance criteria that cannot all hold, shown with evidence."
+              "description": "live-checkout: work only the live checkout can take. owner-gate: a stop the issue itself asks for at this point (for example after the plan; ask once, approve or revise, with the plan summarised in the owner's terms), or a question a plan or an audit addresses to the owner on access, security or a documented promise, which is never answered by you or recorded as an assumption. authorization: spending, production, destroying data, publishing. requirement-conflict: acceptance criteria that cannot all hold, shown with evidence."
             },
             "recommendation": {
               "type": "string",
@@ -428,6 +428,57 @@
             "null"
           ],
           "description": "The revision fingerprint this turn was told it starts from, echoed so a turn that worked from something else is detectable; null on the first implementation, when no candidate exists yet. The revision the turn PRODUCES is computed by the engine from the worktree after the turn and is never self-reported."
+        },
+        "ownerHolds": {
+          "type": "array",
+          "maxItems": 5,
+          "description": "Only when implementation must wait for the owner: a question on access, security or a documented promise that is neither your call nor the coordinator's. Never for a technical choice, which is decided and recorded as an assumption. The engine puts each hold to the owner before implementation goes on. A stated hold stands until the owner answers it, whatever a later output says or omits, so to change a question restate the same id. In a run with nothing to implement it stops nothing.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "question",
+              "category",
+              "reason",
+              "recommendation"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^H[0-9]+$"
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600,
+                "pattern": "\\S",
+                "description": "ONE question the owner can answer in one line."
+              },
+              "category": {
+                "enum": [
+                  "access",
+                  "security",
+                  "documented-promise"
+                ],
+                "description": "What makes this the owner's: access a seat or a person has, a security trade-off, or something the documentation promises."
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1200,
+                "pattern": "\\S",
+                "description": "Why this is the owner's decision in that category, in terms of what was observed."
+              },
+              "recommendation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600,
+                "pattern": "\\S",
+                "description": "What you would do, so the owner can simply agree."
+              }
+            }
+          }
         }
       }
     },
@@ -446,6 +497,57 @@
             "changes-needed"
           ],
           "description": "An auditor may only approve or request changes. 'blocked' is an engine state, never a verdict."
+        },
+        "ownerHolds": {
+          "type": "array",
+          "maxItems": 5,
+          "description": "Only when implementation must wait for the owner: a question on access, security or a documented promise that is neither your call nor the coordinator's. Never for a technical choice, which is decided and recorded as an assumption. The engine puts each hold to the owner before implementation goes on. A stated hold stands until the owner answers it, whatever a later output says or omits, so to change a question restate the same id. In a run with nothing to implement it stops nothing.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "question",
+              "category",
+              "reason",
+              "recommendation"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^H[0-9]+$"
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600,
+                "pattern": "\\S",
+                "description": "ONE question the owner can answer in one line."
+              },
+              "category": {
+                "enum": [
+                  "access",
+                  "security",
+                  "documented-promise"
+                ],
+                "description": "What makes this the owner's: access a seat or a person has, a security trade-off, or something the documentation promises."
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1200,
+                "pattern": "\\S",
+                "description": "Why this is the owner's decision in that category, in terms of what was observed."
+              },
+              "recommendation": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 600,
+                "pattern": "\\S",
+                "description": "What you would do, so the owner can simply agree."
+              }
+            }
+          }
         },
         "artifactRevision": {
           "type": [

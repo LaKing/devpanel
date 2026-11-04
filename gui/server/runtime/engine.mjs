@@ -64,6 +64,7 @@ import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
 import { ensureMountPoint, fenceStubsPresent, removeFenceStubs } from './tooling-mounts.mjs'
 import { toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
+import { holdGatesTurn, openOwnerHolds, ownerHoldKey, ownerHoldsOf } from './owner-holds.mjs'
 import { interruptedFromEvents, wallClockElapsedMs, wallClockRefusal, wallClockStanding } from './wall-clock.mjs'
 
 export { extractOutput }
@@ -3636,6 +3637,7 @@ export class Engine {
       // the ask would be lost without ever being made.
       if (!await this.applyOperatorRequests()) break
       if (this.snapshot.tactic && !await this.applyCoordinatorEffects()) break
+      await this.recordOwnerHolds()
       const next = plan(this.snapshot, this.activeSteps(), this.outputs, this.planEvidence())
 
       // An acceptance buys one confirmation of this revision. A replay that wants any
@@ -3680,6 +3682,14 @@ export class Engine {
           await this.persist({ type: 'checks', revision: next.revision, result: 'not-run', commands: 0 })
         }
         continue
+      }
+
+      // A seat left this to the owner: no brief, implementation or confirmation goes
+      // past it, and nothing the coordinator wrote is read here.
+      const hold = holdGatesTurn(this.snapshot, next) ? openOwnerHolds(this.run.steps, this.outputs)[0] : null
+      if (hold) {
+        await this.pauseForOwnerHold(hold, next)
+        break
       }
 
       if (this.snapshot.tactic && ['staging','deployment'].includes(this.snapshot.tactic) && next.step.id === 'investigate-release-operator') {
@@ -3863,6 +3873,29 @@ export class Engine {
       return false
     }
     return true
+  }
+
+  /** The holds on the run's record, for whoever reads it; the gate derives them from the steps itself. */
+  async recordOwnerHolds () {
+    const holds = ownerHoldsOf(this.run.steps, this.outputs)
+    if (!holds.length) return
+    const record = Object.fromEntries(holds.map(({ identity, ...hold }) => [identity, hold]))
+    if (JSON.stringify(record) === JSON.stringify(this.run.ownerHolds)) return
+    this.run.ownerHolds = record
+    await this.persist({ type: 'owner-holds', open: holds.filter((h) => !h.answeredByStep).map((h) => h.identity) })
+  }
+
+  /** One question per pause, verbatim: the answer closes the hold by that wording. */
+  async pauseForOwnerHold (hold, next) {
+    await this.pauseFor({
+      key: ownerHoldKey(hold),
+      question: hold.question,
+      options: null,
+      // The phase is where the run stands, so the answer's step sits there; the rest is who asked.
+      askedBy: { phase: next.phase.id, stepId: hold.stepId, step: hold.latestStep, role: hold.role },
+      decisionKind: 'owner-hold',
+      request: { reason: hold.reason, projectAction: null, category: 'owner-gate', holdCategory: hold.category, recommendation: hold.recommendation }
+    })
   }
 
   /** Which budget, if any, is spent. Steps are not the only way a run runs away. */

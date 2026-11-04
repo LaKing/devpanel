@@ -236,7 +236,8 @@ supervisor is told to decide from evidence it has read, to read more (`get_step`
 reserved decision. The answer is recorded on the run as an operator step attributed to the
 supervisor. A request whose `pause.request.category` is `owner-gate` or
 `requirement-conflict` is the user's decision: the supervisor relays the question and
-recommendation and answers only with what the user said. An `authorization` request
+recommendation and answers only with what the user said; that includes an owner hold
+(`pause.kind: 'owner-hold'`, execution-contract.md "Owner holds"). An `authorization` request
 is the supervisor's when it asks for something within its own authority (shared
 staging, a technical route), and the user's when it asks for a reserved decision.
 

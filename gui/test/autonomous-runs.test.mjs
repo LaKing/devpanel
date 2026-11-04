@@ -272,7 +272,7 @@ export default async (t) => {
   t.section('9. a mid-run request says what kind of decision it is, and what the agents recommend')
   {
     const e = explainRun({ status: 'paused', pause: { question: 'Approve the plan?', request: { reason: 'The issue asks to confirm the plan first.', category: 'owner-gate', recommendation: 'Approve: it meets AC1–AC4.' } } })
-    t.eq('headed by its category', e.headline, 'Waiting for you: the issue asked to confirm at this point')
+    t.eq('headed by its category', e.headline, 'Waiting for you: this decision is yours')
     t.ok('with the recommendation', e.detail.includes('Recommended: Approve: it meets AC1–AC4.'), e.detail)
   }
 

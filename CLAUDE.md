@@ -593,7 +593,9 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   use `onExhausted: extend-if-converging` (one extra round only when findings shrank and none reopened; nobody is asked).
   `operatorRequest` needs a `category` (`live-checkout` | `owner-gate` | `authorization` |
   `requirement-conflict`) and a `recommendation`; technical choices go to handoff `assumptions`, listed in
-  `result.md`.
+  `result.md`. A seat's `ownerHolds` (`access` | `security` | `documented-promise`, with a reason) pause the run before
+  implementation and before confirmation until the owner answers, whatever the coordinator wrote (`runtime/owner-holds.mjs`,
+  `run.ownerHolds`, execution-contract.md "Owner holds").
 - Operator decisions are steps. A phase transition `to: await-input` (with a `question`), a loop
   `onExhausted: await-input`, or the coordinator's own `operatorRequest` on its `handoff` pauses the run
   (`status: paused`, `run.pause`); `engine.answer()` records the

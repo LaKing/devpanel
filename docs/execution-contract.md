@@ -2098,7 +2098,10 @@ work genuinely needs the live checkout. So the `handoff` contract carries an
 optional `operatorRequest` — `question`, `reason`, a required `category` and
 `recommendation`, and optionally the `projectAction` that would do it. The
 category is one of `live-checkout`, `owner-gate` (a stop the issue itself asks
-for at this point, such as confirming the plan: one approve-or-revise question),
+for at this point, such as confirming the plan: one approve-or-revise question;
+or a question a plan or an audit addresses to the owner on access, security or a
+documented promise, which is never answered by the coordinator or recorded as an
+assumption),
 `authorization` (spending, production, destroying data, publishing) or
 `requirement-conflict` (criteria that cannot all hold, with evidence). There is
 no category for a technical choice: the coordinator decides it and records it in
@@ -2126,6 +2129,32 @@ effect gate it exactly as they gate a refused start, in the same dispatcher. Whe
 issue with `create_issue` rather than answering as though it were done, and says
 so in the answer. An answer is recorded as a step, and later turns read it as
 fact.
+
+### Owner holds
+
+A seat can leave a decision to the owner so that the engine sees it: `ownerHolds`
+on `authorArtifact` and `reviewResult`, each with `id`, `question`,
+`recommendation`, a `reason` and a `category` of `access`, `security` or
+`documented-promise`. A hold without them fails the contract and goes to protocol
+repair, so it is not a hold; a technical choice has no category here and stays an
+assumption.
+
+`runtime/owner-holds.mjs` derives the holds from every recorded step, active or
+not, by `<role>:<id>`, the latest statement winning, and `run.ownerHolds` records
+them. A window reset, a later revision that omits a hold, and anything the
+coordinator writes change nothing; there is no withdrawal, so a moot hold is restated
+as moot and asked. It closes when an operator step answers its key
+(`owner-hold:<role>:<id>`) with the same question as the latest statement: restating
+it, or omitting it, never asks again, and a different question under that id does.
+
+In a strategy with a `recordsRevision` step, the engine pauses before a coordinator
+turn in that step's loop, before that step, and before a `closureConfirmation`
+while a hold is open, with `pause.kind: 'owner-hold'` and `pause.request.category:
+'owner-gate'`, one hold at a time. Plan review goes on meanwhile, so the owner is
+asked about a plan the audits approved. The answer reaches later turns through
+`decisions`; one that changes the approved plan is what `restartPlan` is for. What
+a seat writes only in prose the engine cannot see: the coordinator raises it as an
+`owner-gate` `operatorRequest`.
 
 ## Runtime failures, retry and availability
 

@@ -166,9 +166,12 @@ Anything but `autonomous` ends the run after triage (`to: ask-owner`), so nothin
 stays live for it; the owner answers on the issue page, and the answers start a fresh run
 or the split becomes new issues. During a run the coordinator decides technical
 choices itself and records them as `assumptions`; `operatorRequest` remains for
-live-checkout work, a stop the issue itself asked for (`owner-gate`),
-authorization and verified requirement conflicts, one question with a
-recommendation.
+live-checkout work, a stop the issue itself asked for or a question a plan or an
+audit addresses to the owner on access, security or a documented promise
+(`owner-gate`), authorization and verified requirement conflicts, one question
+with a recommendation. A seat states such a question in `ownerHolds`, and the
+engine asks it before implementation, whatever the coordinator wrote
+(execution-contract.md "Owner holds").
 
 ## Proportional scope
 

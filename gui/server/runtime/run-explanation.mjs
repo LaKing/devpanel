@@ -528,10 +528,10 @@ function standingOf (run, { outputs, active, ownership }) {
       if (p.kind === 'manual') return { tone: 'waiting', headline: 'Paused', detail: 'Everything done so far is saved.', next: 'Resume continues from the next unfinished step.' }
       if (p.request) {
         // The question is what to answer; the reason is why the run cannot do it.
-        const heading = { 'owner-gate': 'Waiting for you: the issue asked to confirm at this point', authorization: 'Waiting for you: this needs your authorization', 'requirement-conflict': "Waiting for you: the requirements can't all be met" }[p.request.category] ?? 'Waiting for you: work the run may not do itself'
+        const heading = { 'owner-gate': 'Waiting for you: this decision is yours', authorization: 'Waiting for you: this needs your authorization', 'requirement-conflict': "Waiting for you: the requirements can't all be met" }[p.request.category] ?? 'Waiting for you: work the run may not do itself'
         return { tone: 'waiting', headline: heading,
           detail: [p.question, p.request.reason, p.request.recommendation ? `Recommended: ${p.request.recommendation}` : null].filter(Boolean).join('\n\n') || null,
-          next: p.request.projectAction ? `Run the project's "${p.request.projectAction}" action, then answer with what happened.` : 'Do the work, then answer with what happened.' }
+          next: p.request.projectAction ? `Run the project's "${p.request.projectAction}" action, then answer with what happened.` : p.request.category === 'owner-gate' ? 'Answer below; the run continues from your answer.' : 'Do the work, then answer with what happened.' }
       }
       return { tone: 'waiting', headline: 'Waiting for your answer', detail: p.question ?? null, next: 'Answer below; the run continues from your answer.' }
     }

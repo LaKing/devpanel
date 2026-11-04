@@ -1238,6 +1238,10 @@
       "type": "object",
       "description": "Operator requests the coordinator raised, keyed by the step number that raised one. Present so a request is asked exactly once, across a crash and a replay."
     },
+    "ownerHolds": {
+      "type": "object",
+      "description": "Owner holds the seats stated, keyed by <role>:<id>: question, category, reason, recommendation, stepId, statedByStep, latestStep and answeredByStep (null while open). Written from the recorded steps (runtime/owner-holds.mjs), which are what the engine decides from."
+    },
     "reportDisposition": {
       "type": "object"
     },
