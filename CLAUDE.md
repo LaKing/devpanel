@@ -56,6 +56,9 @@ npm run publish:check        # does the tracked tree name this installation? gre
                              # (tools/publish-check.mjs; no denylist, nothing to find)
 npm run --silent selftest-history -- --project <id> [--test <name>]   # recorded selftest outcomes and which tests read
                              # as unstable, with the drives that made them so, as JSON; read-only (tools/selftest-history.mjs)
+npm run --silent drive-records -- --project <id> --from <utc> --to <utc>   # the test drives that began in a period: drive time, slot wait and
+                             # result, as JSON; read-only, beside tools/staging-host-sampler.sh's samples
+                             # (tools/drive-records.mjs; docs/project-infrastructure.md "Measuring a host during concurrent drives")
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
 npm run --silent supervisor-calls -- --from <YYYY-MM-DD> --to <YYYY-MM-DD>   # the top-level supervisor's calls per started run

@@ -324,6 +324,139 @@ port, identity and proxy still apply. Two things end a drive `unavailable` befor
   hostname is fixed, so the settings it holds would be lost; the error names them. Use
   `Match originalhost <alias>`, or move the rule below the `Host` block that sets `HostName`.
 
+### Measuring a host during concurrent drives
+
+This answers one question: with the current two drives, does resource-driven slowdown or
+instability remain, and does one-drive operation improve it? Bytes held in swap do not
+answer it: pages can sit in swap with nothing short of memory. A shortage shows as swap
+traffic and pressure while drives run.
+
+A person does this. Seats have no SSH to the host and a run's checks drive one revision at
+a time, so no run can produce the measurement. You need SSH to the staging host and a shell
+on the panel host.
+
+**1. Sample the host.** `tools/staging-host-sampler.sh` needs only bash and awk there. Log
+in as the account the target's SSH reference logs in as: its `drive_units` column counts
+that account's user units, or the system's for root, which is where the drives' units are.
+
+```sh
+scp tools/staging-host-sampler.sh <host>:
+ssh <host> 'nohup bash staging-host-sampler.sh --label two-drives --duration 3h </dev/null >sampler.log 2>&1 &'
+ssh <host> 'date -u'; date -u   # note any difference: samples carry the host's clock, drive records the panel's
+```
+
+`--interval` is 5 seconds by default. The output is
+`host-samples-<label>-<UTC start>.tsv` in the directory it started in, the login's home here
+(`--output` names another), and it stays on the host until you copy it back. It takes one
+line per sample, comment lines naming the host, kernel, CPU count and which pressure files
+exist, and it refuses an existing file. Interrupting it (`kill <pid>`) keeps what it has.
+Start it a few minutes before the first drive, so the record shows the host at rest.
+
+| Columns | What they say |
+|---|---|
+| `ts_utc`, `elapsed_s`, `drive_units` | the sample's time; `devpanel-check-*` units running. A drive can hold several units, and a kept smoke instance has units and no slot, so this says "something is running", not how many slots are held |
+| `swap_used_mib`, `swap_cached_mib`, `swap_total_mib` | bytes held in swap |
+| `swap_in_pages_s`, `swap_out_pages_s`, `major_faults_s` | swap traffic and disk-backed page faults over the interval |
+| `mem_available_mib`, `mem_total_mib` | memory left |
+| `mem_some_pct`, `mem_full_pct` | share of the interval tasks stalled on memory (`/proc/pressure/memory`); `full` means every non-idle task did |
+| `cpu_some_pct`, `load1/5/15`, `procs_running`, `cpu_busy_pct`, `cpu_steal_pct` | waiting for CPU, and how busy it was |
+| `io_some_pct`, `io_full_pct`, `cpu_iowait_pct`, `procs_blocked` | waiting for disk, where swapping also shows |
+| `cg_*` | the same for the sampler's root cgroup (`/sys/fs/cgroup`), where it offers them |
+
+`NA` means the host does not offer the figure, or a first sample has no interval behind it. It
+is never 0. A kernel without pressure data reads `NA` in the pressure columns and the file's
+header says so: that is no evidence of low pressure. Then judge from swap traffic, major faults,
+`procs_blocked` and `cpu_iowait_pct`, and write in the issue that pressure was not measured. In a
+container (`# virtualization:`), `/proc` may describe the whole machine or the container depending
+on how it was built, so name in the issue which you read; the `cg_*` columns are the container's own.
+
+**2. Measure both settings.** Sample one period at each setting, each with its own label:
+
+- *Two drives*: the current setting, `testDrive.maxConcurrentDrives` absent or 2 in the host
+  settings.
+- *One drive*: set `"testDrive": { "maxConcurrentDrives": 1 }` in `host-config/settings.json`,
+  keeping any other `testDrive` key. Put the earlier value back afterwards.
+
+The setting is read when a drive starts, with no restart, and it applies to every staging host of
+this panel. A drive already running or waiting keeps the cap it read, so change it with no drive
+in progress. `totals.byCap` below shows what the drives read. Runs on the host for other reasons
+count against both periods alike: leave them out or name them.
+
+Compare like with like: the same projects, playbooks and kinds of work, and enough drives in each
+period to say something. The drives must actually overlap in the two-drive period. Base drives count as
+load, and one reused from the baseline cache is no drive, so a period of repeats is lighter: compare
+`totals.byKind`. A person starts the runs in the usual way, so this spends what those runs spend.
+
+**3. Get drive time, queueing and failures** for each period, on the panel host, from `gui/`, after
+that period's runs have finished. Name every project that drives this host:
+
+```sh
+npm run --silent drive-records -- --project <id> --project <id> --from <utc> --to <utc> > drives-two.json
+```
+
+| Figure | Field of `drive-records` | Record it comes from (`runs/<run-id>/run.json`, or the bundle's `<id>.runs.json` once packed) |
+|---|---|---|
+| Drive time | `driveMs` (`durationMs` less the wait), `totals.byTier.*.passedDriveMs` | `at` and `durationMs` of `checkResults[]` and their `attempts[]`, `priorCheckResults[]`, `reconciliations[].checks`, `baselineChecks[]`, `diagnosticDrives[]`; `checkHistory[].runs[]` for an earlier revision |
+| Queueing | `waitMs`, `cap`, `host`, `totals.byTier.*.waitMs` | `driveSlot` on those records (`waitMs`, `cap`, `host`); `driveSlotWaits[]` by `dir`. `metrics.time.driveSlotWaitMs` on `GET …/runs/:runId` is the same per run, as a union |
+| Failure rate | `result`, `failed`, `timedOut`, `totals.byTier.*.notPassed` | `result` and `commands[]` on those records; `checkHistory[].result` and `gating` |
+| Which tests failed | run `npm run --silent selftest-history -- --project <id> --test <name>`, or read the file | `issues/<project>/.selftest-history/<runId>.jsonl`, `commands[].failed` and `asNew`, by `at` and `dir`; the command logs in `runs/<run-id>/checks/<n>/` |
+
+A null is not recorded, never 0: `checkHistory` keeps no result for a retried attempt of an earlier
+revision, no slot for it and no cap or host for any of its drives. Those read null and stay out of the
+means, whose `of` says how many they cover. `npm run overview` averages over all history, so it
+does not answer for a period.
+
+Only remote drives count; local checks are left out. `checkHistory` does not say which a drive was,
+so a drive with no record of its own, slot or wait to say so takes its run's target, only when the
+run's other records, `checkRefresh`, `checkRefreshHistory` and `resolved-playbook.json` all agree on
+one. Where they do not (a target that changed between remote and local, a packed run with no other
+record, a packed run that was refreshed, whose first target its record no longer shows) it is listed
+under `targetUnknown`, in no total: if the list holds any, say so in the issue.
+
+A drive holds the host from `at + waitMs` to `at + durationMs`. Those intervals, corrected by the
+clock difference from step 1, are what to lay over `ts_utc`: which samples had two drives on the host,
+and what the host was doing when a drive failed. Summarize what the drives were running through:
+
+```sh
+bash staging-host-sampler.sh --summary host-samples-two-drives-….tsv --busy   # samples with drive_units above 0
+bash staging-host-sampler.sh --summary host-samples-two-drives-….tsv --from <utc> --to <utc>   # or a stretch by host clock
+```
+
+Each column gets its `samples`, `absent`, `nonzero`, `mean` and `max`. When `drive_units` itself is
+`NA`, `--busy` finds nothing: use `--from` and `--to`.
+
+**4. Read it.**
+
+- *Active memory shortage*: sustained `swap_in_pages_s`, `swap_out_pages_s` or `major_faults_s`
+  while drives run, together with `mem_some_pct` or `mem_full_pct` above what the host shows at rest.
+  Swap traffic in the failures' stretches matters more than the mean. A high, flat
+  `swap_used_mib` with no such traffic is parked pages, not a shortage.
+- *CPU shortage*: `cpu_some_pct` well above rest and `procs_running` or `load1` beyond the
+  CPU count of the header. `cpu_steal_pct` above rest points outside this host.
+- *Slowdown*: `passedDriveMs` of the same tier, two drives against one. Set the wait beside it: one
+  drive trades drive time for `waitMs`, so a run may take longer even as each drive speeds up.
+- *Instability*: `notPassed` of the same tier, and whether those drives' `failed` and `timedOut`
+  commands and failing tests fall in stretches of pressure or also occur without it. A timing
+  failure in a quiet stretch is not evidence of a resource cause.
+
+Then record the result in the issue, as a note on its page (*Add to this issue*, with the sample files and
+`drive-records` outputs attached). Write:
+
+- the periods (UTC), labels, settings, projects, and the clock difference;
+- per period: drives by kind and tier, `passedDriveMs`, `waitMs`, `notPassed`, and the failing commands or
+  tests with the sample values around them;
+- per period: the `--busy` summary's swap traffic, memory and CPU pressure, and `swap_used_mib`;
+- which figures were `NA`, and which scope `/proc` or `cg_*` described;
+- the answer: does resource-driven slowdown or instability remain with two drives, and did one drive improve it?
+- the decision about a further limit beside drive slots, from the first line that fits:
+
+| What the record shows | Decision |
+|---|---|
+| Too few overlapping drives, or the figures that decide it are absent | Inconclusive: measure again, nothing is built |
+| With two drives, no resource-driven slowdown or instability | Close it, with the measurement as the reason: the existing limit is enough |
+| Two drives show it and one drive removes it, at a wait that is acceptable | Close it, with the measurement as the reason: the existing limit is enough at 1. Keep the setting at 1, and say so |
+| It remains with one drive, or the wait at one drive is not acceptable, or what strains the host is outside what a slot counts (a kept smoke instance, load within one drive) | It goes ahead, for exactly that: name in what way the existing limit is insufficient and the figures that show it |
+
 ### One application snapshot per run
 
 `DEVPANEL_RUN_ID` is the run's id. Every check command receives it: local and
