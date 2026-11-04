@@ -235,7 +235,7 @@ export default async function (t) {
   }
 
   t.section('a failed Bash sandbox stops the invocation on its first tool result')
-  for (const mode of ['sandbox-error', 'sandbox-error-array', 'sandbox-read', 'sandbox-success']) {
+  for (const mode of ['sandbox-error', 'sandbox-error-array', 'sandbox-read', 'sandbox-success', 'sandbox-own-bwrap']) {
     const record = path.join(await temp(), 'calls'), ledgerDir = await temp()
     process.env.DEVPANEL_CLAUDE_BIN = await shim({ shape:'claude', record, mode })
     const claude = await import('../../harness/claude.mjs')

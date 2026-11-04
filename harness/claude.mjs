@@ -648,13 +648,19 @@ export function describeEvent (e) {
 function streamObserver (observe, onSandboxFailure = () => {}) {
   let result = null
   let cliVersion = null
-  const bashCalls = new Set()
+  const bashCalls = new Map()
   const observer = lineObserver({ observe, describeEvent, onEvent: e => {
     if (e?.type === 'result') result = e
     if (e?.type === 'system' && e.subtype === 'init' && typeof e.claude_code_version === 'string') cliVersion = e.claude_code_version
     for (const block of e?.message?.content ?? []) {
-      if (e.type === 'assistant' && block.type === 'tool_use' && block.name === 'Bash') bashCalls.add(block.id)
-      if (e.type !== 'user' || block.type !== 'tool_result' || !bashCalls.delete(block.tool_use_id)) continue
+      if (e.type === 'assistant' && block.type === 'tool_use' && block.name === 'Bash') bashCalls.set(block.id, String(block.input?.command ?? ''))
+      if (e.type !== 'user' || block.type !== 'tool_result' || !bashCalls.has(block.tool_use_id)) continue
+      const command = bashCalls.get(block.tool_use_id)
+      bashCalls.delete(block.tool_use_id)
+      // A command that names bwrap speaks for itself: a seat probing namespaces got this
+      // answer from its own call, and it says nothing about the sandbox around the call.
+      // The sandbox's own failure still shows on the turn's next command.
+      if (/\bbwrap\b/.test(command)) continue
       const text = typeof block.content === 'string' ? block.content : (block.content ?? []).filter(c => c.type === 'text').map(c => c.text).join('\n')
       const failure = /^(?:Exit code [1-9]\d*\s*)?(bwrap:[^\n]*)/i.exec(text.trim())
       if (failure && block.is_error !== false) onSandboxFailure(failure[1].slice(0, 2000))

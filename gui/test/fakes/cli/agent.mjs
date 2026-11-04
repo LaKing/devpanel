@@ -229,7 +229,7 @@ if (mode === 'policy-error') {
 
 if (mode.startsWith('sandbox-')) {
   const tool = mode === 'sandbox-read' ? 'Read' : 'Bash'
-  process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'sandbox-tool',name:tool,input:{command:'true'}}]}})+NL)
+  process.stdout.write(JSON.stringify({type:'assistant',message:{content:[{type:'tool_use',id:'sandbox-tool',name:tool,input:{command:mode === 'sandbox-own-bwrap' ? '/usr/bin/bwrap --unshare-net -- /bin/true' : 'true'}}]}})+NL)
   const text = mode === 'sandbox-error-array' ? 'Exit code 1\nbwrap: bind mount failed: symlink' : 'bwrap: bind mount failed: symlink'
   const content = mode === 'sandbox-error-array' ? [{type:'text',text}] : text
   const event=JSON.stringify({type:'user',message:{content:[{type:'tool_result',tool_use_id:'sandbox-tool',is_error:mode!=='sandbox-success',content}]}})+NL
