@@ -25,7 +25,6 @@ import * as store from './store.mjs'
 import { readChat, instructionsFor, instructionsBlock } from './coordinator-chat.mjs'
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
-import { driveSlotWaitMs } from './run-metrics.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
@@ -64,6 +63,7 @@ import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
 import { ensureMountPoint, fenceStubsPresent, removeFenceStubs } from './tooling-mounts.mjs'
 import { toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
+import { interruptedFromEvents, wallClockElapsedMs, wallClockRefusal, wallClockStanding } from './wall-clock.mjs'
 
 export { extractOutput }
 
@@ -1227,7 +1227,8 @@ export class Engine {
     this.run.recovery = { required: false, reason: null, detectedAt: null }
     // Retry the unaccepted step with a fresh session. No response or approval
     // from the quarantined invocation is adopted as successful work.
-    for (const p of Object.values(this.run.participants)) {
+    for (const [role, p] of Object.entries(this.run.participants)) {
+      if (p.pendingInvocation) this.recordInterruptedTurn(role, p.pendingInvocation, 'quarantined')
       p.pendingInvocation = null
       p.session = null
       p.state = 'uninitialised'
@@ -1243,6 +1244,8 @@ export class Engine {
     this.run = await store.readRun(this.issuePath, this.runId)
     this.snapshot = await store.readSnapshot(this.issuePath, this.runId)
     this.outputs = await store.readOutputs(this.issuePath, this.runId)
+    // A record from before interrupted turns were kept: read them off its journal, once.
+    if (!Array.isArray(this.run.interruptedTurns)) this.run.interruptedTurns = interruptedFromEvents((await store.inspectRunJournal(this.issuePath, this.runId)).events, this.run)
     this.applyControlOverrides()
     return this
   }
@@ -1292,6 +1295,32 @@ export class Engine {
     this.controller.abort()
   }
 
+  /** What the wall-clock budget has used so far (wall-clock.mjs). */
+  wallClockElapsed () {
+    const since = [this.checkRunningSince, ...[...this.openDriveWaits.values()].map((w) => w.from)].filter((t) => t != null)
+    return wallClockElapsedMs(this.run, this.clock.now(), { liveCheckSince: since.length ? Math.min(...since) : null })
+  }
+
+  /** A drive is not on the record until it ends; the wall clock reads it from here. */
+  async whileChecking (drive) {
+    const outer = this.checkRunningSince ?? null
+    this.checkRunningSince = outer ?? this.clock.now()
+    try { return await drive() } finally { this.checkRunningSince = outer }
+  }
+
+  /**
+   * A turn that ran and will never answer: it stays seat time beside any check.
+   * It ended when it stopped, or was answered and then held; a turn the service
+   * lost has no such time, and its end is now, because only a live engine records
+   * a check and recovery comes before any new one: every check this interval can
+   * overlap ran while the turn did.
+   */
+  recordInterruptedTurn (role, pending, reason) {
+    if (!pending?.startedAt || pending.derivedFrom) return
+    this.run.interruptedTurns ??= []
+    this.run.interruptedTurns.push({ invocationId: pending.invocationId, role, stepId: pending.cursor?.stepId ?? null, startedAt: pending.startedAt, endedAt: pending.stoppedAt ?? pending.answeredAt ?? this.clock.iso(), reason, ...(pending.abandonedMs != null ? { abandonedMs: pending.abandonedMs } : {}) })
+  }
+
   /**
    * Abort the in-flight invocation when the wall-clock budget expires. Returns a
    * cancel handle so a turn that finishes in time disarms it.
@@ -1299,10 +1328,13 @@ export class Engine {
   armDeadline () {
     const minutes = this.run.budgets.limits?.wallClockMinutes
     if (!minutes) return () => {}
-    const left = () => Date.parse(this.run.startedAt) + this.wallClockExcusedMs() + minutes * 60_000 - this.clock.now()
+    // Time already spent waiting on a check still running is free here too, not
+    // only once its result is recorded.
+    const left = () => minutes * 60_000 - this.wallClockElapsed()
     let disarm = () => {}, disarmed = false
-    // Asked again when it fires: a drive that began waiting for a slot after this
-    // was armed moves the deadline out, and an open wait holds it still.
+    // Asked again when it fires: with no seat turn running a check or a wait for its
+    // slot moves the deadline out, and one still open holds it still. A seat turn in
+    // flight counts whatever runs beside it, so it is cut when this first fires.
     const arm = (after) => {
       disarm = this.clock.after(after, () => {
         if (disarmed || this.controller.signal.aborted) return
@@ -1313,12 +1345,6 @@ export class Engine {
     }
     arm(left())
     return () => { disarmed = true; disarm() }
-  }
-
-  /** What the wall-clock budget does not count: time stopped, and time a drive waited for a slot, a wait in progress included. */
-  wallClockExcusedMs () {
-    const open = [...this.openDriveWaits.values()]
-    return (this.run.inputRetrySuspendedMs ?? 0) + (this.run.checkRefreshSuspendedMs ?? 0) + (this.run.controlSuspendedMs ?? 0) + driveSlotWaitMs(this.run, { open, now: this.clock.now() })
   }
 
   /** A drive's wait for a slot on its staging host begins or ends (drive-slots.mjs). */
@@ -1421,6 +1447,7 @@ export class Engine {
       // refuse to guess.
       if (retryUncertain && this.run.integrity?.status === 'clear') {
         const invocationId = p.pendingInvocation.invocationId
+        this.recordInterruptedTurn(role, p.pendingInvocation, 'lost')
         p.pendingInvocation = null
         p.session = null
         p.state = 'uninitialised'
@@ -1464,7 +1491,9 @@ export class Engine {
     this.run.recovery = { required: false, reason: null, detectedAt: null }
     this.run.status = 'blocked'
     this.run.blockedReason = 'owner-lost'
-    const entry = await this.resumeExecution({ budgets, stoppedAt: lostAt ?? detectedAt, actor, origin })
+    // No short-time refusal here: this path has no way to raise the limit, and a
+    // turn cut at the deadline blocks into the guarded Resume.
+    const entry = await this.resumeExecution({ budgets, stoppedAt: lostAt ?? detectedAt, actor, origin, guardShortWallClock: false })
     return { resumed: true, entry }
   }
 
@@ -1558,6 +1587,8 @@ export class Engine {
         durationUnknown: durationMs === null
           ? 'adopted after a restart — the runtime finished at a time nothing recorded'
           : null,
+        // Not a duration: how far check time beside this turn stays counted.
+        ...(endedAt ? {} : { adoptedAt: this.clock.iso() }),
         revision: null,
         outputRef: `outputs/${created.number}.json`,
         ...(reportFile ? {reportFile} : {}),
@@ -1780,7 +1811,7 @@ export class Engine {
     if (stale) await this.discardKeptInstance('revision-changed')
     const instance = level ? await this.instanceDecision({ configured, level, target, force, overrideTarget, current, stale }) : {}
     await this.persist({ type: 'checks-started', revision: current, target: target.kind, ...tierOf, step: step?.number ?? null })
-    const result = await this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory, keep: instance.keep ?? null, continueFrom: instance.continueFrom ?? null })
+    const result = await this.whileChecking(() => this.checkCandidate({ target, revision: current, fingerprint: fp, baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: this.run.workspace.path, history: this.run.checkHistory, keep: instance.keep ?? null, continueFrom: instance.continueFrom ?? null }))
     // Why this full drive ran from scratch; the attempts say so when a retry replaced the drive that knew.
     if (level === 'full' && !result.continuedFrom) {
       const replaced = result.attempts?.find((a) => a.continuedFrom)
@@ -2083,7 +2114,7 @@ export class Engine {
     const target = tierTarget(configured, configured.tiers ? tier : null)
     let result
     try {
-      result = await runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), dirName, variant: { patchFile } })
+      result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), dirName, variant: { patchFile } }))
     } catch (error) {
       result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
     }
@@ -2571,6 +2602,8 @@ export class Engine {
         meta: { invocationId, role, stepId: step.id, round, attempt, reapTag: pending.reapTag }
       }) } finally { await brokerTurn?.close().catch(() => {}) }
     } catch (error) {
+      // When the seat stopped working, before any scan or advice that follows.
+      pending.stoppedAt = this.clock.iso()
       // A runtime whose escaped descendants were not proved gone leaves the
       // workspace unproved, whatever else went wrong (P3-3).
       const lost = unprovedScan(error?.reap) ? error.reap : null
@@ -2583,6 +2616,7 @@ export class Engine {
         abandonedMs = Math.max(0, this.clock.now() - Date.parse(pending.startedAt))
         this.run.timing = this.run.timing ?? { agentMs: 0, abandonedMs: 0, unknownSteps: 0 }
         this.run.timing.abandonedMs += abandonedMs
+        pending.abandonedMs = abandonedMs
       }
       forward('exit', error.name === 'AbortError'
         ? `invocation aborted; the process group was terminated${lost ? `, but escaped descendants could not be proved gone (${lost.status})` : ''}`
@@ -2617,6 +2651,7 @@ export class Engine {
       }
       if (error.name === 'AbortError') {
         const byDeadline = this.abortReason === 'deadline'
+        this.recordInterruptedTurn(role, pending, 'aborted')
         p.state = 'ready'
         p.pendingInvocation = null
         if (await this.pauseForShutdown({ role, stepId: step.id, invocationId, abandonedMs, ...(lost ? { cleanup: lost.status } : {}) })) return { cancelled: true, byDeadline }
@@ -2724,9 +2759,10 @@ export class Engine {
   /**
    * The budget limits a continued run (resume, Continue) gets: raised by the
    * operator, never lowered, and the time it stood still not counted. Refuses
-   * when a limit is still exhausted after the raise.
+   * when a limit is still exhausted after the raise, or when the wall clock left
+   * is below the run's mean round, unless that was explicitly accepted.
    */
-  async continuationLimits ({ budgets = {}, stoppedAt = null } = {}) {
+  async continuationLimits ({ budgets = {}, stoppedAt = null, acceptShortWallClock = false, guardShortWallClock = true } = {}) {
     const limits = { ...this.run.budgets.limits }
     if (!budgets || typeof budgets !== 'object' || Array.isArray(budgets)) throw Object.assign(new Error('budgets must be an object'), { status: 400 })
     for (const [key, value] of Object.entries(budgets)) {
@@ -2739,17 +2775,22 @@ export class Engine {
     const stopped = stoppedAt ?? this.run.pause?.at ?? this.run.endedAt ?? events.filter(e => ['budget-exhausted', 'failed', 'cancelled', 'finished'].includes(e.type)).at(-1)?.at
     if (!stopped || !Number.isFinite(Date.parse(stopped))) throw Object.assign(new Error('No reliable stop time is recorded for this run.'), { status: 409 })
     const suspendedMs = Math.max(0, this.clock.now() - Date.parse(stopped))
-    const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - this.wallClockExcusedMs() - suspendedMs
-    if ((limits.wallClockMinutes && elapsedMs >= limits.wallClockMinutes * 60000) ||
-        (limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
+    const standing = limits.wallClockMinutes ? wallClockStanding(this.run, this.outputs, this.clock.now(), { limitMinutes: limits.wallClockMinutes, stoppedAt: Date.parse(stopped) }) : null
+    const refusal = standing ? wallClockRefusal(standing) : null
+    const refuse = () => { throw Object.assign(new Error(refusal.message), { status: 422, code: refusal.code, detail: refusal.detail }) }
+    if (refusal?.code === 'WALL_CLOCK_EXHAUSTED') refuse()
+    if ((limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
         (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens)) {
-      throw Object.assign(new Error('Increase the exhausted budget before resuming. Recorded usage is preserved.'), { status: 422 })
+      // Short of wall clock as well: said here, and the override does not get past this.
+      throw Object.assign(new Error(`${refusal ? `${refusal.numbers} ` : ''}Increase the exhausted budget before resuming. Recorded usage is preserved.`), { status: 422, ...(refusal ? { detail: refusal.detail } : {}) })
     }
-    return { limits, suspendedMs }
+    if (refusal && guardShortWallClock && acceptShortWallClock !== true) refuse()
+    const wallClock = standing ? { rule: standing.rule, remainingMs: standing.remainingMs, meanRoundMs: standing.meanRoundMs, rounds: standing.rounds, overridden: Boolean(refusal && guardShortWallClock) } : null
+    return { limits, suspendedMs, wallClock }
   }
 
   /** Keep the immutable launch snapshot and record explicit continuation allowances separately. */
-  async resumeExecution ({ budgets = {}, stoppedAt = null, unrecordedBarrier = [], actor = 'operator', origin = 'panel' } = {}) {
+  async resumeExecution ({ budgets = {}, stoppedAt = null, unrecordedBarrier = [], actor = 'operator', origin = 'panel', acceptShortWallClock = false, guardShortWallClock = true } = {}) {
     await this.assertJournal()
     const refusal = resumeUnavailable(this.run)
     if (refusal) throw Object.assign(new Error(refusal), { status: 409 })
@@ -2766,7 +2807,7 @@ export class Engine {
       const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
       if (current.hash !== checkpoint.hash) throw Object.assign(new Error('The retained workspace changed; resolve integrity before resuming.'), { status: 409 })
     }
-    const { limits, suspendedMs } = await this.continuationLimits({ budgets, stoppedAt })
+    const { limits, suspendedMs, wallClock } = await this.continuationLimits({ budgets, stoppedAt, acceptShortWallClock, guardShortWallClock })
     const previousStatus = this.run.status
     const previousReason = this.run.blockedReason
     const overrides = structuredClone(this.run.controlOverrides ?? {})
@@ -2782,7 +2823,7 @@ export class Engine {
     if (previousReason === 'protocol-repair-exhausted') overrides.repairAttempts = this.snapshot.reviewPolicy.protocolRepair.maxAttempts + 1
     this.run.controlOverrides = overrides
     this.applyControlOverrides()
-    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides }
+    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides, ...(wallClock ? { wallClock } : {}) }
     this.run.resumeHistory ??= []
     this.run.resumeHistory.push(entry)
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
@@ -2834,7 +2875,11 @@ export class Engine {
     this.run.checkRefresh = { target: refreshTarget, revision, requestedAt: this.clock.iso(), pending: true }
     this.run.supersededSteps = [...new Set([...(this.run.supersededSteps ?? []), ...this.run.steps.filter(s => this.outputs[s.number]?.contract === 'closureConfirmation').map(s => s.number)])]
     const stoppedAt = Date.parse(this.run.endedAt ?? this.run.closure?.at)
-    if (Number.isFinite(stoppedAt)) this.run.checkRefreshSuspendedMs = (this.run.checkRefreshSuspendedMs ?? 0) + Math.max(0, this.clock.now() - stoppedAt)
+    if (Number.isFinite(stoppedAt)) {
+      this.run.checkRefreshSuspendedMs = (this.run.checkRefreshSuspendedMs ?? 0) + Math.max(0, this.clock.now() - stoppedAt)
+      // The span: a stop only a total records leans towards counting (wall-clock.mjs).
+      this.run.checkRefresh.stop = { from: new Date(stoppedAt).toISOString(), to: this.clock.iso() }
+    }
     this.run.status = 'pending'
     this.run.blockedReason = null
     this.run.endedAt = null
@@ -2948,7 +2993,7 @@ export class Engine {
    * briefs the author for the next round in the same worktree and sessions.
    * The closure confirmations are superseded: the run confirms again afterwards.
    */
-  async continueRun ({ text = '', actor, budgets = {} } = {}) {
+  async continueRun ({ text = '', actor, budgets = {}, acceptShortWallClock = false } = {}) {
     await this.assertJournal()
     const refusal = continueUnavailable(this.run)
     if (refusal) throw Object.assign(new Error(refusal), { status: 409 })
@@ -2960,7 +3005,7 @@ export class Engine {
     const byStep = this.run.steps.find((s) => s.number === this.run.revisions.at(-1).byStep)
     const phase = this.snapshot.phases.find((p) => p.loop && p.id === byStep?.phase)
     if (!phase) throw Object.assign(new Error('No review loop produced this run’s candidate; there is nothing to continue.'), { status: 409 })
-    const { limits, suspendedMs } = await this.continuationLimits({ budgets })
+    const { limits, suspendedMs, wallClock } = await this.continuationLimits({ budgets, acceptShortWallClock })
 
     const previousReason = this.run.blockedReason
     const closure = this.run.closure
@@ -2983,7 +3028,7 @@ export class Engine {
       invocationId, startedAt: decision.askedAt, endedAt: at, durationMs: null, durationUnknown: null, revision: null, outputRef: null, usage: null, response, decision
     })
     this.run.supersededSteps = [...new Set([...(this.run.supersededSteps ?? []), ...this.run.steps.filter((s) => this.outputs[s.number]?.contract === 'closureConfirmation').map((s) => s.number)])]
-    const entry = { at, actor: decision.actor, step: created.number, phase: phase.id, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, notes: notes.map((n) => n.name) }
+    const entry = { at, actor: decision.actor, step: created.number, phase: phase.id, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, notes: notes.map((n) => n.name), ...(wallClock ? { wallClock } : {}) }
     this.run.continueHistory ??= []
     this.run.continueHistory.push(entry)
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
@@ -3024,6 +3069,8 @@ export class Engine {
     const stoppedAt = Date.parse(this.run.endedAt ?? failure.at)
     const suspendedMs = Math.max(0, this.clock.now() - stoppedAt)
     this.run.inputRetrySuspendedMs = (this.run.inputRetrySuspendedMs ?? 0) + suspendedMs
+    // The span, so a check that settled inside this stop is not excused twice.
+    failure.retryStop = { from: new Date(stoppedAt).toISOString(), to: this.clock.iso() }
     this.run.status = 'pending'
     this.run.failure = null
     this.run.blockedReason = null
@@ -3104,6 +3151,7 @@ export class Engine {
     // records a disposition; only the unauthorized changes keep the blocked ending.
     if (classified.class === 'output-limit' && this.run.integrity?.latest?.reason === PARTIAL_CHANGES && !this.cleanupHold()) {
       const p = this.run.participants[role]
+      this.recordInterruptedTurn(role, pending, 'failed')
       p.pendingInvocation = null
       p.state = p.session ? 'ready' : 'uninitialised'
       this.run.failure = { class: classified.class, message: classified.message, role, stepId: step.id, invocationId: pending.invocationId, retries: this.run.failures.filter((f) => f.cursorKey === record.cursorKey && f.retried).length, availability: null }
@@ -3165,6 +3213,7 @@ export class Engine {
       }
     }
     // The verified-failed invocation is over either way: nothing pending remains.
+    this.recordInterruptedTurn(role, pending, 'failed')
     p.pendingInvocation = null
     p.state = p.session ? 'ready' : 'uninitialised'
     if (classified.class === 'quota' && this.quotaFallback && !cleanupBlocked && !this.controller.signal.aborted) {
@@ -3282,7 +3331,7 @@ export class Engine {
     const level = this.snapshot.checks?.target?.tiers ? (tier ?? 'full') : null
     if (!current || this.run.checkResults.some((c) => c.revision === current && (c.tier ?? null) === level)) return null
     this.checksRevision = current
-    const running = this.maybeRunChecks({ tier }).finally(() => { this.checksInFlight = null; this.checksRevision = null })
+    const running = this.whileChecking(() => this.maybeRunChecks({ tier })).finally(() => { this.checksInFlight = null; this.checksRevision = null })
     running.catch(() => { /* surfaced by settleChecks */ })
     this.checksInFlight = running
     return running
@@ -3735,8 +3784,7 @@ export class Engine {
     // used.costUnknownSteps and cannot be capped; the closure report says so.
     // maxCostUsd is reporting metadata, not evidence of provider quota exhaustion.
     if (limits.wallClockMinutes) {
-      const elapsedMs = this.clock.now() - Date.parse(this.run.startedAt) - this.wallClockExcusedMs()
-      if (elapsedMs >= limits.wallClockMinutes * 60_000) return 'wallClockMinutes'
+      if (this.wallClockElapsed() >= limits.wallClockMinutes * 60_000) return 'wallClockMinutes'
     }
     return null
   }

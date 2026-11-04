@@ -133,6 +133,30 @@ export default async (t) => {
       t.eq('which answers the mark', [finished.stoppedBy, finished.resumeHistory.at(-1).origin], [null, 'panel'])
     }
 
+    t.section('less wall clock than a mean round: not started, no override, both numbers on record')
+    {
+      const { issueId, runId } = await inFlight('Short')
+      await until(async () => (await record(issueId, runId)).steps.length > 0, 'a step to be recorded')
+      await stage.setControl({ delayMs: 0 })
+      await stage.restart({ signal: 'SIGTERM' })
+      await stage.kill()
+      const stopped = await record(issueId, runId)
+      // One completed round of an hour; thirty minutes allowed, and well under that used.
+      const step = stopped.steps[0]
+      Object.assign(step, { phase: 'implement-review', round: 0, startedAt: new Date(Date.parse(step.endedAt) - 60 * 60_000).toISOString() })
+      await fs.writeFile(path.join(dir(issueId, runId), 'outputs', `${step.number}.json`), JSON.stringify({ valid: true, contract: 'reviewResult', output: { findings: [] } }))
+      stopped.budgets.limits.wallClockMinutes = 30
+      await fs.writeFile(path.join(dir(issueId, runId), 'run.json'), JSON.stringify(stopped))
+      await setAutoResume(true)
+      await stage.restart()
+      const after = await stage.run(issueId, runId)
+      t.eq('not started, still marked', [after.status, after.stoppedBy, after.resumeHistory.length], ['cancelled', 'service-shutdown', 0])
+      t.ok('both numbers are on record', /min of wall clock remaining of 30/.test(after.autoResumeRefused?.reason ?? '') && /60 min/.test(after.autoResumeRefused.reason), after.autoResumeRefused?.reason)
+      t.ok('and in what a person reads', after.explanation.detail.includes(after.autoResumeRefused.reason), after.explanation.detail)
+      t.eq('the limit was not touched', (await record(issueId, runId)).budgets.limits.wallClockMinutes, 30)
+      await setAutoResume(false)
+    }
+
     t.section('a limit already exhausted: not started, left stopped with the reason on record')
     {
       const { issueId, runId } = await inFlight('Exhausted')

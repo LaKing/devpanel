@@ -65,7 +65,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
  }}
  const full=async(project,issueId,runId)=>{
   const issue=await issues.getIssue(project,issueId)
-  return getRun(issue.path,runId,{issues,project,issueId,isActive:supervisor.isActive(project,issueId)})
+  return getRun(issue.path,runId,{issues,project,issueId,isActive:supervisor.isActive(project,issueId),liveCheckSince:supervisor.liveCheckSince(project,issueId,runId)})
  }
  // The supervisor sees summaries; the panel's full view stays behind get_step.
  // A packed issue (archived, or an answered inquiry that packed itself) has no run folders, but its bundle keeps every

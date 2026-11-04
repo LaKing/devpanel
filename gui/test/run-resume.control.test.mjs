@@ -45,7 +45,7 @@ export default async t => {
     await page.setViewportSize({ width: 390, height: 844 })
     await page.screenshot({ path: path.join(os.tmpdir(), 'devpanel-resume-mobile.png'), fullPage: true })
     await page.getByRole('button', { name: 'Resume run', exact: true }).click()
-    t.eq('resume dialog defaults to seven days', await page.locator('.v-dialog input[type=number]').first().inputValue(), '10080')
+    t.eq('resume dialog starts from the run\'s own limit', await page.locator('.v-dialog input[type=number]').first().inputValue(), String(paused.budgets.limits.wallClockMinutes))
     await stage.setControl({ delayMs: 0 })
     await page.getByRole('button', { name: 'Resume saved run', exact: true }).click()
     await page.locator('.v-dialog').waitFor({ state: 'hidden' })

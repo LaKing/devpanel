@@ -460,7 +460,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   enforces one live run per issue, in-process and against persisted runs with a live lock owner. Several issues of a project may
   run at once: deliveries and base snapshots take turns on each repository's delivery lock (`runtime/source-lock.mjs`), remote test
   drives wait for a slot per resolved staging host (`testDrive.maxConcurrentDrives`, default 2, `runtime/drive-slots.mjs`; pinned to that
-  host, the wait recorded on `result.driveSlot` and excused from the wall clock), and only a live in-place run, or two release-tactic runs,
+  host, the wait recorded on `result.driveSlot` and, with no seat turn running, excused from the wall clock), and only a live in-place run, or two release-tactic runs,
   stay apart (`run-exclusivity.mjs`).
 
 ## Harness adapters (`harness/`)
@@ -578,7 +578,9 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
 - Round/budget exhaustion, disagreement and protocol blocking leave the issue *unresolved*; only the full
   closure checklist (same-revision approval, checks satisfied, no blocking findings, coordinator confirmation,
   delivery completed) closes it. Budgets are `maxSteps`, `wallClockMinutes`, `maxTokens` and `maxCostUsd`
-  (known cost only; unpriced steps are counted in `used.costUnknownSteps`).
+  (known cost only; unpriced steps are counted in `used.costUnknownSteps`). `wallClockMinutes` does not count stops, waits
+  for an operator, or waiting for checks with no seat turn running; a check beside a seat counts (`runtime/wall-clock.mjs`).
+  Resume and Continue refuse less than the run's mean round left unless `acceptShortWallClock` (execution-contract.md "What the wall clock counts").
 - Runs are autonomous (execution-contract.md "Asking the owner before any work starts"): triage records a required
   `autonomy.verdict` (`autonomous` | `needs-owner-input` with questions | `too-large` with a split); anything
   but autonomous ends the run after triage via `to: ask-owner` (`run.ownerInput`, result `needs-input`, no

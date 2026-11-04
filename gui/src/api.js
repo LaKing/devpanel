@@ -159,7 +159,7 @@ export const api = {
   resolveIntegrity: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/integrity`, { method: 'POST', body: JSON.stringify(body) }),
   acknowledgeCleanup: (project, id, runId, reason) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/cleanup-acknowledgement`, { method: 'POST', body: JSON.stringify({ reason }) }),
   recoverRun: (project, id, runId, actor) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/recover`, { method: 'POST', body: JSON.stringify({ actor }) }),
-  resumeRun: (project, id, runId, budgets = {}, actor) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/resume`, { method: 'POST', body: JSON.stringify({ budgets, actor }) }),
+  resumeRun: (project, id, runId, budgets = {}, actor, acceptShortWallClock = false) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/resume`, { method: 'POST', body: JSON.stringify({ budgets, actor, acceptShortWallClock }) }),
   refreshChecks: (project, id, runId) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/refresh-checks`, { method: 'POST', body: JSON.stringify({}) }),
   acceptCheckResult: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/accept-check-result`, { method: 'POST', body: JSON.stringify(body) }),
   continueRun: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/continue`, { method: 'POST', body: JSON.stringify(body) }),

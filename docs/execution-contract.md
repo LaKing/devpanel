@@ -1501,8 +1501,9 @@ Locks carry owner identity — pid, boot id, process start time, host.
   `testDrive.maxConcurrentDrives` slots of its staging host while it runs; over the
   cap it waits and is never failed for waiting (project-infrastructure.md "How many
   drives a host runs"). The wait is on `result.driveSlot` and `run.driveSlotWaits`,
-  and the wall-clock budget does not count it, a wait in progress included: an armed
-  deadline looks again when it fires. Local checks take no slot.
+  and with no seat turn running the wall-clock budget does not count it, a wait in
+  progress included: an armed deadline looks again when it fires ("What the wall
+  clock counts"). Beside a seat turn the time counts. Local checks take no slot.
 - **Step-allocation lock** — taken by *every* step-creating path, including manual
   creation through the API. Retry-on-`EEXIST` is not sufficient here: two
   concurrent creates with different slugs both succeed and both take the same
@@ -2231,6 +2232,7 @@ refreshes, so a settlement cannot consume the completion/failure notification.
 
 ### Continuing a run stopped at closure
 
+Continue applies the same wall-clock guard as Resume ("What the wall clock counts").
 `POST .../runs/:runId/continue` (`engine.continueRun`) and the supervisor's
 `continue_run` reopen the review loop that produced the candidate of a code run
 blocked at closure (`closure-conditions-unmet`, `refreshed-checks-failed`), with
@@ -2449,10 +2451,10 @@ recovery paths; resume does not waive those conditions or closure requirements.
 
 The optional `budgets` object supplies positive integer total `maxSteps`,
 `maxTokens` and `wallClockMinutes` allowances. Limits cannot shrink, and exhausted
-allowances must be explicitly increased. The UI defaults elapsed time to seven
-days (10,080 minutes). Time spent stopped or waiting for an operator answer is
-excluded from the deadline; spent steps and tokens are never reset. Resume grants
-one additional review round or protocol repair when that is the exhausted limit.
+allowances must be explicitly increased. Spent steps and tokens are never reset.
+Resume grants one additional review round or protocol repair when that is the
+exhausted limit.
+
 Changes are recorded in `resumeHistory` and `controlOverrides`, and each
 `resumeHistory` entry and `operator-resumed` event names its `actor` and `origin`
 (`panel` or `supervisor`, or `service-restart` with actor `service` for a resume at
@@ -2460,6 +2462,63 @@ start-up; `operator` when no name was known; older entries carry
 neither and are not rewritten); the original
 resolved playbook snapshot stays immutable. Explicit continuation does not imply
 approval of any outstanding finding or automatic resolution of the issue.
+
+#### What the wall clock counts
+
+`wallClockMinutes` limits the run's elapsed time, less what it does not count
+(`runtime/wall-clock.mjs`; the rule is `waiting-excluded`, and every record is read
+by it, whenever it started). The running deadline, the budget check between turns,
+Resume, Continue and the panel's figure all read the same number.
+
+- **Excluded:** time the run stood stopped or waited for an operator answer, and
+  time spent waiting for checks while no seat turn runs, a drive's wait for a slot on
+  its staging host and a diagnostic drive included. That exemption holds during the
+  wait itself: a check not yet recorded is counted free from when it began, so a run
+  is never stopped for time that would later be credited back.
+- **Counted:** everything else, including a check running beside a seat turn, a seat
+  turn later cut, failed or lost in a crash (`run.interruptedTurns`), retry waits and
+  the engine's own work between steps. Per-command check timeouts are unchanged.
+- **Where the record cannot show it, the time counts**, so an error runs the budget
+  out sooner, never later. A check running at a crash, or never recorded, excuses
+  nothing. A turn lost in a crash ends at its recovery, and one adopted after a
+  restart at its adoption (`adoptedAt`, beside `endedAt: null`). A chat question to
+  the coordinator is not a seat turn. A base drive reused from the cache was another
+  run's time and excuses nothing.
+- **Older records** get their interrupted turns once, off `events.jsonl`, when next
+  loaded. An ending event with no `invoking` line starts with the run, and any
+  `timing.abandonedMs` no entry explains comes off what is excused. So does any stop
+  known only as a total (`controlSuspendedMs`, `inputRetrySuspendedMs`,
+  `checkRefreshSuspendedMs` with no interval placing it), since a check may have lain
+  inside it. Against a clock that counted checks these only subtract from elapsed time;
+  the one thing that counts again is a drive's wait for a slot beside a seat turn.
+
+Resume and Continue compare what is left, after any raise, with the run's mean round
+time: the mean over its completed rounds, across every review loop, of each round's
+answered turns (a round is complete once it holds a valid review). With less than
+that left they refuse (422, `WALL_CLOCK_SHORT`, `detail` with both numbers, as does
+the message), unless the request carries `acceptShortWallClock: true`; the panel asks
+with a checkbox. With no time left they refuse (`WALL_CLOCK_EXHAUSTED`), naming both
+numbers or saying no round has completed, and there is no override: the limit must be
+raised, or the run would block at once. With `maxSteps` or `maxTokens` exhausted and less
+than a mean round left, the refusal for that budget names both numbers too, and the
+override does not get past it. With no completed round there is no mean and no short
+refusal. `resumeHistory` and `continueHistory` record `wallClock: {rule,
+remainingMs, meanRoundMs, rounds, overridden}`.
+
+The guard reads the record; it guarantees nothing about one turn. A mean round is not
+a bound on a turn, short plan rounds lower it, and an overridden or guarded run can
+still be cut at the deadline. A service restart has no override: a short run stays
+stopped with the reason on `run.autoResumeRefused` until a person resumes it. The
+supervisor has none either: its `continue_run` is refused and the matter is the
+operator's. Owner-loss recovery skips the short check, having no way to raise a
+limit, and still refuses an exhausted one; `answer`, `retryInput`, `refresh-checks`
+and accepting a check result are not guarded.
+
+The panel starts its Resume and Continue dialogs from the run's own limit, raised only
+when that could not go on (by the mean round, or by the limit again when exhausted),
+and shows both numbers. A run that started before this rule (`wallClockRule` absent)
+keeps the earlier seven-day (10,080 minute) Resume default. No limit a run already
+states, or that an operator set explicitly, is ever lowered.
 
 For explicitly authorized operator corrections, `retained-amendment.mjs` provides
 `amendRetained(engine, { edits, target, actor, reason })` under the exclusive run

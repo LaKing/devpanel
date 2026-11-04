@@ -5,6 +5,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { systemClock } from './clock.mjs'
+import { WALL_CLOCK_RULE } from './wall-clock.mjs'
 
 /*
  * Durable run state, under <issue>/runs/<run-id>/.
@@ -136,6 +137,10 @@ export async function initRun (issuePath, { runId, issue, resolved, clock = syst
     // that took an hour of which four minutes were agents is a different problem
     // from one that was busy the whole time.
     timing: { agentMs: 0, abandonedMs: 0, unknownSteps: 0 },
+    // Turns that ran and never answered: their time counts against the wall
+    // clock (wall-clock.mjs). A record without these two predates the rule.
+    interruptedTurns: [],
+    wallClockRule: WALL_CLOCK_RULE,
     delivery: null,
     closure: null,
     recovery: { required: false, reason: null, detectedAt: null }

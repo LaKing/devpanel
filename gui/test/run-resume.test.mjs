@@ -122,4 +122,93 @@ export default async t => {
     await releaseOwnership(engine)
   }
 
+  t.section('Resume refuses when the wall clock left is below the mean round, naming both')
+  {
+    const hour = 60 * 60_000
+    const stopped = async () => {
+      const f = await engineFixture()
+      let once = false
+      const engine = await launch(f, { hooks: { beforeInvoke: async e => { if (!once) { once = true; await e.requestPause() } } } })
+      await engine.drive()
+      return { f, engine }
+    }
+    // One completed round of an hour, on the paused run's record.
+    const aRound = (engine) => {
+      const step = engine.run.steps[0]
+      Object.assign(step, { phase: 'implement-review', round: 0, startedAt: new Date(Date.parse(step.endedAt) - hour).toISOString() })
+      engine.outputs[step.number] = { valid: true, contract: 'reviewResult', output: { findings: [] } }
+    }
+    {
+      const { f, engine } = await stopped()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const before = JSON.stringify([engine.run.status, engine.run.pause, engine.run.resumeHistory ?? [], engine.run.budgets.limits])
+      const refused = await refuses(() => engine.resumeExecution({}))
+      t.eq('refused, with the code and both numbers in detail', [refused?.status, refused?.code, refused?.detail?.remainingMs, refused?.detail?.meanRoundMs, refused?.detail?.rounds], [422, 'WALL_CLOCK_SHORT', 30 * 60_000, hour, 1])
+      t.ok('and in the message', refused?.message.includes('30 min') && refused.message.includes('60 min'), refused?.message)
+      t.eq('nothing changed on the run', JSON.stringify([engine.run.status, engine.run.pause, engine.run.resumeHistory ?? [], engine.run.budgets.limits]), before)
+      const raised = await engine.resumeExecution({ budgets: { wallClockMinutes: 90 } })
+      t.eq('a raise that holds a round passes', [raised.wallClock.overridden, raised.wallClock.rule, raised.wallClock.meanRoundMs], [false, 'waiting-excluded', hour])
+      await releaseOwnership(engine)
+      void f
+    }
+    {
+      const { engine } = await stopped()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const entry = await engine.resumeExecution({ acceptShortWallClock: true })
+      t.eq('an explicit override passes and is recorded', [entry.wallClock.overridden, engine.run.resumeHistory.at(-1).wallClock.remainingMs], [true, 30 * 60_000])
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const entry = await engine.resumeExecution({ guardShortWallClock: false })
+      t.eq('owner-loss recovery skips the short check and says it did not override', entry.wallClock.overridden, false)
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      engine.run.budgets.limits.wallClockMinutes = 1
+      const entry = await engine.resumeExecution({})
+      t.eq('with no completed round there is no mean and no refusal', [entry.wallClock.meanRoundMs, entry.wallClock.rounds], [null, 0])
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.startedAt = new Date(Date.parse(engine.run.pause.at) - 40 * 60_000).toISOString()
+      const spent = await refuses(() => engine.resumeExecution({ acceptShortWallClock: true }))
+      t.eq('exhausted: the override does not get past it', [spent?.status, spent?.code, spent?.detail?.remainingMs, spent?.detail?.meanRoundMs], [422, 'WALL_CLOCK_EXHAUSTED', 0, hour])
+      t.ok('and the message names both', spent?.message.includes('0 min remaining of 30') && spent.message.includes('60 min') && /exhausted budget/.test(spent.message), spent?.message)
+      const short = await refuses(() => engine.resumeExecution({ budgets: { wallClockMinutes: 50 } }))
+      t.eq('a raise that still leaves too little is the short refusal', short?.code, 'WALL_CLOCK_SHORT')
+      const entry = await engine.resumeExecution({ budgets: { wallClockMinutes: 50 }, acceptShortWallClock: true })
+      t.eq('which the override does pass', entry.wallClock.overridden, true)
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.budgets.limits.maxSteps = 1
+      const other = await refuses(() => engine.resumeExecution({ acceptShortWallClock: true }))
+      t.ok('another budget exhausted: its refusal names both numbers too', other?.status === 422 && /exhausted budget/.test(other.message) && other.message.includes('30 min') && other.message.includes('60 min'), other?.message)
+      t.eq('with both in detail, and the override does not get past it', [other?.detail?.remainingMs, other?.detail?.meanRoundMs, engine.run.resumeHistory ?? []], [30 * 60_000, hour, []])
+      engine.run.budgets.limits.wallClockMinutes = 600
+      const room = await refuses(() => engine.resumeExecution({}))
+      t.eq('with room on the clock it says only that budget', [room?.message, room?.detail], ['Increase the exhausted budget before resuming. Recorded usage is preserved.', undefined])
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.startedAt = new Date(Date.parse(engine.run.pause.at) - 40 * 60_000).toISOString()
+      const spent = await refuses(() => engine.resumeExecution({}))
+      t.ok('exhausted with no completed round says so', spent?.code === 'WALL_CLOCK_EXHAUSTED' && /no mean round time/.test(spent.message), spent?.message)
+      await releaseOwnership(engine)
+    }
+  }
 }

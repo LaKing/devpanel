@@ -606,7 +606,8 @@ app.get('/api/projects/:project/issues/:id/runs/:runId', route(async (req, res) 
     issues,
     project: req.params.project,
     issueId: req.params.id,
-    isActive: supervisor.isActive(req.params.project, req.params.id)
+    isActive: supervisor.isActive(req.params.project, req.params.id),
+    liveCheckSince: supervisor.liveCheckSince(req.params.project, req.params.id, req.params.runId)
   }))
 }))
 
@@ -667,7 +668,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/pause', route(async (req
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/resume', route(async (req, res) => {
   const { project, id: issueId, runId } = req.params
-  res.status(202).json(await supervisor.resume({ project, issueId, runId, budgets: req.body?.budgets ?? {}, actor: resumingActor(req), origin: 'panel' }))
+  res.status(202).json(await supervisor.resume({ project, issueId, runId, budgets: req.body?.budgets ?? {}, actor: resumingActor(req), origin: 'panel', acceptShortWallClock: req.body?.acceptShortWallClock === true }))
 }))
 
 app.get('/api/projects/:project/issues/:id/runs/:runId/integrity', route(async (req, res) => {
@@ -718,8 +719,8 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/owner-input', route(asyn
 // retained candidate, with the operator's instruction and the new issue notes.
 app.post('/api/projects/:project/issues/:id/runs/:runId/continue', route(async (req, res) => {
   const { project, id: issueId, runId } = req.params
-  const { instruction = '', actor, budgets = {} } = req.body ?? {}
-  res.status(202).json(await supervisor.continueRun({ project, issueId, runId, text: instruction, actor: req.actor ?? actor, budgets }))
+  const { instruction = '', actor, budgets = {}, acceptShortWallClock } = req.body ?? {}
+  res.status(202).json(await supervisor.continueRun({ project, issueId, runId, text: instruction, actor: req.actor ?? actor, budgets, acceptShortWallClock: acceptShortWallClock === true }))
 }))
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/refresh-checks', route(async (req, res) => {

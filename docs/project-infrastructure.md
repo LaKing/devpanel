@@ -260,8 +260,9 @@ processes. A drive over it waits, is never failed for waiting, and can be stoppe
 drive counts: candidate and base, smoke and full, a retry, a diagnostic drive. A base reused
 from the cache is not a drive, a kept smoke instance holds no slot while it waits for its
 full drive, and local checks are not capped. The wait is on the check result
-(`driveSlot`), counted as check waiting in run metrics (`driveSlotWaitMs`) and not
-charged to the wall-clock budget.
+(`driveSlot`), counted as check waiting in run metrics (`driveSlotWaitMs`) and, with no
+seat turn running, not charged to the wall-clock budget (execution-contract.md "What the
+wall clock counts").
 
 A host is what SSH itself would dial: the `hostname` of `ssh -G` for the target's
 reference, read once per drive, so two aliases of one `HostName` share a count. DNS is not

@@ -2,6 +2,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
+import { timeSplit } from '../server/runtime/run-metrics.mjs'
+import { wallClockElapsedMs } from '../server/runtime/wall-clock.mjs'
 
 export default async function (t) {
   let approve=false
@@ -33,4 +35,39 @@ export default async function (t) {
   t.eq('old confirmation remains in history',engine.run.supersededSteps.length,1)
   t.eq('newest check is authoritative',engine.run.checkResults.at(-1).result,'passed')
   await releaseWorkspace(engine)
+
+  t.section('a refresh under the wall-clock rule: its stop and its check, with no seat, are free')
+  {
+    const MIN=60_000
+    approve=false
+    const g=await engineFixture({playbook:'implementation',script})
+    engine=await startRun({...g,deliveryProvider:g.delivery})
+    await engine.drive()
+    t.eq('stopped at closure',engine.run.blockedReason,'closure-conditions-unmet')
+    const before=engine.wallClockElapsed()
+    g.clock.advance(60*MIN)
+    await engine.refreshClosureChecks({kind:'local',commands:[{id:'functional',run:'echo verified',timeoutSeconds:10}]})
+    t.eq('the stop is located',[engine.run.checkRefresh.stop.to,engine.run.checkRefreshSuspendedMs],[g.clock.iso(),60*MIN])
+    t.eq('and not counted',engine.wallClockElapsed(),before)
+    t.eq('nor unplaced',timeSplit(engine.run,g.clock.now()).unplacedStopsMs,0)
+    // The drive takes twenty minutes of the fake clock. The refresh runs inline, with no seat.
+    const during=[]
+    const drive=engine.checkCandidate.bind(engine)
+    engine.checkCandidate=async(args)=>{
+      const began=g.clock.iso()
+      g.clock.advance(20*MIN)
+      during.push(engine.wallClockElapsed())
+      const result=await drive(args)
+      return {...result,at:began,durationMs:20*MIN}
+    }
+    approve=true
+    // Less than the drive takes: only a clock that counted it would stop this run.
+    engine.run.budgets.limits.wallClockMinutes=10
+    await engine.drive()
+    t.eq('a limit the drive alone would pass does not stop it, and the run completes',engine.run.status,'completed')
+    t.eq('free during the drive itself',during,[before])
+    t.eq('and once recorded',wallClockElapsedMs(engine.run,Date.parse(engine.run.endedAt)),before)
+    t.eq('nothing still reads as a check running',engine.checkRunningSince,null)
+    await releaseWorkspace(engine)
+  }
 }

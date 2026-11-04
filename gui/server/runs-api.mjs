@@ -6,6 +6,7 @@ import { loadConfig, resolvePlaybook } from './config/load.mjs'
 import { previewRun } from './runtime/preview.mjs'
 import * as store from './runtime/store.mjs'
 import { runMetrics } from './runtime/run-metrics.mjs'
+import { interruptedFromEvents, wallClockStanding } from './runtime/wall-clock.mjs'
 import { supportedActions, LIVE_STATUSES } from './supervisor.mjs'
 import { triageSuggestion } from './runtime/triage-suggestion.mjs'
 import { refusedAcceptance, runResult } from './runtime/run-result.mjs'
@@ -74,7 +75,7 @@ export async function listRuns (issuePath) {
  * One run, assembled into the shape a timeline needs: every turn with its role,
  * model, prompt, response, structured output and revision.
  */
-export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, platform = hostPlatform() }) {
+export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, liveCheckSince = null, platform = hostPlatform() }) {
   let run
   try {
     run = await store.readRun(issuePath, runId)
@@ -103,6 +104,9 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
 
   const issue = await issues.getIssue(project, issueId)
   const stepsOnDisk = new Map(issue.steps.map((s) => [s.number, s]))
+
+  // A record from before interrupted turns were kept reads them off its journal, as the engine will.
+  const counted = Array.isArray(run.interruptedTurns) ? run : { ...run, interruptedTurns: interruptedFromEvents(events.events, run) }
 
   const currentRevision = run.revisions.at(-1)?.fingerprint ?? null
 
@@ -225,7 +229,13 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     endedAt: run.endedAt,
     // Convergence measurements read off the record: rounds and restarts, the
     // time split, and distinct findings versus confirmations.
-    metrics: runMetrics(run, { outputs }),
+    metrics: runMetrics(counted, { outputs }),
+    // What the wall-clock budget has used, as Resume and Continue will read it.
+    wallClock: counted.budgets?.limits?.wallClockMinutes
+      ? { ...wallClockStanding(counted, outputs, Date.now(), { liveCheckSince, stoppedAt: Date.parse(run.pause?.at ?? run.endedAt ?? '') || null }), startedUnderRule: run.wallClockRule ?? null,
+          // While only a check runs the clock stands still: the panel holds this reading instead of ticking on.
+          waitingOnCheckAlone: liveCheckSince != null && !Object.values(run.participants ?? {}).some((p) => p?.pendingInvocation) }
+      : null,
     phase: run.phase,
     active,
     participants: Object.fromEntries(Object.entries(run.participants).map(([role, p]) => [role, {

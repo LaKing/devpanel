@@ -521,7 +521,7 @@ export function createSupervisor ({
    * exclusivity applies as for a start: one live run per issue, and none beside
    * a run this one cannot share the project with.
    */
-  async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false, acceptCheck = null }) {
+  async function answer ({ project, issueId, runId, text, actor, origin, pauseId, retryInput = false, refreshChecks = false, resume = false, recover = false, integrity = null, budgets = {}, continueRun = false, acceptCheck = null, acceptShortWallClock = false }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
@@ -576,7 +576,7 @@ export function createSupervisor ({
         }
       }
       const setup = resume && awaitsSetup(engine.run)
-      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin, acceptShortWallClock }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets, acceptShortWallClock }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
       // Stopped before it had a workspace: the setup it never finished, from its
       // own snapshot, and the turns after it, as a start would have gone on.
       if (setup) {
@@ -1737,6 +1737,11 @@ export function createSupervisor ({
   }
 
   const isActive = (project, issueId) => active.has(key(project, issueId))
+  /** When the check this process is running for that run began; null when none is. */
+  const liveCheckSince = (project, issueId, runId) => {
+    const record = active.get(key(project, issueId))
+    return record?.runId === runId ? record.engine?.checkRunningSince ?? null : null
+  }
 
   /** For tests and shutdown: wait for whatever is running to settle. */
   const settle = () => Promise.allSettled([...active.values()].map((r) => r.finished))
@@ -1808,7 +1813,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**

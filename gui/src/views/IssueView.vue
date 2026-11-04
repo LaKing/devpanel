@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import { wallClockAt, wallClockPrefill, wallClockUsedMinutes } from '@/wall-clock'
 import AddToIssue from '@/components/AddToIssue.vue'
 import IssueMaterial from '@/components/IssueMaterial.vue'
 import MarkdownText from '@/components/MarkdownText.vue'
@@ -119,7 +120,7 @@ const budgets = computed(() => {
     used: key === 'maxSteps' ? (used.steps ?? 0)
       : key === 'maxTokens' ? (used.tokens ?? 0)
         : key === 'maxCostUsd' ? (used.costUsd ?? 0)
-          : run.value?.startedAt ? Math.max(0, Math.round(((run.value.status === 'paused' ? Date.parse(run.value.pause?.at) : run.value.endedAt ? Date.parse(run.value.endedAt) : now.value) - Date.parse(run.value.startedAt) - (run.value.suspendedMs ?? 0)) / 60000)) : 0,
+          : wallClockUsedMinutes(run.value, now.value),
     unit: key === 'wallClockMinutes' ? 'min' : ''
   }))
 })
@@ -541,6 +542,8 @@ const pausing = ref(false)
 const resuming = ref(false)
 const resumeDialog = ref(false)
 const resumeBudgets = ref({})
+const acceptShortWallClock = ref(false)
+const resumeClock = computed(() => wallClockAt(run.value?.wallClock, resumeBudgets.value.wallClockMinutes))
 async function requestPause () {
   pausing.value = true
   actionError.value = ''
@@ -551,7 +554,8 @@ async function requestPause () {
 function openResume () {
   const limits = run.value.budgets?.limits ?? {}
   const used = run.value.budgets?.used ?? {}
-  resumeBudgets.value = { wallClockMinutes: Math.max(10080, limits.wallClockMinutes ?? 0) }
+  acceptShortWallClock.value = false
+  resumeBudgets.value = limits.wallClockMinutes ? { wallClockMinutes: wallClockPrefill(run.value.wallClock, { resume: true }) } : {}
   for (const key of ['maxSteps', 'maxTokens']) {
     if (limits[key]) resumeBudgets.value[key] = Math.max(limits[key], (used[key === 'maxSteps' ? 'steps' : 'tokens'] ?? 0) + 1)
   }
@@ -564,7 +568,7 @@ async function resumeRun () {
   resuming.value = true
   actionError.value = ''
   try {
-    await api.resumeRun(project.value, issueId.value, run.value.runId, resumeBudgets.value, actorName(answerActor.value) || undefined)
+    await api.resumeRun(project.value, issueId.value, run.value.runId, resumeBudgets.value, actorName(answerActor.value) || undefined, resumeClock.value?.short === true && acceptShortWallClock.value)
     resumeDialog.value = false
     await load()
   } catch (error) { actionError.value = error.message }
@@ -1093,12 +1097,15 @@ watch(() => route.query.run, (runId) => {
       <v-dialog v-model="resumeDialog" max-width="520">
         <v-card title="Resume this run">
           <v-card-text>
-            <p class="mb-4">Continue with the saved workspace, sessions and completed steps. Time spent paused is excluded; previous usage remains recorded.</p>
+            <p class="mb-4">Continue with the saved workspace, sessions and completed steps. Time spent paused, or waiting for checks with no seat working, is excluded; previous usage remains recorded.</p>
             <p v-if="run?.blockedReason === 'rounds-exhausted'" class="mb-4">Resume grants one more review round.</p>
             <p v-if="run?.blockedReason === 'protocol-repair-exhausted'" class="mb-4">Resume grants one more response repair attempt.</p>
             <v-text-field type="number" v-for="(_, key) in resumeBudgets" :key="key" v-model.number="resumeBudgets[key]"
-              :label="key === 'wallClockMinutes' ? 'Total active time limit (minutes; 10,080 = 7 days)' : key === 'maxSteps' ? 'Total step limit' : 'Total token limit'"
+              :label="key === 'wallClockMinutes' ? 'Total active time limit (minutes)' : key === 'maxSteps' ? 'Total step limit' : 'Total token limit'"
               :min="run?.budgets?.limits?.[key] ?? 1" density="compact" variant="outlined" />
+            <p v-if="resumeClock" class="mb-2">{{ resumeClock.text }}</p>
+            <v-alert v-if="resumeClock?.exhausted" type="warning" variant="tonal" class="mb-2">No time is left under this limit: raise it to resume.</v-alert>
+            <v-checkbox v-if="resumeClock?.short" v-model="acceptShortWallClock" density="compact" hide-details label="Less than a mean round is left: resume anyway. A turn may be cut at the deadline." />
             <v-alert v-if="actionError" type="error" variant="tonal">{{ actionError }}</v-alert>
           </v-card-text>
           <v-card-actions><v-spacer /><v-btn :disabled="resuming" @click="resumeDialog = false">Cancel</v-btn><v-btn color="primary" :loading="resuming" @click="resumeRun">Resume saved run</v-btn></v-card-actions>

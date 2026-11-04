@@ -22,7 +22,7 @@ const ms = (iso) => { const t = Date.parse(iso ?? ''); return Number.isFinite(t)
 const interval = (from, to) => (from != null && to != null && to > from ? { from, to } : null)
 
 /** Total length of a union of intervals: overlapping records count once. */
-function unionMs (intervals) {
+export function unionMs (intervals) {
   const sorted = intervals.filter(Boolean).sort((a, b) => a.from - b.from)
   let total = 0, cur = null
   for (const i of sorted) {
@@ -34,7 +34,7 @@ function unionMs (intervals) {
 }
 
 /** Length of `a` that lies inside the union of `b`. */
-function overlapMs (a, b) {
+export function overlapMs (a, b) {
   return unionMs(a) + unionMs(b) - unionMs([...a, ...b])
 }
 
@@ -51,15 +51,19 @@ const asksAQuestion = (pause) => Boolean(pause) && pause.kind !== 'manual'
  * attempts, results an amendment set aside, the base commit's checks, and the
  * runs the history keeps for earlier revisions. One check can appear in
  * several of these; the union counts it once. The time between check runs —
- * the engine comparing results, persisting, waiting — is not check time.
+ * the engine comparing results, persisting, waiting — is not check time. A base
+ * drive reused from the cache keeps the times of the run that drove it, which
+ * are not this run's.
  */
 function checkIntervals (run) {
   const span = (c) => { const a = ms(c?.at); return a != null && typeof c.durationMs === 'number' ? interval(a, a + c.durationMs) : null }
   const results = [...(run.checkResults ?? []), ...(run.priorCheckResults ?? [])]
   return [
     ...results.flatMap((c) => [span(c), ...(c.attempts ?? []).map(span)]),
-    ...(run.baselineChecks ?? []).map(span),
+    ...(run.baselineChecks ?? []).filter((b) => !b.reused).map(span),
     ...(run.diagnosticDrives ?? []).map(span),
+    // A wait for a slot is check waiting, whether or not the drive left a result.
+    ...(run.driveSlotWaits ?? []).map((w) => interval(ms(w.from), ms(w.to))),
     ...(run.checkHistory ?? []).flatMap((h) => (h.runs ?? []).map(span))
   ].filter(Boolean)
 }
@@ -93,8 +97,13 @@ export function driveSlotWaitMs (run, { open = [], now = null } = {}) {
  * the engine also adds that span to `controlSuspendedMs` so the wall-clock
  * budget excuses it. Summing the two fields would count it twice. What was
  * recorded twice is reported, not hidden.
+ *
+ * `checksAloneMs` is what the wall-clock budget excuses (wall-clock.mjs). Two
+ * options exist for it alone: a check still running (`liveCheckSince`, known
+ * only to the engine driving it) and a stop at `checksUntil`, past which a
+ * check that was settling is the stop's time.
  */
-function timeSplit (run, now) {
+export function timeSplit (run, now, { liveCheckSince = null, checksUntil = null } = {}) {
   const started = ms(run.startedAt)
   const ended = ms(run.endedAt) ?? now
   const elapsedMs = started != null && ended >= started ? ended - started : null
@@ -147,16 +156,35 @@ function timeSplit (run, now) {
   // Check time outside every seat turn is the run waiting on its checks. The
   // part of that which also lay inside a wait or a suspension is already
   // counted there, so only the rest leaves otherMs.
-  const checks = checkIntervals(run)
+  const until = (c) => (checksUntil == null ? c : interval(c.from, Math.min(c.to, checksUntil)))
+  const checks = [...checkIntervals(run), interval(liveCheckSince, now)].filter(Boolean).map(until).filter(Boolean)
   const checksMs = unionMs(checks)
-  // A turn still in flight is a seat turn too, running until now.
-  for (const p of Object.values(run.participants ?? {})) if (p?.pendingInvocation) turns.push(interval(ms(p.pendingInvocation.startedAt), ended))
+  // A turn still in flight is a seat turn too, running until now; one that
+  // already stopped and waits on a decision ran until it stopped.
+  for (const p of Object.values(run.participants ?? {})) {
+    const pending = p?.pendingInvocation
+    if (pending) turns.push(interval(ms(pending.startedAt), ms(pending.stoppedAt) ?? ms(pending.answeredAt) ?? ended))
+  }
+  // Seat time a check may not be excused beside, beyond the answered turns: turns
+  // that never answered, and a step the record cannot place (adopted after a
+  // restart). These lean towards counting and go into no other figure.
+  for (const t of run.interruptedTurns ?? []) turns.push(interval(ms(t.startedAt), ms(t.endedAt)))
+  for (const s of run.steps ?? []) {
+    if (s.role !== 'operator' && (ms(s.startedAt) == null || ms(s.endedAt) == null)) turns.push(interval(ms(s.startedAt) ?? started, ms(s.endedAt) ?? ms(s.adoptedAt) ?? ended))
+  }
   const seatTurns = turns.filter(Boolean)
   const waitingForChecksMs = checksMs - overlapMs(checks, seatTurns)
-  const checksAloneMs = checksMs - overlapMs(checks, [...seatTurns, ...waits, ...suspensions.filter(Boolean)])
+  // Input-limit retries and check refreshes are recorded as totals, each with its span beside it.
+  const retryStops = (run.failures ?? []).map((f) => interval(ms(f.retryStop?.from), ms(f.retryStop?.to)))
+  const refreshStops = [run.checkRefresh, ...(run.checkRefreshHistory ?? [])].map((r) => interval(ms(r?.stop?.from), ms(r?.stop?.to)))
+  const checksAloneMs = checksMs - overlapMs(checks, [...seatTurns, ...waits, ...suspensions, ...retryStops, ...refreshStops].filter(Boolean))
+  // What the totals excuse that no interval places (an older record): a check
+  // may lie inside it, and only the wall clock's reading has to care.
+  const placedStops = [...completedWaits, ...resumes.map((r) => interval(ms(r.at) - r.suspendedMs, ms(r.at))), ...retryStops, ...refreshStops].filter(Boolean)
+  const unplacedStopsMs = Math.max(0, control + (run.inputRetrySuspendedMs ?? 0) + (run.checkRefreshSuspendedMs ?? 0) - unionMs(placedStops))
   const remainder = elapsedMs == null ? null : elapsedMs - agentMs - operatorWaitMs - suspendedMs - checksAloneMs
   return {
-    elapsedMs, agentMs, seatMs, operatorWaitMs, suspendedMs, checksMs, waitingForChecksMs, driveSlotWaitMs: driveSlotWaitMs(run),
+    elapsedMs, agentMs, seatMs, operatorWaitMs, suspendedMs, checksMs, waitingForChecksMs, checksAloneMs, unplacedStopsMs, driveSlotWaitMs: driveSlotWaitMs(run),
     otherMs: remainder == null ? null : Math.max(0, remainder),
     // A negative remainder means the parts exceed the whole: the record is
     // inconsistent and the split must not be trusted for this run.
@@ -165,7 +193,7 @@ function timeSplit (run, now) {
     waitsInControlTotalMs,
     unknownSteps,
     basis,
-    means: 'agent turns, waits on a question and suspensions are disjoint intervals unioned from the record (seatMs is the seats\' own time summed: concurrent reviewers each count); checksMs is the union of every recorded check run (overlap with seat turns counted once), waitingForChecksMs the part of it during which no seat turn ran, and otherMs excludes that part; driveSlotWaitMs is the check time spent waiting for a slot on a staging host, inside checksMs and, where no seat turn ran, inside waitingForChecksMs; a turn still in flight counts as a seat turn until now, and the engine\'s work between check runs stays in otherMs; overlappingSuspensionMs is recorded suspension that lay inside a wait and was counted as the wait; waitsInControlTotalMs is answered waiting the engine also folded into controlSuspendedMs, counted here once as waiting; suspendedMs "inferred" means an older record carried only a total; inconsistentMs > 0 means the parts exceed the elapsed time'
+    means: 'agent turns, waits on a question and suspensions are disjoint intervals unioned from the record (seatMs is the seats\' own time summed: concurrent reviewers each count); checksMs is the union of every recorded check run (overlap with seat turns counted once), waitingForChecksMs the part of it during which no seat turn ran (a turn cut, failed or lost counts as a seat turn until it stopped, a step adopted after a restart until it was adopted), checksAloneMs that part outside waits and stops, which the wall-clock budget excuses less unplacedStopsMs (suspension totals no interval places), and otherMs excludes it; driveSlotWaitMs is the check time spent waiting for a slot on a staging host, inside checksMs and, where no seat turn ran, inside waitingForChecksMs; a turn still in flight counts as a seat turn until now, and the engine\'s work between check runs stays in otherMs; overlappingSuspensionMs is recorded suspension that lay inside a wait and was counted as the wait; waitsInControlTotalMs is answered waiting the engine also folded into controlSuspendedMs, counted here once as waiting; suspendedMs "inferred" means an older record carried only a total; inconsistentMs > 0 means the parts exceed the elapsed time'
   }
 }
 
@@ -179,7 +207,7 @@ function timeSplit (run, now) {
  * boundary: a mark never erases an unmarked restart before it, and a rerun a
  * mark explains is not counted twice.
  */
-function cycleBoundaries (run) {
+export function cycleBoundaries (run) {
   const steps = run.steps ?? []
   const effects = run.coordinatorEffects ?? {}
   const recorded = Object.entries(effects).filter(([, e]) => e?.reset).map(([n]) => Number(n)).sort((a, b) => a - b)
@@ -197,7 +225,7 @@ function cycleBoundaries (run) {
   return { after, inferred, recorded: recorded.length, basis: inferred === 0 ? 'recorded' : recorded.length ? 'mixed' : 'inferred' }
 }
 
-const cycleOf = (boundaries, stepNumber) => boundaries.after.filter((n) => Number(stepNumber) > n).length
+export const cycleOf = (boundaries, stepNumber) => boundaries.after.filter((n) => Number(stepNumber) > n).length
 
 /**
  * Round executions per phase, beside cycle restarts. A round execution is one

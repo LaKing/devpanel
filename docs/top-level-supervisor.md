@@ -1126,6 +1126,9 @@ After an operator installs missing candidate tests, `refresh_checks_run` lets th
 supervisor reassess a retained closure-blocked candidate without another full
 implementation run. Accepted residual risk does not turn an unmet acceptance
 criterion into a met one.
+A run with less wall clock left than its mean round is refused with both numbers
+(execution-contract.md "What the wall clock counts"): only an operator can raise the
+limit or override it, so that goes to `ask_operator`.
 `continue_run {project, issueId, runId, instruction}` continues a run it owns that
 stopped at closure (execution-contract.md "Continuing a run stopped at closure"):
 the author gets another round with the instruction, the closure record and the new

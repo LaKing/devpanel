@@ -1369,6 +1369,15 @@
     "checkRefreshSuspendedMs": {
       "type": "number",
       "minimum": 0
+    },
+    "interruptedTurns": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Seat turns that ran and never answered (aborted, failed, quarantined, lost), with when they started and stopped: check time beside them is not excused from the wall clock."
+    },
+    "wallClockRule": {
+      "type": "string",
+      "description": "The wall-clock rule the run started under; absent on a run that started before the rule. Every run is counted by the current rule; this says only which panel defaults it gets."
     }
   }
 }

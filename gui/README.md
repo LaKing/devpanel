@@ -740,14 +740,14 @@ Three properties this shape exists to hold:
 
 Run controls: **Pause run** finishes and saves the current turn, then waits.
 **Resume run** continues with the same sessions, steps and workspace. Its dialog
-shows total budget allowances (seven days by default); previously spent usage is
+shows total budget allowances, starting from the run's own limit (a run from before the wall-clock rule keeps seven days); previously spent usage is
 retained. Decision pauses continue through **Record answer and continue**.
 The endpoints are `POST /api/projects/:project/issues/:id/runs/:runId/pause`
-and `POST …/resume` (optional body: `{ "budgets": { "wallClockMinutes": 10080 } }`).
+and `POST …/resume` (optional body: `{ "budgets": { "wallClockMinutes": 480 }, "acceptShortWallClock": true }`; the flag accepts less wall clock than the run's mean round, execution-contract.md "What the wall clock counts").
 **Continue playbook** (`src/components/ContinueRun.vue`) is offered on a code run
 stopped at closure (`closure-conditions-unmet`, `refreshed-checks-failed`) with its
 candidate retained: `POST …/continue` `{ "instruction": "…", "actor": "…",
-"budgets": {…} }` gives the author another round of the loop that produced the
+"budgets": {…}, "acceptShortWallClock": true }` (the flag as for resume) gives the author another round of the loop that produced the
 candidate, in the same worktree and sessions, then reviews, checks and closure run
 again. The server adds the closure record and the issue notes written since the run
 began to the recorded decision. Resume does not fit there: replaying an unchanged

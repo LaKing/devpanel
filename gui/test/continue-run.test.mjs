@@ -83,4 +83,67 @@ export default async function (t) {
     t.eq('a second Continue would not carry the same note again', (await engine.notesSinceStart()).length, 0)
     await releaseWorkspace(engine)
   }
+
+  t.section('Continue refuses when the wall clock left is below the mean round, naming both')
+  {
+    const hour = 60 * 60_000
+    // Every completed round but one is cleared: one round of an hour, on the stopped run's record.
+    const aRound = (engine) => {
+      const audit = engine.run.steps.find((s) => engine.outputs[s.number]?.contract === 'reviewResult')
+      for (const s of engine.run.steps) if (s !== audit && s.phase === audit.phase) Object.assign(s, { endedAt: s.startedAt, durationMs: 0 })
+      audit.endedAt = new Date(Date.parse(audit.startedAt) + hour).toISOString()
+    }
+    {
+      const { engine } = await scenario()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const steps = engine.run.steps.length
+      const refused = await engine.continueRun({ text: 'x', actor: 'supervisor' }).then(() => null, (e) => e)
+      t.eq('refused, with the code and the mean in detail', [refused?.status, refused?.code, refused?.detail?.meanRoundMs, refused?.detail?.rounds], [422, 'WALL_CLOCK_SHORT', hour, 1])
+      t.ok('and both numbers in the message any caller reads', refused?.message.includes('30 min') && refused.message.includes('60 min'), refused?.message)
+      t.eq('no decision step, and still stopped', [engine.run.steps.length, engine.run.status, engine.run.continueHistory ?? []], [steps, 'blocked', []])
+      const entry = await engine.continueRun({ text: 'x', actor: 'tester', acceptShortWallClock: true })
+      t.eq('an explicit override passes and is recorded', [entry.wallClock.overridden, engine.run.continueHistory.at(-1).wallClock.meanRoundMs], [true, hour])
+      await releaseWorkspace(engine)
+    }
+    {
+      const { engine } = await scenario()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const entry = await engine.continueRun({ text: 'x', actor: 'tester', budgets: { wallClockMinutes: 90 } })
+      t.eq('a raise that holds a round passes', [entry.wallClock.overridden, entry.limits.wallClockMinutes], [false, 90])
+      await releaseWorkspace(engine)
+    }
+    {
+      const { engine } = await scenario()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.startedAt = new Date(Date.parse(engine.run.endedAt) - 40 * 60_000).toISOString()
+      const steps = engine.run.steps.length
+      const spent = await engine.continueRun({ text: 'x', actor: 'tester', acceptShortWallClock: true }).then(() => null, (e) => e)
+      t.eq('exhausted: the override does not get past it', [spent?.status, spent?.code, spent?.detail?.remainingMs, spent?.detail?.meanRoundMs, engine.run.steps.length], [422, 'WALL_CLOCK_EXHAUSTED', 0, hour, steps])
+      t.ok('and the message names both', spent?.message.includes('0 min remaining of 30') && spent.message.includes('60 min'), spent?.message)
+      await releaseWorkspace(engine)
+    }
+    {
+      const { engine } = await scenario()
+      aRound(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.budgets.limits.maxSteps = 1
+      const steps = engine.run.steps.length
+      const other = await engine.continueRun({ text: 'x', actor: 'tester', acceptShortWallClock: true }).then(() => null, (e) => e)
+      t.ok('another budget exhausted: its refusal names both numbers too', other?.status === 422 && /exhausted budget/.test(other.message) && other.message.includes('30 min') && other.message.includes('60 min'), other?.message)
+      t.eq('with both in detail, and the override does not get past it', [other?.detail?.remainingMs, other?.detail?.meanRoundMs, engine.run.steps.length], [30 * 60_000, hour, steps])
+      await releaseWorkspace(engine)
+    }
+    {
+      const { engine } = await scenario()
+      for (const output of Object.values(engine.outputs)) if (output.contract === 'reviewResult') output.contract = 'cleared'
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.startedAt = new Date(Date.parse(engine.run.endedAt) - 40 * 60_000).toISOString()
+      const spent = await engine.continueRun({ text: 'x', actor: 'tester' }).then(() => null, (e) => e)
+      t.ok('exhausted with no completed round says so', spent?.code === 'WALL_CLOCK_EXHAUSTED' && /no mean round time/.test(spent.message), spent?.message)
+      await releaseWorkspace(engine)
+    }
+  }
 }
