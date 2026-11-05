@@ -925,6 +925,27 @@ in their diagnostics rather than claim more than they enforce, and the
 recorded policy is what an auditor checks a transcript against. Check
 commands themselves run only in the rebuilt candidate.
 
+**A Node child's output that could not be read.** Under some sandboxes a Node
+program that reads a Node child through `execFile` gets exit 0 and no output,
+whatever the child printed. The offline wrapper measures this for each declared
+command once isolation is decided, and changes nothing about the command: `child
+output unobservable` on stderr when a child's output came back empty, `child output
+unchecked` when the measurement itself failed, nothing when it was read. Each line
+carries that call's nonce, and those seen in a turn's output are on its step as
+`step.childOutput` and in `result.md`. That is not a failure of the turn and
+nothing gates on it: `run.failures` keeps provider refusals (`refusal`), adapter
+failures (`runtime`) and fence failures (`environment`), and `step.fence` a turn's
+`namespace: 0`.
+
+With `devpanel-offline: child output unobservable` on a command's stderr, a result
+that depends on a Node child's output, such as exit 0 with nothing printed or a test
+failing on empty child output like `Unexpected end of JSON input`, is not evidence:
+not "the command printed nothing", not a pass, and not by itself a defect of the
+candidate. Record it as not observed under `verification.notRun`, quoting the line,
+and judge from other evidence such as a check drive. `devpanel-offline: child output
+unchecked` means it is not known whether such output can be read here. Through the
+wrapper with neither line, empty output with exit 0 means the command printed nothing.
+
 Beside the configured roots, every working seat may read the run's `evidence/`
 and `checks/` directories (read-only). Once a check exists, its prompt names
 `checks/`: each check's directory holds every command's full `.log` and

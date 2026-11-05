@@ -62,7 +62,7 @@ import { candidateDiff } from './diff.mjs'
 import { COORDINATOR_INSTRUCTIONS, TRIAGE_READ_INSTRUCTIONS, coordinationInput } from './coordination.mjs'
 import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
 import { ensureMountPoint, fenceStubsPresent, removeFenceStubs } from './tooling-mounts.mjs'
-import { toolingBrief } from './tooling-commands.mjs'
+import { childOutputScan, toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
 import { holdGatesTurn, openOwnerHolds, ownerHoldKey, ownerHoldsOf } from './owner-holds.mjs'
 import { interruptedFromEvents, wallClockElapsedMs, wallClockRefusal, wallClockStanding } from './wall-clock.mjs'
@@ -1635,6 +1635,9 @@ export class Engine {
         // Whether the seat fence held this turn, and if not, why (decision 8:
         // a turn that could not be fenced runs, visibly, as namespace 0).
         ...(pending.fence ? { fence: pending.fence } : {}),
+        // The offline wrapper's lines seen in this turn's output, if any: a Node
+        // child's output could not be read. Reported; nothing gates on it.
+        ...(pending.childOutput ? { childOutput: pending.childOutput } : {}),
         // How the turn's declared commands were given when not inside the fence.
         ...(pending.tooling ? { tooling: pending.tooling } : {}),
         // The runtime's descendant scan (process.mjs): proved, or why not.
@@ -2598,7 +2601,14 @@ export class Engine {
         .then((written) => { if (written.entry) this.emit?.({ type: 'live', role, stepId: step.id, invocationId, entry: written.entry }) })
         .catch(() => {})
     }
-    const onOutput = (stream, chunk) => forward(stream, String(chunk))
+    // A wrapper line saying a Node child's output could not be read: what the turn
+    // saw, on the step, never a failure of the turn (tooling-commands.mjs).
+    const scanChildOutput = childOutputScan()
+    const onOutput = (stream, chunk) => {
+      const seen = scanChildOutput(String(chunk))
+      if (seen) pending.childOutput = seen
+      forward(stream, String(chunk))
+    }
     // The command line opens the terminal view; see runtime/command-line.mjs.
     const onSpawn = ({ pid: id, command, args, cwd }) => forward('spawn', `process ${id} started`, command ? { pid: id, ...describeCommand({ command, args, cwd }) } : { pid: id })
 

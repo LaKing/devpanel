@@ -237,7 +237,14 @@ supervisor, model oracle, performance probe) always pass `hygiene: true`.
   early or fails proves nothing. The wrapper's own interpreter (`/bin/sh`) is
   where trust starts: a preload that subverts the shell itself is beyond what a
   script can check. Neither isolation proved, it exits **125**, says the command was
-  NOT run with both reasons, and never falls back to running it with network. The prompt tells the seat to record exactly that, quoted. **Network
+  NOT run with both reasons, and never falls back to running it with network. The prompt tells the seat to record exactly that, quoted. Once
+  isolation is decided, the wrapper also measures whether a Node child's output
+  can be read here: fixed-path `/usr/bin/node`, every variable unset, a per-call
+  nonce read back through `execFile`. It says `child output unobservable [<nonce>]`
+  on stderr when a cleanly exiting child's output came back empty, `child output
+  unchecked [<nonce>]` when the measurement failed, and nothing when it was read.
+  The command runs the same either way, with its own exit code, and the exit 125
+  path never measures (docs/execution-contract.md "Tooling policy"). **Network
   policy:** nothing here grants network; a turn's own `networkAccess`
   (infrastructure inspection) and the CLI's API traffic are unchanged, and the
   declared commands have none. Seats never install anything: the mounts are

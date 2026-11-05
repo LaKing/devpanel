@@ -21,11 +21,20 @@
 # a verifier that exits 0 with a final line carrying the nonce made for this
 # call counts as proof (one that stops early or fails proves nothing).
 #
+# Once isolation is decided, and only then, one thing is measured and reported,
+# never decided on: whether a Node child's output can be read here. A fixed-path
+# Node with every variable unset reads a child's stdout through execFile. An
+# empty answer from a child that exited cleanly says "child output unobservable"
+# on stderr, any other failure of the measurement "child output unchecked", and
+# an intact answer says nothing. The command then runs the same either way, with
+# its own exit code. The exit 125 path never gets here.
+#
 # Exit 64: usage. Exit 125: network isolation could not start in this seat and
 # no denial was proved, so the command was NOT run. There is no fallback to
 # running it with network.
 BWRAP=/usr/bin/bwrap
 VERIFIER=/usr/bin/python3
+NODE=/usr/bin/node
 NL='
 '
 # Unset every exported variable whose name matches the pattern $1 (builtins only).
@@ -42,7 +51,32 @@ EOF
 drop 'LD_*'
 if [ "$#" -eq 0 ]; then echo 'devpanel-offline: usage: offline <program> [args...]' >&2; exit 64; fi
 if [ "$1" = "--" ]; then echo 'devpanel-offline: no "--" separator; pass the program directly' >&2; exit 64; fi
+nonce=
+IFS= read -r nonce < /proc/sys/kernel/random/uuid 2>/dev/null
+CHILD_PROBE='
+const nonce = process.argv[1]
+const bound = setTimeout(() => { console.log("failed " + nonce + " timeout"); process.exit(0) }, 15000)
+require("node:child_process").execFile(process.execPath, ["-e", "process.stdout.write(process.argv[1])", nonce], { timeout: 12000 }, (e, out) => {
+  clearTimeout(bound)
+  if (e) console.log("failed " + nonce + " " + (e.killed ? "timeout" : String(e.code).replace(/[^A-Za-z0-9_-]/g, "")))
+  else if (out === nonce) console.log("observed " + nonce)
+  else if (out === "") console.log("discarded " + nonce)
+  else console.log("failed " + nonce + " altered")
+})
+'
+UNKNOWN="whether a Node child's output can be read here is unknown"
+check_child_output () {
+  answer=
+  [ -n "$nonce" ] && answer=$(cd / && drop '*'; exec "$NODE" -e "$CHILD_PROBE" "$nonce" 2>/dev/null)
+  case $answer in
+    "observed $nonce") ;;
+    "discarded $nonce") echo "devpanel-offline: child output unobservable [$nonce]: in this runtime's sandbox a Node child's output read through execFile came back empty (0 bytes); the command still runs and its exit code is its own, but empty output from a Node child here means it could not be observed, not that the child printed nothing; output a command writes directly is unaffected" >&2 ;;
+    "failed $nonce "*) echo "devpanel-offline: child output unchecked [$nonce]: the measurement's Node child failed (${answer##* }); $UNKNOWN" >&2 ;;
+    *) echo "devpanel-offline: child output unchecked [$nonce]: the measurement at $NODE gave no answer; $UNKNOWN" >&2 ;;
+  esac
+}
 if err=$("$BWRAP" --dev-bind / / --unshare-net --die-with-parent -- /bin/true 2>&1); then
+  check_child_output
   exec "$BWRAP" --dev-bind / / --unshare-net --die-with-parent -- "$@"
 fi
 NO_IP='
@@ -59,12 +93,11 @@ for family, fname in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6")):
 if opened: print("IP sockets are not refused (" + ", ".join(opened) + ")"); sys.exit(1)
 print("proved " + sys.argv[1])
 '
-nonce=
-IFS= read -r nonce < /proc/sys/kernel/random/uuid 2>/dev/null
 why=$(drop '*'; exec "$VERIFIER" -I -S -c "$NO_IP" "$nonce" 2>&1)
 status=$?
 if [ "$status" -eq 0 ] && [ -n "$nonce" ] && [ "${why##*"$NL"}" = "proved $nonce" ]; then
   echo 'devpanel-offline: isolation inherited: no network namespace here, but this runtime refuses IP sockets (proved: seccomp filter, EPERM creating TCP and UDP sockets, IPv4 and IPv6); loopback is refused too' >&2
+  check_child_output
   exec "$@"
 fi
 echo "devpanel-offline: network isolation could not start in this seat: ${err:-bwrap unavailable}" >&2

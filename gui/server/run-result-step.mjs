@@ -111,6 +111,12 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
     for (const a of assumptions) lines.push(`- ${a.decision} — ${a.reason} (step ${String(a.step).padStart(3, '0')})`)
     lines.push('')
   }
+  const unread = (run.steps ?? []).filter((s) => s.childOutput)
+  if (unread.length) {
+    lines.push('## Output a command could not observe', '', 'Empty output from a Node child in these turns may not mean it printed nothing; it is not evidence either way (docs/execution-contract.md "Tooling policy").', '')
+    for (const s of unread) lines.push(`- step ${s.number} (${s.role}): lines seen in its output: ${s.childOutput.unobservable} unobservable, ${s.childOutput.unchecked} unchecked`)
+    lines.push('')
+  }
   const risks = run.closure?.residualRisks ?? []
   if (risks.length) {
     lines.push('## Left open', '')

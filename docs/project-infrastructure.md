@@ -690,7 +690,9 @@ What happens with them:
   `isolation inherited`; loopback is refused there too, so a command that
   listens on it fails in a Codex seat. Exit 125 from the wrapper means neither
   isolation could be had in that seat: the command was not run, and the seat
-  records it as not run with the line and output quoted. No
+  records it as not run with the line and output quoted. A command that does
+  run may carry `child output unobservable` on stderr: a Node child's output could
+  not be read in that seat (docs/execution-contract.md "Tooling policy"). No
   new network is granted; infrastructure inspection access is unchanged.
 - **"Could not run" is not a report for a listed command.** Author, plan and
   audit prompts, the coordinator's briefs and its closure confirmation list the

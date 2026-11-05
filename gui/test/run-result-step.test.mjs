@@ -44,6 +44,15 @@ export default async function (t) {
   t.ok('its cost is time and tokens, never money', text.includes('- Time: 00:12:30') && text.includes('- Tokens: 4.28 M tokens') && !text.includes('$'), text.split('## Record')[1])
   t.eq('the patch is copied beside it', await fs.readFile(path.join(folder, 'changes.patch'), 'utf8'), 'diff --git a/x b/x\n')
 
+  t.section('a turn that could not observe a Node child\'s output says so in the result')
+  {
+    const heading = '## Output a command could not observe'
+    t.ok('nothing is said when no turn saw it', !renderResult(base).includes(heading))
+    const seen = renderResult({ ...base, steps: [{ number: '001', role: 'auditor-1', childOutput: { unobservable: 2, unchecked: 1, line: 'the line' } }, { number: '002', role: 'implementer' }] })
+    t.ok('the section names the step, the seat and the counts', seen.includes(heading) && seen.includes('step 001 (auditor-1)') && seen.includes('2 unobservable, 1 unchecked'), seen)
+    t.ok('and only that step', !seen.includes('step 002'))
+  }
+
   t.section('a later end rewrites the same entry')
   await fs.writeFile(path.join(dir, 'runs', 'r1', 'run.json'), JSON.stringify({ ...base, status: 'blocked', outcome: 'unresolved', blockedReason: 'budget-exhausted', budgets: { limits: { maxSteps: 1 }, used: { steps: 1 } } }))
   const again = await writeRunResultStep({ issuePath: dir, runId: 'r1' })

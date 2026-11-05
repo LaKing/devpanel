@@ -245,7 +245,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   sockets, IPv4 and IPv6, checked by `/usr/bin/python3 -I -S` with every variable unset and `LD_*` dropped before anything runs, proof
   only on exit 0 plus a per-call nonce —, which refuses
   loopback too; otherwise exit 125 = isolation unavailable, NOT run, no
-  fallback), and "could not run" for a listed command must quote the attempt. Gemini seats have no shell and are
+  fallback; once isolation is decided it also measures whether a Node child's output can be read here, `child output unobservable` on stderr and `step.childOutput` when not, execution-contract.md "Tooling policy"), and "could not run" for a listed command must quote the attempt. Gemini seats have no shell and are
   told so. The panel's own project mounts `gui/node_modules` and `gui/.browser` (the browser suite builds into scratch,
   served through `DEVPANEL_DIST_DIR`); an application can mount its own formatter module for
   `harness/tooling/prettier-check.mjs`, which calls that formatter handler and compares. `npm run live -- --tooling --project <id>` is the paid proof.

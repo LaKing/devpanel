@@ -593,6 +593,17 @@
           },
           "reportFile": {
             "type": "string"
+          },
+          "childOutput": {
+            "type": "object",
+            "description": "The offline wrapper's lines seen in this turn's output: how many calls said a Node child's output came back empty (unobservable) or could not be measured (unchecked), and one line verbatim. Not a failure of the turn; nothing gates on it.",
+            "additionalProperties": false,
+            "required": ["unobservable", "unchecked", "line"],
+            "properties": {
+              "unobservable": { "type": "integer", "minimum": 0 },
+              "unchecked": { "type": "integer", "minimum": 0 },
+              "line": { "type": "string" }
+            }
           }
         }
       }
