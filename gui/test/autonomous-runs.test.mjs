@@ -141,8 +141,11 @@ export default async (t) => {
     t.eq('with the split recorded', run.ownerInput?.split?.length, 2)
     t.eq('its result names the split', runResult(run, {}).resultReason, 'owner-split')
     const starts = []
+    const archivedPart = await f.issues.createIssue('devpanel-project', { name: split[0].title })
+    await f.issues.setIssueArchived('devpanel-project', archivedPart.id, true, { overrideReason: 'test' })
     const out = await createOwnerInput({ issues: f.issues, supervisor: { start: async (a) => { starts.push(a); return {} } }, configRoot: f.configRoot })
       .answer({ project: 'devpanel-project', issueId: f.issue.id, runId: engine.runId, actor: 'op', split: 'accept' })
+    t.eq('a part whose id an archived issue holds gets its own', out.answer.createdIssues[0], `${archivedPart.id}-2`)
     t.eq('two issues were created', out.answer.createdIssues.length, 2)
     t.eq('and nothing started', starts.length, 0)
     const issue = await f.issues.getIssue('devpanel-project', f.issue.id)

@@ -3,14 +3,18 @@ import os from 'node:os'
 import express from 'express'
 
 import { clientHost } from './opened-by.mjs'
+import { validFingerprint } from './report-identity.mjs'
 import { reporterForKey } from './reporters.mjs'
 
 /*
- * POST /api/report/:project {input, kind?, category?} — open an issue from a project's deployment.
+ * POST /api/report/:project {input, kind?, category?, fingerprint?} — open an issue from a project's deployment.
  *
  * It can do nothing else: no run is started, nothing is read back, the answer is only {project, id, trust}.
  * A report already opened today is answered 409 {error, project, id}, naming that issue so the reporter
- * can stop resubmitting; only its id, which the report's own title and the date determine.
+ * can stop resubmitting; only its id, which the report's own title and the date determine. An id an archived
+ * issue holds is never taken, and two reports of one title whose fingerprints differ are two issues
+ * (issues.js createIssue). A fingerprint comes from `fingerprint` or from the report's own text; a match with
+ * an earlier issue is recorded on the new one, never told to the reporter (report-identity.mjs).
  * Mounted in index.js BEFORE the token gate, with its own small body parser.
  *
  * Who may: a peer whose address is private (RFC 1918, IPv6 ULA) and that did not come through the
@@ -81,15 +85,19 @@ export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refu
       const category = req.body?.category ?? null
       if (!KINDS.includes(kind)) return res.status(400).json({ error: `kind must be one of ${KINDS.join(', ')}` })
       if (category !== null && !CATEGORIES.includes(category)) return res.status(400).json({ error: `category must be one of ${CATEGORIES.join(', ')}` })
+      const fingerprint = req.body?.fingerprint ?? null
+      if (fingerprint !== null && !validFingerprint(fingerprint)) return res.status(400).json({ error: 'fingerprint must be one word of 6 to 128 letters, digits and . _ : + / = -, starting with a letter or digit' })
       const input = reportText(req.body?.input)
       if (!input) return res.status(400).json({ error: 'input (the report as Markdown) is required' })
       const bucket = reporter ? `reporter:${reporter.name}` : `peer:${bare(req.socket.remoteAddress)}`
       const times = (recent.get(bucket) ?? []).filter((t) => now() - t < WINDOW_MS)
       if (times.length >= PER_WINDOW) return res.status(429).json({ error: `at most ${PER_WINDOW} reports per ${WINDOW_MS / 60000} minutes from one reporter or address` })
       recent.set(bucket, [...times, now()])
-      const report = { kind, category, reporter: reporter?.name ?? null, trust: reporter ? kind : 'anonymous' }
+      const report = { kind, category, reporter: reporter?.name ?? null, trust: reporter ? kind : 'anonymous', ...(fingerprint ? { fingerprint } : {}) }
       const issue = await createIssue(req.params.project, { input, reportOrigin: report, openedBy: { user: reporter?.name ?? 'report', host: await clientHost(req) } })
       emit({ reason: 'issue-created', project: issue.project, id: issue.id })
+      // Unknown format, or several values: no repeat can be claimed for it, and that should be findable.
+      if (issue.report && !issue.report.fingerprint && /fingerprint/i.test(input)) console.info(`${req.method} ${req.path}: ${issue.id} mentions a fingerprint, but none could be read`)
       res.status(201).json({ project: issue.project, id: issue.id, trust: report.trust })
     } catch (error) {
       // A resubmission is routine, not a failure: info here, because the app's error handler warns.

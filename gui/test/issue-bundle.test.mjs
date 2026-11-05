@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import crypto from 'node:crypto'
 
 export const name = 'archived issues are packed out of the project folder, and restored intact'
 
@@ -133,6 +134,168 @@ export default async function (t) {
     }
     t.eq('reads beside the pack: every archive succeeds, reads as packed and leaves no folder', outcomes.filter(([refused, archived, isPacked, folder]) => refused || !archived || !isPacked || folder), [])
     t.eq('nothing of the removal stays in the project folder', (await fs.readdir(path.join(issuesDir, project))).filter((n) => n.startsWith('.removing-')), [])
+
+    const { bundleFiles, packIssue, unpackIssue } = await import('../server/issue-bundle.mjs')
+    const { buildOverview } = await import('../server/supervisor-overview.mjs')
+    const sha = (file) => fs.readFile(file).then((bytes) => crypto.createHash('sha256').update(bytes).digest('hex'))
+    const sums = async (files, names) => Object.fromEntries(await Promise.all(names.map(async (n) => [n, await sha(files[n])])))
+    const folderOf = (id) => path.join(issuesDir, project, id)
+    const packedIssue = async (title) => {
+      const issue = await issues.createIssue(project, { name: title })
+      await issues.createStep(project, issue.id, { name: 'older-note', text: 'only in the older issue' })
+      await issues.setIssueArchived(project, issue.id, true, { overrideReason: 'test fixture' })
+      return { id: issue.id, dir: folderOf(issue.id), files: bundleFiles(issuesDir, project, issue.id) }
+    }
+    // What an id that once named two left behind: a folder beside a bundle of its id, built by hand.
+    const collided = async (title) => {
+      const older = await packedIssue(title)
+      await issues.createEngineNote(project, older.id, { name: 'owed', text: 'owed to the older issue', invocationId: `owed-${older.id}` })
+      await fs.mkdir(older.dir)
+      await fs.writeFile(path.join(older.dir, 'issue.json'), JSON.stringify({ name: `${title} (newer)`, project, status: 'open' }))
+      return older
+    }
+    const named = (error, { dir, files }) => error?.status === 409 && error.message.includes(dir) && error.message.includes(files.bundle)
+    const refusalOf = (promise) => promise.then(() => null, (error) => error)
+
+    t.section('archiving never lands on a bundle of its id')
+    {
+      const c = await collided('Collision archive')
+      const before = await sums(c.files, ['bundle', 'summary', 'runs', 'notes'])
+      const error = await refusalOf(issues.setIssueArchived(project, c.id, true, { overrideReason: 'test fixture' }))
+      t.ok('refused, naming both', named(error, c), error?.message)
+      t.eq('the folder stays open and unmarked', await exists(path.join(c.dir, '.archive.json')), false)
+      t.eq('the bundle and every file beside it are byte for byte what they were', await sums(c.files, ['bundle', 'summary', 'runs', 'notes']), before)
+      t.ok('the older issue is still in the bundle', (await exec('tar', ['-tzf', c.files.bundle])).stdout.includes('older-note'))
+      const direct = await refusalOf(packIssue({ issuesDir, project, id: c.id, issue: { id: c.id }, releaseWorktrees: null }))
+      t.ok('packIssue itself refuses too', named(direct, c), direct?.message)
+      t.eq('still as they were', await sums(c.files, ['bundle', 'summary', 'runs', 'notes']), before)
+    }
+
+    t.section('a folder and a bundle of one id both stay readable, each as itself')
+    {
+      const c = await collided('Collision reads')
+      const before = await sums(c.files, ['bundle', 'summary', 'runs', 'notes'])
+      t.eq('the open list has the folder', (await issues.listIssues(project)).filter((i) => i.id === c.id).map((i) => [i.name, Boolean(i.packed)]), [['Collision reads (newer)', false]])
+      t.eq('the archived list has the bundle', (await issues.listIssues(project, { archived: true })).filter((i) => i.id === c.id).map((i) => [i.name, i.packed]), [['Collision reads', true]])
+      const read = await issues.getIssue(project, c.id)
+      t.eq('the id reads as the folder', [read.name, Boolean(read.packed)], ['Collision reads (newer)', false])
+      t.eq('with the older issue beside it', [read.archivedTwin?.name, read.archivedTwin?.location], ['Collision reads', c.files.bundle])
+      t.eq('the family reads the folder too', (await issues.issueFamily(project, c.id)).parent, null)
+      t.eq('a folder with no runs has none, whatever the bundle holds', await issues.readRunRecords(project, c.id), [])
+      const note = await issues.createEngineNote(project, c.id, { name: 'for-the-folder', text: 'owed to the newer issue', invocationId: `new-${c.id}` })
+      t.eq('a note for the open folder becomes its step', note.where, 'step')
+      await issues.drainArchivedNotes(project)
+      t.eq('and the older issue keeps its own', (JSON.parse(await fs.readFile(c.files.notes, 'utf8'))).map((n) => n.text), ['owed to the older issue'])
+      const folderReads = []
+      const packedReads = []
+      await buildOverview({ projects: [project], listIssues: (p, o) => issues.listIssues(p, o), readRuns: async (p) => { folderReads.push(p); return [] }, readPackedRuns: async (p, id) => { packedReads.push(id); return [] } })
+      t.ok('the overview counts both, each from its own place', folderReads.includes(c.dir) && packedReads.includes(c.id))
+      const error = await refusalOf(issues.setIssueArchived(project, c.id, false))
+      t.ok('restore is refused, naming both', named(error, c), error?.message)
+      t.eq('nothing on disk of the bundle changed', await sums(c.files, ['bundle', 'summary', 'runs', 'notes']), before)
+      t.eq('no outcome file was written for them', await exists(c.files.repeatLookup), false)
+    }
+
+    t.section('a new issue walks past an archived id')
+    {
+      const older = await packedIssue('Walked past')
+      const before = await sha(older.files.bundle)
+      const next = await issues.createIssue(project, { name: 'Walked past' })
+      t.eq('its own id, naming the older only as a shared title', [next.id, next.sameTitleAs, next.repeats], [`${older.id}-2`, { project, id: older.id }, null])
+      await issues.setIssueArchived(project, next.id, true, { overrideReason: 'test fixture' })
+      t.eq('archiving it leaves the older bundle as it was', await sha(older.files.bundle), before)
+      const live = await issues.createIssue(project, { name: 'Live title' })
+      t.eq('a live id still answers as it did', await refusalOf(issues.createIssue(project, { name: 'Live title' })).then((e) => [e.status, e.existingId]), [409, live.id])
+    }
+
+    t.section('concurrent packers: a published bundle does not change')
+    for (let round = 0; round < 5; round++) {
+      const issue = await issues.createIssue(project, { name: `Packed twice ${round}` })
+      const files = bundleFiles(issuesDir, project, issue.id)
+      await fs.writeFile(path.join(folderOf(issue.id), '.archive.json'), JSON.stringify({ archivedAt: new Date().toISOString() }))
+      await fs.mkdir(files.dir, { recursive: true })
+      await fs.writeFile(`${files.bundle}.tmp`, 'another attempt\'s file')
+      const results = await Promise.allSettled([issues.packArchived(project, issue.id), issues.packArchived(project, issue.id)])
+      t.eq(`round ${round}: exactly one packs`, results.filter((r) => r.status === 'fulfilled').length, 1)
+      const published = await sums(files, ['bundle', 'summary', 'runs'])
+      t.eq('the old shared temporary name is not used', await fs.readFile(`${files.bundle}.tmp`, 'utf8'), 'another attempt\'s file')
+      await fs.rm(`${files.bundle}.tmp`)
+      t.eq('the bundle has one name', (await fs.stat(files.bundle)).nlink, 1)
+      await refusalOf(issues.packArchived(project, issue.id))
+      t.eq('a later attempt changes nothing', await sums(files, ['bundle', 'summary', 'runs']), published)
+      t.eq('nothing of an attempt stays', (await fs.readdir(files.dir)).filter((n) => n.startsWith('.pack-')), [])
+    }
+    {
+      const issue = await issues.createIssue(project, { name: 'Raced by another writer' })
+      const files = bundleFiles(issuesDir, project, issue.id)
+      const error = await refusalOf(packIssue({ issuesDir, project, id: issue.id, issue: await issues.getIssue(project, issue.id), releaseWorktrees: async () => { await fs.writeFile(files.bundle, 'another writer\'s bundle') } }))
+      t.ok('a bundle appearing during packing is not replaced: refused, naming both', named(error, { dir: folderOf(issue.id), files }), error?.message)
+      t.eq('its bytes are as they were', await fs.readFile(files.bundle, 'utf8'), 'another writer\'s bundle')
+      t.eq('and the folder stays', await exists(folderOf(issue.id)), true)
+      await fs.rm(files.bundle)
+    }
+
+    t.section('restore replaces nothing: an empty target, a full one, and a new issue beside it')
+    {
+      const a = await packedIssue('Restore over empty')
+      const before = await sha(a.files.bundle)
+      let inode = null
+      const empty = await refusalOf(unpackIssue({ issuesDir, project, id: a.id, beforePublish: async () => { await fs.mkdir(a.dir); inode = (await fs.stat(a.dir)).ino } }))
+      t.ok('an empty folder at the target is refused, naming both', named(empty, a), empty?.message)
+      t.eq('it is the same folder afterwards', (await fs.stat(a.dir)).ino, inode)
+      t.eq('still empty', await fs.readdir(a.dir), [])
+      t.eq('the bundle is as it was', await sha(a.files.bundle), before)
+      t.eq('nothing of the attempt stays', (await fs.readdir(path.join(issuesDir, project))).filter((n) => n.startsWith('.restoring-')), [])
+      await fs.rmdir(a.dir)
+
+      const b = await packedIssue('Restore over full')
+      const beforeB = await sha(b.files.bundle)
+      const full = await refusalOf(unpackIssue({ issuesDir, project, id: b.id, beforePublish: async () => { await fs.mkdir(b.dir); await fs.writeFile(path.join(b.dir, 'theirs'), 'kept') } }))
+      t.ok('a full folder at the target is refused, naming both', named(full, b), full?.message)
+      t.eq('its content stays', await fs.readFile(path.join(b.dir, 'theirs'), 'utf8'), 'kept')
+      t.eq('the bundle is as it was', await sha(b.files.bundle), beforeB)
+      await fs.rm(b.dir, { recursive: true })
+
+      const w = await packedIssue('Written into the reservation')
+      const written = await refusalOf(unpackIssue({ issuesDir, project, id: w.id, afterClaim: () => fs.writeFile(path.join(w.dir, 'theirs'), 'kept') }))
+      t.ok('content written into the reservation refuses it, naming both', named(written, w), written?.message)
+      t.eq('that content stays', await fs.readFile(path.join(w.dir, 'theirs'), 'utf8'), 'kept')
+      await fs.rm(w.dir, { recursive: true })
+
+      // createIssue made its folder just as this id came to a bundle, and a restore arrives before it looks again.
+      let restoreError = null
+      let older = null
+      const created = await issues.createIssue(project, { name: 'Interleaved' }, { afterMkdir: async (id) => {
+        if (older) return
+        // Packed from a folder that stands aside: the id is free again only for the moment it takes to hold it.
+        const aside = `${folderOf(id)}.aside`
+        await fs.rename(folderOf(id), aside)
+        const made = await issues.createIssue(project, { name: 'Interleaved' }, { afterMkdir: async () => {} })
+        await issues.setIssueArchived(project, made.id, true, { overrideReason: 'test fixture' })
+        older = { id: made.id, dir: folderOf(made.id), files: bundleFiles(issuesDir, project, made.id) }
+        await fs.rename(aside, folderOf(id))
+        restoreError = await refusalOf(unpackIssue({ issuesDir, project, id }))
+      } })
+      t.ok('a restore arriving after createIssue\'s mkdir is refused, naming both', named(restoreError, older), restoreError?.message)
+      t.eq('createIssue takes the empty folder back and moves on', [created.id, created.sameTitleAs?.id], [`${older.id}-2`, older.id])
+      t.eq('the older one is still whole in its bundle, and restores now', await unpackIssue({ issuesDir, project, id: older.id }), older.dir)
+      t.eq('each has its own record', [(await issues.getIssue(project, older.id)).name, (await issues.getIssue(project, created.id)).id], ['Interleaved', created.id])
+      await issues.setIssueArchived(project, older.id, true, { overrideReason: 'test fixture' }).catch(() => {})
+
+      const r = await packedIssue('Reservation held')
+      let during = null
+      await unpackIssue({ issuesDir, project, id: r.id, afterClaim: async () => { during = await issues.createIssue(project, { name: 'Reservation held' }) } })
+      t.eq('a new issue during a held reservation takes another id', during.id, `${r.id}-2`)
+      t.ok('and the restore completes, with its content', (await fs.readdir(r.dir)).includes('issue.json'))
+
+      const twice = await packedIssue('Restored twice')
+      const results = await Promise.allSettled([unpackIssue({ issuesDir, project, id: twice.id }), unpackIssue({ issuesDir, project, id: twice.id })])
+      t.ok('of two restores at once one succeeds', results.some((x) => x.status === 'fulfilled'))
+      t.ok('with every file there', (await fs.readdir(twice.dir)).includes('issue.json'))
+      await fs.writeFile(path.join(twice.dir, 'issue.json'), JSON.stringify({ name: 'edited since' }))
+      await unpackIssue({ issuesDir, project, id: twice.id })
+      t.eq('a late restore extracts nothing over an edit', JSON.parse(await fs.readFile(path.join(twice.dir, 'issue.json'), 'utf8')).name, 'edited since')
+    }
   } finally {
     for (const [key, value] of [['DEVPANEL_ISSUES_DIR', saved.issues], ['DEVPANEL_PROJECTS_DIR', saved.projects]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
     await fs.rm(root, { recursive: true, force: true })

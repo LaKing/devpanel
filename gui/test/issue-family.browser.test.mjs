@@ -43,5 +43,60 @@ export default async function (t) {
     browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${rule.id}`, { token: stage.token })
     await browser.until(() => browser.has('Waiting for this'))
     t.ok('the prerequisite lists what waits for it', family().includes('Child finding'), family())
+    browser.close()
+
+    // What a report's record says, written by hand: the report route refuses a loopback peer.
+    const write = async (issue, fields) => {
+      const recordFile = path.join(stage.issuesDir, stage.project, issue.id, 'issue.json')
+      await fs.writeFile(recordFile, JSON.stringify({ ...JSON.parse(await fs.readFile(recordFile, 'utf8')), ...fields }))
+    }
+    const archive = (issue) => stage.request(`/api/projects/${stage.project}/issues/${issue.id}/archive`, { method: 'POST', body: JSON.stringify({ overrideReason: 'test' }) })
+    const older = await stage.createIssue('Older fault history')
+    await archive(older)
+    const repeat = await stage.createIssue('Newer report of it')
+    await write(repeat, { repeats: { project: stage.project, id: older.id, evidence: 'fingerprint', fingerprint: 'abc123def' } })
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${repeat.id}`, { token: stage.token })
+    await browser.until(() => browser.has('Repeats (same fingerprint'))
+    t.ok('an open report names what it repeats, with the fingerprint', family().includes('Older fault history') && family().includes('abc123def'), family())
+    t.ok('as a link to that history', browser.all('.family__repeats a').some((a) => a.getAttribute('href')?.endsWith(`/${older.id}`)))
+    browser.close()
+
+    await archive(repeat)
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${repeat.id}`, { token: stage.token })
+    await browser.until(() => browser.has('Repeats (same fingerprint'))
+    t.ok('so does a packed report', browser.has('Archived and packed') && browser.all('.family__repeats a').some((a) => a.getAttribute('href')?.endsWith(`/${older.id}`)))
+    browser.close()
+
+    const titled = await stage.createIssue('Shares only a title')
+    await write(titled, { sameTitleAs: { project: stage.project, id: older.id } })
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${titled.id}`, { token: stage.token })
+    await browser.until(() => browser.has('Same title as'))
+    t.ok('a shared title says it is not shown to be the same fault', family().includes('not shown to be the same fault') && !family().includes('Repeats'), family())
+    browser.close()
+
+    const pending = await stage.createIssue('Pending report')
+    await write(pending, { repeatLookup: { unread: [older.id], at: 'x' } })
+    await archive(pending)
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${pending.id}`, { token: stage.token })
+    await browser.until(() => browser.has('Could not check'))
+    t.ok('a packed report still pending names what it could not check', family().includes('1 archived issue') && family().includes(older.id), family())
+    browser.close()
+
+    const listing = await stage.createIssue('Unlisted report')
+    await write(listing, { repeatLookup: { listing: true, at: 'x' } })
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${listing.id}`, { token: stage.token })
+    await browser.until(() => browser.has('could not be listed'))
+    t.ok('and one whose listing failed says so', family().includes('not known yet'), family())
+    browser.close()
+
+    // A folder beside a bundle of its id, as an id that once named two left it.
+    const twin = await stage.createIssue('Older twin')
+    await archive(twin)
+    const twinDir = path.join(stage.issuesDir, stage.project, twin.id)
+    await fs.mkdir(twinDir)
+    await fs.writeFile(path.join(twinDir, 'issue.json'), JSON.stringify({ name: 'Newer twin', project: stage.project }))
+    browser = await openBrowser(`${stage.origin}/projects/${stage.project}/${twin.id}`, { token: stage.token })
+    await browser.until(() => browser.has('An older archived issue has this same id'))
+    t.ok('the folder\'s page keeps the older issue readable', browser.has('Older twin') && browser.has('Newer twin'))
   } finally { browser.close() }
 }

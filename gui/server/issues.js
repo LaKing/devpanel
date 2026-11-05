@@ -15,7 +15,8 @@ import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './
 import { withLock } from './runtime/lock.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { ARCHIVE_FILE, archiveState, requireUnarchived } from './issue-archive.mjs'
-import { bundleFiles, deletePacked, packIssue, packedRuns, packedSummaries, packedSummary, unpackIssue } from './issue-bundle.mjs'
+import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
+import { completePendingLookup, findRepeat, folderFingerprint, repeatOutcome, reportFingerprint } from './report-identity.mjs'
 import { openedBy as openedByRecord, derivedOpenedBy } from './opened-by.mjs'
 import { brief, families } from './issue-family.mjs'
 
@@ -173,6 +174,10 @@ async function readIssue (project, dirName) {
     // Who opened it (user@host) and the issue it came from (opened-by.mjs).
     openedBy: meta.openedBy ?? derivedOpenedBy(meta, project),
     report: meta.report ?? null,
+    // The earlier issue a report repeats (a fingerprint match), or why that is not known yet, and an
+    // archived issue that only shares its title (report-identity.mjs).
+    ...await repeatOutcome(ISSUES_DIR, project, dirName, meta),
+    sameTitleAs: meta.sameTitleAs ?? null,
     // Distinct from any run's status: an issue stays open while a run is paused,
     // blocked, failed or cancelled.
     status: ['open', 'resolved', 'abandoned'].includes(meta.status) ? meta.status : 'open',
@@ -331,7 +336,7 @@ export async function listIssues (project, { archived = false } = {}) {
     // Packed issues are no longer folders here; their summaries stand in.
     const present = new Set(listed.map((i) => i.id))
     for (const summary of await packedSummaries(ISSUES_DIR, project)) {
-      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null, stagingOperations: summary.operations?.length ?? 0 })
+      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, ...await repeatOutcome(ISSUES_DIR, project, summary.issue.id, summary.issue), archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null, stagingOperations: summary.operations?.length ?? 0 })
     }
   }
   return listed.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
@@ -344,7 +349,10 @@ export async function listIssues (project, { archived = false } = {}) {
  */
 export async function issueFamily (project, id) {
   const issue = await getIssue(project, id)
-  const all = [...await listIssues(project), ...await listIssues(project, { archived: true })]
+  const listed = [...await listIssues(project), ...await listIssues(project, { archived: true })]
+  // A folder beside a bundle of its id: the id reads as the folder, the one getIssue gives.
+  const folders = new Set(listed.filter((i) => !i.packed).map((i) => i.id))
+  const all = listed.filter((i) => !i.packed || !folders.has(i.id))
   if (!all.some((i) => i.id === id)) all.push(issue)
   const links = families(all, project).get(`${project}/${id}`)
   const named = new Map(all.map((i) => [`${i.project ?? project}/${i.id}`, i]))
@@ -354,6 +362,9 @@ export async function issueFamily (project, id) {
   }
   const from = issue.openedBy?.from
   return {
+    repeats: issue.repeats ? { ...await describe(issue.repeats.project ?? project, issue.repeats.id), evidence: issue.repeats.evidence, fingerprint: issue.repeats.fingerprint } : null,
+    sameTitleAs: issue.sameTitleAs ? await describe(issue.sameTitleAs.project ?? project, issue.sameTitleAs.id) : null,
+    repeatLookup: issue.repeatLookup ?? null,
     parent: from?.issueId ? { ...await describe(from.project ?? project, from.issueId), via: from.via, runId: from.runId ?? null } : null,
     children: await Promise.all(links.children.map((c) => describe(project, c))),
     dependsOn: await Promise.all((issue.dependsOn?.issues ?? []).map((d) => describe(d.project, d.id))),
@@ -380,7 +391,11 @@ export async function readRunRecords (project, issueId) {
   if (!ISSUE_PATTERN.test(issueId)) return []
   const runsDir = path.join(ISSUES_DIR, project, issueId, 'runs')
   const entries = await fs.readdir(runsDir, { withFileTypes: true }).catch(() => null)
-  if (!entries) return (await packedRuns(ISSUES_DIR, project, issueId)).filter(Boolean)
+  if (!entries) {
+    // A folder with no runs has none, whatever a bundle of its id holds.
+    if (await fs.stat(path.join(ISSUES_DIR, project, issueId)).then(() => true, () => false)) return []
+    return (await packedRuns(ISSUES_DIR, project, issueId)).filter(Boolean)
+  }
   const records = await Promise.all(entries.filter((e) => e.isDirectory() && !/^(worktree|workspace)-/.test(e.name))
     .map((e) => fs.readFile(path.join(runsDir, e.name, 'run.json'), 'utf8').then(JSON.parse, () => null)))
   return records.filter(Boolean)
@@ -391,8 +406,57 @@ export const packedOperations = async (project, id) => (await packedSummary(ISSU
 
 export const packedReceiptsFile = (project, id) => bundleFiles(ISSUES_DIR, project, id).receipts
 
-/** Open an issue against a project. Both the project and the name are required. */
-export async function createIssue (project, { name, input, fromInquiry = null, openedBy = null, reportOrigin = null } = {}) {
+const MAX_ID_SUFFIX = 100
+
+/*
+ * The id a new issue may take: `<date>-<slug>`, then `-2`, `-3`, … An archived id is never taken, by anyone. A
+ * live one answers as it always has (409 naming it), unless both are reports whose fingerprints differ: that is
+ * another fault under one title, and a 409 would make its reporter stop and lose it.
+ */
+async function freeIssueId (project, base, slug, fingerprint, lookupSeams) {
+  let sameTitleAs = null
+  for (let n = 1; n <= MAX_ID_SUFFIX; n++) {
+    const id = n === 1 ? base : `${base}-${n}`
+    const dir = path.join(ISSUES_DIR, project, id)
+    const folder = await fs.stat(dir).then(() => true, () => false)
+    const held = (await archivedIdHolders(ISSUES_DIR, project, id)).length > 0
+    if (!folder && !held) return { id, sameTitleAs }
+    // Held with a folder that has no record yet: a restore's reservation, about to become that archived issue.
+    const reserved = folder && held && !await fs.stat(path.join(dir, META_FILE)).then(() => true, () => false)
+    if (!folder || reserved || await archiveState(dir)) {
+      sameTitleAs ??= { project, id }
+      continue
+    }
+    let other = null
+    if (fingerprint) {
+      try { other = await folderFingerprint(ISSUES_DIR, project, id, { seams: lookupSeams }) } catch (error) {
+        // Packed since it was looked at: an archived id now, not a live one to answer with.
+        if (error.code === 'ENOENT' && !await fs.stat(dir).then(() => true, () => false)) {
+          sameTitleAs ??= { project, id }
+          continue
+        }
+      }
+    }
+    if (!other || other === fingerprint) {
+      throw Object.assign(new IssueError(`"${slug}" was already opened against this project today`, 409), { existingId: id })
+    }
+  }
+  throw new IssueError(`"${slug}" has taken every id up to ${base}-${MAX_ID_SUFFIX} today; this one was not opened`, 409)
+}
+
+// Reports with a fingerprint take turns per project, so each sees every report finished before it.
+const reportTurns = new Map()
+function inReportTurn (project, fn) {
+  const turn = (reportTurns.get(project) ?? Promise.resolve()).then(fn)
+  reportTurns.set(project, turn.catch(() => {}))
+  return turn
+}
+
+/**
+ * Open an issue against a project. Both the project and the name are required.
+ * `seams` exist only so a test can land between the steps.
+ */
+export async function createIssue (project, { name, input, fromInquiry = null, openedBy = null, reportOrigin = null } = {}, seams = {}) {
   // An issue made from an inquiry's proposal came from that inquiry, whoever asked.
   const opener = openedByRecord({ ...(openedBy ?? { user: 'unknown' }), ...(fromInquiry && !openedBy?.from ? { from: { project, issueId: fromInquiry.inquiryId, runId: fromInquiry.runId, via: 'inquiry' } } : {}) })
   // An issue made from an inquiry's proposal names where it came from; the
@@ -450,23 +514,13 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
   const { name: finalName, slug } = requireName(name, 'an issue', Infinity)
 
   const openedAt = new Date()
-  const dirName = `${today(openedAt)}-${slug}`
+  const base = `${today(openedAt)}-${slug}`
   const projectDir = path.join(ISSUES_DIR, project)
-  const dir = path.join(projectDir, dirName)
+  const fingerprint = reportOrigin ? (reportOrigin.fingerprint ?? reportFingerprint(report)) : null
 
   await fs.mkdir(projectDir, { recursive: true })
 
-  try {
-    // Fails if it already exists, which is how uniqueness is enforced.
-    await fs.mkdir(dir)
-  } catch (err) {
-    if (err.code === 'EEXIST') {
-      throw Object.assign(new IssueError(`"${slug}" was already opened against this project today`, 409), { existingId: dirName })
-    }
-    throw err
-  }
-
-  const record = {
+  const open = (repeat) => openIssueFolder({ project, base, slug, fingerprint, seams, describe: (sameTitleAs) => ({
     name: finalName,
     ...(sourcePath ? { sourcePath } : {}),
     ...(fromInquiry ? { fromInquiry: { inquiryId: fromInquiry.inquiryId, runId: fromInquiry.runId, key: fromInquiry.key } } : {}),
@@ -477,21 +531,49 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
     openedAt: openedAt.toISOString(),
     openedBy: opener,
     // From POST /api/report (report.mjs): {kind, category, reporter, trust}; bounds the supervisor (reporters.mjs).
-    ...(reportOrigin ? { report: reportOrigin } : {})
-  }
+    ...(reportOrigin ? { report: { ...reportOrigin, ...(fingerprint ? { fingerprint } : {}) } } : {}),
+    ...(repeat?.repeats ? { repeats: repeat.repeats } : {}),
+    ...(repeat?.repeatLookup ? { repeatLookup: repeat.repeatLookup } : {}),
+    ...(sameTitleAs ? { sameTitleAs } : {})
+  }), report })
 
-  try {
-    if (report !== null) {
-      await fs.mkdir(path.join(dir, '000-report'))
-      await fs.writeFile(path.join(dir, '000-report', 'response.md'), report, 'utf8')
+  if (!fingerprint) return open(null)
+  // A resubmission is answered here, ahead of any other report's lookup.
+  await freeIssueId(project, base, slug, fingerprint, seams.lookup)
+  return inReportTurn(project, async () => open(await findRepeat({ issuesDir: ISSUES_DIR, project, fingerprint, seams: seams.lookup, movesWaitMs: seams.movesWaitMs })))
+}
+
+/*
+ * The folder of a new issue. mkdir fails on anything there, which is how uniqueness among folders is enforced;
+ * packing publishes a bundle before its folder goes, so a folder made as one went is seen beside its bundle,
+ * and only the empty folder just made is taken back.
+ */
+async function openIssueFolder ({ project, base, slug, fingerprint, seams, describe, report }) {
+  for (let attempt = 0; attempt < MAX_ID_SUFFIX; attempt++) {
+    const { id, sameTitleAs } = await freeIssueId(project, base, slug, fingerprint, seams.lookup)
+    const dir = path.join(ISSUES_DIR, project, id)
+    try { await fs.mkdir(dir) } catch (error) {
+      if (error.code === 'EEXIST') continue
+      throw error
     }
-    await fs.writeFile(path.join(dir, META_FILE), JSON.stringify(record, null, 2) + '\n', 'utf8')
-  } catch (error) {
-    await fs.rm(dir, { recursive: true, force: true })
-    throw error
+    await seams.afterMkdir?.(id)
+    if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) {
+      await fs.rmdir(dir).catch(() => {})
+      continue
+    }
+    try {
+      if (report !== null) {
+        await fs.mkdir(path.join(dir, '000-report'))
+        await fs.writeFile(path.join(dir, '000-report', 'response.md'), report, 'utf8')
+      }
+      await fs.writeFile(path.join(dir, META_FILE), JSON.stringify(describe(sameTitleAs), null, 2) + '\n', 'utf8')
+    } catch (error) {
+      await fs.rm(dir, { recursive: true, force: true })
+      throw error
+    }
+    return readIssue(project, id)
   }
-
-  return readIssue(project, dirName)
+  throw new IssueError(`"${slug}" could not be given a free id; this one was not opened`, 409)
 }
 
 /**
@@ -664,17 +746,41 @@ export async function getIssue (project, id) {
     // Archived issues are packed out of the project folder; they are read from
     // their summary (issue-bundle.mjs) until restored.
     if (!error.packed) throw error
-    return { ...describePacked(await packedSummary(ISSUES_DIR, project, id)), archivedNotes: await readArchivedNotes(project, id) }
+    return settleRepeatLookup(project, { ...await describePacked(await packedSummary(ISSUES_DIR, project, id)), archivedNotes: await readArchivedNotes(project, id) })
   }
   const issue = await readIssue(project, id)
   if (!issue) throw new IssueError('no such issue', 404)
-  return { ...issue, steps: await listSteps(project, id) }
+  const twin = await packedSummary(ISSUES_DIR, project, id)
+  return settleRepeatLookup(project, { ...issue, steps: await listSteps(project, id), ...(twin ? { archivedTwin: describeTwin(twin, project, id) } : {}) })
+}
+
+/** A pending repeat lookup is rerun on read, in whatever state the issue is; its outcome is read back. */
+async function settleRepeatLookup (project, issue) {
+  if (!issue.repeatLookup) return issue
+  await completePendingLookup({ issuesDir: ISSUES_DIR, project, id: issue.id, record: issue })
+  return { ...issue, ...await repeatOutcome(ISSUES_DIR, project, issue.id, issue) }
+}
+
+/*
+ * An older issue archived under the id this folder has (an id once named two): the page keeps it readable,
+ * since restoring it is refused while the folder stands and its list row opens the folder.
+ */
+function describeTwin (summary, project, id) {
+  return {
+    id,
+    name: summary.issue?.name ?? id,
+    disposition: summary.issue?.disposition ?? null,
+    packedAt: summary.packedAt ?? null,
+    location: bundleFiles(ISSUES_DIR, project, id).bundle,
+    results: summary.results ?? []
+  }
 }
 
 /** A packed issue, described the way the lists and pages describe any issue. */
-function describePacked (summary) {
+async function describePacked (summary) {
   return {
     ...summary.issue,
+    ...await repeatOutcome(ISSUES_DIR, summary.issue.project, summary.issue.id, summary.issue),
     archived: true,
     packed: true,
     location: bundleFiles(ISSUES_DIR, summary.issue.project, summary.issue.id).bundle,
@@ -893,6 +999,8 @@ export async function setIssueArchived (project, id, archived, { overrideReason 
   // Archiving what is already packed is a repeat, and harmless.
   if (archived && ISSUE_PATTERN.test(String(id)) && !await fs.stat(path.join(ISSUES_DIR, project, id)).then(() => true, () => false) &&
       await packedSummary(ISSUES_DIR, project, id)) return getIssue(project, id)
+  // Refused before the marker: the folder stays as it was, and the bundle of its id with it.
+  if (archived && ISSUE_PATTERN.test(String(id))) await refuseArchiveOverBundle(ISSUES_DIR, project, id)
   const result = await markArchived(project, id, archived, { overrideReason })
   if (!archived) {
     await drainArchivedNotes(project, id)
@@ -1047,7 +1155,10 @@ export async function deleteIssue (project, id) {
     const runIds = (await fs.readdir(path.join(dir,'runs')).catch(error=>{if(error.code==='ENOENT')return [];throw error})).filter(id=>!id.startsWith('worktree-')&&!id.startsWith('workspace-'))
     const released = await releaseWorktrees(dir, project)
     await fs.rm(dir, { recursive: true, force: true })
-    await fs.rm(bundleFiles(ISSUES_DIR, project, id).notes, { force: true })
+    // What is kept beside a bundle of this id is that issue's, not this folder's.
+    if (!(await archivedIdHolders(ISSUES_DIR, project, id)).length) {
+      await Promise.all([bundleFiles(ISSUES_DIR, project, id).notes, bundleFiles(ISSUES_DIR, project, id).repeatLookup].map((f) => fs.rm(f, { force: true })))
+    }
     await writeJson(path.join(path.dirname(dir),'.deleted-issues',id+'.json'), {project,id,runIds,deletedAt:new Date().toISOString()})
     // After the directory is gone, so every registration that pointed into it
     // is now prunable.
@@ -1128,8 +1239,11 @@ export function classifyReference (value) {
 
 const readArchivedNotes = (project, id) => fs.readFile(bundleFiles(ISSUES_DIR, project, id).notes, 'utf8').then(JSON.parse, () => [])
 
+// A folder answers for itself, whatever a bundle of its id holds.
 async function isArchived (project, id) {
-  return Boolean(await archiveState(path.join(ISSUES_DIR, project, id))) || Boolean(await packedSummary(ISSUES_DIR, project, id))
+  const dir = path.join(ISSUES_DIR, project, id)
+  if (await fs.stat(dir).then(() => true, () => false)) return Boolean(await archiveState(dir))
+  return Boolean(await packedSummary(ISSUES_DIR, project, id))
 }
 
 /**
@@ -1167,6 +1281,8 @@ export async function drainArchivedNotes (project, id = null) {
   const ids = id ? [id] : (await fs.readdir(dir).catch(() => [])).filter((n) => n.endsWith('.notes.json')).map((n) => n.slice(0, -'.notes.json'.length))
   for (const issueId of ids) {
     if (await isArchived(project, issueId)) continue
+    // Still held by a bundle: the notes are that issue's, not a folder's that shares its id.
+    if ((await archivedIdHolders(ISSUES_DIR, project, issueId)).length) continue
     const file = bundleFiles(ISSUES_DIR, project, issueId).notes
     if (!await fs.stat(file).then(() => true, () => false)) continue
     await withLock(`${file}.lock`, { purpose: 'archived-notes', waitMs: 10000 }, async () => {

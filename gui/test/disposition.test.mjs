@@ -113,6 +113,14 @@ export default async function (t) {
     t.eq('the run records the links by risk index', record.closure.followUps.map((x) => x.riskIndex).join(','), '0,2')
     const source = all.find((i) => i.id === f.issue.id)
     t.eq('the source issue has no disposition set by this', source.disposition, null)
+    // A follow-up's id is generated: one archived since is not taken by the next.
+    await f.issues.setIssueArchived('devpanel-project', first.followUps[0].issueId, true, { overrideReason: 'test' })
+    const runFile = path.join(f.issuePath, 'runs', run.runId, 'run.json')
+    const stored = JSON.parse(await fs.readFile(runFile, 'utf8'))
+    await fs.writeFile(runFile, JSON.stringify({ ...stored, closure: { ...stored.closure, followUps: [] } }))
+    const retaken = await f.issues.createFollowUps('devpanel-project', f.issue.id, run.runId)
+    t.eq('a follow-up over an archived id gets its own', retaken.followUps[0].issueId, `${first.followUps[0].issueId}-2`)
+    t.eq('over a live one it is skipped as before', Boolean(retaken.followUps[1].skipped), true)
   }
 
   t.section('3. the supervisor cannot archive without a disposition, and finish stops it after its runs')

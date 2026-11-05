@@ -640,7 +640,12 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   (every packed file listed) before the folder is removed. A packed issue reads through `getIssue`/`listIssues`
   (`packed: true`, `archive.results`), refuses changes with 409, and its runs cannot be resumed. Restore unpacks it
   (runs marked `workspace.state: removed`); delete removes the bundle. Deleting is only offered for archived issues.
-  `tools/pack-archived.mjs` packs issues archived before this existed.
+  `tools/pack-archived.mjs` packs issues archived before this existed. An id names one issue: packing refuses to
+  replace a bundle and restore a folder, each with a 409 naming both, a bundle is published with `link()` and a restore
+  reserves its destination with `mkdir`; every generated id walks past an archived one (`-2`, `-3`; `publishFindings`
+  reuses its own). A folder beside a bundle of one id, from before this, reads as the folder with `archivedTwin` on it
+  and can be neither archived nor restored until someone decides. A report's `repeats` (a fingerprint match) and
+  `repeatLookup` (not known yet, rerun on read, kept in `<id>.repeat-lookup.json`) are `server/report-identity.mjs`.
 
 ## Front-end conventions (`gui/src/`)
 

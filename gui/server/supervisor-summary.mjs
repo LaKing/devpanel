@@ -295,6 +295,7 @@ export function summariseIssue ({ issue, reports, runs }) {
     issue: {
       id: issue.id, name: issue.name, project: issue.project, status: issue.status, archived: issue.archived,
       openedOn: issue.openedOn, openedBy: issue.openedBy ?? null, report: issue.report ?? null, path: issue.path, disposition: issue.disposition ?? null,
+      ...(issue.repeats ? { repeats: issue.repeats } : {}), ...(issue.repeatLookup ? { repeatLookup: issue.repeatLookup } : {}), ...(issue.sameTitleAs ? { sameTitleAs: issue.sameTitleAs } : {}),
       // Never clipped: a risk's text, like its id, names it in acceptRisks.
       unacceptedRisks: issue.unacceptedRisks ?? null, acceptedRisks: issue.acceptedRisks ?? [],
       steps: (issue.steps ?? []).map((s) => ({ number: s.number, slug: s.slug, files: (s.files ?? []).map((f) => f.name) })),

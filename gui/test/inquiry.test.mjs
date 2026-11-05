@@ -201,5 +201,12 @@ export default async function (t) {
     t.eq('the ordinary rows apply again', (await supervisor.inquiryStatus({ project, inquiryId: q.id })).row, 5)
     t.ok('reopening needs a reason', await supervisor.reopenInquiry({ project, inquiryId: q.id, reason: ' ' }).then(() => false, (e) => e.status === 400))
   }
+  t.section('an inquiry over an archived id gets its own')
+  {
+    const first = await f.issues.createInquiry(project, { question: 'Asked twice, archived between?' })
+    await f.issues.setIssueArchived(project, first.id, true, { overrideReason: 'test' })
+    const again = await f.issues.createInquiry(project, { question: 'Asked twice, archived between?' })
+    t.eq('another id, still an inquiry', [again.id, again.kind], [`${first.id}-2`, 'inquiry'])
+  }
   await supervisor.shutdown?.().catch?.(() => {})
 }

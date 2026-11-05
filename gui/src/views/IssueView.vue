@@ -909,6 +909,20 @@ watch(() => route.query.run, (runId) => {
             </button>
           </div>
           <IssueFamily :project="String(project)" :issue-id="issue.id" />
+          <!-- An older issue archived under this id: restoring it is refused while this folder stands. -->
+          <section v-if="issue.archivedTwin" class="head__twin" aria-label="An archived issue with this id">
+            <p class="head__twin-title">
+              <v-icon icon="$archive" size="15" /> An older archived issue has this same id: <strong>{{ issue.archivedTwin.name }}</strong>
+              <template v-if="issue.archivedTwin.disposition"> · {{ issue.archivedTwin.disposition.value.replace(/-/g, ' ') }}</template>
+              <template v-if="issue.archivedTwin.packedAt"> · packed {{ issue.archivedTwin.packedAt }}</template>
+            </p>
+            <p class="head__twin-note">This page is the newer issue. Neither can replace the other, so this one cannot be archived and the older one cannot be restored while both hold the id.</p>
+            <CopyPath class="issue__location" :path="issue.archivedTwin.location" label="Copy the archive bundle path" />
+            <details v-for="result in issue.archivedTwin.results" :key="result.runId" class="head__twin-result">
+              <summary>Result of run {{ result.runId }}</summary>
+              <pre>{{ result.text }}</pre>
+            </details>
+          </section>
         </div>
 
         <!-- The issue's own facts, which no run sets. -->
@@ -1553,6 +1567,10 @@ watch(() => route.query.run, (runId) => {
 .head__caret--open { transform: rotate(90deg); }
 @media (prefers-reduced-motion: reduce) { .head__caret { transition: none; } }
 .head__packed { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; opacity: 0.8; }
+.head__twin { margin-top: 8px; font-size: 0.8125rem; }
+.head__twin-title, .head__twin-note { margin: 0 0 4px; overflow-wrap: anywhere; }
+.head__twin-note { opacity: 0.7; }
+.head__twin-result pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.75rem; }
 .packed { overflow: hidden; }
 .packed__head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 14px; padding: 14px 18px 8px; }
 .packed__title { font-size: 1rem; font-weight: 650; }

@@ -175,7 +175,13 @@ The key is `chmod 600` and `cert/` is git-ignored — it must never be committed
 > does nothing else: no run starts, nothing is read back, the answer is `{project, id, trust}`.
 > The same report again on the same day changes nothing and is answered 409
 > `{error, project, id}`, `id` being the issue already open, so the reporter can stop
-> resubmitting. The panel logs that at info, not as a warning.
+> resubmitting. The panel logs that at info, not as a warning. An id an archived issue holds
+> is never taken (`-2`, `-3`, …, the record's `sameTitleAs` naming it), and two reports of one
+> title whose fingerprints differ are two issues. A fingerprint comes from the optional
+> `fingerprint` field or a labelled line of the report's text; a match with an earlier issue, on
+> any date, live or archived, is the record's `repeats` and a link on the issue page, never told
+> to the reporter. A lookup that could not finish says so (`repeatLookup`) and is rerun on read;
+> its outcome is kept beside the bundle in `<id>.repeat-lookup.json`, so it survives archiving.
 > Allowed peers have a private address (10/8, 172.16/12, 192.168/16, fc00::/7) and no
 > `X-Forwarded-For` header, i.e. a sibling container reaching `https://<panel ip>/` directly;
 > a reverse proxy sets that header (`option forwardfor`) and behind it is the internet.
@@ -332,7 +338,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `GET /api/projects` | re-scans `/srv` — every `*-project`, each with its issue count |
 | `GET /api/projects/:project/issues` | that project's issues, newest first; each with `family` (`server/issue-family.mjs`): `parent` (`openedBy.from`, `known: false` when it is in no folder and no bundle), `children`, `openChildren`, `waitingOn` (unsettled prerequisites; one in another project is `unknown`) and `blocks`. The list page nests children under their parent (`src/issue-tree.js`) while no column sort is set |
 | `POST /api/projects/:project/issues` | open one — `{ name }` |
-| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), answers `{ project, id, trust }` only, or 409 `{ error, project, id }` naming the issue already opened today; see the notes under "HTTPS" |
+| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), optional `fingerprint`, answers `{ project, id, trust }` only, or 409 `{ error, project, id }` naming the issue already opened today; see the notes under "HTTPS" |
 | `GET /api/projects/:project/issues/:id` | one issue with its steps and files |
 | `GET /api/projects/:project/issues/:id/family` | `{parent, children, dependsOn, dependsOnReason, blocks}`, each member `{project, id, name, disposition, archived, packed, settled, run}` (packed issues included; an unreadable one `missing: true`). Provenance and order stay separate: a parent is not a prerequisite |
 | `POST /api/projects/:project/issues/:id/steps` | add the next step — `{ name }` |
