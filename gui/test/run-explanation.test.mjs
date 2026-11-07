@@ -11,6 +11,17 @@ export default async function (t) {
   t.ok('an operator request names the project action',
     explainRun({ status: 'paused', pause: { request: { reason: 'Needs a dump.', projectAction: 'push' } } }).next.includes('"push"'))
 
+  // A pause on a run that already holds an answer says so: the reader sees what
+  // the owner decided before, not only the new question.
+  const answerStep = (number, key, answer) => ({ number, role: 'operator', stepId: 'decision', decision: { key, question: 'A or B?', answer, actor: 'owner', at: '2026-11-07T07:16:01.000Z' } })
+  const asked = { status: 'paused', pause: { key: 'operator-request:14', question: 'Still A?', kind: 'operator-request', request: { reason: 'The plan implements B.', category: 'owner-gate' } },
+    steps: [{ number: '003', role: 'coordinator' }, answerStep('004', 'operator-request:3', 'A')] }
+  t.ok('a paused run names the answer it already holds', explainRun(asked).detail.includes('Answered earlier in this run: step 004 — "A" (by owner, 2026-11-07T07:16:01.000Z).'), explainRun(asked).detail)
+  t.ok('beside the new question', explainRun(asked).detail.startsWith('Still A?'))
+  const again = { status: 'paused', pause: { key: 'operator-request:3', question: 'A or B?' }, steps: [answerStep('004', 'operator-request:3', 'A')] }
+  t.eq('the same question asked again says it was already answered', explainRun(again).detail, 'A or B?\n\nThis question was already answered: step 004 — "A" (by owner, 2026-11-07T07:16:01.000Z).')
+  t.eq('a run with no answers keeps the question alone', explainRun({ status: 'paused', pause: { question: 'Which mailbox?' }, steps: [{ number: '001', role: 'coordinator' }] }).detail, 'Which mailbox?')
+
   t.section('launch refusals are recognised')
   const dirty = explainRun({ status: 'failed', blockedReason: 'base policy "head" requires a clean checkout, but 812 tracked path(s) are modified in /opt/x. Choose base …' })
   t.eq('a dirty checkout says so', dirty.headline, "Couldn't start: the project has uncommitted changes")

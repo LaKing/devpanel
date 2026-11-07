@@ -2206,7 +2206,11 @@ A closed question accepts only one of its options; anything else is refused with
 422, never interpreted. Operator steps are not counted against `maxSteps`.
 
 Every later step may name `decisions` in its context and receives every answer
-so far, verbatim. The panel answers through `POST …/runs/:runId/answer`; the
+so far, verbatim. `decisions` is read from the whole run, not from the current
+window: an evidence refresh or a plan restart (`windowResetAfter`) discards
+evidence, plans and findings, never an answer. While a run is paused, its
+explanation names the answers it already holds, and says so when the same
+question was answered before. The panel answers through `POST …/runs/:runId/answer`; the
 top-level supervisor through `answer_run`, on runs it owns.
 
 ### The operator can ask the coordinator, and instruct it

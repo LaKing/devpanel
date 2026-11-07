@@ -633,7 +633,8 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   supervisor cannot run it either — `pause.request.projectAction` names what a person could do — so it answers
   with what is actually true and opens an issue for the work. Requests are applied before any other coordinator effect on
   the same handoff, or a window decision would block the run or reset past the step that asked. A closed question (`pause.options`) accepts
-  exactly one option, never prose. Every later step may name `decisions` in its context. Operator steps spend
+  exactly one option, never prose. Every later step may name `decisions` in its context, read from the whole run so an evidence refresh or plan
+  restart never drops an answer; a paused run's explanation names the answers it already holds. Operator steps spend
   no step budget.
 - Runtime failures are classified (`runtime/failure.mjs`): `rate-limit`, `transient` and `output-limit` are retried after a
   bounded wait (`retryPolicy`, default 3 attempts, 30 s doubling, 10 min cap, provider retry-after honoured);

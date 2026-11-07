@@ -922,7 +922,11 @@ export function buildContext (snapshot, run, steps, outputs) {
     checks: { latest: checkSummary(run.checkResults.at(-1)) },
     // Every operator answer so far, oldest first: a decision the run asked for
     // is binding on every later step, and the engine delivers it, not a brief.
-    decisions: decisionsOf(steps).map(({ key, question, answer, actor, at }) => ({ key, question, answer, actor, at })),
+    // Read from the whole run, not from `steps` (the current window): an
+    // evidence refresh or plan restart discards evidence, plans and findings,
+    // never an answer. Reading the window let a reset after the answer hand the
+    // next cycle's planner an empty record, and it planned the rejected option.
+    decisions: decisionsOf(run?.steps ?? steps).map(({ key, question, answer, actor, at }) => ({ key, question, answer, actor, at })),
     steps: byStepId
   }
 }

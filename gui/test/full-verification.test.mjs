@@ -142,6 +142,8 @@ export default async function (t) {
       t.eq('the schedule armed the next day', (await fv.latest()).schedule.next, '2026-11-08T05:00:00.000Z')
 
       t.section('4. "Full verification now": the same freeze, runs and record, the earlier cycle kept')
+      // The record says 'ended' before the cycle's promise lets go of the slot: wait for the cycle itself.
+      await fv.settle()
       const hand = await fv.startNow({ by: 'tester' })
       t.eq('a hand start returns the frozen record', [hand.id, hand.trigger, hand.by, hand.state], ['2026-11-07.2', 'hand', 'tester', 'frozen'])
       const second = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.id === '2026-11-07.2' && r.state === 'ended' ? r : null }, 'the hand cycle')

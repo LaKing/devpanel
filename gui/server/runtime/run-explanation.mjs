@@ -500,6 +500,20 @@ function withIgnoredSelftests (run, standing) {
   return { ...standing, detail: [standing.detail, ...ignored.map(ignoredWords)].filter(Boolean).join(' ') }
 }
 
+/**
+ * The answers a paused run already holds (operator decision steps), so whoever
+ * reads the pause sees what was decided before: the same question asked again
+ * says so, and earlier answers are named, the last three, newest last.
+ */
+function answeredWords (run) {
+  const answers = (run.steps ?? []).filter((s) => s.role === 'operator' && s.decision)
+  if (!answers.length) return null
+  const say = (s) => `step ${s.number} — "${firstLine(s.decision.answer, 200)}"${s.decision.actor ? ` (by ${s.decision.actor}${s.decision.at ? `, ${s.decision.at}` : ''})` : ''}`
+  const same = run.pause?.key ? answers.filter((s) => s.decision.key === run.pause.key).at(-1) : null
+  if (same) return `This question was already answered: ${say(same)}.`
+  return `Answered earlier in this run: ${answers.slice(-3).map(say).join('; ')}.`
+}
+
 function standingOf (run, { outputs, active, ownership }) {
   if (run.landed) return landed(run, standingOf({ ...run, landed: undefined }, { outputs, active }))
   const kept = run.workspace?.state === 'retained' ? 'Its workspace and logs are kept.' : 'Its logs are kept.'
@@ -549,14 +563,15 @@ function standingOf (run, { outputs, active, ownership }) {
       if (p.kind === 'full-verification') return { tone: 'waiting', headline: 'Paused for the daily full verification',
         detail: `Admission closed for cycle ${p.cycleId ?? 'unknown'}; everything done so far is saved.`,
         next: p.manualPending ? 'An operator pause was pending as well, so the cycle leaves this run paused: Resume continues it.' : 'It resumes when the cycle ends; Resume continues it after that.' }
+      const answered = answeredWords(run)
       if (p.request) {
         // The question is what to answer; the reason is why the run cannot do it.
         const heading = { 'owner-gate': 'Waiting for you: this decision is yours', authorization: 'Waiting for you: this needs your authorization', 'requirement-conflict': "Waiting for you: the requirements can't all be met" }[p.request.category] ?? 'Waiting for you: work the run may not do itself'
         return { tone: 'waiting', headline: heading,
-          detail: [p.question, p.request.reason, p.request.recommendation ? `Recommended: ${p.request.recommendation}` : null].filter(Boolean).join('\n\n') || null,
+          detail: [p.question, p.request.reason, p.request.recommendation ? `Recommended: ${p.request.recommendation}` : null, answered].filter(Boolean).join('\n\n') || null,
           next: p.request.projectAction ? `Run the project's "${p.request.projectAction}" action, then answer with what happened.` : p.request.category === 'owner-gate' ? 'Answer below; the run continues from your answer.' : 'Do the work, then answer with what happened.' }
       }
-      return { tone: 'waiting', headline: 'Waiting for your answer', detail: p.question ?? null, next: 'Answer below; the run continues from your answer.' }
+      return { tone: 'waiting', headline: 'Waiting for your answer', detail: [p.question, answered].filter(Boolean).join('\n\n') || null, next: 'Answer below; the run continues from your answer.' }
     }
     case 'cancelled':
       return run.abandonment
