@@ -30,6 +30,7 @@ import { checkoutPaths } from './runtime/path-overlap.mjs'
 import { readGrants, writeGrant, revokeGrant } from './broker/broker.mjs'
 import { listProjectActions, readOperation, startProjectAction, stopProjectAction } from './project-actions.mjs'
 import { createSupervisor } from './supervisor.mjs'
+import { createFullVerification } from './full-verification.mjs'
 import { createOwnerInput } from './owner-input.mjs'
 import { clientHost } from './opened-by.mjs'
 import { identify, proxyActor } from './proxy-user.mjs'
@@ -420,6 +421,7 @@ app.delete('/api/projects/:project/issues/:id', route(async (req, res) => {
 // subscription cannot be opened without the token.
 let supervisor = null
 let topSupervisor = null
+let fullVerification = null
 let modelPerformance = null
 const emitProjectAction = (event) => { io?.emit('project:action', event) }
 
@@ -458,10 +460,19 @@ app.post('/api/supervisor/stop', route(async (_req, res) => {
 /* An archived issue packed out of the folder has no runs to act on or read
    until it is restored; its results are on the issue itself. */
 async function unpackedIssue (project, id) {
-  const issue = await getIssue(project, id)
+  // A full verification run home holds runs too (issues.getRunHolder); it is never an issue.
+  const issue = await issues.getRunHolder(project, id)
   if (issue.packed) throw new IssueError('This issue is archived and packed. Restore it to see or act on its runs.', 409)
   return issue
 }
+
+// The daily full verification (server/full-verification.mjs): the latest cycle and
+// "Full verification now", which starts the same cycle the schedule does.
+app.get('/api/verification/latest', route(async (_req, res) => res.json(await fullVerification.latest())))
+app.post('/api/verification/start', route(async (req, res) => {
+  const cycle = await fullVerification.startNow({ by: req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || 'operator') })
+  res.status(202).json({ cycleId: cycle.id, state: cycle.state, cycle })
+}))
 
 app.get('/api/attention', route(async (_req, res) => {
   // The supervisor's open questions come first: nothing else can answer them.
@@ -608,7 +619,7 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
 }))
 
 app.get('/api/projects/:project/issues/:id/runs', route(async (req, res) => {
-  const issue = await getIssue(req.params.project, req.params.id)
+  const issue = await issues.getRunHolder(req.params.project, req.params.id)
   res.json(issue.packed ? [] : await listRuns(issue.path))
 }))
 
@@ -653,6 +664,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/chat', route(async (req,
 app.post('/api/projects/:project/issues/:id/runs', route(async (req, res) => {
   const { playbook, configHash, runOptions = {}, pregate: pregateBody = null } = req.body ?? {}
   if (!playbook) throw Object.assign(new Error('a playbook id is required'), { status: 400 })
+  if (runOptions?.fullVerification !== undefined) throw Object.assign(new Error('runOptions.fullVerification is set by the daily full verification only'), { status: 400 })
 
   // Returns as soon as the run has an id and durable state; execution continues
   // in the background, so closing the browser does not stop it.
@@ -982,6 +994,10 @@ modelPerformance = await createModelPerformanceService({ file: path.join(issues.
  * knew about.
  */
 const recovered = await supervisor.reconcile()
+// A cycle the last process left unfinished is marked interrupted, and the runs its
+// freeze paused are resumed, before anything else can start.
+fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event) })
+await fullVerification.recover().catch((error) => console.warn(`[devpanel] full verification recovery: ${error.message}`))
 // What the last shutdown cancelled comes back, before the top-level supervisor or
 // anyone else could take its project's slot. Recovery above is untouched: a run
 // that missed the shutdown's grace is recovery-required, and carries no mark.
@@ -1076,6 +1092,8 @@ if (listeners.length) {
   let pending = listeners.length
   listeners.forEach((listener, i) => listener.listen(PORT, HOSTS[i], () => { if (--pending === 0) announce() }))
 } else server.listen(PORT, HOST, announce)
+// Armed once serving: no block in the host settings, no scheduled cycle.
+fullVerification.start()
 
 let closing = false
 
@@ -1090,6 +1108,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     io.close()
     server.close()
     for (const listener of listeners) listener.close()
+    fullVerification?.stop()
 
     // Exiting without this leaves agent processes running with no owner, and
     // runs persisted as live whose owner is about to disappear.

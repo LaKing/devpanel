@@ -369,6 +369,15 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operator capability on the project page. An action may declare `effect: commit-checkout` (`projects/<id>.yaml`
   or a `# DEVPANEL effect:` header; the host settings may name another marker word) to state what it does rather than leave it inferred from a filename — a script
   may also version, publish, restart or deploy.
+- `full-verification.mjs` — the daily full verification: at the host settings' `fullVerification {at, timeZone}`
+  (or `POST /api/verification/start`) `supervisor.freeze` closes admission (starts and continuations refused
+  `FULL_VERIFICATION_FREEZE`; `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last
+  statement before the runtime call; live runs pause as `full-verification`, `manualPending` when an operator pause
+  was pending too), waits until no run of an issue is left, starts one Deployment run (environment staging,
+  `runOptions.fullVerification`) per `infrastructure.staging` in the run home `issues/<project>/.verification-<date>/`
+  (`issues.getRunHolder`, never an issue), one at a time per staging host; the run drives the full tier after its
+  staging release against the previous green cycle (`runtime/full-verification-drive.mjs`); then thaws, resumes what
+  it paused and keeps `issues/.verification/<date>/cycle.json`. execution-contract.md "Full verification freeze".
 - `runtime/path-overlap.mjs` — would this candidate write files another live run, of its project or another, is touching? Compared at the real destination, through links (`related` plays no part): expected paths from the issue's earlier runs (retained worktree, patch, plan text; none reads `unknown`, never `none`), a live run's from its worktree now and its plan. On readiness and preview as `pathOverlap`, an information prerequisite; every start reads it again and records `run.startOverlap`. It refuses nothing, for operator and supervisor alike. docs/top-level-supervisor.md "Readiness".
 - `staging-coverage.mjs` — which delivered runs a staging release carried, from content: each delivery's patch names its blobs per path, a staging release (a Deployment run in the staging environment, or an older Staging run) compares its snapshot once as it releases (`run.release.coverage`), an older green one is read from its retained archive. `stagingPendingReport` is `GET /api/projects/:project/staging-pending` and `overview`'s `stagingPending`: `pending`, `indeterminate`, `batch.ready`, and deliveries from before `COVERAGE_BASELINE` only as `history.count` (their content is never read). It starts nothing. `deploy_staging` names its candidates `indeterminate` (`deployed-content-unproven`) and clears nothing: only a staging release does. Notes go through `issues.createEngineNote`, kept beside an archived issue until restored. docs/staging-deployment.md "What a release covers".
 - `config/release-plan.mjs` + `release-selection.mjs` — where a staging or deployment run releases: the Deployment

@@ -1297,7 +1297,7 @@ watch(() => route.query.run, (runId) => {
 
           <!-- A paused run asked a question. Nothing is in flight; the answer is
                recorded as a step of its own and the run goes on from it. -->
-          <div v-if="run.status === 'paused' && run.pause && run.pause.kind !== 'manual'" class="answer">
+          <div v-if="run.status === 'paused' && run.pause && !['manual', 'full-verification'].includes(run.pause.kind)" class="answer">
             <v-text-field v-if="!proxyUser" v-model="answerActor" label="Your name" density="compact"
                           variant="outlined" hide-details class="answer__actor" />
             <div v-if="run.pause.options" class="answer__options">

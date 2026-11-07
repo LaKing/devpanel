@@ -9,6 +9,7 @@ export function infrastructureErrors (infra) {
   const errors = []
   if (new Set(environments.map(e => e.id)).size !== environments.length) errors.push('environment ids must be unique')
   errors.push(...reservedEnvironmentErrors(infra))
+  for (const e of infra.deployments) if (e.fullVerification) errors.push(`${e.id}: fullVerification applies to the staging environment only`)
   if (infra.deployments.some(e => e.ssh.hostRef === infra.staging.ssh.hostRef)) errors.push('staging and deployment containers must have different SSH host references')
   if (!infra.testDrive.commands.some(c => c.required !== false)) errors.push('testDrive needs at least one required command')
   const commands = [...infra.testDrive.commands, ...(infra.testDrive.finallyCommands ?? [])]

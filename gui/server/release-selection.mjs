@@ -36,12 +36,15 @@ const sha256File = (file) => new Promise((resolve, reject) => {
 
 const issuesModule = () => import('./issues.js')
 
-/** Every green staging release of a project, newest first, with the issue that holds it. */
-export async function greenStagingReleases ({ project, listIssues, readRuns = runsOf, readPackedRuns = packedRunsOf }) {
+/** The daily full verification's run homes of a project (issues.js listRunHomes): their staging releases count too. */
+export const runHomesOf = async (project, listHomes = null) => (listHomes ?? (await issuesModule()).listRunHomes)(project).catch(() => [])
+
+/** Every green staging release of a project, newest first, with the issue (or run home) that holds it. */
+export async function greenStagingReleases ({ project, listIssues, listHomes = null, readRuns = runsOf, readPackedRuns = packedRunsOf }) {
   const list = listIssues ?? (await issuesModule()).listIssues
-  const [open, archived] = await Promise.all([list(project), list(project, { archived: true })])
+  const [open, archived, homes] = await Promise.all([list(project), list(project, { archived: true }), runHomesOf(project, listHomes)])
   const out = []
-  for (const issue of [...open, ...archived]) {
+  for (const issue of [...open, ...archived, ...homes]) {
     const runs = issue.packed ? await readPackedRuns(issue.project ?? project, issue.id) : await readRuns(issue.path)
     for (const run of runs) if (run.release?.tactic === 'staging' && stagedReleasePassed(run.release, run)) out.push({ issue, run })
   }
@@ -127,8 +130,8 @@ const describe = ({ issue, run }) => ({ issueId: issue.id, runId: run.runId, sta
  *   { releaseId, issueId, startedAt, packed, matched: 'content-identity' }
  *   { releaseId: null, reason: 'no-green-staging' | 'content-not-staged', latestGreen, compared, unverifiable }
  */
-export async function selectStagedRelease ({ project, projectPath, listIssues, readRuns, readPackedRuns, identityOfArchive = archiveIdentity, identityOfCheckout = checkoutIdentity, verifyArchive = archiveVerified }) {
-  const green = await greenStagingReleases({ project, listIssues, readRuns, readPackedRuns })
+export async function selectStagedRelease ({ project, projectPath, listIssues, listHomes = null, readRuns, readPackedRuns, identityOfArchive = archiveIdentity, identityOfCheckout = checkoutIdentity, verifyArchive = archiveVerified }) {
+  const green = await greenStagingReleases({ project, listIssues, listHomes, readRuns, readPackedRuns })
   const unverifiable = []
   const compared = []
   const checkout = new Map()

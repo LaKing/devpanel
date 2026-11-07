@@ -44,7 +44,8 @@ export function overlapMs (a, b) {
  * operator request, a phase's await-input, exhausted rounds); a manual pause
  * is a person stopping the run, which is suspension.
  */
-const asksAQuestion = (pause) => Boolean(pause) && pause.kind !== 'manual'
+// Neither an operator's pause nor the daily full verification's freeze asks anything.
+const asksAQuestion = (pause) => Boolean(pause) && !['manual', 'full-verification'].includes(pause.kind)
 
 /*
  * Every check run the record still holds, as its own interval (a check's `at`

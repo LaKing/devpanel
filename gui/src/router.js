@@ -5,6 +5,7 @@ import DashboardView from '@/views/DashboardView.vue'
 const routes = [
   { path: '/supervisor', name: 'supervisor', component: () => import('@/views/SupervisorView.vue'), meta: { title: 'Supervisor' } },
   { path: '/models', name: 'models', component: () => import('@/views/ModelAvailabilityView.vue'), meta: { title: 'Model availability' } },
+  { path: '/verification', name: 'verification', component: () => import('@/views/VerificationView.vue'), meta: { title: 'Full verification' } },
   {
     path: '/',
     name: 'dashboard',

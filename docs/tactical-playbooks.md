@@ -566,3 +566,56 @@ startup/tests; staging recovery can be automatic while production recovery stays
 manual to protect subsequent customer writes. The target settings are in
 `host-config/releases/<site>-targets.json`. Configuration and read-only
 inspections do not deploy either instance.
+
+## The daily full verification
+
+Every day, at a time the host settings name, the panel finishes the seat turns in flight,
+starts nothing new, and verifies every project on its stage with the Deployment playbook
+(environment staging, full checks): the day's changes together. "Full verification now"
+starts the same cycle by hand.
+
+**Configure it** in the host settings (docs/host-config.md "Host settings"):
+
+```json
+{ "fullVerification": { "at": "06:00", "timeZone": "Europe/Berlin" } }
+```
+
+`at` is HH:MM local to `timeZone`, an IANA zone the runtime must know. Without the block
+there is no scheduled cycle; the hand start still works. The schedule fires once per local
+date, when the clock reaches `at`; a service that starts after that time waits for the
+next day (no catch-up). On a daylight-saving change an ambiguous time is its earlier
+instant and a skipped one fires shifted forward.
+
+**What freezes and resumes.** At the time admission closes: no run starts, and no seat
+turn begins beyond the one in flight. Live runs pause at their next step boundary as
+`paused: full-verification` and resume when the cycle ends; a run an operator had also
+asked to pause stays paused for that operator. The cycle starts only when no seat turn is
+running. Details are in execution-contract.md "Full verification freeze".
+
+**What runs.** One Deployment run in environment staging for each configured stage: a
+project's `infrastructure.staging`. The candidate is the project's development checkout as
+it stands (the strategy's `working-tree` base). After the staging release the engine drives
+the project's full check tier on the same snapshot and compares it with the previous green
+cycle of that stage; a new failure blocks the run. Runs on one staging host go one at a
+time and hosts run side by side, each drive within the host's drive slots. A project with
+no infrastructure, or whose staging declares `fullVerification: instances` (a framework
+verified through the applications that deploy it), is recorded as verified through its
+instances and gets no run. A stage whose run cannot start (a missing release target,
+`TARGET_MISSING`, or another refusal) is a red entry with the refusal.
+
+The runs live in the project's run home `issues/<project>/.verification-<date>/`, which is
+not an issue: the cycle opens no issue and bumps no version. A green cycle release counts as
+a green staging release (production promotion, staging coverage).
+
+**Where the record is.** Each cycle writes `issues/.verification/<date>/cycle.json` at
+every step: `id`, `trigger` (`schedule` or `hand`), `by`, `schedule`, `state` (`frozen`,
+`running`, `resuming`, `ended`, `interrupted`, `failed`), `frozenAt`, `seatsIdleAt`,
+`startedAt`, `endedAt`, `verdict` (`green`, `red`, `no-stages`: any red entry, a project whose
+configuration cannot be read included, makes it `red`), the runs it waited on,
+and one entry per project: its stage and host, `runId`, `status`, `release`, `check`
+(result, gate, baseline cycle, new failures, the drive's files and their hashes), `verdict`,
+`startedAt`, `endedAt`, `durationMs`, or `verifiedThrough: instances`, or a `refusal`. The
+runs it resumed, those left paused for an operator and the refused resumes are listed too.
+An earlier cycle of the same date is kept as `cycle.<n>.json`. The dashboard and
+`/verification` show the latest cycle (`GET /api/verification/latest`); "Full verification
+now" is `POST /api/verification/start`. Part 4 of the daily verification reads the record.

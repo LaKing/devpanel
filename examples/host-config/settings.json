@@ -9,5 +9,6 @@
   "selection": { "forbiddenPrefixes": ["production", "staging"] },
   "skill": { "linkBaseVariable": "EDITOR_LINKBASE" },
   "reporter": { "panelUrl": "https://192.0.2.10" },
-  "seatGuidance": { "projects": ["devpanel-project"] }
+  "seatGuidance": { "projects": ["devpanel-project"] },
+  "fullVerification": { "at": "06:00", "timeZone": "Europe/Berlin" }
 }

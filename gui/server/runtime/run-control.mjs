@@ -42,8 +42,12 @@ export const awaitsAutoResume = (run) => run?.status === 'cancelled' && run.stop
  * work to keep and nothing to verify, so resuming it is doing its setup, from its
  * snapshot (supervisor.answer). A workspace path is set once provisioning began.
  */
+/** A pause resumed by a plain resume: an operator's, or the daily full verification's freeze. */
+export const RESUMABLE_PAUSES = ['manual', 'full-verification']
+const resumablePause = (run) => run?.status === 'paused' && RESUMABLE_PAUSES.includes(run.pause?.kind)
+
 export const awaitsSetup = (run) => !run?.workspace?.path &&
-  ((run?.status === 'paused' && run.pause?.kind === 'manual') || (run?.status === 'cancelled' && run.stoppedBy === SERVICE_SHUTDOWN))
+  (resumablePause(run) || (run?.status === 'cancelled' && run.stoppedBy === SERVICE_SHUTDOWN))
 
 /** Resume is an explicit operator action; uncertain mutations still need recovery. */
 export function resumeUnavailable (run) {
@@ -52,8 +56,8 @@ export function resumeUnavailable (run) {
   if (run.journal?.recoveryRequired || run.recovery?.required || run.integrity?.status !== 'clear') return 'Resolve the run’s recovery or integrity condition first.'
   if (Object.values(run.participants ?? {}).some(p => p.pendingInvocation || p.state === 'recovery-required')) return 'An invocation still needs recovery.'
   if (!run.workspace?.path || run.workspace.state === 'removed') return 'The saved workspace is no longer available.'
-  if (run.release && !(run.status === 'paused' && run.pause?.kind === 'manual' && run.release.status === 'completed')) return 'Use the release recovery or finalization controls for this run.'
-  if (run.status === 'paused') return run.pause?.kind === 'manual' ? null : 'Answer the pending question to continue this run.'
+  if (run.release && !(resumablePause(run) && run.release.status === 'completed')) return 'Use the release recovery or finalization controls for this run.'
+  if (run.status === 'paused') return resumablePause(run) ? null : 'Answer the pending question to continue this run.'
   // cleanup-unproved resumes only past a proof or an acknowledgement (engine.resumeExecution).
   if (run.status === 'blocked' && ['budget-exhausted', 'rounds-exhausted', 'protocol-repair-exhausted', 'owner-lost', 'cleanup-unproved'].includes(run.blockedReason)) return null
   if (run.status === 'failed' && /input_too_large|Input exceeds the maximum length/i.test(run.failures?.at(-1)?.evidence ?? '')) return 'Use Retry input to replace the rejected session and continue.'

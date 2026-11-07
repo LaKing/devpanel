@@ -6,6 +6,8 @@ import { ignoredWords, openStability, owedAsRisk } from './selftest-history.mjs'
 import { writeJson } from './persistence.mjs'
 import fs from 'node:fs/promises'
 import { executeRelease, recoverRelease } from './release.mjs'
+import { fullVerificationDrive } from './full-verification-drive.mjs'
+import { issuesRoot } from '../project-path.mjs'
 import { planOf as releasePlanOf } from '../config/release-plan.mjs'
 import { hostConfigDir, DEFAULT_CONFIG_ROOT } from '../config/host-config.mjs'
 import { captureWindow } from './current-window.mjs'
@@ -2753,6 +2755,13 @@ export class Engine {
           runId: this.runId, runDir: store.runDir(this.issuePath, this.runId), invocationId, seat: role } })
         if (turnFence) { turnFence.writable = [...turnFence.writable, ...brokerTurn.fence.writable]; turnFence.readOnly = [...turnFence.readOnly, ...brokerTurn.fence.readOnly] }
       }
+      // The daily full verification's freeze (execution-contract.md "Full verification
+      // freeze"): the last statement before the runtime starts, with nothing awaited
+      // between it and the call, so a freeze is either seen here or the turn is in flight.
+      if (this.run.freezeRequested) {
+        await brokerTurn?.close().catch(() => {})
+        return await this.withholdTurn({ role, step, invocationId, pending, p })
+      }
       try { result = await adapter.invoke({
         // A reading triage turn has its own session: later coordinator turns
         // resume the coordinator's, which never held the source text.
@@ -2923,9 +2932,43 @@ export class Engine {
     }
   }
 
+  /**
+   * The daily full verification closed admission (supervisor freeze): no seat turn
+   * of this run begins after this (the gate in runTurn) and it pauses at its next
+   * boundary as `full-verification`. Its own field, so a pending operator pause
+   * cannot hide it. The assignment is synchronous; the returned promise persists it.
+   */
+  requestFreeze (cycleId) {
+    if (!['running', 'pending', 'preflighting'].includes(this.run.status) || this.run.freezeRequested) return null
+    this.run.freezeRequested = { cycleId, at: this.clock.iso() }
+    return this.persist({ type: 'freeze-requested', cycleId })
+  }
+
+  /** A turn prepared but not started because the freeze arrived: no step, nothing in flight. */
+  async withholdTurn ({ role, step, invocationId, pending, p }) {
+    if (!await this.endIntegrity(role, pending, 'withheld', 'the daily full verification closed admission before the turn started')) {
+      p.state = 'ready'
+      p.pendingInvocation = null
+      await this.persist({ type: 'turn-withheld', role, stepId: step.id, invocationId, reason: 'full-verification' })
+      return { blocked: true }
+    }
+    p.state = 'ready'
+    p.pendingInvocation = null
+    await this.persist({ type: 'turn-withheld', role, stepId: step.id, invocationId, reason: 'full-verification', cycleId: this.run.freezeRequested?.cycleId ?? null })
+    return { withheld: true }
+  }
+
   async pauseAtBoundary () {
-    if (!this.run.pauseRequested) return false
+    if (!this.run.pauseRequested && !this.run.freezeRequested) return false
+    const freeze = this.run.freezeRequested
+    const manual = Boolean(this.run.pauseRequested)
     this.run.pauseRequested = null
+    this.run.freezeRequested = null
+    if (freeze) {
+      // An operator's pause pending beside the freeze is kept: the cycle does not resume this run.
+      await this.pauseFor({ key: `full-verification:${uuid()}`, question: `Paused for the daily full verification (cycle ${freeze.cycleId}). ${manual ? 'An operator pause was also requested, so the cycle leaves it paused: resume it by hand.' : 'It resumes when the cycle ends.'}`, options: null, askedBy: null, decisionKind: 'full-verification', cycleId: freeze.cycleId, manualPending: manual })
+      return true
+    }
     await this.pauseFor({ key: `manual:${uuid()}`, question: 'Paused by the operator. Resume to continue from the next unfinished step.', options: null, askedBy: null, decisionKind: 'manual' })
     return true
   }
@@ -2937,7 +2980,7 @@ export class Engine {
    */
   async pauseForShutdown (event) {
     if (this.abortReason !== SERVICE_SHUTDOWN) return false
-    if (this.run.pauseRequested) await this.pauseAtBoundary()
+    if (this.run.pauseRequested || this.run.freezeRequested) await this.pauseAtBoundary()
     else if (this.run.status !== 'paused') return false
     await this.persist({ type: 'stopped-for-pause', stoppedBy: SERVICE_SHUTDOWN, ...event })
     return true
@@ -3017,6 +3060,7 @@ export class Engine {
     this.run.budgets.limits = limits
     this.run.pause = null
     this.run.pauseRequested = null
+    this.run.freezeRequested = null
     // Answered: a later stop of this run says who made that one.
     delete this.run.stoppedBy
     delete this.run.autoResumeRefused
@@ -3036,7 +3080,8 @@ export class Engine {
     this.run.blockedReason = null
     // `request` is what the asker wants done, when the ask is for work rather
     // than for a decision: the reason, and the project action that would do it.
-    this.run.pause = { id: uuid(), key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, kind: next.decisionKind, ...(next.request ? { request: next.request } : {}), at: this.clock.iso() }
+    this.run.pause = { id: uuid(), key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, kind: next.decisionKind, ...(next.request ? { request: next.request } : {}),
+      ...(next.cycleId ? { cycleId: next.cycleId, manualPending: Boolean(next.manualPending) } : {}), at: this.clock.iso() }
     await this.persist({ type: 'paused', pauseId: this.run.pause.id, key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, ...(next.request ? { request: next.request } : {}) })
   }
 
@@ -3268,7 +3313,7 @@ export class Engine {
 
   async answer ({ text, actor, pauseId }) {
     await this.assertJournal()
-    if (this.run.status !== 'paused' || !this.run.pause || this.run.pause.kind === 'manual') throw Object.assign(new Error('the run is not waiting for a decision'), { status: 409 })
+    if (this.run.status !== 'paused' || !this.run.pause || ['manual', 'full-verification'].includes(this.run.pause.kind)) throw Object.assign(new Error('the run is not waiting for a decision'), { status: 409 })
     if (typeof text !== 'string' || !text.trim()) throw Object.assign(new Error('an answer is required'), { status: 400 })
     if (typeof actor !== 'string' || !actor.trim()) throw Object.assign(new Error('the answering actor must be named'), { status: 400 })
     if (!pauseId || pauseId !== this.run.pause.id) throw Object.assign(new Error('the question has changed; reload the run before answering'), { status: 409 })
@@ -3605,6 +3650,7 @@ export class Engine {
     return {
       cancelled: outcomes.some((o) => o.cancelled),
       blocked: outcomes.some((o) => o.blocked),
+      withheld: outcomes.some((o) => o.withheld),
       retried: outcomes.some((o) => o.retried)
     }
   }
@@ -3822,12 +3868,30 @@ export class Engine {
         if(!releaseAssessmentAccepted(prepared)) {
           this.run.status='blocked';this.run.blockedReason='release-preparation-unresolved';this.run.outcome='unresolved';await this.persist();break
         }
+        // No release mutation starts once the daily full verification closed admission.
+        if (await this.pauseAtBoundary()) break
         this.run.release = await executeRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),workspace:this.run.workspace,snapshot:this.snapshot,signal:this.controller.signal,coverage:this.releaseCoverage?args=>this.releaseCoverage({...args,snapshotAt:this.run.startedAt}):null,onUpdate:async state=>{this.run.release=structuredClone(state);await this.persist({type:'release-command',command:state.commands.at(-1)?.id,status:state.commands.at(-1)?.status})},verifySource:async()=>{
           if(!await this.beginIntegrity('release-operator',{invocationId:`release-${uuid()}`}))throw new Error('release source integrity changed')
         }})
         await this.persist({type:'release-operation',status:this.run.release.status})
         if (this.run.release.status !== 'completed') {
           this.run.status='blocked';this.run.blockedReason=`release-${this.run.release.status}`;this.run.outcome='unresolved';await this.persist();break
+        }
+        // A daily full verification run: the project's full tier on this snapshot, judged
+        // against the previous green cycle, before anyone assesses the release. Once per run.
+        if (this.snapshot.fullVerification && !this.run.fullVerification?.check) {
+          const drive = this.fullVerificationDrive ?? fullVerificationDrive
+          const check = await this.whileChecking(() => drive({ target: this.snapshot.fullVerification.target, workspace: this.run.workspace, runDir: store.runDir(this.issuePath, this.runId), runId: this.runId,
+            project: this.run.issue.project, stage: this.snapshot.infrastructure?.staging?.id ?? null, verificationDir: this.verificationDir ?? path.join(issuesRoot(), '.verification'),
+            clock: this.clock, signal: this.controller.signal, platform: this.platform, onDriveWait: (wait) => this.noteDriveWait(wait) }))
+          this.run.fullVerification = { ...(this.run.fullVerification ?? {}), check }
+          await this.persist({ type: 'full-verification-check', result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline })
+          if (check.gating !== 'passed') {
+            // The stage keeps what was released, for people to look at: no restore.
+            this.run.status = 'blocked'; this.run.blockedReason = 'full-verification-checks-failed'; this.run.outcome = 'unresolved'; this.run.endedAt = this.clock.iso()
+            await this.persist({ type: 'blocked', reason: 'full-verification-checks-failed' })
+            break
+          }
         }
       }
       // staging-then-production: production only after this run's staging release
@@ -3877,6 +3941,8 @@ export class Engine {
       const outcome = batch.length === 1 ? await this.runTurn(next) : await this.runConcurrently(batch)
       if (this.checksInFlight && concurrentReview(next)) await this.settleChecks()
       if (outcome.cancelled || outcome.blocked) break
+      // A turn the freeze withheld: the boundary at the top of the loop pauses the run.
+      if (outcome.withheld) { await this.persist(); continue }
       if (outcome.retried) continue
       this.applyReviewOutcomes()
       await this.persist()
@@ -4323,6 +4389,7 @@ export class Engine {
         if (next.kind !== 'turn') return stand('notice-unfinished', `no auditor could answer on this drive (${next.reason ?? next.kind})`)
         const outcome = await this.runTurn(next)
         if (outcome.cancelled) return stand('notice-unfinished', 'the auditor\'s turn on this drive was cancelled')
+        if (outcome.withheld) return stand('notice-unfinished', 'the daily full verification closed admission before the auditor\'s turn on this drive')
         if (outcome.blocked) return stand('notice-unfinished', `the auditor\'s turn on this drive could not finish (${this.refusalReason() ?? this.run.blockedReason ?? 'blocked'})`)
       }
     } catch (error) {

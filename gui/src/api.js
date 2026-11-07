@@ -121,6 +121,9 @@ export const api = {
   // ---- runs -------------------------------------------------------------
   /** Every agent currently invoked, across every project. */
   listAgents: () => request('/api/agents'),
+  /** The daily full verification: the latest cycle, and "Full verification now" (server/full-verification.mjs). */
+  verificationLatest: () => request('/api/verification/latest'),
+  startVerification: () => request('/api/verification/start', { method: 'POST', body: '{}' }),
   listAttention: () => request('/api/attention'),
   listPlaybooks: () => request('/api/playbooks'),
   previewPlaybook: (playbookId, { project, issue, runOptions = {} } = {}) => {

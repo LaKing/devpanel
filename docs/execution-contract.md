@@ -2686,6 +2686,61 @@ neither and are not rewritten); the original
 resolved playbook snapshot stays immutable. Explicit continuation does not imply
 approval of any outstanding finding or automatic resolution of the issue.
 
+### Full verification freeze
+
+The daily full verification (tactical-playbooks.md "The daily full verification",
+`server/full-verification.mjs`) closes admission while it runs. `supervisor.freeze(cycleId)`
+sets the freeze and asks every run of an issue that this process drives to stop:
+
+- **No run starts.** `supervisor.start()` refuses every start but the cycle's own with
+  409 `FULL_VERIFICATION_FREEZE` (`started: false`, `retryable: true`): the panel, the
+  top-level supervisor's `start_run` and a triage's autoStart alike. Resume, answer,
+  Continue and refresh-checks of an issue's run are refused the same way; finalize
+  (delivery, no seat turn) is not.
+- **No seat turn begins beyond the one in flight.** The freeze is its own field,
+  `run.freezeRequested {cycleId, at}` (`engine.requestFreeze`, set synchronously; a
+  reservation carries it into its engine), so an operator's pause already pending cannot
+  hide it. The last statement before a seat's runtime is invoked (`runTurn`) checks it,
+  with nothing awaited between the check and the call: a freeze is either seen there, and
+  the prepared turn is withheld (journal `turn-withheld`, no step recorded, nothing in
+  flight, replay plans it again), or the turn was already in flight and finishes. Siblings
+  of a concurrent round already invoking finish; the others are withheld. No release
+  mutation starts either: a staging or deployment run pauses before `executeRelease`.
+- **Live runs pause at their next step boundary** as `status: paused`, `pause.kind:
+  full-verification` with `pause.cycleId`. A plain resume continues such a pause, like a
+  manual one. When an operator's pause was pending as well, the pause records
+  `manualPending: true`: the cycle leaves that run paused for the operator.
+- **The cycle starts** once no run of an issue is left in the process (`supervisor.busy()`),
+  so no seat turn is running. Its own Deployment runs carry `run.fullVerification
+  {cycleId}`, live in the project's run home `issues/<project>/.verification-<date>/`
+  (id `verification-<date>`; never an issue: no list, count or lookup of issues reads it,
+  and its parent is the project's issue folder, so release and action locks, the git
+  store and the cleanup barrier are the project's own) and are exempt from the freeze; a run of an earlier cycle is not (it is frozen, waited for and
+  refused continuation like any run of an issue).
+- **When the cycle ends** (its runs settled: completed, blocked, failed or paused all
+  count), `supervisor.thaw()` opens admission and the cycle resumes every run of an issue, or of an earlier cycle,
+  paused as `full-verification` without `manualPending` (`actor: service`, `origin:
+  full-verification`), with every refusal of an ordinary resume; refusals and the runs
+  left for an operator are in the cycle record.
+
+A service shutdown during the freeze records a frozen run's stop as that pause. At the
+next start, before `resumeInterrupted`, `recover()` marks an unfinished cycle record
+`interrupted` and resumes the runs paused as `full-verification`; the cycle's own runs
+are not resumed automatically (their homes are not issues, so `resumeInterrupted` never
+lists them; `reconcile` does, so a crash leaves them `recovery-required` like any run).
+
+**The full check of a cycle run.** After its staging release completed, the engine drives
+the project's test-drive target in its full tier (`stagingTarget` + `tierTarget(…, 'full')`,
+without baseline cache or timing) on the run's own snapshot, the development checkout as
+it stood (`runtime/full-verification-drive.mjs`, `run.fullVerification.check`). Its
+failures are compared by name (`compareSelftestReports`, `compareFailures`) with the drive
+of the latest cycle in which this stage was green, copied into `checks/previous-green/`
+after every file is checked against the sha256 that cycle recorded. The baseline cache does
+not apply: it is keyed by the exact base commit, and each day's checkout has another. An
+inherited failure passes; a new failure, a comparison that cannot be made, or a drive with
+no previous green cycle that fails makes the gate fail, and the run blocks
+`full-verification-checks-failed` without restore, so the stage keeps what was released.
+
 #### What the wall clock counts
 
 `wallClockMinutes` limits the run's elapsed time, less what it does not count

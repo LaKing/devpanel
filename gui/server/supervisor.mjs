@@ -90,6 +90,9 @@ const err = (status, message, detail = {}) =>
  * It says nothing about the launch's inputs and the identical start can pass once
  * that clears, so the start gate neither guards it nor keeps the attempt's charge.
  */
+// A full verification run home's id (issues.js HOME_PATTERN): runs of the cycle, never an issue.
+const HOME_PATTERN = /^verification-\d{4}-\d{2}-\d{2}$/
+
 const occupied = (message, detail = {}) => err(409, message, { started: false, retryable: true, ...detail })
 
 export function createSupervisor ({
@@ -126,6 +129,52 @@ export function createSupervisor ({
   const attemptedReconciles = new Set()
 
   const key = (project, issueId) => `${project}/${issueId}`
+  /** An issue, or a full verification run home (issues.getRunHolder); fakes without homes read issues only. */
+  const holderOf = (project, issueId) => (issues.getRunHolder ?? issues.getIssue)(project, issueId)
+  const homesOf = async (project) => (issues.listRunHomes ? issues.listRunHomes(project).catch(() => []) : [])
+
+  /*
+   * The daily full verification's admission freeze (server/full-verification.mjs,
+   * execution-contract.md "Full verification freeze"). While set, no run starts
+   * and no run continues except the cycle's own; every live run of an issue is
+   * asked to pause at its next step boundary, and no seat turn of it begins.
+   */
+  let freeze = null
+  const freezeRefusal = () => Object.assign(err(409, `Admission is closed for the daily full verification (cycle ${freeze.cycleId}, since ${freeze.at}): nothing starts or continues until the cycle ends.`, { code: 'FULL_VERIFICATION_FREEZE', cycleId: freeze.cycleId }), { started: false, retryable: true })
+  const freezeAsk = (cycleId) => ({ cycleId, at: new Date().toISOString() })
+  /** Only the runs of the cycle that closed admission are exempt; an earlier cycle's run is frozen like any other. */
+  const ofCycle = (record) => Boolean(freeze && record.cycleId && record.cycleId === freeze.cycleId)
+  /** Ask one run this process drives to stop at its next boundary for the cycle. Synchronous for an engine. */
+  function freezeRecord (record) {
+    if (!freeze || ofCycle(record)) return null
+    if (record.engine) return record.engine.requestFreeze(freeze.cycleId)
+    record.freezeRequested = freezeAsk(freeze.cycleId)
+    record.reservation.run.freezeRequested ??= record.freezeRequested
+    return store.writeRun(record.issuePath, record.runId, record.reservation.run)
+  }
+  /** Close admission for a cycle and ask every live run of an issue to pause; returns the runs asked. */
+  async function freezeAdmission (cycleId) {
+    if (freeze && freeze.cycleId !== cycleId) throw err(409, `admission is already closed for cycle ${freeze.cycleId}`)
+    freeze = freezeAsk(cycleId)
+    const asked = []
+    const writes = []
+    for (const record of active.values()) {
+      if (ofCycle(record)) continue
+      writes.push(Promise.resolve(freezeRecord(record)).catch((error) => console.warn(`[devpanel] the freeze request of ${record.project}/${record.issueId} run ${record.runId} was not persisted: ${error.message}`)))
+      asked.push({ project: record.project, issueId: record.issueId, runId: record.runId })
+    }
+    await Promise.all(writes)
+    emit?.({ type: 'admission-frozen', cycleId })
+    return asked
+  }
+  function thawAdmission (cycleId = null) {
+    if (freeze && cycleId && freeze.cycleId !== cycleId) return false
+    freeze = null
+    emit?.({ type: 'admission-thawed', cycleId })
+    return true
+  }
+  /** The runs of issues this process drives: until none is left, a seat turn may be running. */
+  const busy = () => [...active.values()].filter((r) => !ofCycle(r)).map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, phase: r.phase }))
 
   /*
    * In-place runs whose open cleanup entries the project barrier file could not
@@ -229,8 +278,9 @@ export function createSupervisor ({
    * Reserve a run and return. Everything expensive happens afterwards, inside a
    * run the caller can already see and stop.
    */
-  async function start ({ project, issueId, playbookId, expectConfigHash = null, runOptions = {}, configRoot: root = configRoot, supervisorLaunchId = null, pregateOverride = null }) {
+  async function start ({ project, issueId, playbookId, expectConfigHash = null, runOptions = {}, configRoot: root = configRoot, supervisorLaunchId = null, pregateOverride = null, cycle = null }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
+    if (freeze && (!cycle || cycle !== freeze.cycleId)) throw freezeRefusal()
     const k = key(project, issueId)
 
     // Two guards, because they fail differently: this one catches a double-click
@@ -245,9 +295,14 @@ export function createSupervisor ({
     let projectPath
     let pregateRecord = null
     let startOverlap = null
+    let home = false
     try { await admission(project, async () => {
-      const issue = await issues.getIssue(project, issueId)
+      const issue = await holderOf(project, issueId)
+      home = Boolean(issue.home)
       if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
+      // A run home takes the cycle's own runs and nothing else; only those run as the full verification.
+      if (home !== Boolean(cycle)) throw err(409, home ? 'a full verification run home takes runs only from the cycle' : 'only the full verification cycle starts a run in a run home')
+      if (Boolean(runOptions?.fullVerification) !== home) throw err(409, 'runOptions.fullVerification is set by the full verification cycle, for its own runs only')
       inquiryAdmission(issue, { playbookId, runOptions })
       projectPath = await resolveProjectPath(project, { projectsDir })
       harnesses = await loadHarnesses()
@@ -323,7 +378,8 @@ export function createSupervisor ({
         expectConfigHash,
         runOptions,
         stagedRelease: stagedRelease?.releaseId ? stagedRelease : null,
-        unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path))
+        unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)),
+        fullVerification: cycle ? { cycleId: cycle } : null
       })
     }) } catch (error) {
       starting.delete(k)
@@ -340,10 +396,14 @@ export function createSupervisor ({
       reservation,
       controller: new AbortController(),
       stopping: false,
-      finished: null
+      finished: null,
+      home,
+      cycleId: cycle
     }
     active.set(k, record)
     starting.delete(k)
+    // Admitted just before a freeze closed admission: asked to pause like any other.
+    if (freeze && !ofCycle(record)) await Promise.resolve(freezeRecord(record)).catch(() => {})
     emit?.({ type: 'run-reserved', project, issueId, runId: record.runId, status: 'preflighting' })
 
     // The record the start went ahead on, beside the run, for the agreement report.
@@ -375,6 +435,8 @@ export function createSupervisor ({
   async function exclusiveHolder (project, exceptIssueId, mine, listed = null) {
     let list = listed ?? []
     if (!listed) try { list = await issues.listIssues(project) } catch { list = [] }
+    // A cycle's release run holds the project's release target like any other.
+    list = [...list, ...await homesOf(project)]
     const conflictOf = async (issuePath, runId) => conflicts(mine, exclusivityOf(await store.readSnapshot(issuePath, runId).catch(() => null)))
     const seen = new Set()
     for (const issue of list) {
@@ -441,7 +503,7 @@ export function createSupervisor ({
       if (state !== 'passed') {
         const stopped = state === 'cancelled' || record.controller.signal.aborted
         record.refusal = refusal
-        if (stopped && record.stoppedBy && reservation.run.pauseRequested) {
+        if (stopped && record.stoppedBy && (reservation.run.pauseRequested || reservation.run.freezeRequested)) {
           await pauseReservation(reservation)
           return
         }
@@ -491,7 +553,7 @@ export function createSupervisor ({
 
   /** A reservation stopped before any workspace exists: paused if a pause was asked for, else cancelled. */
   async function settleStopped ({ reservation, stoppedBy }) {
-    if (stoppedBy && reservation.run.pauseRequested) {
+    if (stoppedBy && (reservation.run.pauseRequested || reservation.run.freezeRequested)) {
       await pauseReservation(reservation)
       return
     }
@@ -510,6 +572,7 @@ export function createSupervisor ({
     if (record.stopping || record.controller.signal.aborted) {
       engine.cancel(record.stoppedBy ?? 'requested')
       if (record.stoppedBy && record.pauseRequested) engine.run.pauseRequested ??= { at: engine.clock.iso() }
+      if (record.stoppedBy && record.freezeRequested) engine.run.freezeRequested ??= record.freezeRequested
       if (await engine.pauseForShutdown({ between: 'provisioning-and-drive' })) return
       // No invocation has begun. drive() refuses an already-aborted controller,
       // so settle here instead of leaving a permanent "stopping" record.
@@ -521,6 +584,7 @@ export function createSupervisor ({
       return
     }
     if (record.pauseRequested && !engine.run.pauseRequested) await engine.requestPause()
+    if ((record.freezeRequested || (freeze && !ofCycle(record))) && !engine.run.freezeRequested) await engine.requestFreeze(record.freezeRequested?.cycleId ?? freeze.cycleId)
     await engine.drive()
   }
 
@@ -541,7 +605,9 @@ export function createSupervisor ({
     try {
       let issue
       await admission(project, async () => {
-        issue = await issues.getIssue(project, issueId)
+        issue = await holderOf(project, issueId)
+        // Nothing continues during the cycle but the cycle's own runs; the cycle resumes what it paused itself.
+        if (freeze && origin !== 'full-verification' && (await store.readRun(issue.path, runId).catch(() => null))?.fullVerification?.cycleId !== freeze.cycleId) throw freezeRefusal()
         if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
         const holder = await exclusiveHolder(project, issueId, exclusivityOf(await store.readSnapshot(issue.path, runId).catch(() => null)))
         if (holder) throw err(409, conflictMessage(holder), holder)
@@ -595,7 +661,7 @@ export function createSupervisor ({
         engine.run.preflight = { ...engine.run.preflight, state: 'pending', startedAt: engine.clock.iso(), endedAt: null }
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
         const reservation = { runId, runLock: engine.runLock, resolution: { resolved: engine.snapshot }, run: engine.run, issuePath: issue.path, clock: engine.clock }
-        const record = { runId, issuePath: issue.path, project, issueId, phase: 'preflight', engine: null, reservation, controller: new AbortController(), stopping: false, finished: null }
+        const record = { runId, issuePath: issue.path, project, issueId, phase: 'preflight', engine: null, reservation, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null }
         const harnesses = await loadHarnesses()
         const projectPath = await resolveProjectPath(project, { projectsDir })
         active.set(k, record)
@@ -610,7 +676,7 @@ export function createSupervisor ({
         engine.run.workspace.retainedReason = null
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
       }
-      const record = { runId, issuePath: issue.path, project, issueId, phase: 'run', engine, reservation: null, controller: new AbortController(), stopping: false, finished: null }
+      const record = { runId, issuePath: issue.path, project, issueId, phase: 'run', engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null }
       active.set(k, record)
       starting.delete(k)
       emit?.({ type: 'run-resumed', project, issueId, runId, decision })
@@ -639,7 +705,7 @@ export function createSupervisor ({
    */
   async function inspectIntegrity ({ project, issueId, runId }) {
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
-    const issue = await issues.getIssue(project, issueId)
+    const issue = await holderOf(project, issueId)
     const engine = await resumeRun({ issuePath: issue.path, runId, harnesses: {}, takeLock: false, configRoot, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
     const report = engine.run.integrity?.latest ?? null
     if (engine.run.integrity?.status !== 'quarantined') throw err(409, 'this run has no source-integrity quarantine')
@@ -826,7 +892,7 @@ export function createSupervisor ({
   /** The run's account in the issue folder, for people. Failing to write it is logged and changes nothing about the run. */
   async function writeResult (project, issueId, runId) {
     try {
-      const issue = await issues.getIssue(project, issueId)
+      const issue = await holderOf(project, issueId)
       // Before the account, and never in its way: a release's notes on the issues it carried.
       await writeRunCoverageNotes({ project, issue, run: await store.readRun(issue.path, runId).catch(() => null), issues })
         .catch((error) => console.warn(`[devpanel] could not write the coverage notes of ${project}/${issueId} run ${runId}: ${error.message}`))
@@ -846,7 +912,7 @@ export function createSupervisor ({
       await retryUntilEstablished(`the end of ${project}/${issueId} run ${runId}`, async () => {
         let run = null
         try {
-          const issue = await issues.getIssue(project, issueId)
+          const issue = await holderOf(project, issueId)
           if (!issue.packed) run = await store.readRun(issue.path, runId)
         } catch (error) {
           if (!recordGone(error)) throw error
@@ -874,6 +940,8 @@ export function createSupervisor ({
 
   async function autoStartAfter (project, issueId, runId) {
     try {
+      // A run home's cycle run starts nothing after it.
+      if (HOME_PATTERN.test(issueId)) return
       const issue = await issues.getIssue(project, issueId)
       if (issue.packed) return
       await routeAutoStart({ project, issueId, issuePath: issue.path, runId }, {
@@ -989,7 +1057,7 @@ export function createSupervisor ({
     if (typeof issueId !== 'string' || !/^[a-zA-Z0-9_.-]+$/.test(issueId) || issueId.startsWith('.')) throw err(400, 'Invalid issue id')
     await issues.requireProject(project)
     const projectDir = path.join(issues.ISSUES_DIR, project)
-    const issue = await issues.getIssue(project, issueId).catch((error) => { if (error.status === 404) return null; throw error })
+    const issue = await holderOf(project, issueId).catch((error) => { if (error.status === 404) return null; throw error })
     if (!issue?.path) {
       if (!unrecorded.get(path.resolve(projectDir))?.has(runId) && !(await readBarrier(projectDir)).entries.some((e) => e.issueId === issueId && e.runId === runId)) {
         throw err(404, issue ? 'This issue is archived and its run has no barrier entry to settle.' : 'No such issue, and no barrier entry of this run remains.')
@@ -1176,7 +1244,7 @@ export function createSupervisor ({
    * honest answer is recovery, not a clean cancellation.
    */
   async function stopUnowned ({ project, issueId, runId }) {
-    const issue = await issues.getIssue(project, issueId)
+    const issue = await holderOf(project, issueId)
     const run = await store.readRun(issue.path, runId).catch(() => null)
     if (!run) throw err(404, 'no such run')
 
@@ -1285,7 +1353,7 @@ export function createSupervisor ({
 
   async function abandon ({ project, issueId, runId }) {
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
-    const issue = await issues.getIssue(project, issueId)
+    const issue = await holderOf(project, issueId)
     if (active.has(key(project, issueId))) throw err(409, 'Stop the active run and wait for it to finish before abandoning.')
     try {
       return await withLock(path.join(issue.path, '.run.lock'), { purpose: 'run-abandon', takeOverDead: false }, async () => {
@@ -1335,7 +1403,7 @@ export function createSupervisor ({
    */
   async function deleteRun ({ project, issueId, runId }) {
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
-    const issue = await issues.getIssue(project, issueId)
+    const issue = await holderOf(project, issueId)
     if (issue.packed || issue.archived) throw err(409, 'This issue is archived. Restore it before deleting a run.')
     if (active.has(key(project, issueId)) || starting.has(key(project, issueId))) throw err(409, 'A run is active on this issue; wait for it to settle.')
     try {
@@ -1526,6 +1594,8 @@ export function createSupervisor ({
       // as live that nothing will ever reconcile.
       let list = []
       try { list = await issues.listIssues(projectId) } catch { unread.push({ project: projectId }); continue }
+      // The full verification's run homes hold runs too, and a crash leaves theirs to recover like any other.
+      list = [...list, ...await homesOf(projectId)]
       // Notes kept for an archived issue whose restore did not get to them.
       await issues.drainArchivedNotes?.(projectId).catch((error) => console.warn(`[devpanel] could not finish the archived notes of ${projectId}: ${error.message}`))
 
@@ -1666,6 +1736,7 @@ export function createSupervisor ({
       // Active issues only: an archived issue cannot hold a live run, because
       // archiving refuses one.
       try { list = await issues.listIssues(projectId) } catch { continue }
+      list = [...list, ...await homesOf(projectId)]
 
       for (const issue of list) {
         let names = []
@@ -1795,7 +1866,7 @@ export function createSupervisor ({
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
     const live = active.get(key(project, issueId))
     if (live?.runId === runId && live.engine) return live.engine
-    const issue = await issues.getIssue(project, issueId)
+    const issue = await holderOf(project, issueId)
     if (issue.packed) throw err(409, 'This issue is archived. Restore it to talk to its runs.')
     return resumeRun({ issuePath: issue.path, runId, harnesses: {}, takeLock: false, configRoot, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null) })
   }
@@ -1847,7 +1918,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy }
 }
 
 /**
@@ -1942,7 +2013,7 @@ function baseActions (run, { active = false, refresh } = {}) {
   if (run.status === 'running') return run.pauseRequested ? ['stop'] : ['pause', 'stop']
   if (run.status === 'stopping') return []
   // Manual pauses resume directly; policy questions still require an answer.
-  if (run.status === 'paused') return run.pause?.kind === 'manual' ? (resumeUnavailable(run) ? ['abandon'] : ['resume', 'abandon']) : ['answer', 'abandon']
+  if (run.status === 'paused') return ['manual', 'full-verification'].includes(run.pause?.kind) ? (resumeUnavailable(run) ? ['abandon'] : ['resume', 'abandon']) : ['answer', 'abandon']
   // Stopped only by failed checks on an approved revision: rerunning them is the remedy, beside resume.
   const refreshable = !refreshChecksUnavailable(run, refresh)
   const acceptable = !acceptCheckUnavailable(run, refresh)

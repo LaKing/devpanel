@@ -85,6 +85,22 @@ export default async function (t) {
       t.ok('with neither, a candidate command is refused rather than run as some built-in account', /confinement\.user and \.home/.test(refused ?? ''), refused)
       t.ok('a privileged command needs no unit user', managedRemoteCommand('/opt/c', { id: 'p', kind: 'privileged', run: 'true' }, false, { control: controlDir('/opt/c'), units: {}, confinement: none }).includes('unshare'))
     }
+
+    t.section('6. the daily full verification: the block schedules it, without it the cycle is off')
+    {
+      const root = await temp('devpanel-settings-fv-root-')
+      t.eq('absent: off', hostSettings({ root, hostDir: path.join(root, 'host-config'), env: {} }).fullVerification, null)
+      const hostDir = await temp('devpanel-settings-fv-')
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ fullVerification: { at: '06:00', timeZone: 'Europe/Berlin' } }))
+      t.eq('the block is read as written', hostSettings({ hostDir }).fullVerification, { at: '06:00', timeZone: 'Europe/Berlin' })
+      const refusal = async (block) => {
+        await write(path.join(hostDir, 'settings.json'), JSON.stringify({ fullVerification: block }))
+        try { hostSettings({ hostDir }); return null } catch (e) { return e.message }
+      }
+      t.ok('a time that is not HH:MM is refused', /fullVerification/.test(await refusal({ at: '6:00', timeZone: 'Europe/Berlin' }) ?? ''))
+      t.ok('a zone the runtime does not know is refused', /fullVerification\/timeZone/.test(await refusal({ at: '06:00', timeZone: 'Nowhere/Elsewhere' }) ?? ''))
+      t.ok('both keys are required', /fullVerification/.test(await refusal({ at: '06:00' }) ?? ''))
+    }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
   }

@@ -220,7 +220,10 @@ finalizer changes application data: a smoke's finalizers run before the commands
 continue.
 
 The smoke and full tiers are the **full verification** of a project: the daily cycle and
-the Deployment playbook. The coding playbooks (Implementation, Plan and implement, Prompt,
+the Deployment playbook (tactical-playbooks.md "The daily full verification": a cycle run
+drives the full tier on its released snapshot and compares it with the previous green
+cycle; `infrastructure.staging.fullVerification: instances` records a project as verified
+through its instances instead). The coding playbooks (Implementation, Plan and implement, Prompt,
 Refactoring) do not run them per revision on a Boilerplate project; they run the modules
 tier below, and no `timing: approved` full drive runs there.
 

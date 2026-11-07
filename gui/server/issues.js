@@ -622,6 +622,13 @@ export async function setInquiryClosure (project, id, closure, { reopenedBy = nu
 async function issueDir (project, id) {
   await requireProject(project)
 
+  // A full verification run home holds runs and their steps, never an issue.
+  if (typeof id === 'string' && HOME_PATTERN.test(id)) {
+    const home = homePath(project, id)
+    if (!(await fs.stat(home).catch(() => null))?.isDirectory()) throw new IssueError('no such run home', 404)
+    return home
+  }
+
   if (typeof id !== 'string' || !ISSUE_PATTERN.test(id)) {
     throw new IssueError('no such issue', 404)
   }
@@ -741,6 +748,67 @@ async function stepOwners (dir) {
     owners.set(String(r.number).padStart(3, '0'), { runId: m[1], playbook: turn?.playbook ?? null, startedAt: turn?.startedAt ?? null, role: null, kind: 'result' })
   }
   return owners
+}
+
+// --- full verification run homes -----------------------------------------
+
+/*
+ * The daily full verification (server/full-verification.mjs) starts its
+ * Deployment runs in a run home, issues/<project>/.verification-<date>/, id
+ * verification-<date>. It holds a task report, runs and their steps like an
+ * issue folder, but it is not an issue: its name never matches ISSUE_PATTERN,
+ * so no list, count or lookup of issues reads it, and getIssue answers 404.
+ * Its parent is the project's issue folder, so everything that finds the
+ * project from a run's folder (release and action locks, the git store, the
+ * cleanup barrier, selftest history) finds the same project an issue would.
+ */
+export const HOME_PATTERN = /^verification-(\d{4}-\d{2}-\d{2})$/
+export const homeIdFor = (date) => `verification-${date}`
+const homePath = (project, id) => {
+  const dir = path.join(ISSUES_DIR, project, `.${id}`)
+  if (path.dirname(path.resolve(dir)) !== path.resolve(path.join(ISSUES_DIR, project))) throw new IssueError('no such run home', 404)
+  return dir
+}
+
+function describeHome (project, id, dir, runs = []) {
+  const date = HOME_PATTERN.exec(id)[1]
+  return { id, project, name: `Daily full verification ${date}`, openedOn: date, kind: 'verification', home: true, packed: false, archived: false,
+    path: dir, location: dir, latestRun: runs[0] ?? null, runCount: runs.length }
+}
+
+/** A run home, as the run routes and the supervisor read an issue; 404 when absent. */
+export async function getRunHome (project, id) {
+  const dir = await issueDir(project, id)
+  if (!HOME_PATTERN.test(id)) throw new IssueError('no such run home', 404)
+  return { ...describeHome(project, id, dir, await runSummaries(dir)), steps: await listSteps(project, id) }
+}
+
+/** What holds a run: an issue, or a full verification run home. */
+export const getRunHolder = (project, id) => (typeof id === 'string' && HOME_PATTERN.test(id) ? getRunHome(project, id) : getIssue(project, id))
+
+/** Every run home of a project, newest first, each with its latest run as listIssues gives one. */
+export async function listRunHomes (project) {
+  await requireProject(project)
+  const entries = await fs.readdir(path.join(ISSUES_DIR, project), { withFileTypes: true }).catch(() => [])
+  const homes = []
+  for (const e of entries) {
+    if (!e.isDirectory() || !e.name.startsWith('.') || !HOME_PATTERN.test(e.name.slice(1))) continue
+    const dir = path.join(ISSUES_DIR, project, e.name)
+    homes.push(describeHome(project, e.name.slice(1), dir, await runSummaries(dir)))
+  }
+  return homes.sort((a, b) => (a.id < b.id ? 1 : -1))
+}
+
+/** Create the run home of a date once, with the task report its runs read; returns it. */
+export async function ensureRunHome (project, date, report) {
+  await requireProject(project)
+  const id = homeIdFor(date)
+  if (!HOME_PATTERN.test(id)) throw new IssueError('invalid run home date', 400)
+  const dir = homePath(project, id)
+  const reportDir = path.join(dir, '000-report')
+  await fs.mkdir(reportDir, { recursive: true })
+  if (!(await fs.stat(path.join(reportDir, 'response.md')).catch(() => null))) await writeAtomic(path.join(reportDir, 'response.md'), report)
+  return getRunHome(project, id)
 }
 
 /** One issue with its steps, or a 404. */

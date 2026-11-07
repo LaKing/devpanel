@@ -697,7 +697,9 @@ export async function reserveRun ({
   platform = hostPlatform(),
   // Open cleanup entries the barrier file could not be written with (the
   // supervisor holds them): they bar an in-place start like the file's own.
-  unrecordedBarrier = []
+  unrecordedBarrier = [],
+  // The daily full verification cycle that starts this run ({ cycleId }), or null.
+  fullVerification = null
 }) {
   const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: issue?.project, stagedRelease })
   if (!resolution.ok) {
@@ -755,6 +757,7 @@ export async function reserveRun ({
     run.host = platform.describe()
     // What another live run was touching as this start went ahead (path-overlap.mjs).
     if (startOverlap) run.startOverlap = startOverlap
+    if (fullVerification) run.fullVerification = { cycleId: fullVerification.cycleId }
     // A run on a host without the fence, under the install's opt-in, says so
     // from its first record (confinement-policy.mjs; result.md, the run page).
     const fence = fencePolicy({ platform })
@@ -830,10 +833,15 @@ export async function abandonReservation (reservation, { status = 'failed', bloc
  */
 export async function pauseReservation (reservation) {
   const { run, issuePath, runId, runLock, clock } = reservation
-  const pause = { id: crypto.randomUUID(), key: `manual:${crypto.randomUUID()}`, question: 'Paused by the operator. Resume to run the setup and continue.', options: null, askedBy: null, kind: 'manual', at: clock.iso() }
+  // The daily full verification's freeze wins over an operator's pause, and keeps it (engine.pauseAtBoundary).
+  const freeze = run.freezeRequested
+  const pause = freeze
+    ? { id: crypto.randomUUID(), key: `full-verification:${crypto.randomUUID()}`, question: `Paused for the daily full verification (cycle ${freeze.cycleId}). ${run.pauseRequested ? 'An operator pause was also requested, so the cycle leaves it paused: resume it by hand.' : 'It resumes when the cycle ends.'}`, options: null, askedBy: null, kind: 'full-verification', cycleId: freeze.cycleId, manualPending: Boolean(run.pauseRequested), at: clock.iso() }
+    : { id: crypto.randomUUID(), key: `manual:${crypto.randomUUID()}`, question: 'Paused by the operator. Resume to run the setup and continue.', options: null, askedBy: null, kind: 'manual', at: clock.iso() }
   run.status = 'paused'
   run.blockedReason = null
   run.pauseRequested = null
+  run.freezeRequested = null
   run.pause = pause
   await store.writeRun(issuePath, runId, run)
   await store.appendEvent(issuePath, runId, { type: 'paused', pauseId: pause.id, key: pause.key, question: pause.question, options: null, askedBy: null }, { clock })

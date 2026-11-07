@@ -546,6 +546,9 @@ function standingOf (run, { outputs, active, ownership }) {
     case 'paused': {
       const p = run.pause ?? {}
       if (p.kind === 'manual') return { tone: 'waiting', headline: 'Paused', detail: 'Everything done so far is saved.', next: 'Resume continues from the next unfinished step.' }
+      if (p.kind === 'full-verification') return { tone: 'waiting', headline: 'Paused for the daily full verification',
+        detail: `Admission closed for cycle ${p.cycleId ?? 'unknown'}; everything done so far is saved.`,
+        next: p.manualPending ? 'An operator pause was pending as well, so the cycle leaves this run paused: Resume continues it.' : 'It resumes when the cycle ends; Resume continues it after that.' }
       if (p.request) {
         // The question is what to answer; the reason is why the run cannot do it.
         const heading = { 'owner-gate': 'Waiting for you: this decision is yours', authorization: 'Waiting for you: this needs your authorization', 'requirement-conflict': "Waiting for you: the requirements can't all be met" }[p.request.category] ?? 'Waiting for you: work the run may not do itself'
@@ -737,6 +740,13 @@ function blocked (run, outputs, kept) {
       const closed = closureUnmet(run, latestConfirmation(outputs))
       const why = { ...closed, detail: [closed.detail, returnWords(run), notReturnedWords(run.closure?.notReturned)].filter(Boolean).join(' ') || null }
       return { ...base, ...why, next: why.unmet?.length ? 'Start a new run that addresses these points, or record the outcome yourself.' : 'Start a new run, or record the outcome yourself.' }
+    }
+    case 'full-verification-checks-failed': {
+      const c = run.fullVerification?.check
+      const fresh = [...(c?.selftest?.newFailures ?? []), ...(c?.failures?.newFailures ?? [])].map((f) => `${f.command}: ${f.test}`)
+      return { ...base, headline: 'Stopped: the full verification found failures',
+        detail: [`The full check of the released snapshot ${c?.result?.result === 'passed' ? 'passed but its selftest report' : 'did not pass and'} could not be judged inherited from the previous green cycle${c?.baseline?.cycleId ? ` (${c.baseline.cycleId})` : ' (there is none)'}.`, fresh.length ? `New: ${fresh.slice(0, 10).join('; ')}` : null].filter(Boolean).join(' '),
+        next: 'The stage keeps what was released. The next cycle verifies again.' }
     }
     case 'refreshed-checks-failed':
       return { ...base, headline: 'Stopped: checks failed after the evidence was refreshed', next: 'Start a new run against the current project.' }

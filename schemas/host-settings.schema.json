@@ -26,6 +26,16 @@
       "enum": ["gitlink", "include"],
       "description": "What a working-tree snapshot takes of a repository nested in the project's checkout (a monorepo's parts). `gitlink` (default): what `git add -A` records, the nested repository's HEAD commit id and no content, so its directory is empty in the run's worktree. `include`: what that repository would carry (tracked and untracked, unignored files, as they are on disk; never its .git), so the run sees the whole tree; apply-to-source writes changes there in place, and a commit delivery that touches one is refused. runtime/working-tree.mjs includeNested."
     },
+    "fullVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "timeZone"],
+      "description": "The daily full verification (docs/tactical-playbooks.md \"The daily full verification\"): at `at` local time in `timeZone` admission closes, live runs pause at their next step boundary, and once no seat turn is running one Deployment run (environment staging, full checks) starts per configured stage; the record is issues/.verification/<date>/cycle.json. Absent: no scheduled cycle (a hand start still works).",
+      "properties": {
+        "at": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$", "description": "HH:MM, 24-hour, local to timeZone." },
+        "timeZone": { "type": "string", "minLength": 1, "description": "An IANA time zone, e.g. Europe/Berlin; one the runtime does not know is an error." }
+      }
+    },
     "resumeAfterShutdown": {
       "type": "boolean",
       "description": "Whether the next start resumes the runs a service shutdown cancelled (run.stoppedBy: service-shutdown), limits unchanged. Default true; false leaves them cancelled and marked, for a person to resume."

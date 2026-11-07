@@ -26,8 +26,11 @@ import { readAutoStart } from './auto-start.mjs'
 
 const err = (status, message) => Object.assign(new Error(message), { status })
 
+// What holds the runs: an issue, or a full verification run home (issues.getRunHolder).
+const holderOf = (issues, project, id) => (issues.getRunHolder ?? issues.getIssue)(project, id)
+
 async function issueDir (issues, project, id) {
-  const issue = await issues.getIssue(project, id)   // throws IssueError(404) if absent
+  const issue = await holderOf(issues, project, id)   // throws IssueError(404) if absent
   return issue
 }
 
@@ -103,7 +106,7 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     store.inspectRunJournal(issuePath, runId)
   ])
 
-  const issue = await issues.getIssue(project, issueId)
+  const issue = await holderOf(issues, project, issueId)
   const stepsOnDisk = new Map(issue.steps.map((s) => [s.number, s]))
 
   // A record from before interrupted turns were kept reads them off its journal, as the engine will.
@@ -330,7 +333,7 @@ export async function readLiveOutput (issuePath, runId, invocationId, { after = 
 
 /** A step's response, as text. Kept separate: it can be large. */
 export async function readStepResponse (issues, project, issueId, number) {
-  const issue = await issues.getIssue(project, issueId)
+  const issue = await holderOf(issues, project, issueId)
   const step = issue.steps.find((s) => s.number === number)
   if (!step) throw err(404, 'no such step')
   try {

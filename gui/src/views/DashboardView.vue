@@ -2,6 +2,7 @@
 import { computed, onUnmounted, ref } from 'vue'
 
 import ActiveAgents from '@/components/ActiveAgents.vue'
+import FullVerificationCard from '@/components/FullVerificationCard.vue'
 import NeedsAttention from '@/components/NeedsAttention.vue'
 import SupervisorOverview from '@/components/SupervisorOverview.vue'
 import StatTile from '@/components/StatTile.vue'
@@ -157,6 +158,9 @@ const facts = computed(() => {
           <v-divider />
           <h2 class="panel__section">Running agents</h2>
           <ActiveAgents ref="agents" />
+          <v-divider />
+          <h2 class="panel__section">Full verification</h2>
+          <FullVerificationCard />
         </v-card>
       </v-col>
 

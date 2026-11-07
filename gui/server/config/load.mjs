@@ -7,7 +7,8 @@ import { Ajv2020 } from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
 import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-options.mjs'
 import { releasePlan, RELEASE_ENVIRONMENTS } from './release-plan.mjs'
-import { infrastructureErrors, localChecksErrors, localTarget, modulesErrors, modulesTarget, tierErrors } from '../infrastructure.mjs'
+import { infrastructureErrors, localChecksErrors, localTarget, modulesErrors, modulesTarget, stagingTarget, tierErrors } from '../infrastructure.mjs'
+import { tierTarget } from '../runtime/baseline-cache.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
@@ -511,6 +512,18 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     blockers.push(...planned.blockers)
     for (const message of planned.errors) err(errors, message, playbook.file, '/runOptions/releaseId')
   } else if (runOptions.releaseId || runOptions.environment) err(errors,'releaseId/environment only apply to staging or deployment',playbook.file,'/runOptions')
+  // The daily full verification's run: a staging Deployment on a project with a test
+  // drive, which also drives the full tier on its snapshot (runtime/full-verification-drive.mjs).
+  // The target is the project's own, with no cache or timing: the baseline is the previous green cycle.
+  let fullVerification = null
+  if (runOptions.fullVerification) {
+    if (strategy.tactic !== 'deployment' || release?.mode !== 'staging' || !infrastructure) err(errors, 'fullVerification applies to a Deployment run in environment staging on a project with infrastructure', playbook.file, '/runOptions/fullVerification')
+    else {
+      // A target without tiers is its full tier already; it is named so either way.
+      const { baselineCache: _cache, compareBaseline: _compare, timing: _timing, ...target } = tierTarget(stagingTarget(infrastructure), 'full')
+      fullVerification = { target: { ...target, tier: 'full' } }
+    }
+  }
 
   // Checks: a playbook may strengthen the requirement, never weaken it.
   const strategyReq = strategy.checks?.requirement ?? 'optional'
@@ -648,6 +661,7 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     evidence: project?.evidence ?? (infrastructure ? [infrastructure.staging, ...infrastructure.deployments].flatMap(e => Object.entries(e.files ?? {}).map(([name, p]) => ({name:`${e.id}-${name}`,path:p,required:false}))) : []),
     runOptions: canonicalOptions(runOptions),
     ...(release ? { release } : {}),
+    ...(fullVerification ? { fullVerification } : {}),
     parameterDefinitions: {
       ...(sourceDeliveryChoice ? { delivery: ['apply-to-source', 'worktree-diff'] } : {}),
       release: ['staging','deployment'].includes(strategy.tactic) ? {

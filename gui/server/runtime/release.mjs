@@ -13,7 +13,13 @@ import { spawn } from 'node:child_process'
 import { createWriteStream } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
-const withReleaseLock=(issuePath,fn)=>withLock(path.join(path.dirname(issuePath),'.staging-deployment.lock'),{purpose:'release',waitMs:0},()=>withLock(path.join(path.dirname(issuePath),'.actions','.lock'),{purpose:'release-project-exclusion',waitMs:0},fn))
+/**
+ * The project's release lock and its project-action lock, from the folder holding
+ * the run: an issue, or a full verification run home (issues/<project>/.verification-<date>),
+ * whose parent is the same project folder, so both exclude each other.
+ */
+export const releaseLockPaths=(issuePath)=>({release:path.join(path.dirname(issuePath),'.staging-deployment.lock'),actions:path.join(path.dirname(issuePath),'.actions','.lock')})
+const withReleaseLock=(issuePath,fn)=>{const locks=releaseLockPaths(issuePath);return withLock(locks.release,{purpose:'release',waitMs:0},()=>withLock(locks.actions,{purpose:'release-project-exclusion',waitMs:0},fn))}
 const phases=['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test']
 
 /**
@@ -32,7 +38,8 @@ export const releaseEnvironment=({hostDir,runId,archive,sha256,environment,state
 export async function stagedRelease (projectDir, releaseId, { extractTo = null, findPacked = defaultFindPacked } = {}) {
   if(!/^[a-zA-Z0-9-]+$/.test(releaseId??''))throw new Error('a staged releaseId is required')
   for(const entry of await fs.readdir(projectDir,{withFileTypes:true})) {
-    if(!entry.isDirectory()||!/^\d{4}-\d{2}-\d{2}-/.test(entry.name))continue
+    // An issue, or a full verification run home (issues.js HOME_PATTERN) whose staging release a production run may promote.
+    if(!entry.isDirectory()||!(/^\d{4}-\d{2}-\d{2}-/.test(entry.name)||/^\.verification-\d{4}-\d{2}-\d{2}$/.test(entry.name)))continue
     const dir=path.join(projectDir,entry.name,'runs',releaseId)
     let receipt
     try { receipt=JSON.parse(await fs.readFile(path.join(dir,'release.json'),'utf8')) }catch(e){if(e.code==='ENOENT')continue;throw e}
