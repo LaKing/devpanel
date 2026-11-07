@@ -202,8 +202,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - `runtime/source-delivery.mjs` — default delivery for Implementation, Plan and implement and Refactoring:
   apply the verified patch to the bound development checkout, under a repository lock, without committing
   or staging. Destination fingerprint verification gates resolution. `worktree-diff` remains selectable.
-  Changed materialized-symlink paths are refused; drift on the patch's own paths leaves the patch for manual
-  application or a rerun, drift elsewhere is applied beside (`application.composed`), and the next run of the
+  Changed materialized-symlink paths are refused; drift on the patch's own paths is merged three-way (`runtime/source-merge.mjs`, owner routes too: `delivery.merged`, `delivery.conflicts` with their lines, `delivery.mergedFrom`, `mergeCheck` saying no check ran on the merged bytes) and only a conflict leaves the patch for manual application, reconcile or a rerun, drift elsewhere is applied beside (`application.composed`), and the next run of the
   issue starts from the undelivered approved patch (`runtime/carry-forward.mjs`, `workspace.seed`). Finalize uses destination/base fingerprints for recovery, retaining the worktree until verified.
   `runtime/apply-artifact.mjs` offers explicit application of completed retained patches, including old runs.
   `runtime/patch-check.mjs` answers, read-only and per owning checkout (following symlinked collections, C-quoted

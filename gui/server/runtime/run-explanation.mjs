@@ -3,6 +3,7 @@ import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mj
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
 import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
+import { describeConflict } from './source-merge.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -87,6 +88,24 @@ function cleanupUnproved (run, open, kept) {
       : 'Resume proves the cleanup first and stops what it finds. If it cannot, look for processes whose environment carries that tag, stop them, then Acknowledge cleanup, saying what you checked.' }
 }
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+/**
+ * What a source delivery's three-way merge did (source-merge.mjs), for people:
+ * `merged` names the paths merged with edits in the project and says that no
+ * check ran on the merged bytes; `conflicts` names each conflicting path with
+ * its lines. Either is null when there is nothing to say. result.md uses it too.
+ */
+export function mergeSummary (delivery) {
+  const merged = (delivery?.merged ?? []).filter((m) => m.applied !== false && !m.identical)
+  const notWritten = (delivery?.merged ?? []).filter((m) => m.applied === false).length
+  const unchecked = delivery?.mergeCheck?.ran === false ? ` No check ran on the merged bytes (merged tree ${delivery.mergedFrom}).` : ''
+  return {
+    merged: merged.length ? `Merged three-way with edits in the project: ${merged.map((m) => `${m.path} (${plural(m.hunks, 'hunk')})`).join(', ')}.${unchecked}` : null,
+    conflicts: delivery?.conflicts?.length
+      ? `Conflicts with edits in the project: ${delivery.conflicts.map(describeConflict).join('; ')}.${notWritten ? ` ${plural(notWritten, 'other path')} would merge cleanly, but nothing was written.` : ' Nothing was written.'}`
+      : null
+  }
+}
 const firstLine = (text, max = 300) => {
   const line = String(text ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? ''
   return line.length > max ? `${line.slice(0, max - 1)}…` : line
@@ -613,7 +632,10 @@ function completed (run, outputs) {
   const next = 'Check the result, then record what it means for the issue.'
   if (run.artifactApplication?.verified) return { tone: 'success', headline: 'Done: the change is in your project', detail: 'The saved patch was applied and verified.', next }
   if (action === 'worktree-diff' && delivered) return { tone: 'success', headline: 'Done: a patch is ready', detail: 'Your project was not changed. Download or apply the patch below.', next }
-  if (action === 'apply-to-source' && delivered) return { tone: 'success', headline: 'Done: the change is in your project', detail: 'Applied to the project folder and verified; not committed.', next }
+  if (action === 'apply-to-source' && delivered) {
+    const merge = mergeSummary(run.delivery).merged
+    return { tone: 'success', headline: 'Done: the change is in your project', detail: `Applied to the project folder and verified; not committed.${merge ? ` ${merge}` : ''}`, next }
+  }
   if (action === 'commit' && delivered) return { tone: 'success', headline: 'Done: the change is committed on a branch', detail: run.integration?.mergeCommit ? 'It has also been merged.' : 'It is not merged yet.', next }
   if (action === 'in-place' && delivered) return { tone: 'success', headline: 'Done: changed directly in the project', next }
   const strategy = run.playbook?.strategy
@@ -733,7 +755,8 @@ function blocked (run, outputs, kept) {
     const refused = attempt && attempt.state !== 'accepted' ? ` Reconciling with the project was refused (${attempt.state})${attempt.conflicts?.length ? ` at ${attempt.conflicts.slice(0, 5).join(', ')}` : ''}.` : ''
     const notRun = run.autoReconcile?.state === 'not-run' ? ` The automatic reconcile did not run: ${String(run.autoReconcile.reason).replace(/\.$/, '')}.` : ''
     const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it, unless only declared inert paths drifted; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
-    return { ...base, headline: d.headline, detail: (d.detail ?? '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
+    const conflicts = reason === 'source-delivery-blocked' ? mergeSummary(run.delivery).conflicts : null
+    return { ...base, headline: d.headline, detail: (d.detail ?? '') + (conflicts ? ` ${conflicts}` : '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
   }
   if (typeof reason === 'string' && reason.startsWith('release-')) {
     return { ...base, headline: `Stopped: the release ${reason.slice(8).replace(/-/g, ' ')}`, next: 'Check the release commands in the technical details.' }

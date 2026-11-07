@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import { fingerprint } from './fingerprint.mjs'
 import { acquireSourceLocks, releaseSourceLocks } from './source-lock.mjs'
 import { writeJson } from './persistence.mjs'
+import { MERGE_CHECK, conflictMessage, mergeDrifted, mergeRecord } from './source-merge.mjs'
 
 const exec = promisify(execFile)
 const git = async (cwd, args, options = {}) => (await exec('git', ['-C', cwd, ...args], { maxBuffer: 256 * 1024 * 1024, ...options })).stdout
@@ -124,7 +125,9 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     if (prior && (prior.path !== source.path || prior.revision !== revision)) return refuse('recovery-required', 'Earlier delivery names a different destination or revision.')
     let observed = await readDestination()
     if (observed.fingerprint === revision) {
-      application = { ...application, fingerprint: revision, state: 'complete', verified: true, completedAt: clock.iso(), owners: prior?.owners ?? routeList.map(r => ({ path: r.path, repository: r.repository })) }
+      // As in source-delivery.mjs: with no earlier delivery, each changed path was edited to exactly the approved bytes.
+      const merged = prior ? prior.merged : changed.length ? changed.map(e => ({ path: e.path, hunks: 0, identical: true })) : null
+      application = { ...application, ...(merged ? { merged } : {}), fingerprint: revision, state: 'complete', verified: true, completedAt: clock.iso(), owners: prior?.owners ?? routeList.map(r => ({ path: r.path, repository: r.repository })) }
       await writeJson(journal, application); return finish()
     }
     const changedPaths = new Set(changed.map(e => e.path))
@@ -134,26 +137,64 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     const foreign = drift(observed)
     const composed = foreign === '[]' ? null : { paths: JSON.parse(foreign).map(e => e.path), entries: JSON.parse(foreign) }
     if (prior && foreign !== JSON.stringify(prior.composed?.entries ?? [])) return refuse('recovery-required', 'Source composition outside the approved patch changed since the earlier delivery attempt.')
+    const baseOf = e => ({ contentHash: baseline.get(e.path), mode: baseline.modes?.get(e.path) })
+    // A changed path the source changed too is merged three-way, as in
+    // source-delivery.mjs (source-merge.mjs). The merge is decided once, before
+    // any owner is written, and journaled; recovery reads it from the journal.
+    const readBase = async p => (await exec('git', [...reconstructionRepository(workspace), 'cat-file', 'blob', `${workspace.baseCommit}:${p}`], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 })).stdout
+    const mergeOf = entries => mergeDrifted({ readBase, sourceRoot: source.path, candidateRoot: workspace.path,
+      entries: entries.map(({ entry, got }) => ({ path: entry.path, want: entry, got, baseHash: baseline.get(entry.path) ?? null, baseMode: baseline.modes?.get(entry.path) ?? null })) })
+    let mergeJournal = prior?.merge ?? null
+    let mergedRecord = prior?.merged ?? null
+    const mergedBytes = new Map()
+    if (!prior) {
+      const got = new Map(observed.entries.map(e => [e.path, e]))
+      const drifted = changed.filter(e => !same(got.get(e.path), baseOf(e)))
+      if (drifted.length) {
+        const outcome = await mergeOf(drifted.map(entry => ({ entry, got: got.get(entry.path) ?? { path: entry.path, status: 'deleted', contentHash: null } })))
+        if (outcome.refusal) return refuse(outcome.refusal.state, outcome.refusal.error)
+        if (outcome.conflicts.length) {
+          // Nothing is written. The conflicting paths are kept, as source-delivery.mjs keeps them: `reconcile-delivery` merges them.
+          application = { ...application, drifted: outcome.conflicts.map(c => c.path), conflicts: outcome.conflicts, merged: mergeRecord(outcome.merged, false) }
+          return refuse('source-drift', conflictMessage(outcome.conflicts))
+        }
+        for (const m of outcome.merged) if (!m.identical) mergedBytes.set(m.path, m)
+        mergeJournal = { paths: outcome.merged.map(m => m.path), expected: Object.fromEntries([...mergedBytes.values()].map(m => [m.path, { from: m.from, to: m.to }])) }
+        mergedRecord = mergeRecord(outcome.merged)
+      }
+    }
+    // An identical path needs nothing written, so it is left out of the owner patches, but it stays verified:
+    // it starts and ends at the approved bytes. A merged one goes from the source's bytes to the merge's.
+    const identical = new Set((mergeJournal?.paths ?? []).filter(p => !mergeJournal.expected[p]))
+    const toWrite = route => route.entries.filter(e => !identical.has(e.path))
+    const startOf = e => identical.has(e.path) ? e : mergeJournal?.expected[e.path] ? { contentHash: mergeJournal.expected[e.path].from, mode: e.mode } : baseOf(e)
+    const goalOf = e => mergeJournal?.expected[e.path] ? { contentHash: mergeJournal.expected[e.path].to, mode: e.mode } : e
     const states = current => routeList.map(route => {
       const got = new Map(current.entries.map(e => [e.path, e]))
-      const baseMatches = route.entries.every(e => same(got.get(e.path), { contentHash: baseline.get(e.path), mode: baseline.modes?.get(e.path) }))
-      const approvedMatches = route.entries.every(e => same(got.get(e.path), e))
+      const baseMatches = route.entries.every(e => same(got.get(e.path), startOf(e)))
+      const approvedMatches = route.entries.every(e => same(got.get(e.path), goalOf(e)))
       return approvedMatches ? 'complete' : baseMatches ? 'pending' : 'drift'
     })
     let progress = states(observed)
-    if (composed && progress.every(p => p === 'complete') && prior?.composed) {
+    const merging = Object.keys(mergeJournal?.expected ?? {}).length > 0
+    const mergeFields = mergeJournal ? { merge: mergeJournal, merged: mergedRecord } : {}
+    if ((composed || merging) && progress.every(p => p === 'complete') && (prior?.composed || prior?.merge)) {
       // Re-verified now: the record states what was just observed, not what an
       // interrupted attempt had written before it finished.
       const owners = (prior.owners?.length ? prior.owners : routeList.map(r => ({ path: r.path, repository: r.repository }))).map(o => ({ ...o, state: 'complete' }))
-      application = { ...application, ...prior, owners, error: null, fingerprint: observed.fingerprint, state: 'complete', verified: true, completedAt: clock.iso() }
+      application = { ...application, ...prior, owners, error: null, fingerprint: observed.fingerprint, state: 'complete', verified: true, completedAt: clock.iso(),
+        ...(merging ? { mergedFrom: observed.fingerprint, mergeCheck: MERGE_CHECK } : {}) }
       await writeJson(journal, application); return finish()
     }
-    if (progress.includes('drift') || (!prior && progress.includes('complete'))) {
-      // The paths are kept, as source-delivery.mjs keeps them: `reconcile-delivery` merges them.
-      const got = new Map(observed.entries.map(e => [e.path, e]))
-      const drifted = changed.filter(e => !same(got.get(e.path), { contentHash: baseline.get(e.path), mode: baseline.modes?.get(e.path) }) && !same(got.get(e.path), e)).map(e => e.path)
-      if (!prior && drifted.length) application = { ...application, drifted }
-      return refuse(prior ? 'recovery-required' : 'source-drift', `An owner matches neither the captured base nor a recorded delivery of the approved candidate.${drifted.length ? ` The approved patch's own paths changed: ${drifted.slice(0, 5).join(', ')}${drifted.length > 5 ? ', …' : ''}.` : ''}`)
+    if (progress.includes('drift') || (!prior && progress.some((p, i) => p === 'complete' && toWrite(routeList[i]).length))) {
+      return refuse(prior ? 'recovery-required' : 'source-drift', 'An owner matches neither the captured base nor a recorded delivery of the approved candidate.')
+    }
+    // Recovery: a pending route's merge is decided again from the same bytes and must give the journaled result.
+    if (prior && merging) {
+      const pending = routeList.filter((r, i) => progress[i] === 'pending').flatMap(r => r.entries).filter(e => mergeJournal.expected[e.path])
+      const again = pending.length ? await mergeOf(pending.map(entry => ({ entry, got: { path: entry.path, status: 'modified', ...startOf(entry) } }))) : { merged: [], conflicts: [] }
+      if (again.refusal || again.conflicts.length || again.merged.some(m => m.to !== mergeJournal.expected[m.path]?.to)) return refuse('recovery-required', 'The journaled merge no longer reproduces; inspect the source before proceeding.')
+      for (const m of again.merged) mergedBytes.set(m.path, m)
     }
     const patch = await fs.readFile(path.join(runDir, receipt.artifactRef))
     if (hash(patch) !== receipt.patchHash) return refuse('unverifiable', 'The verified patch changed; no source was written.')
@@ -170,15 +211,21 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
       const route = routeList[i], staging = path.join(temporary, `owner-${i}`)
       await fs.mkdir(staging)
       await git(staging, ['init', '--quiet'])
-      for (const entry of route.entries) if (baseline.has(entry.path)) {
+      for (const entry of toWrite(route)) if (mergedBytes.has(entry.path)) {
+        // A merged path's owner patch goes from the source's bytes now to the merge's.
+        const bytes = await fs.readFile(path.join(source.path, entry.path))
+        if (progress[i] === 'pending' && hash(bytes) !== mergedBytes.get(entry.path).from) throw Error(`The source changed while it was read (${entry.path})`)
+        await put(staging, entry.destination, bytes, entry.mode)
+      } else if (baseline.has(entry.path)) {
         const bytes = await git(rebuilt, ['show', `${workspace.baseCommit}:${entry.path}`], { encoding: 'buffer' })
         await put(staging, entry.destination, bytes, baseline.modes?.get(entry.path) ?? '000644')
       }
       await git(staging, ['add', '--force', '--all'])
       const tree = (await git(staging, ['write-tree'])).trim()
-      for (const entry of route.entries) {
+      for (const entry of toWrite(route)) {
         await fs.rm(path.join(staging, entry.destination), { force: true })
-        if (entry.status !== 'deleted') {
+        if (mergedBytes.has(entry.path)) await put(staging, entry.destination, mergedBytes.get(entry.path).bytes, entry.mode)
+        else if (entry.status !== 'deleted') {
           const full = path.join(rebuilt, entry.path)
           const bytes = entry.mode === 'link' ? Buffer.from(await fs.readlink(full)) : await fs.readFile(full)
           await put(staging, entry.destination, bytes, entry.mode)
@@ -197,7 +244,7 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     await checkBindings()
     observed = await readDestination()
     if (drift(observed) !== foreign || JSON.stringify(states(observed)) !== JSON.stringify(progress)) return refuse('source-drift', 'Source composition changed before owner delivery.')
-    application = { ...application, state: 'applying', startedAt: clock.iso(), owners: routeList.map(r => r.record), ...(composed ? { composed } : {}) }
+    application = { ...application, state: 'applying', startedAt: clock.iso(), owners: routeList.map(r => r.record), ...(composed ? { composed } : {}), ...mergeFields }
     await writeJson(journal, application)
     for (let i = 0; i < routeList.length; i++) {
       if (progress[i] === 'complete') continue
@@ -214,9 +261,10 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     await checkBindings()
     observed = await readDestination()
     application.fingerprint = observed.fingerprint
-    const exact = composed ? states(observed).every(p => p === 'complete') && drift(observed) === foreign : observed.fingerprint === revision
+    const exact = composed || merging ? states(observed).every(p => p === 'complete') && drift(observed) === foreign : observed.fingerprint === revision
     if (!exact) throw Error('Delivered source composition does not match the approved revision')
-    application = { ...application, state: 'complete', verified: true, completedAt: clock.iso() }
+    // The merged tree, re-fingerprinted under the delivery locks: the delivered revision's `mergedFrom`.
+    application = { ...application, state: 'complete', verified: true, completedAt: clock.iso(), ...(merging ? { mergedFrom: observed.fingerprint, mergeCheck: MERGE_CHECK } : {}) }
     await writeJson(journal, application)
     return finish()
   } catch (error) {

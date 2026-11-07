@@ -4,7 +4,7 @@ import path from 'node:path'
 import { withStepReservation } from './step-allocation.mjs'
 import { writeAtomic } from './runtime/persistence.mjs'
 import * as store from './runtime/store.mjs'
-import { explainRun } from './runtime/run-explanation.mjs'
+import { explainRun, mergeSummary } from './runtime/run-explanation.mjs'
 import { runResult } from './runtime/run-result.mjs'
 import { ignoredSelftests, ignoredWords } from './runtime/selftest-history.mjs'
 
@@ -73,6 +73,10 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
   else if (d.action === 'commit') lines.push(`Committed on \`${d.branch}\`${run.integration?.mergeCommit ? ` and merged into \`${run.integration.targetBranch}\`` : ', not merged'}.`)
   else if (d.action === 'in-place') lines.push('Changed directly in the project checkout.')
   else if (d.action === 'none') lines.push('The report is the result; no files changed.')
+  // A three-way merge with edits in the project: which paths merged, which conflicted and where.
+  const merge = mergeSummary(d)
+  if (merge.merged) lines.push('', merge.merged)
+  if (merge.conflicts) lines.push('', merge.conflicts)
   if (d?.artifactRef) lines.push('', 'The change is in `changes.patch` next to this file.')
   if (approvedPatch) lines.push('', 'The approved revision\'s patch is in `changes.patch` next to this file: its check artifact, verified against the revision\'s fingerprint. It reached no project.')
   lines.push('')

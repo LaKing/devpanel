@@ -44,6 +44,19 @@ export default async function (t) {
   t.ok('its cost is time and tokens, never money', text.includes('- Time: 00:12:30') && text.includes('- Tokens: 4.28 M tokens') && !text.includes('$'), text.split('## Record')[1])
   t.eq('the patch is copied beside it', await fs.readFile(path.join(folder, 'changes.patch'), 'utf8'), 'diff --git a/x b/x\n')
 
+  t.section('result.md says what a delivery merged and where it conflicted')
+  {
+    const merged = renderResult({ ...base, status: 'completed', outcome: 'resolved',
+      delivery: { action: 'apply-to-source', completedAt: 'x', application: { path: '/p' }, merged: [{ path: 'server.mjs', hunks: 1 }], mergedFrom: 'sha256:m', mergeCheck: { ran: false } } })
+    t.ok('the merged path and the unchecked merge are named', merged.includes('Merged three-way with edits in the project: server.mjs (1 hunk). No check ran on the merged bytes (merged tree sha256:m).'), merged)
+    const conflicted = renderResult({ ...base, status: 'blocked', outcome: 'unresolved', blockedReason: 'source-delivery-blocked',
+      delivery: { action: 'apply-to-source', completedAt: null, error: 'conflict', conflicts: [{ path: 'server.mjs', kind: 'text', lines: [{ start: 9, end: 9, side: 'source' }] },
+        { path: 'logo.png', kind: 'binary', lines: [{ start: 1, end: 2, side: 'source' }] }, { path: 'gone.txt', kind: 'deleted', lines: [{ start: 1, end: 3, side: 'candidate' }] }] } })
+    for (const text of ['server.mjs line 9 (source)', 'logo.png lines 1–2 (source, binary)', "gone.txt lines 1–3 of the candidate's file (deleted in the source)"]) {
+      t.ok(`the conflict is named in What reached the project: ${text}`, conflicted.split('## What reached the project')[1]?.includes(text), conflicted)
+    }
+  }
+
   t.section('a turn that could not observe a Node child\'s output says so in the result')
   {
     const heading = '## Output a command could not observe'

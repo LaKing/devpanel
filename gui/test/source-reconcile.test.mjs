@@ -82,6 +82,9 @@ const until = async (test, label) => {
 const CHANGELOG_ONLY = { worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'candidate: fixed line 9\nv1 released\n' }, source: { 'changelog.txt': 'other: landed first\nv1 released\n' } }
 const CODE_CONFLICT = { worktree: { 'server.mjs': lines(10, { 5: 'line 5 by the candidate' }) }, source: { 'server.mjs': lines(10, { 5: 'line 5 by someone else' }) } }
 const DECLARED = "'**/changelog.txt': prepend"
+const PREPEND = { '**/changelog.txt': 'prepend' }
+// A clean code edit at delivery merges by itself (source-merge.mjs); a run blocks for reconcile only beside this changelog conflict.
+const WITH_CHANGELOG = ({ worktree, source }) => ({ worktree: { ...CHANGELOG_ONLY.worktree, ...worktree }, source: { ...CHANGELOG_ONLY.source, ...source } })
 const types = (events) => events.map((e) => e.type)
 const finishes = (events, runId = null) => events.filter((e) => e.type === 'run-finished' && (!runId || e.runId === runId)).length
 const shows = (run, text) => JSON.stringify(explainRun(run)).includes(text)
@@ -114,12 +117,20 @@ export default async function (t) {
   try {
     t.section('1. clean merge: the source changed another line of the patched file')
     {
-      const { f, engine } = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 elsewhere' }) } })
-      t.eq('delivery was refused for drift on its own path', `${engine.run.blockedReason} ${engine.run.delivery?.application?.state}`, 'source-delivery-blocked source-drift')
-      t.eq('the drifted path is recorded', engine.run.delivery.application.drifted, ['server.mjs'])
+      // Delivery merges it by itself (source-merge.mjs): nothing is blocked and nothing is left to reconcile.
+      const direct = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 elsewhere' }) } })
+      t.eq('delivery merged it at once', `${direct.engine.run.status} ${direct.engine.run.outcome}`, 'completed resolved', `${direct.engine.run.blockedReason} ${direct.engine.run.delivery?.error}`)
+      t.eq('the source holds both changes', await read(direct.f, 'server.mjs'), lines(10, { 1: 'line 1 elsewhere', 9: 'line 9 fixed' }))
+      t.eq('no reconcile was needed or is offered', [direct.engine.run.reconciliations ?? null, supportedActions(direct.engine.run)], [null, ['start-new']])
+      await releaseOwnership(direct.engine, { reason: 'test' }).catch(() => {})
+
+      // Beside a changelog that conflicts, delivery blocks on the changelog alone and reconcile merges both.
+      const { f, engine } = await blockedRun({ worktree: { ...CHANGELOG_ONLY.worktree }, source: { ...CHANGELOG_ONLY.source, 'server.mjs': lines(10, { 1: 'line 1 elsewhere' }) } })
+      t.eq('delivery was refused for the conflict on its own path', `${engine.run.blockedReason} ${engine.run.delivery?.application?.state}`, 'source-delivery-blocked source-drift')
+      t.eq('only the conflicting path is recorded as drifted', engine.run.delivery.application.drifted, ['changelog.txt'])
       t.eq('reconcile is offered beside finalize', supportedActions(engine.run), ['reconcile-delivery', 'finalize', 'start-new'])
       const approved = engine.run.closure.revision
-      await engine.reconcileDelivery({ policy: {} })
+      await engine.reconcileDelivery({ policy: PREPEND })
       t.eq('delivered', `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${engine.run.delivery?.error} ${JSON.stringify(engine.run.reconciliations?.at(-1))}`)
       t.eq('the source holds both changes', await read(f, 'server.mjs'), lines(10, { 1: 'line 1 elsewhere', 9: 'line 9 fixed' }))
       const revision = engine.run.revisions.at(-1)
@@ -130,10 +141,10 @@ export default async function (t) {
       const attempt = engine.run.reconciliations.at(-1)
       t.eq('the checks ran on the merged candidate', `${attempt.checks.result} ${engine.run.checkResults.at(-1).revision === revision.fingerprint}`, 'passed true')
       t.eq('the delivery record names the merge', [engine.run.delivery.reconciliation.from, engine.run.delivery.reconciliation.mergeBase, engine.run.delivery.reconciliation.merged, engine.run.delivery.reconciliation.appended],
-        [approved, engine.run.workspace.baseCommit, ['server.mjs'], []])
+        [approved, engine.run.workspace.baseCommit, ['server.mjs'], ['changelog.txt']])
       const gitDir = engine.run.workspace.gitDir ? ['--git-dir', engine.run.workspace.gitDir] : ['-C', engine.run.workspace.path]
       t.eq('the source base B′ is a commit over the snapshot', (await exec('git', [...gitDir, 'rev-parse', `${engine.run.delivery.reconciliation.sourceBase}^`])).stdout.trim(), engine.run.workspace.baseCommit)
-      t.eq('the source index and HEAD are untouched', (await git(f.projectPath, 'status', '--porcelain')).trim(), 'M server.mjs')
+      t.eq('the source index and HEAD are untouched', (await git(f.projectPath, 'status', '--porcelain')).split('\n').map((l) => l.trim()).filter(Boolean), ['M changelog.txt', 'M server.mjs'])
       const events = (await readEvents(f.issuePath, engine.runId)).events.map((e) => e.type)
       t.ok('journaled', ['reconcile-started', 'reconciled'].every((e) => events.includes(e)) && events.at(-1) === 'finished')
       t.eq('nothing further is offered', supportedActions(engine.run), ['start-new'])
@@ -582,9 +593,9 @@ export default async function (t) {
 
     t.section('4. a merged candidate that fails revalidation is not delivered')
     {
-      const { f, engine } = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) } })
+      const { f, engine } = await blockedRun(WITH_CHANGELOG({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) } }))
       t.eq('the approved candidate passed its check', engine.run.checkResults.at(-1)?.result, 'passed')
-      await engine.reconcileDelivery({ policy: {} })
+      await engine.reconcileDelivery({ policy: PREPEND })
       const attempt = engine.run.reconciliations.at(-1)
       t.eq('the merge was clean but the check failed, as a new failure', `${attempt.state} ${attempt.checks.result} ${attempt.checks.gating}`, 'revalidation-failed failed failed', JSON.stringify(attempt))
       t.eq('still blocked as before', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked source-delivery-blocked')
@@ -601,7 +612,7 @@ export default async function (t) {
       t.eq('get_check_log reads its log, bound to the merged candidate', [log.result, log.exitCode, log.revision], ['failed', attempt.checks.commands[0].exitCode, attempt.revision])
       t.ok('a command it did not record is still refused', await readCheckLog({ issuePath: f.issuePath, runId: engine.runId, check: checkNumber(attempt.checks.dir), command: 'other' }).then(() => false, (e) => /No recorded command log/.test(e.message)))
 
-      await engine.reconcileDelivery({ policy: {} })
+      await engine.reconcileDelivery({ policy: PREPEND })
       const second = engine.run.reconciliations.at(-1)
       const again = await getRunView(f, engine)
       t.eq('a second attempt keeps its own check', [second.n, second.state, second.checks.dir !== attempt.checks.dir], [2, 'revalidation-failed', true])
@@ -615,9 +626,9 @@ export default async function (t) {
     {
       // The failed test appears only on the merge: the approved candidate and the source alone report none.
       const collect = '      - id: collect\n        report: selftest\n        run: |\n          if grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs; then t=\',{"test":"core/new","error":"regression"}\'; fi\n          echo "== runtime/selftest.report"\n          printf \'{\\n  "total": 1,\\n  "tests": [{"test":"core/a"}%s]\\n}\\n\' "$t"\n'
-      const { f, engine } = await blockedRun({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) }, commands: collect })
+      const { f, engine } = await blockedRun({ ...WITH_CHANGELOG({ worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }, source: { 'server.mjs': lines(10, { 1: 'line 1 INCOMPATIBLE' }) } }), commands: collect })
       t.eq('the approved candidate passed its gate', engine.run.blockedReason, 'source-delivery-blocked', JSON.stringify(engine.run.checkResults.at(-1)?.baselineComparison))
-      await engine.reconcileDelivery({ policy: {} })
+      await engine.reconcileDelivery({ policy: PREPEND })
       const attempt = engine.run.reconciliations.at(-1)
       const reason = 'selftest verdict new-failures: collect: core/new'
       t.eq('the drive passed and the gate failed', [attempt.state, attempt.checks.result, attempt.checks.gating], ['revalidation-failed', 'passed', 'failed'], JSON.stringify(attempt))
@@ -725,7 +736,8 @@ export default async function (t) {
         const { f, engine } = await blockedRun({ ...scenario, ...c })
         const before = await c.drives()
         const undeclared = autoReconcileRefusal(engine.run, INERT)
-        t.eq(`${label}: as today, the automatic attempt ${scenario === FOREIGN ? 'applies' : 'does not apply'}`, undeclared === null, scenario === FOREIGN, undeclared)
+        // The clean own-path edit merged at delivery, so only the declared changelog conflicted: the automatic attempt applies to both.
+        t.eq(`${label}: the automatic attempt applies`, undeclared, null)
         await engine.reconcileDelivery({ policy: INERT })
         const attempt = engine.run.reconciliations.at(-1)
         t.eq(`${label}: delivered`, `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${JSON.stringify(attempt)}`)
@@ -890,8 +902,7 @@ export default async function (t) {
       const a = await approve(src, { repository: 1, excludes: ['secret.env'] }, (dir) => fs.writeFile(path.join(dir, 'app.txt'), lines(10, { 9: 'line 9 fixed' })))
       t.ok('A and S differ', a.ws.sourceBase && a.ws.sourceBase !== a.ws.baseCommit)
       await fs.writeFile(path.join(src, 'app.txt'), lines(10, { 1: 'line 1 elsewhere' }))
-      const refused = await applyToSource({ workspace: a.ws, baseline: a.baseline, revision: a.fp.fingerprint, fingerprint: a.fp, receipt: a.receipt, runDir: a.runDir })
-      t.eq('delivery refused for its own path', [refused.application.state, refused.application.drifted], ['source-drift', ['app.txt']])
+      // Delivery itself would merge this edit (source-merge.mjs); reconcile's merge is driven directly here.
       const merge = await mergeOf(a)
       try {
         t.eq('merged', merge.state, 'merged', merge.error)
@@ -921,9 +932,8 @@ export default async function (t) {
       const a = await approve(app, { symlinks: 'materialize' }, (dir) => fs.writeFile(path.join(dir, 'shared/shared.txt'), lines(10, { 9: 'line 9 fixed' })))
       t.eq('the link was materialized', a.ws.symlinks.materialized, ['shared'])
       await fs.writeFile(path.join(owner, 'modules/shared.txt'), lines(10, { 1: 'line 1 by the owner' }))
-      const refused = await applyToSource({ workspace: a.ws, baseline: a.baseline, revision: a.fp.fingerprint, fingerprint: a.fp, receipt: a.receipt, runDir: a.runDir })
-      t.eq('owner delivery refuses and records the drifted path', [refused.application.state, refused.application.drifted], ['source-drift', ['shared/shared.txt']])
-      t.eq('so reconcile is offered', offered(refused.application), null)
+      // Owner delivery would merge this edit itself (source-merge.mjs); a conflict there records the path as drifted, which offers reconcile.
+      t.eq('a drifted owner path is offered reconcile', offered({ state: 'source-drift', drifted: ['shared/shared.txt'] }), null)
       const merge = await mergeOf(a)
       try {
         t.eq('merged, not refused as unsupported', [merge.state, merge.merged], ['merged', ['shared/shared.txt']], merge.error)
@@ -982,7 +992,7 @@ export default async function (t) {
       const commands = `${COMPATIBLE}      - id: flaky\n        run: "! grep -q fixed server.mjs"\n`
       const worktree = { 'server.mjs': lines(10, { 9: 'line 9 fixed' }) }
       const accepted = async (source) => {
-        const { f, engine } = await blockedRun({ worktree, source: { 'server.mjs': source }, commands })
+        const { f, engine } = await blockedRun({ ...WITH_CHANGELOG({ worktree, source: { 'server.mjs': source } }), commands })
         t.ok('the check stopped it and acceptance is offered', supportedActions(engine.run).includes('accept-check-result'), `${engine.run.blockedReason} ${supportedActions(engine.run)}`)
         await engine.acceptCheckResult({ failures: ['flaky'], reason: 'unrelated', revision: engine.run.revisions.at(-1).fingerprint, actor: 'alice' })
         await engine.drive()
@@ -994,7 +1004,7 @@ export default async function (t) {
       {
         const { f, engine } = await accepted(lines(10, { 1: 'line 1 elsewhere' }))
         const approved = engine.run.closure.revision
-        await engine.reconcileDelivery({ policy: {}, actor: 'alice' })
+        await engine.reconcileDelivery({ policy: PREPEND, actor: 'alice' })
         const attempt = engine.run.reconciliations.at(-1)
         t.eq('the checks ran again on the merged candidate', `${attempt.state} ${attempt.checks.result} ${attempt.checks.gating} ${attempt.acceptedCheckRisk}`, 'accepted failed failed true')
         t.eq('delivered', `${engine.run.status} ${engine.run.outcome}`, 'completed resolved', `${engine.run.blockedReason} ${engine.run.delivery?.error}`)
@@ -1006,7 +1016,7 @@ export default async function (t) {
       }
       {
         const { f, engine } = await accepted(lines(10, { 1: 'line 1 INCOMPATIBLE' }))
-        await engine.reconcileDelivery({ policy: {}, actor: 'alice' })
+        await engine.reconcileDelivery({ policy: PREPEND, actor: 'alice' })
         t.eq('a failure nobody named is refused', engine.run.reconciliations.at(-1).state, 'revalidation-failed')
         t.eq('still blocked as before', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked source-delivery-blocked')
         t.eq('the source is untouched', await read(f, 'server.mjs'), lines(10, { 1: 'line 1 INCOMPATIBLE' }))

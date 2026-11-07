@@ -8,6 +8,7 @@ import { escapingLinks, workspaceProjection } from './fingerprint.mjs'
 import { splitPatch } from './patch-check.mjs'
 import { priorRuns, stepText } from './prior-runs.mjs'
 import * as store from './store.mjs'
+import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
 
 /*
  * Would this candidate write files another live run is also touching?
@@ -28,6 +29,23 @@ import * as store from './store.mjs'
  * in-place run's writes through a link do not show in its git changes. Whatever
  * could not be read is named, and reads `unknown`, never `none`.
  */
+
+/**
+ * The checkout's uncommitted paths (modified, staged, untracked; both names of
+ * a rename), for the project page's warning: manual edits a live run is also
+ * touching. Read-only, bounded like every launch-path git read.
+ */
+export async function checkoutPaths (projectPath) {
+  const { stdout } = await gitRead('git', ['-C', projectPath, 'status', '--porcelain', '-z', '--untracked-files=all'],
+    { env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' }, maxBuffer: GIT_OUTPUT_LIMIT })
+  const tokens = stdout.split('\0').filter(Boolean)
+  const paths = []
+  for (let i = 0; i < tokens.length; i++) {
+    paths.push(tokens[i].slice(3))
+    if (/^[RC]/.test(tokens[i])) paths.push(tokens[++i])
+  }
+  return [...new Set(paths.filter(Boolean))]
+}
 
 const MAX_FILES_SHOWN = 30
 // No path is longer than this, so nothing a delivery could write is dropped by it.
@@ -211,6 +229,11 @@ const names = (entry) => `${entry.files.map((f) => f.path).join(', ')}${entry.mo
 const describe = (entry) => `${entry.project} (run ${entry.runId} of issue ${entry.issueId}, ${entry.status}) touches ${names(entry)}, owned by ${entry.ownerProject ?? 'a checkout outside every project'}`
 
 function detailOf ({ state, expected, overlaps, possible, uncompared }) {
+  if (expected.source === 'working-tree') {
+    const notCompared = uncompared.length ? ` Not compared: ${uncompared.map((u) => `${u.project}${u.runId ? ` (run ${u.runId})` : ''}: ${u.reason}`).join('; ')}.` : ''
+    if (state === 'overlap') return `Uncommitted changes in this checkout are also being touched by a live run: ${overlaps.map(describe).join('; ')}. Nothing is blocked: when that run delivers, it merges with these edits and stops only on lines both changed.${notCompared}`
+    return state === 'none' ? 'No live run touches the uncommitted changes in this checkout.' : `Whether a live run touches the uncommitted changes in this checkout is not known.${notCompared}`
+  }
   const unread = `${expected.incomplete.length ? ` Expected files not fully read: ${expected.incomplete.join('; ')}.` : ''}${uncompared.length ? ` Not compared: ${uncompared.map((u) => `${u.project}${u.runId ? ` (run ${u.runId})` : ''}: ${u.reason}`).join('; ')}.` : ''}`
   if (state === 'overlap') return `This candidate's expected files, from the ${expected.source === 'plan' ? 'plan' : 'previous revision'} of run ${expected.fromRun}, are also being touched: ${overlaps.map(describe).join('; ')}. Whichever delivers second may find its paths drifted. The start is not refused.${unread}`
   if (state === 'none') return expected.known ? 'No other live run touches this candidate\'s expected files.' : 'No other run that delivers is live.'
@@ -236,7 +259,8 @@ async function reachable (root, files) {
  * @returns inspect({ project, projectPath, issuePath, deliveryAction, now }) → the reading; it never throws
  */
 export function createPathOverlap ({ listProjects, listIssues }) {
-  return async function inspect ({ project, projectPath, issuePath = null, deliveryAction = null, now = Date.now() }) {
+  /** `paths` replaces the issue's expected paths: the checkout's uncommitted ones (checkoutPaths), for the project page. */
+  return async function inspect ({ project, projectPath, issuePath = null, deliveryAction = null, now = Date.now(), paths = null }) {
     const observedAt = new Date(now).toISOString()
     const empty = { observedAt, expected: { known: false, source: null, fromRun: null, count: 0, incomplete: [] }, overlaps: [], possible: [], uncompared: [] }
     if (deliveryAction === 'none') return { state: 'not-applicable', ...empty, detail: 'This configuration delivers nothing.' }
@@ -247,7 +271,7 @@ export function createPathOverlap ({ listProjects, listIssues }) {
         return { id: p.id, path: real, spellings: [...new Set([real, p.path, projectDir(p.id)])] }
       }))
       const roots = projects.some((p) => p.path === root) ? projects : [...projects, { id: project, path: root, spellings: [root, projectPath] }]
-      const expected = await expectedPaths(issuePath)
+      const expected = paths ? { known: true, source: 'working-tree', fromRun: null, paths, gaps: [] } : await expectedPaths(issuePath)
       const wanted = new Map()
       for (const rel of expected.paths) wanted.set(await expectedDestination(root, rel, roots), rel)
 
@@ -280,7 +304,7 @@ export function createPathOverlap ({ listProjects, listIssues }) {
       }
       const state = overlaps.length ? 'overlap' : uncompared.length || ((!expected.known || expected.gaps.length) && liveRuns) ? 'unknown' : 'none'
       const summary = { known: expected.known, source: expected.source, fromRun: expected.fromRun, count: expected.paths.length, incomplete: expected.gaps }
-      return { state, observedAt, expected: summary, overlaps, possible, uncompared, detail: detailOf({ state, expected: summary, overlaps, possible, uncompared }) }
+      return { state, observedAt, ...(paths ? { basis: 'path-overlap' } : {}), expected: summary, overlaps, possible, uncompared, detail: detailOf({ state, expected: summary, overlaps, possible, uncompared }) }
     } catch (error) {
       return { state: 'unavailable', ...empty, detail: `The overlap with other live runs could not be read: ${error.message}` }
     }

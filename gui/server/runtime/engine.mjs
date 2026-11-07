@@ -4520,6 +4520,10 @@ export class Engine {
         bytes: receipt?.bytes ?? null,
         reconstruction,
         ...(action === 'apply-to-source' ? { application: receipt?.application ?? null } : {}),
+        // A three-way merge with edits in the source (source-merge.mjs): what merged, what conflicted, the merged tree.
+        ...(receipt?.application?.merged ? { merged: receipt.application.merged.map(({ path: p, hunks, identical, applied }) => ({ path: p, hunks, ...(identical ? { identical } : {}), ...(applied === false ? { applied } : {}) })) } : {}),
+        ...(receipt?.application?.conflicts ? { conflicts: receipt.application.conflicts } : {}),
+        ...(receipt?.application?.mergedFrom ? { mergedFrom: receipt.application.mergedFrom, mergeCheck: receipt.application.mergeCheck ?? null } : {}),
         // What a reconciliation merged: the approved revision, its base, the source it was merged onto.
         ...(candidate ? { reconciliation: (({ n, from, mergeBase, sourceBase, merged, appended, noDrive }) => ({ n, from, mergeBase, sourceBase, merged, appended, ...(noDrive ? { noDrive } : {}) }))(candidate.reconciliation) } : {}),
         repository: receipt?.repository ?? null,
@@ -4538,11 +4542,12 @@ export class Engine {
         blockedReason = 'delivery-unverifiable'
       } else if (action === 'apply-to-source' && (reconstruction?.verified !== true ||
         reconstruction.fingerprint !== current || receipt?.application?.verified !== true ||
-        // Applied beside foreign drift (source-delivery.mjs `composed`), the
+        // Applied beside foreign drift (source-delivery.mjs `composed`) or merged
+        // with edits in the source (`mergedFrom`), the
         // checkout's fingerprint is not the revision's: there the per-path proof
         // recorded by the application stands in for the whole-tree equality.
         receipt.application.revision !== current ||
-        (receipt.application.fingerprint !== current && !(receipt.application.composed && receipt.application.state === 'complete')) ||
+        (receipt.application.fingerprint !== current && !((receipt.application.composed || receipt.application.mergedFrom) && receipt.application.state === 'complete')) ||
         receipt.application.path !== this.run.workspace.source?.path)) {
         blockedReason = 'source-delivery-blocked'
         record.error = receipt?.application?.error ?? 'Source application did not verify the approved revision at the bound destination.'

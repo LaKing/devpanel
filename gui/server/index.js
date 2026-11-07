@@ -25,6 +25,7 @@ import { sourceState } from './staleness.mjs'
 import { topSupervisorService } from './top-supervisor-service.mjs'
 import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
 import { stagingPendingReport } from './staging-coverage.mjs'
+import { checkoutPaths } from './runtime/path-overlap.mjs'
 import { readGrants, writeGrant, revokeGrant } from './broker/broker.mjs'
 import { listProjectActions, readOperation, startProjectAction, stopProjectAction } from './project-actions.mjs'
 import { createSupervisor } from './supervisor.mjs'
@@ -165,6 +166,15 @@ app.get('/api/projects/:project/infrastructure', route(async (req, res) => {
 app.get('/api/projects/:project/infrastructure/:environment/:resource', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
   res.json(await inspectEnvironment(req.params, { root: process.env.DEVPANEL_CONFIG_ROOT }))
+}))
+
+// The project page's warning: uncommitted changes in the checkout that a live run is also touching (path-overlap.mjs). It blocks nothing.
+app.get('/api/projects/:project/checkout-overlap', route(async (req, res) => {
+  await knownInfrastructureProject(req.params.project)
+  const dir = projectPath(req.params.project)
+  const paths = await checkoutPaths(dir).catch(() => null)
+  if (!paths) return res.json({ state: 'unavailable', overlaps: [], detail: 'The checkout\'s uncommitted changes could not be read.' })
+  res.json(await supervisor.pathOverlap({ project: req.params.project, projectPath: dir, paths }))
 }))
 
 // Delivered runs no successful Staging run has covered (staging-coverage.mjs). Reads; starts nothing.

@@ -93,6 +93,8 @@ const countLabel = computed(() => {
  * slower answer wins and the archived tab can end up showing the active list.
  */
 let loadSeq = 0
+// Uncommitted changes in the checkout that a live run is also touching (path-overlap.mjs): a warning, never a block.
+const checkoutOverlap = ref(null)
 
 async function load () {
   const seq = ++loadSeq
@@ -103,6 +105,8 @@ async function load () {
     const [next] = await Promise.all([api.listIssues(project.value, { archived: wanted }), loadProjects()])
     if (seq !== loadSeq) return                    // superseded while in flight
     issues.value = next
+    // Only a warning: a failed reading shows nothing and blocks nothing.
+    api.checkoutOverlap(project.value).then((reading) => { if (seq === loadSeq) checkoutOverlap.value = reading }, () => { if (seq === loadSeq) checkoutOverlap.value = null })
   } catch (err) {
     if (seq !== loadSeq) return
     loadError.value = err.message
@@ -267,6 +271,13 @@ watch([project, archived], () => {
         </v-btn>
       </div>
     </div>
+
+    <v-alert v-if="checkoutOverlap?.state === 'overlap'" type="warning" variant="tonal" density="compact" class="mb-3"
+             data-test="checkout-overlap">
+      Uncommitted changes in this checkout are also being changed by a live run:
+      <span v-for="(o, i) in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`">{{ i ? '; ' : ' ' }}run {{ o.runId }} of {{ o.issueId }} touches {{ o.files.map((f) => f.path).join(', ') }}{{ o.more ? ` and ${o.more} more` : '' }}</span>.
+      Nothing is blocked: its delivery merges with these edits and stops only on lines both changed.
+    </v-alert>
 
     <v-alert v-if="deleteError" type="error" variant="tonal" density="compact" closable
              class="mb-3" @click:close="deleteError = ''">

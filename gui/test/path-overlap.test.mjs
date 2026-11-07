@@ -4,7 +4,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import { createPathOverlap, pathsInText } from '../server/runtime/path-overlap.mjs'
+import { checkoutPaths, createPathOverlap, pathsInText } from '../server/runtime/path-overlap.mjs'
 import { previewRun } from '../server/runtime/preview.mjs'
 import { getRun } from '../server/runs-api.mjs'
 import { summarisePreview, summariseRun } from '../server/supervisor-summary.mjs'
@@ -280,6 +280,25 @@ export default async function (t) {
       t.eq('on the file they share', pathsOf(reading.overlaps[0]), ['app.mjs'])
       const own = await inspector({ 'app-project': [sameProject] })({ project: 'app-project', projectPath: app, issuePath: sameProject.path })
       t.eq('a candidate is not compared with its own issue\'s run', own.overlaps.length, 0, own.detail)
+    }
+
+    t.section('the project page: uncommitted changes in the checkout that a live run is touching')
+    {
+      const sameProject = await liveRow(root, 'app-project', app, async (worktree) => { await fs.writeFile(path.join(worktree, 'app.mjs'), 'changed by a live run') })
+      await fs.writeFile(path.join(app, 'app.mjs'), 'edited by hand\n')
+      await fs.writeFile(path.join(app, 'notes.txt'), 'untracked\n')
+      try {
+        const dirty = await checkoutPaths(app)
+        t.eq('the checkout\'s uncommitted paths, untracked included', dirty.sort(), ['app.mjs', 'notes.txt'])
+        const reading = await inspector({ 'app-project': [sameProject] })({ project: 'app-project', projectPath: app, paths: dirty })
+        t.eq('it warns, naming the run and the overlapping path', [reading.state, reading.basis, reading.overlaps[0]?.runId, pathsOf(reading.overlaps[0])], ['overlap', 'path-overlap', RUN(2), ['app.mjs']])
+        t.ok('it says nothing is blocked', /Uncommitted changes in this checkout/.test(reading.detail) && /Nothing is blocked/.test(reading.detail), reading.detail)
+        const quiet = await inspector({ 'app-project': [sameProject] })({ project: 'app-project', projectPath: app, paths: ['notes.txt'] })
+        t.eq('no warning when nothing overlaps', quiet.state, 'none', quiet.detail)
+      } finally {
+        await git(app, 'checkout', '--', 'app.mjs')
+        await fs.rm(path.join(app, 'notes.txt'))
+      }
     }
 
     t.section('a third project writing into the same owner, and the owner as the candidate')

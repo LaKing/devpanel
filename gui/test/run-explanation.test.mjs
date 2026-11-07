@@ -75,6 +75,30 @@ export default async function (t) {
   const delivery = explainRun({ status: 'blocked', blockedReason: 'source-delivery-blocked', delivery: { error: 'Source composition changed outside the approved patch.' }, workspace: { state: 'retained' } })
   t.eq('a delivery error is kept apart as the cause', delivery.cause, 'Source composition changed outside the approved patch.')
   t.eq('and the retained workspace is mentioned', delivery.kept, 'Its workspace and logs are kept.')
+
+  // A three-way merge at source delivery (source-merge.mjs): what merged and where it conflicts, every kind with its lines.
+  const merged = explainRun({ status: 'completed', outcome: 'resolved', delivery: { action: 'apply-to-source', completedAt: 'x',
+    merged: [{ path: 'server.mjs', hunks: 2 }, { path: 'same.txt', hunks: 0, identical: true }], mergedFrom: 'sha256:merged', mergeCheck: { ran: false, reason: 'no tier' } } })
+  t.eq('a merged delivery names the merged path, its hunks and that nothing checked the merge', merged.detail,
+    'Applied to the project folder and verified; not committed. Merged three-way with edits in the project: server.mjs (2 hunks). No check ran on the merged bytes (merged tree sha256:merged).')
+  const conflicts = [
+    { path: 'server.mjs', kind: 'text', lines: [{ start: 9, end: 9, side: 'source' }, { start: 20, end: 24, side: 'source' }] },
+    { path: 'logo.png', kind: 'binary', lines: [{ start: 1, end: 3, side: 'source' }] },
+    { path: 'run.sh', kind: 'mode', lines: [{ start: 1, end: 20, side: 'source' }] },
+    { path: 'link', kind: 'symlink', lines: [{ start: 1, end: 1, side: 'source' }] },
+    { path: 'new.txt', kind: 'added', lines: [{ start: 1, end: 4, side: 'source' }] },
+    { path: 'gone.txt', kind: 'deleted', lines: [{ start: 1, end: 40, side: 'candidate' }] },
+    { path: 'kept.txt', kind: 'deleted', lines: [{ start: 1, end: 7, side: 'source' }] },
+    { path: 'empty.txt', kind: 'deleted', lines: [{ start: 0, end: 0, side: 'source' }] }
+  ]
+  const conflicted = explainRun({ status: 'blocked', blockedReason: 'source-delivery-blocked', workspace: { state: 'retained' },
+    delivery: { action: 'apply-to-source', error: 'The approved patch conflicts with changes in the source at server.mjs line 9 (source).', conflicts, merged: [{ path: 'other.txt', hunks: 1, applied: false }] } })
+  for (const text of ['server.mjs lines 9, 20–24 (source)', 'logo.png lines 1–3 (source, binary)', 'run.sh lines 1–20 (source, mode change)', 'link line 1 (source, symlink)',
+    'new.txt lines 1–4 (source, added on both sides)', "gone.txt lines 1–40 of the candidate's file (deleted in the source)", 'kept.txt lines 1–7 (source, deleted in the candidate)', 'empty.txt lines (empty) (source, deleted in the candidate)',
+    '1 other path would merge cleanly, but nothing was written.']) {
+    t.ok(`a conflict explanation names: ${text}`, conflicted.detail.includes(text), conflicted.detail)
+  }
+  t.ok('no merge is claimed for a refused delivery', !conflicted.detail.includes('Merged three-way'), conflicted.detail)
   t.eq('an unknown reason is still stated', explainRun({ status: 'blocked', blockedReason: 'brand-new-reason' }).detail, 'Reason recorded: brand-new-reason.')
   const gate = explainRun({ status: 'blocked', blockedReason: 'closure-conditions-unmet', closure: { conditions, notReturned: 'AC2: owner-gate' }, steps: [] }, { outputs })
   t.eq('an unmet goal kept for the operator says why it was not returned', gate.detail, 'AC2 rests on one report. It was not returned to the author: AC2 is a matter for you (owner gate).')

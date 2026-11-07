@@ -10,6 +10,8 @@ import { systemClock } from './clock.mjs'
 import { compositionPaths, nestedFiles, streamGit } from './working-tree.mjs'
 import { applyToOwners } from './owner-delivery.mjs'
 import { selectionState } from './selection.mjs'
+import { repositoryGitArgs, engineGitEnv } from './engine-git.mjs'
+import { MERGE_CHECK, conflictMessage, excludeArg, mergeDrifted, mergeRecord, writeMerged } from './source-merge.mjs'
 export { bindSourceOwners } from './owner-delivery.mjs'
 
 const exec = promisify(execFile)
@@ -122,7 +124,10 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     let observed = await readDestination()
     application.fingerprint = observed.fingerprint
     if (observed.fingerprint === revision) {
-      application = { ...application, verified: true, state: 'complete', completedAt: clock.iso() }
+      // With no earlier application, the source holds the approved bytes because someone made exactly
+      // these edits: each changed path counts as merged, identical, with nothing to write (source-merge.mjs).
+      const merged = prior ? prior.merged : changed.length ? changed.map(p => ({ path: p, hunks: 0, identical: true })) : null
+      application = { ...application, ...(merged ? { merged } : {}), verified: true, state: 'complete', completedAt: clock.iso() }
       await writeJson(file, application)
       return result()
     }
@@ -131,28 +136,50 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     // beside it: the reviewed paths get exactly the reviewed bytes and the
     // drifted paths are left as found. Refusing it threw away approved runs for
     // edits that never met the change. The combination itself was not tested,
-    // so it is recorded as `composed`. Drift on a reviewed path still refuses.
+    // so it is recorded as `composed`. Drift on a reviewed path is merged
+    // three-way (source-merge.mjs): a clean merge is applied, a conflict refuses.
     const wanted = new Map(changed.map(p => [p, candidate.entries.find(e => e.path === p)]))
+    // What each changed path must hold once delivered: the reviewed bytes, or a merge's bytes.
+    const expectedOf = merge => new Map([...wanted].map(([p, want]) => merge?.expected?.[p] ? [p, { ...want, contentHash: merge.expected[p].to }] : [p, want]))
+    let expected = expectedOf(null)
     const drift = obs => obs.entries.filter(e => e.status !== 'unchanged' && !wanted.has(e.path))
-    const delivered = obs => [...wanted].every(([p, want]) => {
+    const ownDrift = obs => obs.entries.filter(e => e.status !== 'unchanged' && wanted.has(e.path))
+    const delivered = (obs, exp = expected) => [...exp].every(([p, want]) => {
       const got = obs.entries.find(e => e.path === p)
       return want.status === 'deleted' ? got?.status === 'deleted' : got?.contentHash === want.contentHash && got?.mode === want.mode
     })
     const foreign = drift(observed)
-    if (prior?.composed && delivered(observed) && JSON.stringify(foreign) === JSON.stringify(prior.composed.entries)) {
-      application = { ...application, composed: prior.composed, verified: true, state: 'complete', completedAt: clock.iso() }
+    if ((prior?.composed || prior?.merge) && delivered(observed, expectedOf(prior.merge)) && JSON.stringify(foreign) === JSON.stringify(prior.composed?.entries ?? [])) {
+      application = { ...application, ...(prior.composed ? { composed: prior.composed } : {}),
+        ...(prior.merge ? { merge: prior.merge, merged: prior.merged, mergedFrom: observed.fingerprint, mergeCheck: MERGE_CHECK } : {}),
+        verified: true, state: 'complete', completedAt: clock.iso() }
       await writeJson(file, application)
       return result()
     }
-    const overlap = observed.entries.filter(e => e.status !== 'unchanged' && wanted.has(e.path)).map(e => e.path)
+    const atMerge = ownDrift(observed)
     // An interrupted earlier application may resume only over the drift it recorded.
     const priorDrift = prior?.composed?.entries ?? []
-    if (overlap.length || (prior && JSON.stringify(foreign) !== JSON.stringify(priorDrift))) {
-      const where = overlap.length ? ` The approved patch's own paths changed: ${overlap.slice(0, 5).join(', ')}${overlap.length > 5 ? ', …' : ''}.` : ''
-      // The paths are kept: they are what `reconcile-delivery` merges (source-reconcile.mjs).
-      if (overlap.length && !prior) application = { ...application, drifted: overlap }
-      return refuse(prior ? 'recovery-required' : 'source-drift', `The destination matches neither the base snapshot nor the approved revision.${where} ${remedy}`)
+    if (prior && (atMerge.length || JSON.stringify(foreign) !== JSON.stringify(priorDrift))) {
+      return refuse('recovery-required', `The destination matches neither the base snapshot nor the approved revision. ${remedy}`)
     }
+    let merge = null
+    if (atMerge.length) {
+      const gitDir = workspace.gitDir && await fs.access(workspace.gitDir).then(() => true, () => false) ? workspace.gitDir : null
+      const readBase = async p => (await exec('git', [...repositoryGitArgs(workspace.path, gitDir), 'cat-file', 'blob', `${workspace.baseCommit}:${p}`],
+        { env: engineGitEnv(), encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 })).stdout
+      const outcome = await mergeDrifted({ readBase, sourceRoot: target.path, candidateRoot: workspace.path,
+        entries: atMerge.map(e => ({ path: e.path, want: wanted.get(e.path), got: e, baseHash: baseline.get(e.path) ?? null, baseMode: baseline.modes?.get(e.path) ?? null })) })
+      if (outcome.refusal) return refuse(outcome.refusal.state, `${outcome.refusal.error} ${remedy}`)
+      if (outcome.conflicts.length) {
+        // Nothing is written. The conflicting paths are what `reconcile-delivery` merges (source-reconcile.mjs).
+        application = { ...application, drifted: outcome.conflicts.map(c => c.path), conflicts: outcome.conflicts, merged: mergeRecord(outcome.merged, false) }
+        return refuse('source-drift', `${conflictMessage(outcome.conflicts)} ${remedy}`)
+      }
+      merge = outcome.merged
+    }
+    const written = (merge ?? []).filter(m => !m.identical)
+    const mergeJournal = merge ? { paths: merge.map(m => m.path), expected: Object.fromEntries(written.map(m => [m.path, { from: m.from, to: m.to }])) } : null
+    expected = expectedOf(mergeJournal)
     const composed = foreign.length ? { paths: foreign.map(e => e.path), entries: foreign } : null
 
     const patch = await fs.readFile(path.join(runDir, receipt.artifactRef))
@@ -160,7 +187,8 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     // Use the captured bytes on stdin for both commands: the artifact cannot be
     // swapped between --check and apply. No index, HEAD or commit is changed.
     const apply = async check => {
-      const child = execFile('git', ['-C', target.path, 'apply', '--binary', '--whitespace=nowarn', ...(check ? ['--check'] : []), '-'], {
+      // A merged path gets the merge's bytes, written after the rest of the patch.
+      const child = execFile('git', ['-C', target.path, 'apply', '--binary', '--whitespace=nowarn', ...(merge ?? []).map(m => excludeArg(m.path)), ...(check ? ['--check'] : []), '-'], {
         maxBuffer: 16 * 1024 * 1024
       })
       await new Promise((resolve, reject) => {
@@ -175,18 +203,24 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     if (patch.length) await apply(true)
     if (hooks.beforeApply) await hooks.beforeApply()
     observed = await readDestination()
-    if (observed.entries.some(e => e.status !== 'unchanged' && wanted.has(e.path)) || JSON.stringify(drift(observed)) !== JSON.stringify(foreign) ||
+    // A merged path must still hold what was merged; any other own-path change refuses.
+    if (JSON.stringify(ownDrift(observed)) !== JSON.stringify(atMerge) || JSON.stringify(drift(observed)) !== JSON.stringify(foreign) ||
       JSON.stringify(await sourceTarget(target.path)) !== JSON.stringify(target)) return refuse('source-drift', `The source changed before patch application. ${remedy}`)
-    application = { ...application, state: 'applying', patchHash: digest(patch), startedAt: clock.iso(), ...(composed ? { composed } : {}) }
+    application = { ...application, state: 'applying', patchHash: digest(patch), startedAt: clock.iso(), ...(composed ? { composed } : {}),
+      ...(merge ? { merge: mergeJournal, merged: mergeRecord(merge) } : {}) }
     await writeJson(file, application)
     if (patch.length) await apply(false)
+    for (const entry of written) await writeMerged(target.path, entry)
     if (hooks.afterApply) await hooks.afterApply()
     observed = await readDestination()
     application.fingerprint = observed.fingerprint
-    const exact = composed ? delivered(observed) && JSON.stringify(drift(observed)) === JSON.stringify(foreign) : observed.fingerprint === revision
+    const exact = composed || written.length ? delivered(observed) && JSON.stringify(drift(observed)) === JSON.stringify(foreign) : observed.fingerprint === revision
     if (!exact || JSON.stringify(await sourceTarget(target.path)) !== JSON.stringify(target)) {
       application = { ...application, state: 'recovery-required', error: `Source verification failed after application. ${remedy}` }
-    } else application = { ...application, state: 'complete', verified: true, completedAt: clock.iso() }
+    } else {
+      // The merged tree, re-fingerprinted under the delivery lock: the delivered revision's `mergedFrom`.
+      application = { ...application, state: 'complete', verified: true, completedAt: clock.iso(), ...(written.length ? { mergedFrom: observed.fingerprint, mergeCheck: MERGE_CHECK } : {}) }
+    }
     await writeJson(file, application)
     return result()
   } catch (error) {

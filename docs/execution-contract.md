@@ -1150,14 +1150,50 @@ separate operations.
 Source delivery saves and reconstructs the patch before writing. It takes a
 destination-repository lock using `runtime/lock.mjs`, checks the bound path and
 repository, records current Git state, and compares source with the captured
-base. Pre-existing dirty work represented by that base is allowed. Subsequent
-drift on a path the patch changes blocks delivery and names the path. Drift on
-other paths (someone else's edit, a regenerated file) does not: the patch is
+base. Pre-existing dirty work represented by that base is allowed. Drift on
+other paths (someone else's edit, a regenerated file) does not block: the patch is
 applied beside it, the patch's paths must then hold exactly the reviewed bytes
 and every drifted path must be as it was found, and the application records
 `composed: {paths}` because that combination was never tested. The same holds
 when the patch changes files under materialized links and is dispatched to
 their Git owners (`runtime/owner-delivery.mjs`).
+
+**Merging with manual edits.** Drift on a path the patch itself changes (a
+manual edit in the checkout since the run's snapshot) is merged three-way
+(`runtime/source-merge.mjs`), on owner-routed paths exactly as on the
+checkout's own: base = the file in the run's captured base commit
+(`workspace.baseCommit`), ours = the source checkout's file now, theirs = the
+candidate's file. Each side must hash as it was read. A text file is merged with
+`git merge-file`; changes that overlap, or touch adjacent lines, are a
+conflict, and the same change made on both sides is not. Binary files (a NUL
+byte in the first 8000 bytes), mode changes, symlinks, a file deleted on one
+side only and a file added on both sides never merge: they conflict unless both
+sides are identical, and an identical path counts as merged with nothing to
+write. Delivery is all or nothing: one conflict means nothing at all is written,
+no conflict markers either, and the run blocks `source-delivery-blocked` with
+the patch kept for manual application, reconcile or carry-forward as before.
+Without a conflict the rest of the patch is applied with `git apply` (the merged
+paths excluded) and each merged file is then written in place, under the same
+repository lock; the journal records the merge's expected hashes before the
+write, so an interrupted merge is recognised on finalize.
+
+The delivery records `delivery.merged: [{path, hunks}]` (hunks: the candidate's
+changes merged into the file; `identical: true` when nothing had to be written,
+`applied: false` for clean paths of a delivery a conflict refused) and
+`delivery.conflicts: [{path, kind, lines}]`. `kind` is `text`, `binary`,
+`mode`, `symlink`, `added` or `deleted`; `lines` is `[{start, end, side}]`,
+1-based and inclusive: for a text conflict the conflicting regions in the
+source file's lines, for the other kinds the whole file, counted in the source
+file (`side: source`) or, when the source no longer has the file, in the
+candidate's (`side: candidate`); an empty file is `{0, 0}`; a symlink's target
+is line 1. Only the conflicting paths go to `application.drifted`, so
+reconcile and the automatic changelog reconcile see exactly what conflicted.
+After a merge the destination is re-fingerprinted under the lock and recorded
+as `delivery.mergedFrom` (the merged tree; `delivery.revision` stays the
+approved revision). There is no per-module check tier, so no check runs on the
+merged bytes: `delivery.mergeCheck: {ran: false, reason}` says so, and so do the
+run explanation and `result.md`, which name the merged paths and every conflict
+with its lines. The run blocks only when `conflicts` is non-empty.
 
 A run blocked with an approved, undelivered candidate is carried forward:
 `runtime/carry-forward.mjs` applies its retained patch to the next run's fresh
@@ -1191,7 +1227,8 @@ is no blind rollback. Owner delivery records destination mappings, patch hashes
 and per-repository progress. After interruption, each owner must match either its
 captured base or its approved result; finalize applies only pending owners and
 verifies the complete application composition. A failed or interrupted
-application retains the patch and worktree. For drift the operator path is
+application retains the patch and worktree. Edits that do not overlap the patch's
+own lines are merged at delivery (above); for a conflict the operator path is
 **reconcile** (below), else **apply manually or rerun** against current source;
 Finalize never rebases the candidate or carries approval onto a different
 composition.
@@ -1229,9 +1266,10 @@ lock) and the worktree is settled afterwards by the same disposal rules.
 
 ### Reconciling a delivery with drifted source
 
-When source delivery refuses because the destination changed the approved
-patch's own paths (`application.state: source-drift`, the paths in
-`application.drifted`; older records name them in the message), the run —
+When source delivery refuses because edits in the destination conflict with the
+approved patch's own paths (`application.state: source-drift`, the conflicting
+paths in `application.drifted` and with their lines in `delivery.conflicts`;
+older records name them in the message), the run —
 blocked `source-delivery-blocked` or `delivery-unverifiable`, worktree retained,
 every closure condition met but delivery — offers `reconcile-delivery`
 (`POST …/runs/:runId/reconcile-delivery`, the **Reconcile with source** button,
