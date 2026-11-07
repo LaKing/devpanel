@@ -10,7 +10,10 @@ participants:
     effort: medium
   release-operator:
     model: opus-5-5
-    effort: xhigh
+    effort: medium   # owner's defaults since 2026-11-07: medium operator, a GPT-6.1 Sol verifier
+  verifier-1:
+    model: gpt-6.1-sol
+    effort: medium
 autoClose:
   minimumVerification: review-only
   justification: Closure requires promotion of the selected staged artifact and accepted production assessments. Every occupied verifier must finish; configured rollback policy governs recovery.
