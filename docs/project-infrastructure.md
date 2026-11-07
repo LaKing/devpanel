@@ -331,7 +331,7 @@ command word... {{tests}} word...
 ```
 
 - Single spaces separate the words, and `{{tests}}` appears once, as a word of its own.
-- `command` is a literal name or path (letters, digits, `_ . / -`), never a shell
+- `command` is a literal name or path (letters, digits, `_ . / -` and `@`, the first character of a Boilerplate collection), never a shell
   builtin or reserved word, and never a program whose purpose is to run its arguments
   (`env`, `xargs`, `sudo`, `sh`, `bash` and the like, by any path).
 - Every other word uses only letters, digits and `_ @ % + = : , . / -`.

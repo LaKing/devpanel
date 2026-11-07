@@ -147,6 +147,8 @@ export default async function (t) {
       'env {{tests}}', 'env A=1 {{tests}}', '/usr/bin/env {{tests}}', 'xargs {{tests}}', 'sudo {{tests}}', 'nohup {{tests}}', 'sh {{tests}}', 'sh -c {{tests}}', '/bin/sh -c {{tests}}', 'bash -lc {{tests}}'
     ]
     for (const form of refusedForms) t.ok(`refused: ${JSON.stringify(form)}`, errors(form).some((e) => e.startsWith('tiers.targeted.run')), JSON.stringify(errors(form)))
+    // A script inside a Boilerplate collection (`@boilerplate/tooling/…`) is a literally named command too.
+    t.ok('a path beginning with @ is a command', !errors('@boilerplate/tooling/run-selftests.sh {{tests}}').some((e) => e.startsWith('tiers.targeted.run')))
     const shells = []
     for (const shell of ['/bin/sh', '/bin/bash']) if (await fs.access(shell).then(() => true, () => false)) shells.push(shell)
     if (shells.includes('/bin/bash')) {

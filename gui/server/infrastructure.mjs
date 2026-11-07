@@ -63,7 +63,8 @@ export function tierErrors (target) {
 // Words the shell would treat as anything but a plain word: no quote, expansion, operator, glob, comment or newline can be spelled in them.
 const TEMPLATE_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/
 // The command is a path or a name, and with no `=` it cannot be an assignment that leaves the first name as the command.
-const TEMPLATE_COMMAND = /^[A-Za-z0-9_./][A-Za-z0-9_./-]*$/
+// `@` is plain to the shell and begins every Boilerplate framework collection (`@boilerplate/tooling/<script>`).
+const TEMPLATE_COMMAND = /^[A-Za-z0-9_.@/][A-Za-z0-9_.@/-]*$/
 // Shell builtins and reserved words: some evaluate an argument (`eval`, `let`, `test -v 'a[$(x)]'`), and none runs a test suite.
 const SHELL_WORDS = '. alias bg bind break builtin caller case cd command compgen complete compopt continue coproc declare dirs disown do done echo elif else enable esac eval exec exit export false fc fg fi for function getopts hash help history if in jobs kill let local logout mapfile popd printf pushd pwd read readarray readonly return select set shift shopt source suspend test then time times trap true type typeset ulimit umask unalias unset until wait while'.split(' ')
 // Programs whose purpose is to run their arguments.
