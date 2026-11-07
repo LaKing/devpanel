@@ -139,7 +139,7 @@ watch(isAuthenticated, (ok) => { if (ok) loadIdentity() }, { immediate: true })
             <span class="text-truncate">{{ hostname }}</span>
           </div>
           <div class="drawer-foot__row drawer-foot__row--muted">
-            <span>v0.1.0</span>
+            <span>{{ connection.version ? 'v' + connection.version : 'version unknown' }}</span>
           </div>
         </div>
       </template>

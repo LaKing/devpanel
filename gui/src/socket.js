@@ -12,6 +12,7 @@ const state = reactive({
   attempts: 0,
   latency: null,
   host: null,
+  version: null,
   tickMs: 2000,
   metrics: null,
   updatedAt: null,
@@ -74,6 +75,7 @@ socket.on('connect_error', (err) => {
 
 socket.on('hello', (payload) => {
   state.host = payload.host
+  state.version = payload.version ?? null
   state.tickMs = payload.tickMs
   applyMetrics(payload.metrics)
 })

@@ -1028,9 +1028,14 @@ function startTicker () {
   ticker.unref()
 }
 
+// The checkout's version file (bumped by checkpoint.sh), read on every connection so the footer follows a
+// checkpoint without a rebuild; the server itself may still be older (the staleness banner says so).
+const panelVersion = () => fs.promises.readFile(path.join(ROOT, '..', 'version'), 'utf8').then((v) => v.trim()).catch(() => null)
+
 io.on('connection', (socket) => {
-  sourceState().then((source) => socket.emit('hello', {
+  Promise.all([sourceState(), panelVersion()]).then(([source, version]) => socket.emit('hello', {
     host: info(),
+    version,
     tickMs: TICK_MS,
     metrics: metricsSnapshot({ clients: io.engine.clientsCount, source })
   }))

@@ -7,7 +7,7 @@ strategyVersion: 2
 participants:
   coordinator:
     model: opus-5-5
-    effort: medium
+    effort: low      # the owner's default since 2026-11-07: a low-effort coordinator everywhere
   investigator:
     model: opus-5-5
     effort: medium

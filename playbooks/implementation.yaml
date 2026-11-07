@@ -8,7 +8,7 @@ strategyVersion: 1
 participants:
   coordinator:
     model: opus-5-5
-    effort: medium
+    effort: low      # the owner's default since 2026-11-07: a low-effort coordinator everywhere
   implementer:
     model: opus-5-5
     effort: medium   # Opus 5.5 medium by default since 2026-09-26; high/xhigh selectable per run
