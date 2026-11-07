@@ -33,7 +33,7 @@ const exec = promisify(execFile)
  * was already staged, so the state of the source checkout says nothing about
  * whether it can run, and refusing it over one would be a fault invented by this
  * gate. A deployment to staging, or staging-then-production, snapshots the
- * checkout like the Staging playbook does (config/release-plan.mjs).
+ * checkout like the removed Staging playbook did (config/release-plan.mjs).
  */
 export const usesSourceRepository = (resolved) => resolved?.tactic !== 'deployment' || Boolean(resolved.release?.mode && resolved.release.mode !== 'production')
 

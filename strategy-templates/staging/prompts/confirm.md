@@ -1,4 +1,0 @@
-Reconcile the latest worker reports and engine evidence against the acceptance criteria. Do not inspect the candidate, rerun checks, or independently verify the workers' claims. Cite the reporting seat/step and the recorded evidence for each met criterion. Preserve unresolved findings and uncertainty; agreement without supporting evidence is insufficient. A truncated report is incomplete evidence, not approval.
-Return only closureConfirmation JSON with criteria, concise reasoning and material residualRisks. Include revision.current for a code candidate; do not invent a revision for a document. Do not claim personal testing, merging or deployment. The engine enforces revision, audit, check and delivery gates after this decision.
-
-Require the completed release receipts and acceptance from every occupied operator/verifier. A failed or incomplete release cannot be approved; preserve the recorded recovery outcome.

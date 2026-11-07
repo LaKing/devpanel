@@ -1,0 +1,158 @@
+{
+  "runId": "2026-11-05T10-00-00-000Z-legacy01",
+  "status": "completed",
+  "outcome": "resolved",
+  "startedAt": "2026-11-05T10:00:00.000Z",
+  "endedAt": "2026-11-05T10:20:00.000Z",
+  "issue": {
+    "project": "example-project",
+    "id": "2026-11-05-cut-a-staging-batch"
+  },
+  "playbook": {
+    "id": "staging",
+    "version": 2,
+    "strategy": "staging",
+    "strategyVersion": 1,
+    "intent": null,
+    "configHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "workspace": {
+    "state": "removed"
+  },
+  "steps": [],
+  "revisions": [],
+  "release": {
+    "runId": "2026-11-05T10-00-00-000Z-legacy01",
+    "tactic": "staging",
+    "stage": "staging",
+    "environment": "stage",
+    "sourceRelease": null,
+    "sha256": "678b7c82fc7a6cce08330861dea0c744bdd22d1a5d800685f7086c3cdb0581b8",
+    "archive": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/artifacts/release.tar",
+    "startedAt": "2026-11-05T10:00:00.000Z",
+    "status": "completed",
+    "commands": [
+      {
+        "id": "inspect",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:00:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:00:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/1-inspect.log"
+      },
+      {
+        "id": "checkpoint",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:01:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:01:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/2-checkpoint.log"
+      },
+      {
+        "id": "verifyCheckpoint",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:02:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:02:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/3-verifyCheckpoint.log"
+      },
+      {
+        "id": "apply",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:03:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:03:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/4-apply.log"
+      },
+      {
+        "id": "verifyRelease",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:04:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:04:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/5-verifyRelease.log"
+      },
+      {
+        "id": "restart",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:05:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:05:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/6-restart.log"
+      },
+      {
+        "id": "observe",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:06:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:06:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/7-observe.log"
+      },
+      {
+        "id": "test",
+        "status": "completed",
+        "startedAt": "2026-11-05T10:07:00.000Z",
+        "code": 0,
+        "cancelled": false,
+        "stdout": "ok",
+        "stderr": "",
+        "truncated": false,
+        "endedAt": "2026-11-05T10:07:30.000Z",
+        "logFile": "/opt/projects/example-project/issues/example-project/2026-11-05-cut-a-staging-batch/runs/2026-11-05T10-00-00-000Z-legacy01/evidence/release/8-test.log"
+      }
+    ],
+    "checkpointVerified": true,
+    "mutated": true,
+    "ownership": "Fixture source only",
+    "rollback": "automatic",
+    "coverage": {
+      "basis": "release-snapshot",
+      "covered": [
+        {
+          "issueId": "2026-11-04-a-delivered-fix",
+          "runId": "2026-11-04T09-00-00-000Z-delivered"
+        }
+      ],
+      "indeterminate": [],
+      "notShipped": []
+    },
+    "content": {
+      "identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "rule": "exec-bit/v1"
+    },
+    "endedAt": "2026-11-05T10:08:00.000Z"
+  },
+  "closure": {
+    "satisfied": true,
+    "verificationLevel": "review-only",
+    "independentAudit": true
+  }
+}

@@ -64,15 +64,17 @@ verification need, a stale or broken staging instance, or a user request. It dep
 the project's live checkout as it stands, uncommitted deliveries included. The engine
 records the delivered runs it may have carried as unproven and notes their issues; the
 supervisor's own note is its assessment of the recorded logs. A deployment never
-clears the staging pending list: only a Staging run does. Production is never deployed without an explicit operator instruction;
+clears the staging pending list: only a staging release (a Deployment run in the
+staging environment) does. Production is never deployed without an explicit operator instruction;
 production environments stay inspection-only.
 
 `overview` gives each project `stagingPending`, the list of `GET
 /api/projects/:project/staging-pending`: runs delivered into the development checkout
-that no successful Staging run has covered. When to cut a batch: `batch.ready` is true,
+that no successful staging release has covered. When to cut a batch: `batch.ready` is true,
 meaning the `pending` list is non-empty, no delivery is in progress (`liveRuns` is
-empty) and a Staging release target is configured. The supervisor or the operator
-decides; the engine never starts a release, and no agent inside a run decides it.
+empty) and a staging release target is configured. The supervisor or the operator
+decides, and the supervisor cuts it by previewing and starting (`start_run`) the deployment
+playbook with `runOptions.environment: staging` (its default); the engine never starts a release, and no agent inside a run decides it.
 `indeterminate` runs are read by a person and prompt no batch. Deliveries from before the
 coverage baseline are history: one number (`history.count`), in neither list and in no
 note, so they never prompt a batch. A red release is noted on

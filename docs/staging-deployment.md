@@ -59,7 +59,10 @@ an issue. The historical analysis triage result stays unchanged.
 
 `GET /api/projects/:project/staging-pending`, and `stagingPending` per project in the
 supervisor's `overview`, list the runs delivered into a project's development checkout
-(by the engine, or landed by hand) that no successful Staging run has covered.
+(by the engine, or landed by hand) that no successful staging release has covered. A staging release is a Deployment
+run in the `staging` environment (the playbook's default), or the staging half of
+`staging-then-production`; Staging runs recorded before the Staging playbook was
+removed (2026-11-07) count the same.
 `server/staging-coverage.mjs` derives them, for every project, whether or not it can
 release (`configured` says what it has).
 
@@ -72,12 +75,12 @@ deployment after upgrade notes nothing for it. A delivery is placed by when it w
 below is about deliveries from the baseline on.
 
 **When to cut a batch.** When `batch.ready` is true: the `pending` list is non-empty, no
-delivery is in progress (`liveRuns` is empty), and a Staging release target is
+delivery is in progress (`liveRuns` is empty), and a staging release target is
 configured. The top-level supervisor or an operator decides, never an agent inside a
 run. The engine only supplies the list and records coverage: it starts no release and
 bisects no red batch, and serial runs need nothing more.
 
-**Covered.** A Staging run compares its snapshot with what each waiting run delivered,
+**Covered.** A staging release compares its snapshot with what each waiting run delivered,
 when the release happens, and records the result on `run.release.coverage`. A run is
 covered when, for every path it changed, the snapshot's bytes are the delivered bytes,
 or those of a later delivery built on them (the delivery's before-image is the earlier
@@ -86,22 +89,23 @@ blobs. A delivery's record names the paths it changed (`delivery.changedPaths`),
 for a later delivery on one path opens no other's patch or bundle; a record older than that
 field, or a landing of another revision, is read from its patch. Recorded order only says which delivery is later, and a release counts only for
 runs delivered before it started: order can exclude a release and never establishes
-coverage. A successful Staging run that recorded nothing counts through its
+coverage. A successful staging release that recorded nothing counts through its
 retained `artifacts/release.tar`, verified against its recorded hash; a missing or
 changed archive establishes nothing, and that reading writes no record or note.
 
 **Indeterminate.** A run whose bytes cannot be known (a landing with hand changes, an
 older in-place run, an unreadable patch, a chmod, whose patch names no blob) or whose paths hold something else, in the
 snapshot or in the checkout, is `indeterminate`, never covered. It stays listed until a
-successful Staging run's bytes establish it. A person reads this list, and there is no
+successful staging release's bytes establish it. A person reads this list, and there is no
 dismissal. It does not count towards `batch.ready`, so a hand-edited path cannot prompt
 batches for ever.
 
-**A Deployment run to staging counts.** A Deployment run with environment `staging`
+**Staging releases are Deployment runs.** A Deployment run with environment `staging`
 (its default), and the staging half of `staging-then-production`, release this
-run's snapshot exactly as a Staging run does: they record coverage and count as
-Staging runs for everything in this section. Their receipt also records the
-snapshot's content identity (`run.release.content`).
+run's snapshot and record coverage (`run.release.coverage`, receipt `tactic: staging`)
+exactly as the removed Staging playbook did, so they are the staging releases of this
+section. Their receipt also records the snapshot's content identity
+(`run.release.content`). An older Staging run reads unchanged.
 
 **Production and coverage.** A production Deployment run with no named releaseId
 is filled with the newest green staging release whose content is the checkout's
@@ -111,22 +115,22 @@ pending is content no green release carried) but decides nothing: the match is
 read from the release's own bytes, because coverage records which deliveries a
 release carried, not what one archive holds. With no match the start is refused
 with *No green staging release matches the content of this project's checkout:
-run Staging (or 'Staging first, Deployment on success'), or name a releaseId.*,
+run a Deployment to staging (or 'Staging first, Deployment on success'), or name a releaseId.*,
 and the start dialog offers the latest green staging release or says there is
 none. An operator may still name a releaseId explicitly.
 
-**Only a Staging run clears a run.** `deploy_staging` runs opaque saved commands and
+**Only a staging release clears a run.** `deploy_staging` runs opaque saved commands and
 leaves no shipped bytes to compare, so reading the instance or the checkout around them
 would not prove what shipped. Its record (`coverage` on the operation) names every
 waiting run `indeterminate`, reason `deployed-content-unproven`; it covers none and
 changes neither list. A run with no hand change stays in `pending`, with `lastDeployment`,
-and can still prompt the Staging release that clears it. The record's `checkout` field
+and can still prompt the staging release that clears it. The record's `checkout` field
 says whether the development checkout held each run's bytes before and after the
 commands; that is information only and decides nothing. A project with shared deployment
-and no Staging release target can never clear a run: its runs stay listed and
+and no staging release target can never clear a run: its runs stay listed and
 `batch.ready` stays false, with the reason.
 
-**Notes.** Each issue a Staging run carried gets one note per release, on success and on
+**Notes.** Each issue a staging release carried gets one note per release, on success and on
 failure, naming the release run, its outcome and a link to it; a later end of the run
 rewrites the note. An indeterminate run's issue gets one when it is first named and on
 every red release. A red release keeps its configured automatic restore, and its failure

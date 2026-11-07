@@ -14,8 +14,7 @@ advance past a round until every occupied seat has returned a valid result.
 | Implementation | `implementer` | `auditor-1` … `auditor-4` | Approved changes applied to development source and verified; patch-only delivery selectable |
 | Refactoring | `planner` (also implements) | `auditor-1` … `auditor-4` (first occupied by default) | Simpler structure with preserved functionality |
 | Plan and implement | `planner` (also implements) | `auditor-1` … `auditor-4` | Plan consensus followed by implementation consensus |
-| Staging | `release-operator` | `verifier-1` … `verifier-4` | Checkpointed stage release and recorded tests |
-| Deployment | `release-operator` | `verifier-1` … `verifier-4` | Promotion of the exact successfully staged archive |
+| Deployment | `release-operator` | `verifier-1` … `verifier-4` | Checkpointed staging release and recorded tests (the default `staging` environment), or promotion of the exact successfully staged archive to production |
 | Prompt | `worker` | none | One seat does the whole task; delivered, unreviewed |
 
 All optional seats default to unoccupied. Configure them in `participants` in the
@@ -126,7 +125,7 @@ reached the last revision. An audit on the last allowed round holding an
 ### What a brief asks for
 
 Every `brief.md` that receives `findings.outstanding` (Implementation, Plan and
-implement, Staging, Deployment, Analysis) asks the coordinator to reference open
+implement, Deployment, Analysis) asks the coordinator to reference open
 findings by ID and quote only what the worker lacks, within the handoff prompt's
 2400-character limit. The Triage brief receives only the issue and the window.
 
@@ -475,11 +474,15 @@ unresolved. Inspect the durable receipt before any manual retry.
 ### Deployment environments
 
 The Deployment playbook releases to one of three environments, named in
-`runOptions.environment` (the start dialog's **Release environment**):
+`runOptions.environment` (the start dialog's **Release environment**). Its `staging`
+environment is how a staging release runs: the separate Staging playbook was removed
+from the catalogue on 2026-11-07, with no alias. Its earlier runs, archives and coverage
+still read unchanged, and an installation that overrides `playbooks/staging.yaml` in its
+host-config deletes that file (it no longer resolves).
 
 | Environment | What the run does | releaseId |
 |---|---|---|
-| `staging` (**Staging**, the default) | Releases this run's snapshot of the project checkout to the staging target, like the Staging playbook, and records what it carried (`run.release.coverage`, `run.release.content`). A green one counts as a staging release for later production starts. | none; naming one is refused |
+| `staging` (**Staging**, the default) | Releases this run's snapshot of the project checkout to the staging target and records what it carried (`run.release.coverage`, `run.release.content`). A green one counts as a staging release for later production starts. | none; naming one is refused |
 | `production` (**Production**) | Promotes the archive of a green staging release, byte for byte, to the production target. | filled automatically, or the one you name |
 | `staging-then-production` (**Staging first, Deployment on success**) | One run, two releases: the staging release of this snapshot, then, only if it passed, the same archive to production. | none: production promotes this run's own staging archive |
 
@@ -497,8 +500,8 @@ needs a single production target).
 
 **When releaseId is filled.** For `production` without a releaseId, the panel
 fills it with the newest green staging release whose content is the content of
-the project's development checkout. Green means the Staging (or Deployment to
-staging) run completed resolved, its release completed and every verifier
+the project's development checkout. Green means the Deployment run to staging (or an
+older Staging run) completed resolved, its release completed and every verifier
 accepted it. Releases in open and archived (packed) issues are compared newest
 first. The checkout is read the way that release's run snapshotted it (its
 materialized links, excludes and nested repositories) and compared as a tree
@@ -515,8 +518,8 @@ its recorded hash before it is promoted.
 **When the start is refused.** When no green staging release matches (a delivery
 since the last green staging release, a hand edit in the checkout, or no green
 staging release at all) the preview and the start are refused with: *No green
-staging release matches the content of this project's checkout: run Staging (or
-'Staging first, Deployment on success'), or name a releaseId.* Nothing is
+staging release matches the content of this project's checkout: run a Deployment to
+staging (or 'Staging first, Deployment on success'), or name a releaseId.* Nothing is
 reserved and nothing is spent (`NO_GREEN_STAGING`, 422). The start dialog then
 offers the latest green staging release ("Use this release") or says there is no
 green staging release in this project.

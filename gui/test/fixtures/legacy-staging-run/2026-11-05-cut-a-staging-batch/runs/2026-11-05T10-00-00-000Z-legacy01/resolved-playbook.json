@@ -1,0 +1,45 @@
+{
+  "tactic": "staging",
+  "runOptions": {},
+  "playbook": {
+    "id": "staging",
+    "version": 2,
+    "title": "Staging",
+    "strategy": "staging",
+    "strategyVersion": 1
+  },
+  "strategy": {
+    "id": "staging",
+    "version": 1,
+    "title": "staging"
+  },
+  "infrastructure": {
+    "kind": "boilerplate",
+    "staging": {
+      "id": "stage"
+    },
+    "deployments": [
+      {
+        "id": "prod"
+      }
+    ],
+    "release": {
+      "targets": {
+        "stage": {
+          "workdir": "/opt/projects/example-project",
+          "ownership": "Fixture source only",
+          "rollback": "automatic"
+        }
+      }
+    }
+  },
+  "completion": {
+    "requires": [
+      "coordinatorConfirmation",
+      "deliveryCompleted"
+    ],
+    "delivery": {
+      "action": "none"
+    }
+  }
+}

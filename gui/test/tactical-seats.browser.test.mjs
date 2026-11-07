@@ -22,7 +22,10 @@ export default async function(t){
   select().value='';select().dispatchEvent(new browser.window.Event('change',{bubbles:true}))
   await browser.until(()=>browser.all('.row__role').length===2,{label:'cleared optional seat preview'})
   t.eq('clearing removes auditor from execution',browser.all('.row__role').length,2)
-  await browser.clickWhen(()=>browser.find('button','Change playbook'));await browser.clickWhen(()=>browser.all('.pick').find(p=>p.querySelector('.pick__id')?.textContent==='deployment'))
+  await browser.clickWhen(()=>browser.find('button','Change playbook'))
+  await browser.until(()=>browser.all('.pick').some(p=>p.querySelector('.pick__id')?.textContent==='deployment'),{label:'playbook list'})
+  t.ok('the start dialog offers no Staging playbook',!browser.all('.pick').some(p=>p.querySelector('.pick__id')?.textContent==='staging'))
+  await browser.clickWhen(()=>browser.all('.pick').find(p=>p.querySelector('.pick__id')?.textContent==='deployment'))
   const envSelect=()=>browser.all('select').find(s=>s.getAttribute('aria-label')==='Release environment')
   await browser.until(()=>envSelect(),{label:'release environment selector'})
   t.eq('deployment offers the three environments by name',[...envSelect().options].map(o=>o.textContent.trim()),['Staging','Production','Staging first, Deployment on success'])
@@ -35,9 +38,8 @@ export default async function(t){
   const target={workdir:'/tmp',ownership:'Fixture source only',rollback:'automatic',commands:Object.fromEntries(['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test','restore','verifyRestore'].map(id=>[id,{run:'true',timeoutSeconds:10}]))}
   await fs.mkdir(path.join(stage.configRoot,'projects'),{recursive:true})
   await fs.writeFile(path.join(stage.configRoot,'projects',`${stage.project}.yaml`),YAML.stringify({id:stage.project,evidence:[],infrastructure:{kind:'boilerplate',orientation:'Test fixture only',staging:environment('stage'),deployments:[environment('prod')],testDrive:{requirement:'optional',commands:[{id:'noop',run:'true'}]},release:{targets:{stage:target,prod:target}}}}))
-  await browser.clickWhen(()=>browser.find('button','Change playbook'));await browser.clickWhen(()=>browser.all('.pick').find(p=>p.querySelector('.pick__id')?.textContent==='staging'))
-  await browser.until(()=>browser.find('button','Start run')?.disabled===false,{label:'configured staging preview'})
-  t.ok('configured staging has no warning chip',!browser.all('.chosen')[0]?.querySelector('.v-chip'))
+  // Another playbook first, so choosing deployment again previews the configuration just written.
+  await browser.clickWhen(()=>browser.find('button','Change playbook'));await browser.clickWhen(()=>browser.all('.pick').find(p=>p.querySelector('.pick__id')?.textContent==='analysis'))
   await browser.clickWhen(()=>browser.find('button','Change playbook'));await browser.clickWhen(()=>browser.all('.pick').find(p=>p.querySelector('.pick__id')?.textContent==='deployment'))
   await browser.until(()=>browser.find('button','Start run')?.disabled===false,{label:'configured deployment to staging'})
   const deploymentChip=()=>browser.all('.chosen')[0]?.querySelector('.v-chip')

@@ -25,7 +25,7 @@ import { stagedReleasePassed } from './runtime/run-result.mjs'
  * counts only for runs delivered before it started: order can exclude, and only
  * bytes establish coverage.
  *
- * Only a successful Staging run clears a run. `deploy_staging` runs opaque saved
+ * Only a successful staging release clears a run. `deploy_staging` runs opaque saved
  * commands and leaves no shipped bytes to compare, so it names its candidates
  * unproven and changes no list; its checkout reading is information only.
  *
@@ -243,7 +243,7 @@ async function readOperationFiles (issue) {
   return out
 }
 
-/** The project as this reading needs it: deliveries in order, Staging runs, deployments, what is live. */
+/** The project as this reading needs it: deliveries in order, staging releases, deployments, what is live. */
 async function projectState ({ project, projectPath = null, lists = null, listIssues, readRuns = runsOf, readPackedRuns = packedRunsOf, readOperations = readOperationFiles }) {
   const [open, archived] = lists ? [lists.open, lists.archived] : await Promise.all([listIssues(project), listIssues(project, { archived: true })])
   const checkouts = projectPath ? [projectPath, await fs.realpath(projectPath).catch(() => projectPath)] : []
@@ -345,7 +345,7 @@ async function retainedSnapshot ({ issue, run }, paths) {
 }
 
 /**
- * Runs no successful Staging run covers, with what successful ones named them.
+ * Runs no successful staging release covers, with what successful ones named them.
  * A successful release that recorded nothing (older than this, or its reading
  * failed) is read from its retained archive, newest first, and writes nothing.
  */
@@ -375,7 +375,7 @@ async function uncovered (state) {
   return { remaining, named }
 }
 
-/** What a Staging run's snapshot carries, for its run record: read once, as the release happens. */
+/** What a staging release's snapshot carries, for its run record: read once, as the release happens. */
 export async function stagingRunCoverage ({ snapshotPath, snapshotAt, ...project }) {
   const state = await projectState(project)
   const { remaining } = await uncovered(state)
@@ -439,11 +439,11 @@ export function deploymentCoverage (project) {
 /**
  * The pending list of a project, for every project whether or not it can release.
  *
- *   pending        no successful Staging run covers it, none named it indeterminate,
+ *   pending        no successful staging release covers it, none named it indeterminate,
  *                  and the checkout holds its bytes: a new release would carry it
- *   indeterminate  its bytes are unknown, a successful Staging run could not find
+ *   indeterminate  its bytes are unknown, a successful staging release could not find
  *                  them, or the checkout no longer holds them; stays until a
- *                  successful Staging run's bytes establish it
+ *                  successful staging release's bytes establish it
  *   history        how many deliveries are from before COVERAGE_BASELINE; none is listed
  *
  * A deployment changes neither. batch.ready reads pending only, so a hand-edited
@@ -546,7 +546,7 @@ const notesOwed = async (home) => {
   return !receipt || Object.values(receipt).some((r) => r.state === 'failed')
 }
 
-/** The notes of a Staging run's release, once the run has ended; on a later end the same notes say the new outcome. */
+/** The notes of a staging release, once the run has ended; on a later end the same notes say the new outcome. */
 export async function writeRunCoverageNotes ({ project, issue, run, issues, resume = false }) {
   const coverage = run?.release?.coverage
   if (!coverage || coverage.error || !issues?.createEngineNote || run.release.tactic !== 'staging' || !ENDED.includes(run.status)) return null
@@ -582,7 +582,7 @@ export async function writeDeploymentNotes ({ project, issue, operation, issues,
     notesFor.set(issueId, [
       `# Shared staging deployment ${passed ? 'completed' : `did not complete (${operation.status})`}`, '',
       `[Deployment ${operation.id}](/projects/${project}/${issue.id}) on issue ${issue.id}${report ? `, report in step ${report.folder}` : ''}.`, '',
-      `What it deployed is unproven: its saved commands leave no shipped bytes to compare. Only a Staging run can clear these runs: ${entries.map((e) => `\`${e.runId}\` (the development checkout ${e.checkout?.before === 'held' ? 'held' : e.checkout?.before === 'differs' ? 'differed from' : 'could not be compared with'} its bytes before the commands)`).join(', ')}.`,
+      `What it deployed is unproven: its saved commands leave no shipped bytes to compare. Only a staging release (a Deployment run in the staging environment) can clear these runs: ${entries.map((e) => `\`${e.runId}\` (the development checkout ${e.checkout?.before === 'held' ? 'held' : e.checkout?.before === 'differs' ? 'differed from' : 'could not be compared with'} its bytes before the commands)`).join(', ')}.`,
       ...(passed ? [] : ['', 'The failure is attributed to every run listed for it. No issue is chosen for the follow-up: the supervisor or an operator decides.'])
     ].join('\n'))
   }

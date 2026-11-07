@@ -21,7 +21,7 @@ import {
   stagingRunCoverage, writeDeploymentNotes, writeRunCoverageNotes
 } from '../server/staging-coverage.mjs'
 
-export const name = 'staging coverage — what a release carried, from content; only a Staging run clears a run'
+export const name = 'staging coverage — what a release carried, from content; only a staging release clears a run'
 
 const exec = promisify(execFile)
 const temps = []
@@ -535,7 +535,7 @@ export default async function (t) {
       const fromIssue = (id) => w.issues.find((i) => i.id === id)
       await writeDeploymentNotes({ project: 'fixture', issue: fromIssue('dep-a'), operation: matching, issues: notes })
       t.eq('a green deployment notes a first-named run\'s issue', notes.written.map((n) => [n.issueId, n.invocationId]), [['i1', `staging-coverage:${matching.id}`]])
-      t.ok('saying only a Staging run clears it', notes.written[0].text.includes('Only a Staging run can clear'))
+      t.ok('saying only a staging release clears it', notes.written[0].text.includes('Only a staging release (a Deployment run in the staging environment) can clear'))
       t.ok('with a link to the deploying issue', notes.written[0].text.includes(`(/projects/fixture/dep-a)`))
       const secondNotes = recordingIssues()
       await writeDeploymentNotes({ project: 'fixture', issue: fromIssue('dep-b'), operation: differing, issues: secondNotes })
@@ -780,7 +780,7 @@ export default async function (t) {
         stagingPending: (project) => stagingPendingReport({ ...w.ctx, project, infrastructure: null }) })
       const line = overview.projects[0].stagingPending
       t.eq('per project, on a project with no staging configured too', [ids(line.pending), line.configured.stagingRelease, line.batch.reason], [['r1'], false, 'no-staging-release-target'])
-      t.ok('and says what it means', overview.means.stagingPending.includes('only a Staging run'))
+      t.ok('and says what it means', overview.means.stagingPending.includes('no successful staging release (a Deployment run in the staging environment)'))
       const small = await buildOverview({ projects: ['p'], listIssues: w.ctx.listIssues, readRuns: w.ctx.readRuns, readPackedRuns: w.ctx.readPackedRuns, openIssueLimit: 0,
         stagingPending: (project) => stagingPendingReport({ ...w.ctx, project, infrastructure: null }) })
       t.eq('a long list says how much was left out', [small.projects[0].stagingPending.pending, small.projects[0].stagingPending.truncated.pending], [[], 1])
@@ -795,7 +795,10 @@ export default async function (t) {
       t.ok('the route exists', (await read('gui/server/index.js')).includes("app.get('/api/projects/:project/staging-pending'"))
       const prompt = await read('gui/server/top-supervisor.mjs')
       t.eq('the prompt no longer asks for a hand-written list', prompt.includes('names the delivered runs'), false)
-      t.ok('it says only a Staging run clears', prompt.includes('only a Staging run does'))
+      t.ok('it says only a staging release clears', prompt.includes('only a staging release (a Deployment run in the staging environment) does'))
+      t.ok('and cuts a batch with a Deployment run to staging (operator-request:016)', prompt.includes('cutting a batch is your decision: preview and start_run the deployment playbook with runOptions.environment staging'))
+      t.eq('it names no Staging playbook', /staging playbook|staging or deployment playbook/i.test(prompt), false)
+      t.ok('deploy_staging stays the saved-command operation', prompt.includes('deploy_staging {project,issueId};') && prompt.includes('It executes the saved operator commands outside agent sandboxes'))
       t.ok('and leaves the batch to the supervisor', prompt.includes('cutting a batch is your decision'))
       const supervisorDoc = await read('docs/top-level-supervisor.md')
       const deploymentDoc = await read('docs/staging-deployment.md')
@@ -804,7 +807,7 @@ export default async function (t) {
         t.ok(`${doc}: when to cut a batch`, /`pending`\s+list is non-empty/.test(text) && /no\s+delivery is in progress/.test(text))
         t.ok(`${doc}: who decides`, /never an agent inside a\s+run|no agent inside a run/.test(text))
       }
-      t.ok('the doc states the deployment limit', /Only a Staging run clears a run/.test(deploymentDoc))
+      t.ok('the doc states the deployment limit', /Only a staging release clears a run/.test(deploymentDoc))
       for (const [doc, text] of [['top-level-supervisor', supervisorDoc], ['staging-deployment', deploymentDoc]]) t.ok(`${doc}: how history is treated`, /coverage\s+baseline/.test(text) && /history/.test(text))
     }
   } finally {

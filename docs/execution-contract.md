@@ -42,7 +42,7 @@ Three things decide how a run behaves, and they are deliberately separate:
   to the config hash, so a preview and a start agree on it.
 
 The playbook catalogue (analysis, triage, implementation, plan-and-implement,
-refactoring, staging, deployment, prompt) is described in `docs/tactical-playbooks.md`.
+refactoring, deployment, prompt) is described in `docs/tactical-playbooks.md`.
 The pingpong playbooks (`standard-change`, `tight-change`, `careful-change`,
 `prototype`, `review`) were removed on 2026-09-25; the `author-auditor-pingpong`
 and `analysis` strategy templates remain for snapshotted runs.

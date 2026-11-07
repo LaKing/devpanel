@@ -30,7 +30,7 @@ export function reservedEnvironmentErrors (infra) {
   return errors
 }
 
-export const NO_GREEN_STAGING = "No green staging release matches the content of this project's checkout: run Staging (or 'Staging first, Deployment on success'), or name a releaseId."
+export const NO_GREEN_STAGING = "No green staging release matches the content of this project's checkout: run a Deployment to staging (or 'Staging first, Deployment on success'), or name a releaseId."
 const TARGET_MISSING = 'Release target requires installed checkpoint, restore, ownership and verification commands'
 
 export function releasePlan ({ tactic, infrastructure: infra, runOptions = {}, stagedRelease = null, file = null }) {

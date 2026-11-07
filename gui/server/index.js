@@ -178,7 +178,7 @@ app.get('/api/projects/:project/checkout-overlap', route(async (req, res) => {
   res.json(await supervisor.pathOverlap({ project: req.params.project, projectPath: dir, paths }))
 }))
 
-// Delivered runs no successful Staging run has covered (staging-coverage.mjs). Reads; starts nothing.
+// Delivered runs no successful staging release has covered (staging-coverage.mjs). Reads; starts nothing.
 app.get('/api/projects/:project/staging-pending', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
   res.json(await stagingPendingReport({ project: req.params.project, projectPath: projectPath(req.params.project), root: process.env.DEVPANEL_CONFIG_ROOT, listIssues: (p, o) => issues.listIssues(p, o) }))

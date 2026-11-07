@@ -325,7 +325,7 @@ const commands = {
 const SETTLING = new Set(['finished', 'paused', 'cancelled', 'run-recovery-required', 'run-finished', 'run-abandoned']);
 
 async function previewOf(project, wanted, playbook) {
-    if (!playbook) fail('name the playbook, e.g. implementation, plan-and-implement, analysis, staging');
+    if (!playbook) fail('name the playbook, e.g. implementation, plan-and-implement, analysis, deployment');
     const id = await resolveId(project, wanted);
     const p = await api('GET', `/api/playbooks/${encodeURIComponent(playbook)}/preview?project=${encodeURIComponent(project)}&issue=${encodeURIComponent(id)}`);
     return { id, p };

@@ -235,8 +235,8 @@ export default async function (t) {
           t.ok('declared: a project modules tier without a selftest report is refused', !refused.ok, JSON.stringify(refused.errors?.map((e) => e.message)))
           await write(infra(modules))
         }
-        const staging = await resolvePlaybook('staging', { root: f.configRoot, projectId: 'devpanel-project' })
-        t.eq(`${label}: staging has no check target`, staging.resolved?.checks?.target ?? null, null)
+        const staging = await resolvePlaybook('deployment', { root: f.configRoot, projectId: 'devpanel-project' })
+        t.eq(`${label}: a deployment to staging has no check target`, staging.resolved?.checks?.target ?? null, null)
         const deployment = await resolvePlaybook('deployment', { root: f.configRoot, projectId: 'devpanel-project', runOptions: { releaseId: 'staged', environment: 'production' } })
         t.eq(`${label}: deployment has no check target`, deployment.resolved?.checks?.target ?? null, null)
         t.eq(`${label}: the smoke and full tiers stay on the project`, deployment.resolved?.infrastructure?.testDrive?.tiers, { smoke: ['boot'] })

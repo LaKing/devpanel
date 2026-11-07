@@ -10,7 +10,8 @@ import { executeRelease, stagedRelease, recoverRelease } from '../server/runtime
 import { runProcess } from '../server/runtime/process.mjs'
 import { captureWindow } from '../server/runtime/current-window.mjs'
 import { publishFindings } from '../server/runtime/tactical-issues.mjs'
-import { stagingRunCoverage } from '../server/staging-coverage.mjs'
+import { stagingRunCoverage, stagingPendingReport } from '../server/staging-coverage.mjs'
+import { runResult } from '../server/runtime/run-result.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 const fence=o=>'```json\n'+JSON.stringify(o)+'\n```'
 const revision=p=>(p.match(/Current revision: (sha256:[a-f0-9]{64})/)??[])[1]??null
@@ -115,8 +116,9 @@ export default async function(t){
  t.eq('no fabricated approvals',ze.run.approvals.length,0)
  t.eq('closure records that no independent audit occurred',ze.run.closure.independentAudit,false)
  await releaseWorkspace(ze)
- t.section('release playbook executes configured operations before verifier seats')
- const releaseSeen=[];const rf=await engineFixture({playbook:'staging',script:script({seen:releaseSeen})})
+ // The Staging playbook was removed (2026-11-07): a staging release is the deployment playbook's default environment.
+ t.section('a deployment to staging executes configured operations before verifier seats and records coverage as a staging release')
+ const releaseSeen=[];const rf=await engineFixture({playbook:'deployment',script:script({seen:releaseSeen})})
  const environment=id=>({id,ssh:{hostRef:`ssh-config:${id}.invalid`,workdir:'/tmp'},projectRoot:'/tmp/fixture',files:{}})
  const infrastructure={kind:'boilerplate',orientation:'Isolated fixture; no real hosts',staging:environment('stage'),deployments:[environment('production')],testDrive:{requirement:'optional',commands:[{id:'noop',run:'true',required:true}],notes:'Fixture only'}}
  infrastructure.release={targets:{stage:{workdir:rf.projectPath,ownership:'Fixture source only',rollback:'automatic',commands:Object.fromEntries(['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test','restore','verifyRestore'].map(id=>[id,{run:'printf verified',timeoutSeconds:10}]))}}}
@@ -133,11 +135,22 @@ export default async function(t){
  // The engine's clock here is a fixture's, older than the coverage baseline: the snapshot time is stated.
  rse.releaseCoverage=args=>stagingRunCoverage({...args,snapshotAt:'2026-11-03T01:00:00.000Z',project:'devpanel-project',projectPath:rf.projectPath,listIssues:async(_,{archived=false}={})=>archived?[]:[carriedIssue],readRuns:async()=>[deliveredRun],readOperations:async()=>[]})
  await rse.drive()
- t.eq('configured staging playbook completes',rse.run.status,'completed')
- t.eq('a Staging run records the delivered run its snapshot carries',rse.run.release.coverage.covered,[{issueId:'carried-issue',runId:'delivered'}])
+ t.eq('configured deployment to staging completes',rse.run.status,'completed')
+ t.eq('it is a deployment run',rse.run.playbook?.strategy,'deployment')
+ t.eq('its receipt is a staging release',[rse.run.release.tactic,rse.run.release.stage,rse.run.productionRelease??null],['staging','staging',null])
+ t.eq('a deployment to staging records the delivered run its snapshot carries',rse.run.release.coverage.covered,[{issueId:'carried-issue',runId:'delivered'}])
  t.eq('with none indeterminate',rse.run.release.coverage.indeterminate,[])
  t.eq('its explanation names it',explainRun(rse.run).releaseCoverage.covered,[{issueId:'carried-issue',runId:'delivered'}])
  t.ok('in words',explainRun(rse.run).detail.includes('delivered (carried-issue)'))
+ t.eq('it reads as staged',runResult(rse.run).result,'staged')
+ {
+  // The pending list counts it as a staging release: the delivered run it carried clears.
+  const releaseIssue={id:'release-issue',project:'devpanel-project',path:rf.issuePath}
+  const report=issues=>stagingPendingReport({project:'devpanel-project',projectPath:rf.projectPath,infrastructure,listIssues:async(_,{archived=false}={})=>archived?[]:issues,readRuns:async dir=>dir===carried?[deliveredRun]:[rse.run],readOperations:async()=>[]})
+  const listed=r=>[...r.pending,...r.indeterminate].map(e=>e.runId)
+  t.eq('before the release the delivered run is waiting',listed(await report([carriedIssue])),['delivered'])
+  t.eq('after the green deployment to staging nothing waits',listed(await report([carriedIssue,releaseIssue])),[])
+ }
  await fs.rm(carried,{recursive:true,force:true})
  t.eq('all release stages recorded',rse.run.release.commands.filter(c=>c.status==='completed').length,8)
  t.ok('operator preparation precedes mutation',!releaseSeen.find(x=>x.stepId==='investigate-release-plan')?.prompt.includes('checkpointVerified'))

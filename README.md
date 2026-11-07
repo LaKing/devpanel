@@ -24,7 +24,8 @@ The screenshots come from an isolated demo instance (example projects, the test 
   folder for each run. A directory's name is its identity, so a folder made by hand still shows up.
 - **Playbooks** (`playbooks/*.yaml`) bind a strategy (`strategy-templates/<id>/`: roles, phases, review loops,
   prompts) to participants from the roster, plus budgets, check requirements and closure authority. The normal
-  catalogue is Analysis, Triage, Implementation, Plan and implement, Staging and Deployment; see
+  catalogue is Analysis, Triage, Implementation, Plan and implement and Deployment (a staging release is a
+  Deployment run in its `staging` environment, the default); see
   [docs/tactical-playbooks.md](docs/tactical-playbooks.md). A playbook is resolved and snapshotted when the run
   starts, so editing YAML never affects a run already in flight.
 - **Seats.** The *coordinator* triages the issue, writes acceptance criteria and briefs the other seats. The

@@ -39,8 +39,7 @@ const PLAYBOOK = {
     triage: 'A short check of whether a specific reported claim holds, before any work is planned.',
     implementation: 'A clear, bounded code or configuration change whose shape is already evident from the report.',
     'plan-and-implement': 'A change large or uncertain enough that a plan should be agreed and reviewed before it is implemented.',
-    staging: 'Release an already-made change to the staging environment and test it there.',
-    deployment: 'Promote a change already tested on staging to production.'
+    deployment: 'Release an already-made change: to the staging environment and test it there (the default), or promote a change already tested on staging to production.'
   }
 }
 

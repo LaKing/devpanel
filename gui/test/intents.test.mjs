@@ -55,11 +55,13 @@ export default async function (t) {
     t.eq('no configuration errors', cfg.errors.length, 0, cfg.errors.map((e) => e.message).join('; '))
     t.ok('the plan-and-implement strategy has its refactoring overlay', cfg.strategies.get('plan-and-implement').intents.has('refactoring'),
       [...cfg.strategies.get('plan-and-implement').intents.keys()].join(','))
-    // The normal catalogue is these six; further offered playbooks (prompt,
+    // The normal catalogue is these five; further offered playbooks (prompt,
     // refactoring) may be added. Asserting properties rather than the exact
     // list keeps a new playbook from breaking this test.
     const offered = [...cfg.playbooks.values()].filter(p=>!p.deprecated).map(p=>p.id)
-    t.ok('the six normal playbooks are offered', ['analysis','deployment','implementation','plan-and-implement','staging','triage'].every((id) => offered.includes(id)), offered.join(','))
+    t.ok('the five normal playbooks are offered', ['analysis','deployment','implementation','plan-and-implement','triage'].every((id) => offered.includes(id)), offered.join(','))
+    // Removed 2026-11-07 with no alias: staging releases are the deployment playbook's staging environment.
+    t.eq('no Staging playbook or strategy is left in the catalogue', [cfg.playbooks.has('staging'), cfg.strategies.has('staging')], [false, false])
     t.eq('one-off campaign playbooks are not offered', offered.filter((id) => /^migration-/.test(id)), [])
 
     const defaults = {}
@@ -68,7 +70,7 @@ export default async function (t) {
       t.ok(`${id} resolves`, r.ok, r.errors?.map((e) => e.message).join('; '))
       defaults[id] = r.resolved?.intent?.id ?? null
     }
-    const expected = { analysis: null, deployment: null, implementation: null, 'plan-and-implement': null, prompt: null, refactoring: 'refactoring', staging: null, triage: null }
+    const expected = { analysis: null, deployment: null, implementation: null, 'plan-and-implement': null, prompt: null, refactoring: 'refactoring', triage: null }
     t.eq('each known playbook carries its default intent', JSON.stringify(Object.fromEntries(Object.keys(expected).map((id) => [id, defaults[id] ?? null]))), JSON.stringify(expected))
 
     const refactoring = (await resolvePlaybook('refactoring', { root: CONFIG_ROOT, config: cfg })).resolved
@@ -167,7 +169,8 @@ export default async function (t) {
     const run = await engine.drive()
     t.eq('the run completed', run.status, 'completed', run.blockedReason)
     t.eq('and resolved', run.outcome, 'resolved')
-    t.eq('steps in order', run.steps.map((s) => s.stepId).join(','), 'brief,investigate-analyser,disposition')
+    // playbooks/analysis.yaml occupies analyser-2 by default (the owner's defaults since 2026-11-07).
+    t.eq('steps in order', run.steps.map((s) => s.stepId).join(','), 'brief,investigate-analyser,investigate-analyser-2,disposition')
     t.eq('no revision was ever recorded', run.revisions.length, 0)
     t.eq('delivery is none and complete', `${run.delivery.action}:${run.delivery.completedAt !== null}`, 'none:true')
     t.eq('closure is review-only and authorised', `${run.closure.verificationLevel}:${run.closure.authorised}`, 'review-only:true')
