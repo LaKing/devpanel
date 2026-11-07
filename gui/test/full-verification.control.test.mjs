@@ -48,6 +48,7 @@ export default async (t) => {
     t.eq('the record is the hand start\'s', [ended.id, ended.trigger], [hand.body.cycleId, 'hand'])
     t.eq('the project without infrastructure is verified through its instances, with no run', ended.projects.map((p) => [p.project, p.verifiedThrough, p.runId ?? null]), [[stage.project, 'instances', null]])
     t.eq('the paused run was resumed by the cycle', ended.resumed.map((r) => r.runId), [started.body.runId])
+    t.eq('no stage was verified: the outcome bumps nothing and opens nothing', [ended.verdict, ended.outcome?.bump ?? null, ended.outcome?.issues ?? null, typeof ended.outcome?.reason], ['no-stages', null, null, 'string'])
     const record = JSON.parse(await fs.readFile(path.join(stage.issuesDir, '.verification', ended.date, 'cycle.json'), 'utf8'))
     t.eq('issues/.verification/<date>/cycle.json is the record the panel shows', record.id, ended.id)
     const finished = await until(async () => { const run = await stage.run(issue.id, started.body.runId); return run.status === 'completed' ? run : null }, 'the resumed run to complete')

@@ -933,6 +933,38 @@ node gui/server/project-action-cli.mjs <project-id> checkpoint
 node gui/server/project-action-cli.mjs <project-id> --list
 ```
 
+### The daily full verification's bump
+
+One engine caller runs `checkpoint` by itself: the daily full verification, when
+every stage of a cycle is green (tactical-playbooks.md "The daily full
+verification", "What the outcome does"). This is a fixed rule of the cycle, not the
+top-level supervisor deciding to run an action, and it runs while admission is
+still closed, so no run delivers into a checkout it commits. For each framework,
+a project that another project's file names as `framework: <id>` (the module
+pool's declaration, runtime/module-pool.mjs), it runs:
+
+1. the framework's `checkpoint` with `--minor`, which steps its middle version
+   number (0.4.x → 0.5.0);
+2. then the `checkpoint` of each instance naming that framework, in id order,
+   with no argument.
+
+Each runs to its end before the next starts, recorded as an ordinary operation
+(actor `full-verification`, `args` on `operation.json`). The first that does not
+complete stops the chain, and nothing after it runs. The cycle record keeps every
+step with its version before and after, read from the project's root `version`
+file, else its `package.json` version (null when neither exists). An instance is
+bumped only when its `projects/<id>.yaml` names its framework. Without that
+declaration the chain is empty, and the record says no project names a
+framework. When any stage is red, no action runs: the cycle opens one issue per
+red project instead, holding the failing tests and their log excerpts.
+
+Arguments exist only for this caller. `startProjectAction` takes `args` from the
+engine alone, each a bare flag (`--minor`; anything else is refused before
+anything runs), and passes them as separate words after the action's command
+line (`bash -c '<run> "$@"'`), so the action's own `run` decides where they go.
+The HTTP route and the CLI pass none, so a browser or a model can still only
+name an action id.
+
 A `checkpoint.sh` that commits a dereferenced copy of the checkout (for example
 `rsync -aL` into a temporary work tree) leaves a checkout whose collections are
 symlinks "dirty" against HEAD by design; the `workspace.base` policy, not a

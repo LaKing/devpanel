@@ -41,6 +41,18 @@ const rows = computed(() => (cycle.value?.projects ?? []).map((p) => ({
   verdict: p.verifiedThrough ? null : p.verdict ?? null,
   duration: p.durationMs != null ? `${Math.round(p.durationMs / 60000)} min` : null
 })))
+
+/** What the cycle did about its verdict: the versions it bumped, where the bump stopped, or the issues it opened. */
+const outcome = computed(() => {
+  const o = cycle.value?.outcome
+  if (!o) return null
+  if (o.error) return `Outcome failed: ${o.error}`
+  if (o.bump?.failed) return `Bump stopped at ${o.bump.failed.project}: ${o.bump.failed.reason}`
+  if (o.bump?.chain?.length) return `Bumped: ${o.bump.chain.map((s) => `${s.project} ${s.versionBefore ?? '?'} → ${s.versionAfter ?? '?'}`).join(', ')}`
+  if (o.bump) return o.bump.reason ?? 'Nothing to bump'
+  if (o.issues) return `Opened ${o.issues.filter((i) => i.issueId).length} ${o.issues.length === 1 ? 'issue' : 'issues'}: ${o.issues.map((i) => i.issueId ?? `${i.project} (not opened)`).join(', ')}`
+  return o.reason ?? null
+})
 </script>
 
 <template>
@@ -59,6 +71,7 @@ const rows = computed(() => (cycle.value?.projects ?? []).map((p) => ({
           <template v-else>No schedule: host settings have no fullVerification block.</template>
           <template v-if="state?.frozen"> · admission closed since {{ new Date(state.frozen.at).toLocaleTimeString() }}</template>
         </div>
+        <div v-if="outcome" class="fv__outcome">{{ outcome }}</div>
       </div>
       <div class="fv__actions">
         <v-btn variant="text" size="small" to="/verification">Details</v-btn>
@@ -100,6 +113,7 @@ const rows = computed(() => (cycle.value?.projects ?? []).map((p) => ({
 .fv__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .fv__summary { font-size: 0.875rem; }
 .fv__schedule { margin-top: 2px; opacity: 0.7; font-size: 0.8125rem; }
+.fv__outcome { margin-top: 2px; font-size: 0.8125rem; overflow-wrap: anywhere; }
 .fv__actions { display: flex; gap: 6px; }
 .fv__rows { list-style: none; margin: 10px 0 0; padding: 0; }
 .fv__row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 0.8125rem; min-width: 0; }

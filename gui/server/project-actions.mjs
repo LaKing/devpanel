@@ -21,6 +21,9 @@ import { hostSettings } from './config/host-settings.mjs'
  *
  * What runs is installed configuration — a script on disk or a saved command —
  * never text supplied by a model or a browser. The caller names an action id.
+ * Only an engine caller (the daily full verification) may append `args`, each a
+ * bare flag (ARG_RE), passed as separate words through "$@"; the HTTP route and
+ * the CLI never pass any.
  *
  * One operation per project at a time. Its record and its output live under
  * <issues>/<project>/.actions/<operation-id>/ so a browser that opens late, a
@@ -36,6 +39,8 @@ const OUTPUT_MAX_BYTES = Number(process.env.DEVPANEL_ACTION_OUTPUT_MAX_BYTES ?? 
 const TAIL_CHARS = 16 * 1024
 const ID_RE = /^[a-z0-9-]+$/
 const OPERATION_ID_RE = /^[0-9TZ-]+-[0-9a-f]{8}$/
+// Arguments an engine caller may append (the daily full verification's `--minor`): flags only, never text.
+const ARG_RE = /^--?[a-z][a-z0-9-]*$/
 
 const fail = (message, status = 400) => Object.assign(new Error(message), { status })
 
@@ -188,8 +193,9 @@ const inflight = new Map()
  * final record. An operation already running on the project is refused (409):
  * two checkpoints interleaved on one checkout is exactly what nobody wants.
  */
-export async function startProjectAction ({ project, actionId, root, projectsDir = projectsRoot(), issuesDir = ISSUES_DIR(), emit = () => {}, signal = null, actor = 'operator' }) {
+export async function startProjectAction ({ project, actionId, args = [], root, projectsDir = projectsRoot(), issuesDir = ISSUES_DIR(), emit = () => {}, signal = null, actor = 'operator' }) {
   if (typeof actionId !== 'string' || !ID_RE.test(actionId)) throw fail('no such action', 404)
+  if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && ARG_RE.test(a))) throw fail('action arguments must be bare flags such as --minor')
   const listing = await listProjectActions(project, { root, projectsDir, issuesDir })
   const action = listing.actions.find((a) => a.id === actionId)
   if (!action) throw fail(`project ${project} has no action "${actionId}"`, 404)
@@ -213,7 +219,7 @@ export async function startProjectAction ({ project, actionId, root, projectsDir
   const recordFile = path.join(dir, 'operation.json')
   const outputFile = path.join(dir, 'output.jsonl')
   const operation = {
-    id, project, action: action.id, label: action.label, run: action.run, cwd: action.cwd, source: action.source,
+    id, project, action: action.id, label: action.label, run: action.run, args: [...args], cwd: action.cwd, source: action.source,
     actor, status: 'running', startedAt: startedAt.toISOString(), endedAt: null, pid: null,
     exitCode: null, signal: null, cancelled: false, timedOut: false, truncated: false, durationMs: null,
     stdoutTail: null, stderrTail: null, error: null
@@ -253,18 +259,20 @@ export async function startProjectAction ({ project, actionId, root, projectsDir
   const signals = [controller.signal, timeout, ...(signal ? [signal] : [])]
   inflight.set(`${project}/${id}`, controller)
 
+  const commandLine = args.length ? `${action.run} ${args.join(' ')}` : action.run
   const done = (async () => {
     try {
       const result = await runProcess({
         command: '/bin/bash',
-        args: ['-c', action.run],
+        // Arguments reach the action's command line as separate words, never re-parsed.
+        args: args.length ? ['-c', `${action.run} "$@"`, 'devpanel-action', ...args] : ['-c', action.run],
         cwd: action.cwd,
         // Non-interactive by construction: no terminal, no credential prompts.
         env: { ...process.env, DEVPANEL_PROJECT_ACTION: action.id, DEVPANEL_OPERATION_ID: id, GIT_TERMINAL_PROMPT: '0', TERM: 'dumb' },
         signal: AbortSignal.any(signals),
         maxBuffer: 4 * 1024 * 1024,
         observe: {
-          onSpawn: ({ pid }) => { operation.pid = pid; append('spawn', `pid ${pid}: ${action.run} (in ${action.cwd})`) },
+          onSpawn: ({ pid }) => { operation.pid = pid; append('spawn', `pid ${pid}: ${commandLine} (in ${action.cwd})`) },
           onOutput: (stream, chunk) => { append(stream, chunk) }
         }
       })

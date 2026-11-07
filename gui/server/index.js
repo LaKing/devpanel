@@ -1003,7 +1003,7 @@ modelPerformance = await createModelPerformanceService({ file: path.join(issues.
 const recovered = await supervisor.reconcile()
 // A cycle the last process left unfinished is marked interrupted, and the runs its
 // freeze paused are resumed, before anything else can start.
-fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event) })
+fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction })
 await fullVerification.recover().catch((error) => console.warn(`[devpanel] full verification recovery: ${error.message}`))
 // What the last shutdown cancelled comes back, before the top-level supervisor or
 // anyone else could take its project's slot. Recovery above is untouched: a run

@@ -604,18 +604,59 @@ instances and gets no run. A stage whose run cannot start (a missing release tar
 `TARGET_MISSING`, or another refusal) is a red entry with the refusal.
 
 The runs live in the project's run home `issues/<project>/.verification-<date>/`, which is
-not an issue: the cycle opens no issue and bumps no version. A green cycle release counts as
+not an issue, and the runs themselves change, deliver and open nothing. A green cycle release counts as
 a green staging release (production promotion, staging coverage).
+
+**What the outcome does.** When the runs have settled, and before admission reopens, the
+cycle acts on its verdict:
+
+- **Every stage green: the framework's minor version steps, then its instances follow.**
+  For each framework (a project that another project's `projects/<id>.yaml` names as
+  `framework:`), the framework's `checkpoint` action runs with `--minor` (0.4.x → 0.5.0),
+  then the `checkpoint` of each instance naming it, in id order: framework first, one at a
+  time, each to its end. The record keeps each step's operation, status and version
+  before and after (the project's root `version` file, else its `package.json` version).
+  The first step that does not complete (a failed or interrupted script, another action
+  already running on that project, no `checkpoint` action) stops the chain: no later
+  action runs, and the record names the failure and what was not run. A cycle whose
+  projects name no framework bumps nothing and says so. An instance is in the chain only
+  when its project file names its framework (`framework: <id>`); see
+  project-infrastructure.md "Project actions: checkpoint.sh".
+- **Any stage red: no action runs, and one issue opens per red project**, named
+  `Full verification <date>: <project> red on <stage>` (`configuration` when its
+  configuration could not be read). Its report names the cycle, the stage run and its run
+  home, why the stage is red (run status, release, the refusal, the full check's gate and
+  the selftest comparison) and its failing tests, each with its basis (`new`: not in the
+  previous green drive; `unjudged`: no comparison could judge it, for example without a
+  previous green cycle, which for a failed command means the failures its own output names,
+  read by the parser the baseline comparison uses; `command`: a failed command whose output
+  names no failure. Whatever the basis, the failures a failed command's output names come
+  first: a whole-command result of the comparison, such as "passes on the base", is kept as
+  context beside them and stands alone only when the output names none) and a log
+  excerpt (the test's selftest-report entry, else the lines around its name in the
+  command's log, else the command's stderr tail, at most 2000 characters each). The body
+  shows the first 30; every failing test with its excerpt is in `failing-tests.md` on the
+  issue's report step (split into `failing-tests-<n>.md` parts when it would exceed the
+  attachment limit). `openedBy.from` names the cycle (`via: full-verification`, `cycle`,
+  the run). Every red cycle opens its own issues: a later cycle of the same date adds
+  ` (cycle <id>)` to the name, since an issue name opens once a day.
+- **No stage verified** (`no-stages`): nothing runs.
+
+Admission then reopens, whatever the outcome was, and the paused runs resume.
 
 **Where the record is.** Each cycle writes `issues/.verification/<date>/cycle.json` at
 every step: `id`, `trigger` (`schedule` or `hand`), `by`, `schedule`, `state` (`frozen`,
-`running`, `resuming`, `ended`, `interrupted`, `failed`), `frozenAt`, `seatsIdleAt`,
+`running`, `outcome`, `resuming`, `ended`, `interrupted`, `failed`), `frozenAt`, `seatsIdleAt`,
 `startedAt`, `endedAt`, `verdict` (`green`, `red`, `no-stages`: any red entry, a project whose
 configuration cannot be read included, makes it `red`), the runs it waited on,
 and one entry per project: its stage and host, `runId`, `status`, `release`, `check`
-(result, gate, baseline cycle, new failures, the drive's files and their hashes), `verdict`,
+(result, gate, baseline cycle, new failures, `failingTests` with their basis, the selftest
+comparison's verdict and reason, the drive's files and their hashes), `verdict`,
 `startedAt`, `endedAt`, `durationMs`, or `verifiedThrough: instances`, or a `refusal`. The
-runs it resumed, those left paused for an operator and the refused resumes are listed too.
-An earlier cycle of the same date is kept as `cycle.<n>.json`. The dashboard and
-`/verification` show the latest cycle (`GET /api/verification/latest`); "Full verification
-now" is `POST /api/verification/start`. Part 4 of the daily verification reads the record.
+runs it resumed, those left paused for an operator and the refused resumes are listed too,
+and `outcome`: `bump` (`chain` with each step's project, args, operation, status and
+versions, `versions`, `failed`, `notRun`, or the `reason` nothing ran) or `issues` (per red
+project: `name`, `issueId`, `runId`, `failingCount`, `attachments`, any `error`), or a
+`reason`. An earlier cycle of the same date is kept as `cycle.<n>.json`. The dashboard and
+`/verification` show the latest cycle with its outcome (`GET /api/verification/latest`); "Full verification
+now" is `POST /api/verification/start`.

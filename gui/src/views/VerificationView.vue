@@ -63,6 +63,31 @@ function invocationOf (project) {
       </v-card-text>
     </v-card>
 
+    <v-card v-if="cycle?.outcome" elevation="0" border class="mb-4">
+      <v-card-item>
+        <v-card-title>Outcome</v-card-title>
+        <v-card-subtitle>{{ cycle.outcome.bump ? 'every stage green: version bump' : cycle.outcome.issues ? 'red: issues opened, no bump' : 'nothing to do' }}</v-card-subtitle>
+      </v-card-item>
+      <v-card-text class="verify__facts">
+        <div v-if="cycle.outcome.reason">{{ cycle.outcome.reason }}</div>
+        <div v-if="cycle.outcome.bump?.reason">{{ cycle.outcome.bump.reason }}</div>
+        <div v-for="step in cycle.outcome.bump?.chain ?? []" :key="step.project">
+          {{ step.project }}: checkpoint{{ step.args?.length ? ` ${step.args.join(' ')}` : '' }} · {{ step.status }}
+          <template v-if="step.status === 'completed'"> · {{ step.versionBefore ?? '?' }} → {{ step.versionAfter ?? '?' }}<template v-if="step.unchanged"> (unchanged)</template></template>
+          <template v-if="step.reason"> · {{ step.reason }}</template>
+          <template v-if="step.operationId"> · operation <code>{{ step.operationId }}</code></template>
+        </div>
+        <div v-if="cycle.outcome.bump?.failed">The chain stopped at {{ cycle.outcome.bump.failed.project }}<template v-if="cycle.outcome.bump.notRun?.length">; not run: {{ cycle.outcome.bump.notRun.map((n) => n.project).join(', ') }}</template></div>
+        <div v-for="item in cycle.outcome.issues ?? []" :key="item.project">
+          <router-link v-if="item.issueId" :to="`/projects/${item.project}/${item.issueId}`">{{ item.name }}</router-link>
+          <span v-else>{{ item.name }} (not opened)</span>
+          · {{ item.failingCount }} failing {{ item.failingCount === 1 ? 'test' : 'tests' }}<template v-if="item.attachments?.length"> · {{ item.attachments.join(', ') }}</template>
+          <template v-if="item.error"> · {{ item.error }}</template>
+        </div>
+        <div v-if="cycle.outcome.error">Error: {{ cycle.outcome.error }}</div>
+      </v-card-text>
+    </v-card>
+
     <v-card v-for="p in started" :key="p.project" elevation="0" border class="mb-4">
       <v-card-item>
         <v-card-title>{{ p.project }} · {{ p.stage }}</v-card-title>
@@ -74,7 +99,8 @@ function invocationOf (project) {
       <v-card-text>
         <p v-if="runs[p.project]?.error">{{ runs[p.project].error }}</p>
         <p v-if="runs[p.project]?.explanation?.detail" class="verify__detail">{{ runs[p.project].explanation.detail }}</p>
-        <p v-if="p.check?.newFailures?.length">New failures: {{ p.check.newFailures.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
+        <p v-if="p.check?.failingTests?.length">Failing tests: {{ p.check.failingTests.map((f) => `${f.command}: ${f.test} (${f.basis})`).join('; ') }}</p>
+        <p v-else-if="p.check?.newFailures?.length">New failures: {{ p.check.newFailures.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
         <RunTimeline v-if="runs[p.project]?.timeline" :timeline="runs[p.project].timeline" :active="runs[p.project].active ?? []"
                      :selected="selected[p.project] == null ? null : String(selected[p.project])" @select="selected = { ...selected, [p.project]: $event }" />
         <LiveOutput v-if="invocationOf(p.project)" :key="invocationOf(p.project).id" :project="p.project" :issue-id="p.issueId" :run-id="p.runId"

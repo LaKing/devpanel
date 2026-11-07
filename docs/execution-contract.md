@@ -2815,8 +2815,14 @@ sets the freeze and asks every run of an issue that this process drives to stop:
   and its parent is the project's issue folder, so release and action locks, the git
   store and the cleanup barrier are the project's own) and are exempt from the freeze; a run of an earlier cycle is not (it is frozen, waited for and
   refused continuation like any run of an issue).
+- **The outcome is handled while admission is still closed** (`state: outcome`, the
+  record's `outcome`): every stage green, each framework's `checkpoint` runs with
+  `--minor` and then each instance's, stopping at the first that does not complete; any
+  stage red, no action runs and one issue opens per red project (tactical-playbooks.md
+  "What the outcome does"). It never throws: a failure of its own is `outcome.error`, and
+  admission reopens after it all the same, and also after a cycle that failed.
 - **When the cycle ends** (its runs settled: completed, blocked, failed or paused all
-  count), `supervisor.thaw()` opens admission and the cycle resumes every run of an issue, or of an earlier cycle,
+  count, and the outcome handled), `supervisor.thaw()` opens admission and the cycle resumes every run of an issue, or of an earlier cycle,
   paused as `full-verification` without `manualPending` (`actor: service`, `origin:
   full-verification`), with every refusal of an ordinary resume; refusals and the runs
   left for an operator are in the cycle record.

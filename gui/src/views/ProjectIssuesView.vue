@@ -165,14 +165,15 @@ const BLOCKED_TEXT = {
 const RESULT_TEXT = { 'artifact-ready': 'patch ready', accepted: 'triaged', duplicate: 'triaged: duplicate', 'needs-information': 'needs information', 'no-findings': 'no findings' }
 // Who opened it, as opened-by.mjs records it: user@host, or a panel process at the panel host.
 // A reported issue names its reporter, or `report` when it came without a key (server/report.mjs).
-const VIA_TEXT = { 'follow-up': 'follow-up of', split: 'split from', inquiry: 'from inquiry', finding: 'finding of' }
+const VIA_TEXT = { 'follow-up': 'follow-up of', split: 'split from', inquiry: 'from inquiry', finding: 'finding of', 'full-verification': 'from full verification' }
 function opener (o) {
   if (!o) return ''
   return o.host ? `${o.user}@${o.host}` : o.user
 }
 function openerTitle (o) {
   if (!o) return 'Not recorded (opened before this was kept)'
-  const from = o.from ? ` · ${VIA_TEXT[o.from.via] ?? o.from.via} ${o.from.issueId}` : ''
+  // A full verification names its cycle, not a parent issue.
+  const from = o.from ? ` · ${VIA_TEXT[o.from.via] ?? o.from.via} ${o.from.cycle ?? o.from.issueId}` : ''
   return `${opener(o)}${from}${o.derived ? ' · derived from the issue\'s own record' : ''}`
 }
 

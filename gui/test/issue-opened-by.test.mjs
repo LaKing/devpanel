@@ -42,6 +42,15 @@ export default async function (t) {
     t.eq('from the source issue and run, as a follow-up', [followUp.openedBy?.from?.issueId, followUp.openedBy?.from?.runId, followUp.openedBy?.from?.via], [source.id, 'run-1', 'follow-up'])
   }
 
+  t.section('3b. a red daily full verification names its cycle, not a parent issue')
+  {
+    const issue = await f.issues.createIssue(project, { input: 'Full verification 2026-11-07: devpanel-project red on stage', openedBy: { user: 'engine', from: { project, runId: 'run-9', via: 'full-verification', cycle: '2026-11-07.1' } } })
+    t.eq('from the cycle and its stage run, with no parent issue', issue.openedBy?.from, { project, issueId: null, runId: 'run-9', via: 'full-verification', cycle: '2026-11-07.1' })
+    let refused = null
+    try { await f.issues.createIssue(project, { input: 'No cycle named', openedBy: { user: 'engine', from: { project, via: 'full-verification' } } }) } catch (error) { refused = error }
+    t.eq('a full verification descent without its cycle is refused', refused?.status, 400)
+  }
+
   t.section('4. issues opened before this was recorded say what their own record implies, marked derived')
   {
     t.eq('from an inquiry proposal', derivedOpenedBy({ fromInquiry: { inquiryId: 'inq', runId: 'r' } }, 'p')?.from?.via, 'inquiry')

@@ -3,11 +3,15 @@ import path from 'node:path'
 
 import { systemClock } from './runtime/clock.mjs'
 import { hostSettings } from './config/host-settings.mjs'
-import { resolvePlaybook } from './config/load.mjs'
+import { loadConfig, resolvePlaybook } from './config/load.mjs'
 import { TARGET_MISSING } from './config/release-plan.mjs'
 import { projectInfrastructure } from './infrastructure.mjs'
 import { writeJson } from './runtime/persistence.mjs'
 import { stagedReleasePassed } from './runtime/run-result.mjs'
+import { failureFingerprints, selftestReport } from './runtime/baseline-failures.mjs'
+import { poolMembers } from './runtime/module-pool.mjs'
+import { startProjectAction } from './project-actions.mjs'
+import { projectPath, projectsRoot } from './project-path.mjs'
 
 /*
  * The daily full verification (docs/tactical-playbooks.md "The daily full
@@ -25,12 +29,20 @@ import { stagedReleasePassed } from './runtime/run-result.mjs'
  *      it against the previous green cycle (runtime/full-verification-drive.mjs);
  *      a project with no infrastructure, or whose staging declares
  *      `fullVerification: instances`, is recorded as verified through its instances;
- *   4. waits until those runs settle, opens admission and resumes the runs it paused;
- *   5. writes issues/.verification/<date>/cycle.json at every step.
- * It bumps no version and opens no issue: part 4 of the daily verification reads the record.
+ *   4. waits until those runs settle and handles the outcome while admission is still
+ *      closed: every stage green, each framework's `checkpoint` runs with --minor and
+ *      then each instance's `checkpoint` (runtime/module-pool.mjs poolMembers order),
+ *      stopping at the first that fails; any stage red, no action runs and one issue
+ *      opens per red project with its failing tests and their excerpts;
+ *   5. opens admission and resumes the runs it paused;
+ *   6. writes issues/.verification/<date>/cycle.json at every step.
  */
 
 export const HOUR = 60 * 60 * 1000
+/** Failing tests shown in a red issue's body; every one is in its failing-tests attachment. */
+export const SHOWN_FAILURES = 30
+const EXCERPT_CHARS = 2000
+const STACK_LINES = 20
 const LIVE = ['pending', 'preflighting', 'running', 'stopping']
 const SETTLED_CYCLE = ['ended', 'interrupted', 'failed']
 
@@ -79,6 +91,142 @@ export function stageOf (project, infra) {
   return { project, stage: infra.staging.id, host: infra.staging.ssh?.hostRef ?? infra.staging.id }
 }
 
+/**
+ * The failing tests of a stage's full check, each with its basis: a failure the previous green
+ * drive does not have (`new`), a failure no comparison could judge (`unjudged`: no or an incomplete
+ * baseline; for a failed command, the failures its own output names, `parsed` from
+ * baseline-failures.mjs failureFingerprints), or a failed required command nothing narrower names
+ * (`command`). Unstable failures are ignored by the gate and are not listed.
+ */
+export function failingTestsOf (check, parsed = []) {
+  const out = []
+  const seen = new Set()
+  const add = ({ command, test, message = null, context = null }, basis) => {
+    const key = `${command}\u0000${test}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ command, test, basis, ...(message ? { message } : {}), ...(context ? { context } : {}) })
+  }
+  const namedIn = (command) => parsed.filter((f) => f.command === command && f.test && f.test !== '(command)')
+  // Named failures from a command's own output always take precedence over a whole-command entry, whatever
+  // the comparison said ('passes on the base', a timeout, an exit code that differs): its reason stays as context.
+  const addNamedFirst = (f, basis) => {
+    const named = f.test === '(command)' ? namedIn(f.command) : []
+    if (named.length) named.forEach((n) => add({ ...n, context: f.message }, basis))
+    else add(f, basis)
+  }
+  for (const f of check?.selftest?.newFailures ?? []) add(f, 'new')
+  for (const f of check?.selftest?.unjudged ?? []) add(f, 'unjudged')
+  for (const f of check?.failures?.newFailures ?? []) addNamedFirst(f, 'new')
+  if (check?.result?.result === 'failed' && check.gating !== 'passed') {
+    // A failed command no comparison named (no baseline, an unreadable or differing base): what its output names, else the command.
+    for (const c of (check.result.commands ?? []).filter((c) => c.required !== false && !c.passed && !out.some((f) => f.command === c.id))) {
+      const named = namedIn(c.id)
+      if (named.length) named.forEach((f) => add(f, 'unjudged'))
+      else add({ command: c.id, test: '(command)', message: `exit ${c.exitCode ?? c.signal ?? 'none'}${c.timedOut ? ' (timed out)' : ''}` }, 'command')
+    }
+  }
+  return out
+}
+
+/** The failed entry of a named test in a selftest report (the walk selftestStates makes). */
+function reportEntry (report, test) {
+  let found = null
+  const walk = (o) => {
+    if (found) return
+    if (Array.isArray(o)) return o.forEach(walk)
+    if (!o || typeof o !== 'object') return
+    if (o.test === test && !o.skipped && (o.error || o.stack)) { found = o; return }
+    Object.values(o).forEach(walk)
+  }
+  walk(report)
+  return found
+}
+
+const asText = (v) => (typeof v === 'string' ? v : JSON.stringify(v, null, 2))
+
+/**
+ * A failing test's excerpt: its own selftest-report entry (error and the start of its stack),
+ * else the lines around its name in the command's log, else the command's stderr tail.
+ */
+export async function excerptOf ({ runDir, dir, command, test, commands = [] }) {
+  const base = path.join(runDir ?? '', dir ?? '')
+  const clip = (text, source) => ({ source, text: text.length > EXCERPT_CHARS ? `${text.slice(0, EXCERPT_CHARS)}\n… (excerpt cut at ${EXCERPT_CHARS} characters; the whole log is ${path.join(dir ?? '', `${command}.log`)} in the run directory)` : text })
+  const read = (name) => (runDir ? fs.readFile(path.join(base, name), 'utf8').catch(() => null) : null)
+  if (test !== '(command)') {
+    // Read directly: readReport gives nothing for a report command that did not pass.
+    const stdout = await read(`${command}.stdout`)
+    const parsed = stdout === null ? null : selftestReport(stdout)
+    const entry = parsed?.report ? reportEntry(parsed.report, test) : null
+    if (entry) {
+      const stack = entry.stack ? asText(entry.stack).split('\n').slice(0, STACK_LINES).join('\n') : null
+      return clip([entry.error ? asText(entry.error) : null, stack].filter(Boolean).join('\n'), 'selftest report')
+    }
+    const lines = (await read(`${command}.log`))?.split('\n') ?? []
+    const at = lines.findIndex((l) => l.includes(test))
+    if (at >= 0) return clip(lines.slice(Math.max(0, at - 5), at + 6).join('\n'), 'log')
+  }
+  const stderr = commands.find((c) => c.id === command)?.stderr
+  if (stderr) return clip(stderr, 'stderr tail')
+  const log = test === '(command)' ? await read(`${command}.log`) : null
+  if (log) return clip(log.split('\n').slice(-20).join('\n'), 'log tail')
+  return { source: null, text: null }
+}
+
+/** A Markdown fence longer than any backtick run in the text. */
+function fenced (text) {
+  const fence = '`'.repeat(Math.max(2, ...[...text.matchAll(/`+/g)].map((m) => m[0].length)) + 1)
+  return `${fence}text\n${text}\n${fence}`
+}
+
+const failureBlock = (f) => [`### \`${f.command}: ${f.test}\` (${f.basis})`, '', ...(f.message ? [f.message, ''] : []),
+  ...(f.context ? [`The command against the previous green drive: ${f.context}.`, ''] : []),
+  f.excerpt?.text ? `${fenced(f.excerpt.text)}\n_From the ${f.excerpt.source}._` : 'No excerpt found: neither the selftest report, the log nor the stderr tail names it.', ''].join('\n')
+
+const plural = (n, one, many) => (n === 1 ? one : many)
+
+/** Every failing test with its excerpt, in parts of at most `maxBytes`, split only between tests. */
+export function failureAttachments ({ name, failures, unread = [], maxBytes }) {
+  const head = (i, n) => `# Failing tests: ${name}${n > 1 ? ` (part ${i} of ${n})` : ''}\n\nAll ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}.\n\n`
+  const blocks = failures.map(failureBlock)
+  if (unread.length) blocks.push(['## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), ''].join('\n'))
+  const headroom = Buffer.byteLength(head(9999, 9999))
+  const parts = []
+  let current = []
+  let bytes = headroom
+  for (const block of blocks) {
+    const size = Buffer.byteLength(block) + 1
+    if (current.length && bytes + size > maxBytes) { parts.push(current); current = []; bytes = headroom }
+    current.push(block)
+    bytes += size
+  }
+  if (current.length) parts.push(current)
+  return parts.map((blocksOf, i) => ({ name: parts.length === 1 ? 'failing-tests.md' : `failing-tests-${i + 1}.md`, text: head(i + 1, parts.length) + blocksOf.join('\n') }))
+}
+
+/** The report of a red project's issue: the cycle, the run, why it is red, the first failing tests. */
+export function redIssueReport ({ record, entry, name, stage, failures, unread = [], parts = [] }) {
+  const lines = [`# ${name}`, '',
+    `The daily full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
+    `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
+    entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
+  if (entry.status) lines.push(`- Run status: ${entry.status}${entry.blockedReason ? ` (${entry.blockedReason})` : ''}${entry.release ? `; release ${entry.release.status}` : ''}`)
+  if (entry.refusal) lines.push(`- Not started: ${entry.refusal.code ? `${entry.refusal.code}: ` : ''}${entry.refusal.message}`)
+  if (entry.check) {
+    lines.push(`- Full check: ${entry.check.result ?? 'no result'}, gate ${entry.check.gating}${entry.check.baseline?.cycleId ? `, compared with cycle ${entry.check.baseline.cycleId}` : ', no previous green cycle to compare with'}`)
+    if (entry.check.selftestVerdict) lines.push(`- Selftest comparison: ${entry.check.selftestVerdict}${entry.check.selftestReason ? ` (${entry.check.selftestReason})` : ''}`)
+  }
+  lines.push('')
+  if (failures.length) {
+    lines.push(`## Failing tests (${failures.length})`, '')
+    if (failures.length > SHOWN_FAILURES) lines.push(`The first ${SHOWN_FAILURES} are shown here; every one is in the attachment named below.`, '')
+    for (const f of failures.slice(0, SHOWN_FAILURES)) lines.push(failureBlock(f))
+  } else lines.push('## Failing tests', '', 'The check names no failing test; the run status above says why the stage is red.', '')
+  if (unread.length) lines.push('## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), '')
+  if (parts.length) lines.push(`All ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}: ${parts.map((p) => `\`${p.name}\``).join(', ')} on the report step (000).`, '')
+  return lines.join('\n')
+}
+
 const report = ({ project, stage }) => `# Daily full verification of ${project} on ${stage}
 
 This is the panel's daily full verification, not a reported problem. Release the project's development
@@ -106,6 +254,19 @@ export function createFullVerification ({
   infrastructureOf = (project) => projectInfrastructure(project, { root: configRoot }),
   readRun = (issuePath, runId) => fs.readFile(path.join(issuePath, 'runs', runId, 'run.json'), 'utf8').then(JSON.parse),
   emit = null,
+  /** The projects' configuration (`framework:` declarations), read when a green cycle bumps. */
+  projectsConfig = async () => (await loadConfig({ root: configRoot })).projects,
+  /** Run a project action to its end; resolves with its operation record (project-actions.mjs). */
+  runAction = async ({ project, actionId, args }) => (await startProjectAction({ project, actionId, args, root: configRoot, actor: 'full-verification', emit: emitAction ?? (() => {}) })).done,
+  emitAction = null,
+  /** A project's version: its root `version` file's first line, else package.json's version, else null. */
+  versionOf = async (project) => {
+    const dir = projectPath(project, projectsRoot())
+    const file = await fs.readFile(path.join(dir, 'version'), 'utf8').catch(() => null)
+    if (file?.trim()) return file.trim().split('\n')[0].trim()
+    return fs.readFile(path.join(dir, 'package.json'), 'utf8').then((t) => JSON.parse(t).version ?? null, () => null)
+  },
+  maxAttachmentBytes = issues.MAX_FILE_BYTES ?? 25 * 1024 * 1024,
   pollMs = 5000,
   log = console
 } = {}) {
@@ -194,7 +355,7 @@ export function createFullVerification ({
     const record = {
       id: null, date, trigger, by, scheduledFor, schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
       state: 'frozen', verdict: null, frozenAt: clock.iso(), seatsIdleAt: null, startedAt: null, endedAt: null,
-      asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], refused: [], error: null
+      asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], refused: [], outcome: null, error: null
     }
     running = true
     current = record
@@ -246,6 +407,9 @@ export function createFullVerification ({
       record.error = error.message
       record.verdict = 'red'
     } finally {
+      // The outcome is handled while admission is still closed, so no run delivers into a checkout
+      // the bump commits. It never throws: admission always reopens after it.
+      await outcome(record)
       record.state = 'resuming'
       supervisor.thaw(record.id)
       await write(record).catch(() => {})
@@ -277,12 +441,22 @@ export function createFullVerification ({
         await wait(pollMs)
       }
       const check = run.fullVerification?.check ?? null
+      // The failures each failed command's own output names (the parser the baseline comparison uses),
+      // for a command no comparison judged; an unreadable output names none.
+      const parsed = check?.result?.result === 'failed'
+        ? await failureFingerprints({ runDir: entry.runDir, check: check.result, target: { commands: (check.result.commands ?? []).map((c) => ({ id: c.id, required: c.required })) } }).catch(() => [])
+        : []
       Object.assign(entry, {
         state: 'settled', status: run.status, outcome: run.outcome ?? null, blockedReason: run.blockedReason ?? null,
         release: run.release ? { status: run.release.status, environment: run.release.environment ?? null } : null,
         endedAt: run.endedAt ?? clock.iso(),
         check: check ? { dir: check.result?.dir ?? null, result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline ?? null, baseCommit: check.baseCommit ?? null, files: check.files ?? {},
-          newFailures: [...(check.selftest?.newFailures ?? []), ...(check.failures?.newFailures ?? [])].map((f) => ({ command: f.command, test: f.test })) } : null,
+          newFailures: [...(check.selftest?.newFailures ?? []), ...(check.failures?.newFailures ?? [])].map((f) => ({ command: f.command, test: f.test })),
+          failingTests: failingTestsOf(check, parsed),
+          selftestVerdict: check.selftest?.verdict ?? null,
+          selftestReason: check.selftest?.reason ?? null,
+          unread: (check.selftest?.unread ?? []).map((u) => ({ command: u.command, reason: u.reason })),
+          failedCommands: (check.result?.commands ?? []).filter((c) => !c.passed).map((c) => ({ id: c.id, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, log: c.log ?? null, stderr: c.stderr ?? null })) } : null,
         verdict: stagedReleasePassed(run.release, run) && check?.gating === 'passed' ? 'green' : 'red'
       })
     } catch (error) {
@@ -290,6 +464,96 @@ export function createFullVerification ({
     }
     entry.durationMs = entry.startedAt ? Math.max(0, Date.parse(entry.endedAt ?? clock.iso()) - Date.parse(entry.startedAt)) : null
     await write(record)
+  }
+
+  // ------------------------------------------------------------ the outcome
+
+  /** Bump or open issues, by the verdict; recorded as `record.outcome`. Never throws. */
+  async function outcome (record) {
+    record.state = 'outcome'
+    record.outcome = { verdict: record.verdict, startedAt: clock.iso(), endedAt: null }
+    await write(record).catch(() => {})
+    try {
+      if (record.verdict === 'green') await bump(record)
+      else if (record.verdict === 'red') await openIssues(record)
+      else record.outcome.reason = 'no stage was verified: nothing to bump and nothing red'
+    } catch (error) {
+      record.outcome.error = error.message
+    }
+    record.outcome.endedAt = clock.iso()
+    await write(record).catch(() => {})
+  }
+
+  /**
+   * Every stage green: each framework's checkpoint with --minor, then each of its instances'
+   * checkpoints (poolMembers: the framework first, instances by id), one at a time. The first
+   * step that does not complete stops every later one.
+   */
+  async function bump (record) {
+    const result = { chain: [], failed: null, notRun: [], versions: {} }
+    record.outcome.bump = result
+    const projects = await projectsConfig()
+    const frameworks = [...new Set([...projects.values()].map((p) => p.framework).filter((id) => id && projects.has(id)))].sort()
+    const steps = frameworks.flatMap((framework) => poolMembers(framework, projects).map((project, i) => ({ project, framework, args: i === 0 ? ['--minor'] : [] })))
+    if (!steps.length) { result.reason = 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
+    for (const [i, s] of steps.entries()) {
+      const step = { project: s.project, framework: s.framework, action: 'checkpoint', args: s.args, status: 'running', versionBefore: await versionOf(s.project).catch(() => null), startedAt: clock.iso() }
+      result.chain.push(step)
+      await write(record).catch(() => {})
+      try {
+        const operation = await runAction({ project: s.project, actionId: 'checkpoint', args: s.args })
+        Object.assign(step, { operationId: operation?.id ?? null, status: operation?.status ?? 'failed', exitCode: operation?.exitCode ?? null })
+        if (step.status !== 'completed') step.reason = operation?.error ?? (operation?.timedOut ? 'the action reached its deadline' : `the action ended ${step.status}${step.exitCode != null ? ` with exit code ${step.exitCode}` : ''}`)
+      } catch (error) {
+        Object.assign(step, { status: 'refused', reason: error.message, code: error.status ?? null })
+      }
+      step.versionAfter = await versionOf(s.project).catch(() => null)
+      step.endedAt = clock.iso()
+      if (step.status !== 'completed') {
+        result.failed = { project: s.project, reason: step.reason }
+        result.notRun = steps.slice(i + 1).map((n) => ({ project: n.project, framework: n.framework, args: n.args }))
+        break
+      }
+      if (step.versionAfter === step.versionBefore) step.unchanged = true
+      result.versions[s.project] = step.versionAfter
+    }
+  }
+
+  /** Any stage red: one new issue per red project, holding that cycle's failing tests, excerpts and run. */
+  async function openIssues (record) {
+    const out = []
+    record.outcome.issues = out
+    // The first cycle of a date names its issues exactly; a later one adds its id (one name per day, issues.js).
+    const later = Number(record.id.split('.').pop()) > 1
+    for (const entry of record.projects.filter((e) => !e.verifiedThrough && e.verdict === 'red')) {
+      const stage = entry.stage ?? 'configuration'
+      const name = `Full verification ${record.date}: ${entry.project} red on ${stage}${later ? ` (cycle ${record.id})` : ''}`
+      const item = { project: entry.project, stage, name, runId: entry.runId ?? null, issueId: null, failingCount: 0, attachments: [] }
+      out.push(item)
+      try {
+        const failures = []
+        for (const f of entry.check?.failingTests ?? []) failures.push({ ...f, excerpt: await excerptOf({ runDir: entry.runDir, dir: entry.check.dir, command: f.command, test: f.test, commands: entry.check.failedCommands ?? [] }) })
+        const unread = entry.check?.unread ?? []
+        item.failingCount = failures.length
+        const parts = failures.length || unread.length ? failureAttachments({ name, failures, unread, maxBytes: maxAttachmentBytes }) : []
+        const issue = await issues.createIssue(entry.project, {
+          input: redIssueReport({ record, entry, name, stage, failures, unread, parts }),
+          openedBy: { user: 'engine', from: { project: entry.project, runId: entry.runId ?? null, via: 'full-verification', cycle: record.id } }
+        })
+        item.issueId = issue?.id ?? null
+        for (const part of parts) {
+          try {
+            await issues.addStepFile(entry.project, item.issueId, '000', part.name, Buffer.from(part.text, 'utf8'))
+            item.attachments.push(part.name)
+          } catch (error) {
+            item.error = `${item.error ? `${item.error}; ` : ''}${part.name} could not be attached: ${error.message}`
+          }
+        }
+      } catch (error) {
+        item.error = `${item.error ? `${item.error}; ` : ''}${error.message}`
+      }
+      await write(record).catch(() => {})
+    }
   }
 
   /**

@@ -34,6 +34,7 @@ export default async function (t) {
     'echo "committed as $DEVPANEL_PROJECT_ACTION/$DEVPANEL_OPERATION_ID" >&2',
     'test -z "$PUSH_FAIL" || { echo "nothing to commit" >&2; exit 3; }',
     'test -z "$PUSH_SLEEP" || sleep "$PUSH_SLEEP"',
+    'echo "args:[$#:$1]"',
     'echo done'
   ].join('\n') + '\n'
   await fs.writeFile(path.join(projectPath, 'checkpoint.sh'), push, { mode: 0o755 })
@@ -85,6 +86,21 @@ export default async function (t) {
     t.eq('the listing shows the last operation per action', (await listProjectActions(project, opts)).actions[0].last?.id, finished.id)
     const report = operationReport(finished)
     t.ok('the model report carries bounded output, not just an exit code', report.stdout.includes('done') && typeof report.outputBounded === 'string' && !('stdoutTail' in report))
+
+    t.section('engine arguments (the daily full verification\'s --minor)')
+    t.eq('without arguments the action gets none', finished.args, [])
+    t.ok('… and the script sees none', finished.stdoutTail.includes('args:[0:]'))
+    const minor = await (await startProjectAction({ project, actionId: 'checkpoint', args: ['--minor'], ...opts })).done
+    t.eq('an argument completes and is recorded on the operation', [minor.status, minor.args], ['completed', ['--minor']])
+    t.ok('it reaches the script as one separate word', minor.stdoutTail.includes('args:[1:--minor]'))
+    const minorRead = await readOperation(project, minor.id, { issuesDir })
+    t.ok('the spawn line names it', minorRead.entries[0].text.includes('bash ./checkpoint.sh --minor'))
+    for (const bad of [';rm -rf .', '--minor x', '$(id)', 'minor', '--Minor', 42]) {
+      let refused = null
+      const before = (await fs.readFile(path.join(projectPath, 'version'), 'utf8')).trim()
+      try { await startProjectAction({ project, actionId: 'checkpoint', args: [bad], ...opts }) } catch (e) { refused = e.status }
+      t.eq(`argument ${JSON.stringify(bad)} is refused before anything runs`, [refused, (await fs.readFile(path.join(projectPath, 'version'), 'utf8')).trim()], [400, before])
+    }
 
     t.section('failure, concurrency, stop, deadline')
     process.env.PUSH_FAIL = '1'
