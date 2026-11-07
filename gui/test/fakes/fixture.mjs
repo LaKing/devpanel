@@ -84,6 +84,11 @@ const verdictFor = (findings) => (findings.some(substantial) ? 'changes-needed' 
  *                          plan-review finding, by id (or a function of the
  *                          review round returning that map); default: addressed
  */
+/** A triage investigator's no-findings disposition under the two-seat sizing contract. */
+export const triageNoFindings = {disposition:'no-findings',reasoning:'Nothing reproduced',response:'Checked the claim; nothing found.',issues:[],
+  size:'minor',sizeReason:'Nothing to change was found.',affectedModules:[],
+  autonomy:{verdict:'needs-owner-input',reason:'Nothing was found to work on.',questions:[{id:'Q1',question:'Close this issue as not reproducible?',category:'missing-information',recommendation:'Close it.'}]}}
+
 export function scriptFor ({ planReviews = [[]], implReviews = [[]], malformed = new Set(), fitVerdict = true, confirm = true, planDispositions = {}, needsInput = null, operatorRequest = null } = {}) {
   // Every substantial plan finding must receive a disposition from the
   // implementation auditor, exactly as the engine will demand of a real one.
@@ -161,10 +166,11 @@ export function scriptFor ({ planReviews = [[]], implReviews = [[]], malformed =
       }
       case 'disposition':
         return fence({disposition:'no-findings',reasoning:'No actionable findings',response:'Investigation complete.',issues:[]})
-      // The triage strategy's investigator returns its disposition directly.
+      // The triage strategy's investigators return their disposition and size directly.
       case 'investigate':
-        return fence({disposition:'no-findings',reasoning:'Nothing reproduced',response:'Checked the claim; nothing found.',issues:[]})
+        return fence(triageNoFindings)
       default:
+        if (stepId === 'investigate-2' && prompt.includes('`triageDisposition`')) return fence(triageNoFindings)
         if (stepId.startsWith('investigate-')) return fence({...(prompt.includes('`releaseAssessment`')?{verdict:'approved'}:{}),summary:'Investigated source and evidence',findings:[],openQuestions:[]})
         return `Unscripted step ${stepId} for ${role}`
     }

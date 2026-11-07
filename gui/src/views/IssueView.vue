@@ -81,6 +81,11 @@ const selectedTurn = ref(null)
 const loading = ref(true)
 const loadError = ref('')
 const showStart = ref(false)
+/** The playbook the start dialog opens at: a triage's recommendation, or none (the list). */
+const startPlaybook = ref(null)
+function openStart (playbook = null) { startPlaybook.value = playbook; showStart.value = true }
+const PLAYBOOK_TITLES = { prompt: 'Prompt', 'plan-and-implement': 'Plan and implement' }
+const playbookTitle = (id) => PLAYBOOK_TITLES[id] ?? id
 const stopRequested = ref(false)
 const answerText = ref('')
 const answerActor = ref(rememberedActor())
@@ -872,6 +877,7 @@ watch(() => route.query.run, (runId) => {
       :project="project"
       :issue-id="issueId"
       :prior-runs="runs.filter((r) => ['completed', 'blocked', 'failed', 'cancelled'].includes(r.status)).length"
+      :initial-playbook="startPlaybook"
       @started="onStarted"
     />
 
@@ -986,6 +992,27 @@ watch(() => route.query.run, (runId) => {
         </div>
       </form>
       <p v-if="priorityError" class="error-text">{{ priorityError }}</p>
+      <!-- The latest triage's two-seat sizing (issue.json sizing): the size, each
+           seat's sentence, the affected modules and the playbook it recommends. -->
+      <div class="decide" data-testid="issue-sizing">
+        <span class="decide__label">Size</span>
+        <div class="decide__value">
+          <template v-if="issue.sizing">
+            <v-chip size="x-small" variant="tonal" :color="issue.sizing.size === 'minor' ? 'success' : 'warning'">{{ issue.sizing.size === 'minor' ? 'Minor issue' : 'Major issue' }}</v-chip>
+            <span class="muted"> recommends {{ playbookTitle(issue.sizing.recommendedPlaybook) }}</span>
+            <div v-for="seat in issue.sizing.seats ?? []" :key="seat.role" class="decide__why sizing__seat">
+              <strong>{{ seat.size }}</strong> — {{ seat.reason }} <span class="muted">({{ seat.role }}{{ seat.model ? `, ${seat.model}` : '' }})</span>
+            </div>
+            <div v-if="issue.sizing.affectedModules?.length" class="sizing__modules">
+              <code v-for="m in issue.sizing.affectedModules" :key="m">{{ m }}</code>
+            </div>
+          </template>
+          <span v-else class="muted">Not sized yet: a Triage sizes it</span>
+        </div>
+        <v-btn v-if="issue.sizing?.recommendedPlaybook && canStart" size="x-small" variant="text"
+               :aria-label="`Start ${playbookTitle(issue.sizing.recommendedPlaybook)}`"
+               @click="openStart(issue.sizing.recommendedPlaybook)">Start {{ playbookTitle(issue.sizing.recommendedPlaybook) }}</v-btn>
+      </div>
       <details v-if="(issue.priorityHistory?.length ?? 0) > 1" class="more">
         <summary>Priority history ({{ issue.priorityHistory.length }})</summary>
         <p v-for="(entry, i) in issue.priorityHistory" :key="i" class="muted">
@@ -998,7 +1025,7 @@ watch(() => route.query.run, (runId) => {
 
         <div class="issue__actions" role="group" aria-label="Issue actions">
           <v-btn v-if="canStart" variant="flat" color="primary" size="small" prepend-icon="$play"
-                 aria-label="Run a playbook" @click="showStart = true">Run a playbook</v-btn>
+                 aria-label="Run a playbook" @click="openStart()">Run a playbook</v-btn>
           <v-btn v-if="!issue.archived" variant="text" size="small"
                  aria-label="Close issue" :title="liveRun ? 'Stop and close issue' : 'Close and archive issue'"
                  :disabled="archiving" :loading="archiving" @click="archiveIssue">Close</v-btn>
@@ -1246,6 +1273,21 @@ watch(() => route.query.run, (runId) => {
             {{ statusOpen ? 'Show less' : 'Show the full reasoning' }}
           </button>
 
+          <!-- What a triage's autoStart did when the run ended (auto-start.mjs). -->
+          <div v-if="run.autoStart" class="status__suggest" data-testid="auto-start">
+            <template v-if="run.autoStart.startedRunId">
+              <strong>Started {{ playbookTitle(run.autoStart.playbook) }}</strong>
+              <span class="muted"> — run {{ run.autoStart.startedRunId }}, as this triage recommended</span>
+            </template>
+            <template v-else-if="run.autoStart.refusal">
+              <strong>{{ playbookTitle(run.autoStart.playbook) }} was not started</strong>
+              <span class="status__suggest-why" :title="run.autoStart.refusal.message"> — {{ run.autoStart.refusal.message }}</span>
+            </template>
+            <template v-else>
+              <strong>Nothing started automatically</strong>
+              <span class="muted"> — {{ run.autoStart.reason?.startsWith('verdict:') ? `the triage verdict was ${run.autoStart.reason.slice(8)}` : run.autoStart.reason }}</span>
+            </template>
+          </div>
           <!-- What triage advised doing with the issue: a suggestion, never an action. -->
           <div v-if="run.triageSuggestion?.action" class="status__suggest">
             <strong>Triage suggests: {{ run.triageSuggestion.label }}</strong>
@@ -1655,6 +1697,8 @@ watch(() => route.query.run, (runId) => {
 
 .decide { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr) auto; align-items: baseline; gap: 8px; font-size: 0.8125rem; padding: 4px 0; }
 .decide__label { opacity: 0.6; }
+.sizing__modules { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.sizing__modules code { font-size: 0.75rem; }
 .decide__why { margin-top: 3px; line-height: 1.45; opacity: 0.8; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .form { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 10px; }
 .form select, .form input {

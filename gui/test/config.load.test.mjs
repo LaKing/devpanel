@@ -17,7 +17,7 @@ export default async function (t) {
   t.eq('wire model resolved', good.resolved.participants.implementer.model.wire, 'claude-opus-5-5')
   t.eq('prompt references resolved', Object.keys(good.resolved.prompts).length, 5)
   t.eq('unoccupied optional seats are omitted', Object.keys(good.resolved.participants).sort(), ['auditor-1', 'coordinator', 'implementer'])
-  t.eq('the default seats', Object.fromEntries(Object.entries(good.resolved.participants).sort(([a], [b]) => a.localeCompare(b)).map(([role, p]) => [role, `${p.model.id}/${p.effort}`])), { 'auditor-1': 'gpt-6.1-sol/medium', coordinator: 'opus-5-5/medium', implementer: 'opus-5-5/medium' })
+  t.eq('the default seats', Object.fromEntries(Object.entries(good.resolved.participants).sort(([a], [b]) => a.localeCompare(b)).map(([role, p]) => [role, `${p.model.id}/${p.effort}`])), { 'auditor-1': 'gpt-6.1-sol/medium', coordinator: 'opus-5-5/low', implementer: 'opus-5-5/medium' })
 
   // The implementation playbook occupies auditor-1 by default; tests that need a
   // particular auditor replace it in the sandbox copy, the way an operator would.

@@ -17,7 +17,9 @@ const props = defineProps({
   project: { type: String, required: true },
   issueId: { type: String, required: true },
   /** Ended runs of the issue: what "Accumulate results" would carry. */
-  priorRuns: { type: Number, default: 0 }
+  priorRuns: { type: Number, default: 0 },
+  /** A playbook to open at its settings, e.g. the one a triage recommended. */
+  initialPlaybook: { type: String, default: null }
 })
 const emit = defineEmits(['update:modelValue', 'started'])
 
@@ -92,7 +94,12 @@ async function loadPreview (id, reset = true) {
     previewData.value = result
     previewedId.value = id
     previewedOptions.value = key
-    if (!parameterData.value) parameterData.value = result
+    if (!parameterData.value) {
+      parameterData.value = result
+      // A triage starts the playbook its sizing recommends when it closes
+      // autonomous: on by default here, as the issue says; the box turns it off.
+      if (result.tactic === 'triage' && runOptions.value.autoStart === undefined) runOptions.value = { ...runOptions.value, autoStart: true }
+    }
   } catch (e) {
     if (seq !== previewSeq) return
     error.value = e.message
@@ -126,6 +133,8 @@ watch(open, async (isOpen) => {
   } finally {
     loading.value = false
   }
+  // Opened from a recommendation: straight to that playbook's settings.
+  if (props.initialPlaybook && playbooks.value.some((p) => p.id === props.initialPlaybook)) pick(props.initialPlaybook)
 })
 
 /** One click: the playbook is chosen and the dialog moves on to its settings. */
@@ -212,6 +221,10 @@ function setAccumulate (on) {
   else delete next.accumulate
   runOptions.value = next
 }
+function setAutoStart (on) {
+  runOptions.value = { ...runOptions.value, autoStart: on }
+}
+const isTriage = computed(() => parameterData.value?.tactic === 'triage')
 const limitsChanged = computed(() => Boolean(Object.keys(runOptions.value.budgets ?? {}).length || Object.keys(runOptions.value.rounds ?? {}).length || runOptions.value.repairAttempts != null))
 const symlinksChoice = computed(() => runOptions.value.symlinks ?? '')
 function setSymlinks (value) {
@@ -420,6 +433,14 @@ async function start (override = false) {
                   Work directly in the project checkout
                 </span>
                 <small>{{ inPlace ? 'No isolated worktree and no patch: edits land in the live tree as they are made, and a failed turn can leave partial edits there. The base setting below does not apply. A project that declares tooling mounts is refused in place (nothing binds them there): run it isolated.' : 'An isolated git worktree cut from the base below. The result is a verified patch; the repository changes only when you integrate it.' }}{{ configuredIsolation === 'in-place' ? ' This playbook defaults to working in place.' : '' }}</small>
+              </label>
+              <label v-if="isTriage" class="setting setting--wide">
+                <span>Next playbook</span>
+                <span class="check-row">
+                  <input type="checkbox" aria-label="Start the recommended playbook when triage finishes" data-setting="autoStart" :checked="runOptions.autoStart === true" @change="setAutoStart($event.target.checked)" />
+                  Start the recommended playbook when triage finishes
+                </span>
+                <small>{{ runOptions.autoStart === true ? 'When triage closes autonomous, Prompt starts for a Minor issue and Plan and implement for a Major one, under the ordinary admission and budgets. Any other verdict starts nothing.' : 'Triage only recommends the next playbook; the issue page offers it.' }}</small>
               </label>
               <label class="setting setting--wide" :class="{ 'setting--inactive': !priorRuns }">
                 <span>Earlier runs</span>

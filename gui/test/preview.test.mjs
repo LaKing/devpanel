@@ -69,7 +69,7 @@ export default async function (t) {
   t.eq('three occupied seats, the empty optional ones omitted', p.participants.map((q) => q.role).sort(), ['auditor-1', 'coordinator', 'implementer'])
   t.eq('coordinator model', byRole.coordinator.model, 'opus-5-5')
   t.eq('with its wire identifier', byRole.coordinator.wireModel, 'claude-opus-5-5')
-  t.eq('and effort (the playbook sets medium for its tool-free coordinator)', byRole.coordinator.effort, 'medium')
+  t.eq('and effort (the playbook sets low for its tool-free coordinator)', byRole.coordinator.effort, 'low')
   t.eq('the implementer is the sole writer', p.participants.filter((q) => q.writesCode).map((q) => q.role), ['implementer'])
   t.eq('a seat with no effort named and no model default shows null', byRole['auditor-1'].effort, null)
   t.ok('every participant carries a connection label', p.participants.every((q) => typeof q.connection.label === 'string'))

@@ -161,6 +161,16 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   a target with `tiers.targeted` runs named selftests (a command template, plus what always runs with it) instead of the smoke on a repair revision whose failing tests the previous drive or an open finding's `failingTests` names, its audit waiting for the result; it never counts for closure, and a full failure after its pass is on `run.targetedMisses` (`runtime/targeted-tier.mjs`);
   a failed check is retried on the same revision (`retryFailed`, default 1; a later pass is `flaky`), unless an earlier revision already reproduced the failure (`retrySkipped`, `runtime/selftest-retry.mjs`); a triage `firstHandoff` is recorded as the round-0 brief without a second turn; all
   engine writes go through one queue. See "Reviews" and "Operator pause and resume" in execution-contract.md.
+- `runtime/triage-sizing.mjs` + `auto-start.mjs` + `start-admission.mjs` — two-seat triage sizing: the triage's
+  `investigate` and `investigate-2` steps are `concurrent: true` (consecutive single-step phases batched like a
+  consensus round, `reviewBatch`); the disposition effect waits for both seats and records
+  `reportDisposition.sizing` (`minor` only when both say minor, modules unioned, most restrictive `autonomy`,
+  `recommendedPlaybook` prompt | plan-and-implement), persisted as `issue.json` `sizing` keyed by run and frozen
+  into later windows (`window.sizing`, the `sizing` context ref). A triage with `runOptions.autoStart` (out of
+  the configHash) that closes autonomous starts the recommendation after `announceEnd`, through `startAdmission`
+  (open dependencies, report trust; shared with the supervisor's `start_run`), the supervisor's start gate when it
+  launched the triage, and `start()`; recorded once in `runs/<id>/auto-start.json`
+  (execution-contract.md "Triage sizing and autoStart").
 - `runtime/structured-output.mjs` — finds the JSON object in a response with a string-aware scanner (never a
   regex), prefers fenced objects, falls back to bare ones, rejects several *different* compliant objects as
   ambiguous, and classifies every rejection (`no-structured-output`, `contract-violation`, `ambiguous-output`).

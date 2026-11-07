@@ -11,7 +11,8 @@ import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
 import { inspectLaunchState } from './supervisor-launch-state.mjs'
 import { buildOverview } from './supervisor-overview.mjs'
 import { setIssueDependencies, openDependencies } from './issue-dependencies.mjs'
-import { readReporters, reportStartLevel, reportStartRefusal } from './reporters.mjs'
+import { readReporters, reportStartLevel } from './reporters.mjs'
+import { startAdmission } from './start-admission.mjs'
 import { launchReadiness } from './supervisor-readiness.mjs'
 import { projectPath } from './project-path.mjs'
 import { performanceForModel } from './model-performance.mjs'
@@ -93,8 +94,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
      stagingPending:(project,lists)=>stagingPendingReport({project,projectPath:projectPath(project),root:configRoot,lists,config:config??=loadConfig({root:configRoot}),listIssues:(p,o)=>issues.listIssues(p,o)})})},
    setPriority:a=>mutate(()=>issues.setIssuePriority(a.project,a.issueId,{value:a.priority,reason:a.reason,by:a.by??'supervisor'})),
    setDependencies:a=>mutate(()=>setIssueDependencies(a.project,a.issueId,{dependsOn:a.dependsOn,reason:a.reason,by:'supervisor'})),
-   openDependencies:async a=>openDependencies(await issues.getIssue(a.project,a.issueId)),
-   reportStartRefusal:async a=>reportStartRefusal(await issues.getIssue(a.project,a.issueId),a.playbook),
+   startAdmission:async a=>startAdmission({issue:await issues.getIssue(a.project,a.issueId),playbook:a.playbook}),
    // What the ready queue cannot read off the listings: which live run holds each project's checkout, by the test a start is refused on, and how far a report's trust reaches.
    readyQueueFacts:async issuesByProject=>{
     const holders={},reportLevels={}
@@ -185,7 +185,10 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    createFollowUps:a=>mutate(()=>issues.createFollowUps(a.project,a.issueId,a.runId,{by:{user:'supervisor'}})),
    markLanded:a=>mutate(()=>supervisor.markLanded(a))
   }}) } catch(e) { await lock.release();throw e }
+ // A triage this supervisor started that closes autonomous starts its recommended
+ // playbook through the supervisor's own start gate (auto-start.mjs).
+ supervisor.setAutoStartGate?.(a=>service.autoStart(a))
  const shutdown=service.shutdown
- service.shutdown=async()=>{try {await shutdown()}finally{await lock.release()}}
+ service.shutdown=async()=>{try {supervisor.setAutoStartGate?.(null);await shutdown()}finally{await lock.release()}}
  return service
 }

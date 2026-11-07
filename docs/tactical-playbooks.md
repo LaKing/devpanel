@@ -262,12 +262,13 @@ workspace deletion. No automatic age-based deletion of unfinished work is enable
 
 ## Analysis and Triage issues
 
-Triage has one workflow: coordinator brief → investigator disposition. The
+Triage has one workflow: coordinator brief → two investigator seats at once, each
+returning a disposition and a size. The
 coordinator receives supplied issue/window context and returns a handoff of at most
 800 characters. Its CLI runs from its scratch directory with built-in tools,
 shell, MCP and inherited tool configuration disabled using the adapters' existing
 tool-free mode. It does not inspect source, reproduce claims or create implementation
-criteria. The investigator receives the original report/window plus the brief,
+criteria. Each investigator receives the original report/window plus the brief,
 performs the evidence gathering necessary for the claim, and returns the final result.
 There is no coordinator re-investigation, synthesis or confirmation turn.
 
@@ -277,11 +278,11 @@ for a disposition. Fix design, unrelated defects and general test suites are out
 triage. A specific missing fact produces needs-information, naming the question and
 next check. It never automatically launches another investigation.
 
-Both seats have at most one formatting repair. The coordinator defaults to medium
-reasoning effort and the investigator to medium. The five-minute run deadline and
-four-turn allowance are runaway guards, not work targets. Token and known-cost
-allowances stop additional calls after 60,000 provider-accounted tokens or $1;
-the final invocation can exceed those allowances. The output contract bounds
+Every seat has at most one formatting repair. The coordinator and the investigators
+run at low reasoning effort. The five-minute run deadline and six-turn allowance
+(brief, two investigators, repairs) are runaway guards, not work targets. Token and
+known-cost allowances stop additional calls after 120,000 provider-accounted tokens
+or $1; the final invocation can exceed those allowances. The output contract bounds
 response length and finding count, and the investigator result is shown directly.
 Accepted reports link the current issue; duplicates link the existing issue.
 Implementation criteria belong to the follow-up fix, not to triage completion.
@@ -300,6 +301,64 @@ Each issue carries bug/feature classification, acceptance criteria, source issue
 run and stable finding identity. Publication is replay-safe and adds evidence
 through the shared step reservation format. The coordinator receives the issue
 catalogue to identify existing reports and avoid semantic duplicates.
+
+### Two-seat sizing
+
+The investigate phase has two seats: `investigator` (Opus 5.5, low) and the optional
+`investigator-2` (GPT-6.1 Sol, low). Their steps are marked `concurrent: true`, so
+they run at the same time, like the reviewers of a consensus round; the brief goes
+to both and neither reads the other. Besides its disposition, each seat records an
+order-of-magnitude sizing, not a design: `size` (`minor`, one write and one
+hand-over, or `major`, it needs a plan), one sentence of reason (`sizeReason`), and,
+for a Boilerplate project, `affectedModules` as `<collection>/<module>` paths
+(framework and application modules alike). Each also gives an `autonomy` verdict
+(the shape of `triageResult.autonomy`): `autonomous` only for an accepted report;
+every other disposition is `needs-owner-input` with the one question the owner
+must answer, and the engine treats `autonomous` on any other disposition as a
+contract violation (protocol repair).
+
+The run records one decision, `reportDisposition.sizing`, once every occupied
+seat has a valid disposition (`runtime/triage-sizing.mjs`):
+
+- **Disagreement reads as Major**: the size is `minor` only when both seats say
+  minor; any disagreement records `major`.
+- **Modules are the union** of both seats' lists, in order of first appearance,
+  primary seat first.
+- The **autonomy verdict is the most restrictive** of the seats' (too-large, then
+  needs-owner-input, then autonomous).
+- **`recommendedPlaybook`** is `prompt` for Minor and `plan-and-implement` for Major.
+
+The disposition, its published issues and `byStep` stay the primary
+investigator's; the second seat's output is recorded beside it and publishes
+nothing. With `investigator-2` left empty, the one seat sizes alone.
+
+The decision is persisted on the issue as `issue.json` `sizing` (size, modules,
+recommended playbook, verdict and each seat's role, model, size and sentence),
+keyed by the run and step that produced it; a later triage replaces it. Every
+later run of the issue reads it: the run's window freezes it at capture
+(`window.json` `sizing`) and the window summary every step sees carries `sizing`
+and `affectedModules`; a step may also name the `sizing` context ref. The issue
+page shows it under Size with a Start button for the recommendation, and the
+supervisor's issue summary carries it.
+
+### Routing: autoStart
+
+`runOptions.autoStart` (triage only; left out of the configHash because it does
+not change the run) is on by default when an operator chooses Triage in the
+issue page's run dialog ("Start the recommended playbook when triage finishes")
+and when the top-level supervisor previews a triage, unless either turns it off.
+When such a triage closes (`completed`) with the verdict `autonomous`, the panel
+starts the recommended playbook on the same issue (`server/auto-start.mjs`): Prompt
+for a Minor issue, Plan and implement for a Major one. Those are the only
+conditions; a duplicate or rejected report is held back by its seats' own verdict.
+The start passes, in order, the shared start admission (`server/start-admission.mjs`:
+open dependencies, and report trust, so an assess-only report is never escalated
+to a writing playbook), then, for a triage the supervisor started, its start gate
+(session limits, spending windows, concurrency, ledger reservation, ownership),
+and finally the run supervisor's own admission. What happened (the started run,
+or the refusal and who refused) is written once to `runs/<triage run>/auto-start.json`
+and shown on the run; it is never retried. With autoStart off, a non-autonomous
+verdict, or a refusal, nothing starts and the recommendation stays on offer.
 
 Rejected and insufficient-information reports create no issues. The stored
 response is shown in the issue page. Insufficient information should produce a
@@ -321,7 +380,10 @@ outcome is the gate: it returns `singleSeatResult` with `completed` and, when
 false, the blockers that stopped it, and closure requires that completion, no
 failed check, no outstanding blocking findings and delivery. An unfinished task
 blocks as `task-incomplete` and delivers nothing; closure records review-only
-with that justification. The worker's summary is the entire report. Use it for
+with that justification. The worker's summary is the entire report. Its step names the `sizing` context
+ref, so the worker is told the issue's triage size and affected modules and that
+a Minor issue is one write and one hand-over; checks and delivery are unchanged.
+Use it for
 small, well-specified changes; anything that needs a plan or a second opinion
 belongs in Implementation.
 

@@ -206,6 +206,9 @@ async function readIssue (project, dirName) {
     priorityHistory: Array.isArray(meta.priorityHistory) ? meta.priorityHistory : (meta.priority ? [meta.priority] : []),
     // Issues that must be settled first (issue-dependencies.mjs), or null.
     dependsOn: meta.dependsOn ?? null,
+    // The latest triage's two-seat sizing, keyed by the run that produced it
+    // (runtime/triage-sizing.mjs), or null when the issue was never sized.
+    sizing: meta.sizing ?? null,
     archiveOverride: archive?.override ?? null,
     ...(archive ? { archivedNotes: await readArchivedNotes(project, dirName) } : {}),
     stepCount,

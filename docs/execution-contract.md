@@ -2082,6 +2082,52 @@ records the `split` disposition naming them; a declined split writes a note and
 starts again. The top-level supervisor has no action for this: owner questions
 are the owner's.
 
+## Triage sizing and autoStart
+
+**Concurrent steps.** A single-step phase whose step declares `concurrent: true`
+runs at once with the consecutive single-step phases whose steps also do, through
+the same batch as a consensus round's reviewers (`reviewBatch`, a
+`concurrent-steps` event), within the remaining step budget. Replay is unchanged:
+each step is still derived from its own recorded attempts. The loader refuses
+`concurrent` inside a loop, on a phase with transitions, on a step that records a
+revision or whose role writes code, and on a step that reads another concurrent
+step's output, so the order of the turns changes nothing recorded.
+
+**Two-seat sizing.** The triage strategy's `investigate` and `investigate-2` steps
+are concurrent. Each returns a `triageDisposition` with `size` (`minor | major`),
+`sizeReason`, `affectedModules` (`<collection>/<module>`) and `autonomy`; the
+engine refuses an `autonomous` verdict on any disposition but `accepted`
+(`triageDispositionProblem`, a contract violation repaired like any other). The
+disposition effect waits until every occupied investigator seat has a valid
+output, then records the primary seat's disposition with
+`reportDisposition.sizing = {size, affectedModules, recommendedPlaybook, autonomy,
+seats, runId}`: `minor` only when every seat said minor (disagreement is `major`),
+modules unioned, the most restrictive verdict, `prompt` for minor and
+`plan-and-implement` for major (`runtime/triage-sizing.mjs`).
+
+**Where it is persisted.** In the same effect the engine writes `issue.json`
+`sizing`, keyed by `runId` and `byStep` (writing the same run's decision again
+changes nothing, so replay is safe); an inquiry writes none. `captureWindow`
+freezes the issue's `sizing` into every later run's `window.json` (a refreshed
+window keeps the first one), `windowSummary` gives it to every step that names
+`window` as `sizing` and `affectedModules`, and the `sizing` context ref renders
+the same value. The engine reads it from `run.currentWindow.sizing`.
+
+**autoStart.** `runOptions.autoStart` is accepted for the triage tactic only and
+is not part of the configHash. After a run ends and its issue is released
+(`announceEnd`), `routeAutoStart` decides from the snapshot and the run exactly:
+autoStart on, a triage, `status: completed`, `sizing.autonomy.verdict:
+autonomous`. A start then passes the shared start admission (`startAdmission`:
+open dependencies, report trust; the same checks the supervisor's `start_run`
+asks), then, when the triage carries a `supervisorLaunchId`, the top-level
+supervisor's start gate (only while its activation runs: session limits,
+spending windows, concurrency, ledger reservation, ownership), and in every case
+the run supervisor's `start()` admission. The record (`decision`, `reason`,
+`playbook`, `startedRunId` or `refusal {by, code, message}`) is written once to
+`runs/<id>/auto-start.json`, returned on the run as `autoStart`, and never
+attempted again. A refusal or any other verdict starts nothing; the recommendation
+stays on the issue.
+
 ## Operator decisions
 
 A run may stop for a human without ending. Three things ask:

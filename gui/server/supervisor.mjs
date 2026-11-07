@@ -44,6 +44,7 @@ import { resolvePlaybook, loadConfig } from './config/load.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
 import { forgetRunDrives } from './runtime/selftest-history.mjs'
+import { routeAutoStart } from './auto-start.mjs'
 
 /*
  * Owns the lifecycle of running playbooks.
@@ -851,6 +852,29 @@ export function createSupervisor ({
       await admission(project, () => packInquiryLocked(project, issueId))
         .then((r) => { if (r.packed) emit?.({ type: 'inquiry-packed', project, issueId, runId }) })
         .catch((error) => console.warn(`[devpanel] inquiry ${project}/${issueId} was not packed: ${error.message}`))
+    }
+    // A triage started with autoStart that closed autonomous starts its
+    // recommended playbook now that the issue is free (auto-start.mjs).
+    if (type === 'run-finished' && !inquiry) await autoStartAfter(project, issueId, runId)
+  }
+
+  /** The top-level supervisor's start gate, when one is attached (top-supervisor-service.mjs). */
+  let supervisorAutoStart = null
+  function setAutoStartGate (gate) { supervisorAutoStart = gate }
+
+  async function autoStartAfter (project, issueId, runId) {
+    try {
+      const issue = await issues.getIssue(project, issueId)
+      if (issue.packed) return
+      await routeAutoStart({ project, issueId, issuePath: issue.path, runId }, {
+        getIssue: (p, id) => issues.getIssue(p, id),
+        startOperator: ({ project: p, issueId: id, playbookId }) => start({ project: p, issueId: id, playbookId }),
+        supervisorGate: supervisorAutoStart,
+        shuttingDown: () => shuttingDown,
+        emit
+      })
+    } catch (error) {
+      console.warn(`[devpanel] autoStart after ${project}/${issueId} run ${runId} failed: ${error.message}`)
     }
   }
 
@@ -1813,7 +1837,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
+  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions }
 }
 
 /**

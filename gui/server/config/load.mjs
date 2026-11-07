@@ -54,7 +54,7 @@ export const FENCE_POLICY = Object.freeze({ hygiene: 1, selection: 1, namespace:
 // such as steps.triage.output.acceptanceCriteria.
 const OUTPUT_FIELDS = {
   triageBrief: ['targetRole', 'prompt'],
-  triageDisposition: ['disposition', 'reasoning', 'response', 'issues'],
+  triageDisposition: ['disposition', 'reasoning', 'response', 'issues', 'size', 'sizeReason', 'affectedModules', 'autonomy'],
   releaseAssessment: ['summary','verdict','findings','openQuestions','observations'],
   investigationResult: ['summary', 'findings', 'openQuestions'],
   reportDisposition: ['disposition', 'reasoning', 'response', 'issues'],
@@ -368,6 +368,27 @@ function checkWorkflow (strategy, errors) {
     seen.add(step.id)
   }
 
+  // `concurrent: true` lets consecutive single-step phases run at once (the triage
+  // investigators). Their order must change nothing that is recorded: no loop,
+  // no transition, no source writer, no revision, and none reads another's output.
+  let group = []
+  for (const phase of strategy.phases) {
+    const at = `/phases/${phase.id}`
+    for (const step of phase.loop?.steps ?? []) {
+      if (step.concurrent) err(errors, `step "${step.id}" is concurrent inside a loop; only a single-step phase may be (review seats of a consensus round already run at once)`, strategy.file, at)
+    }
+    const step = phase.step
+    if (!step?.concurrent) { group = []; continue }
+    if (phase.transitions?.length) err(errors, `step "${step.id}" is concurrent but its phase has transitions; a concurrent step cannot decide where the run goes`, strategy.file, at)
+    if (step.recordsRevision) err(errors, `step "${step.id}" is concurrent but records a revision`, strategy.file, at)
+    if (strategy.roles[step.role]?.writesCode) err(errors, `step "${step.id}" is concurrent but its role "${step.role}" writes code`, strategy.file, at)
+    for (const ref of [...(step.context ?? []), step.promptFrom].filter(Boolean)) {
+      const target = /^steps\.([a-z0-9-]+)\./.exec(ref)?.[1]
+      if (group.includes(target)) err(errors, `step "${step.id}" is concurrent with step "${target}" and reads its ${ref}; concurrent steps cannot read one another`, strategy.file, at)
+    }
+    group.push(step.id)
+  }
+
   // Transition targets must exist.
   for (const phase of strategy.phases) {
     for (const t of phase.transitions ?? []) {
@@ -479,6 +500,7 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   }
 
   if (runOptions.inquiry && strategy.tactic !== 'analysis') err(errors, `an inquiry runs the analysis tactic only, not ${strategy.tactic ?? strategy.id}`, playbook.file, '/runOptions/inquiry')
+  if (runOptions.autoStart !== undefined && strategy.tactic !== 'triage') err(errors, `autoStart only applies to a triage, not ${strategy.tactic ?? strategy.id}`, playbook.file, '/runOptions/autoStart')
   if (['staging','deployment'].includes(strategy.tactic)) {
     const environment = runOptions.environment ?? (strategy.tactic === 'staging' ? infrastructure?.staging?.id : infrastructure?.deployments?.[0]?.id)
     if (strategy.tactic === 'deployment' && (infrastructure?.deployments?.length ?? 0) > 1 && !runOptions.environment) blockers.push({role:'release-operator',model:null,reason:'Select a deployment environment explicitly when multiple targets are configured',file:project?.file??null})
@@ -603,7 +625,10 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     ...Object.values(prompts).map((p) => p.hash)
   ].sort()
 
-  if (Object.keys(runOptions).length) contributing.push(sha256(JSON.stringify(canonicalOptions(runOptions))))
+  // autoStart decides what happens after the run, not what the run does: a triage
+  // with it stays in the same configuration group as one without.
+  const { autoStart: _autoStart, ...hashedOptions } = runOptions
+  if (Object.keys(hashedOptions).length) contributing.push(sha256(JSON.stringify(canonicalOptions(hashedOptions))))
   // The seat-access policy a run executes under is part of what it is, so a
   // policy step starts a new configuration group (harness/README.md "Seat hygiene").
   contributing.push(sha256(`fence:${JSON.stringify(FENCE_POLICY)}`))

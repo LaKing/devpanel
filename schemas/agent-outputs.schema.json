@@ -1107,7 +1107,11 @@
         "disposition",
         "reasoning",
         "response",
-        "issues"
+        "issues",
+        "size",
+        "sizeReason",
+        "affectedModules",
+        "autonomy"
       ],
       "properties": {
         "disposition": {
@@ -1201,6 +1205,131 @@
           ],
           "description": "Assess the captured window. Request specific missing evidence through needs-information.",
           "const": "keep"
+        },
+        "size": {
+          "enum": [
+            "minor",
+            "major"
+          ],
+          "description": "Order-of-magnitude sizing, not a design: minor (one write and one hand-over) or major (it needs a plan). The run records major whenever its seats disagree."
+        },
+        "sizeReason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "One sentence: why this size."
+        },
+        "affectedModules": {
+          "type": "array",
+          "maxItems": 50,
+          "uniqueItems": true,
+          "description": "For a Boilerplate project, the affected modules as <collection>/<module> paths, framework and application modules alike; otherwise empty.",
+          "items": {
+            "type": "string",
+            "pattern": "^[^/\\s]+/[^/\\s]+$",
+            "maxLength": 160
+          }
+        },
+        "autonomy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "verdict",
+            "reason"
+          ],
+          "description": "Can ONE run of the recommended playbook finish the issue without asking anybody? autonomous: it may start (only an accepted report). needs-owner-input: the owner must answer `questions` first (also every disposition other than accepted, with the one question the owner must answer). too-large: the owner is offered `split`. Technical choices and unknowns a worker can establish are never a reason to ask.",
+          "properties": {
+            "verdict": {
+              "enum": [
+                "autonomous",
+                "needs-owner-input",
+                "too-large"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 800
+            },
+            "questions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 5,
+              "description": "Only with needs-owner-input: what only the issue owner can decide, each answerable in a line.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "question",
+                  "category",
+                  "recommendation"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^Q[0-9]+$"
+                  },
+                  "question": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 300
+                  },
+                  "category": {
+                    "enum": [
+                      "owner-gate",
+                      "requirement-conflict",
+                      "authorization",
+                      "missing-information"
+                    ],
+                    "description": "owner-gate: the issue itself asks to stop for the owner's confirmation. requirement-conflict: criteria that cannot all hold, with evidence. authorization: spending, production, destroying data, publishing. missing-information: something only the owner knows (an account, a name, an intent) that no worker can find."
+                  },
+                  "recommendation": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 600,
+                    "description": "What the agents would do, and why, so the owner can simply agree."
+                  },
+                  "options": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 5,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    }
+                  }
+                }
+              }
+            },
+            "split": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 6,
+              "description": "Only with too-large: the parts, each small enough for one run, in the order they should be done.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "title",
+                  "scope"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120
+                  },
+                  "scope": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1200
+                  }
+                }
+              }
+            }
+          }
         }
       },
       "allOf": [

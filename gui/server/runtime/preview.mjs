@@ -1,4 +1,5 @@
 import { resolvePlaybook } from '../config/load.mjs'
+import { sizingSummary } from './triage-sizing.mjs'
 
 /*
  * Dry-run preview.
@@ -27,7 +28,9 @@ function knownContext (issue, project, playbook) {
       project: issue?.project ?? project?.id ?? null
     },
     project: { id: project?.id ?? null, path: project?.path ?? null },
-    playbook: { id: playbook.id, title: playbook.title, description: playbook.description ?? null }
+    playbook: { id: playbook.id, title: playbook.title, description: playbook.description ?? null },
+    // A sized issue's triage decision (issue.json `sizing`); unsized, the slot says where it comes from.
+    ...(issue?.sizing ? { sizing: sizingSummary(issue.sizing) } : {})
   }
 }
 
@@ -47,6 +50,7 @@ function describeRef (ref, stepsById) {
   if (ref === 'plan.approved') return 'the plan the auditor approved, tied to that audit'
   if (ref.startsWith('revision.current')) return 'fingerprint of the candidate, once one exists'
   if (ref.startsWith('checks.latest')) return 'result of the most recent check run'
+  if (ref === 'sizing') return "the issue's triage sizing (issue.json sizing: size, each seat's sentence, affected modules), frozen into the run's window"
   return 'not known until the run starts'
 }
 
@@ -128,6 +132,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
       output: step.output ?? null,
       outputSlot: step.output ? symbolic(`${step.id}.output`, `${step.output} produced at runtime`) : null,
       recordsRevision: Boolean(step.recordsRevision),
+      concurrent: step.concurrent === true,
       promptSource,
       context: (step.context ?? []).map((ref) => {
         const value = resolvePath(ctx, ref)
@@ -219,6 +224,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     parameterDefinitions: r.parameterDefinitions,
     playbook: r.playbook,
     strategy: r.strategy,
+    tactic: r.tactic ?? null,
     intent: r.intent && { id: r.intent.id, title: r.intent.title, description: r.intent.description, source: r.intent.source, steps: Object.keys(r.intent.guidance) },
     participants,
     phases,

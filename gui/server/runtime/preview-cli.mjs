@@ -35,7 +35,7 @@ if (issueRef) {
   const [projectId, ...rest] = issueRef.split('/')
   const issues = await import('../issues.js')
   const found = await issues.getIssue(projectId, rest.join('/'))
-  issue = { name: found.name, openedOn: found.openedOn, path: found.path, project: found.project }
+  issue = { name: found.name, openedOn: found.openedOn, path: found.path, project: found.project, sizing: found.sizing ?? null }
   project = { id: projectId, path: projectPath(projectId) }
 }
 
@@ -72,7 +72,8 @@ for (const phase of p.phases) {
   for (const step of phase.steps) {
     const guard = step.when ? ` ${c.dim}when${c.off} ${step.when}` : ''
     const rev = step.recordsRevision ? ` ${c.dim}[fingerprints the candidate]${c.off}` : ''
-    console.log(`      ${step.id.padEnd(28)} ${c.dim}${step.role}${c.off}${guard}${rev}`)
+    const together = step.concurrent ? ` ${c.dim}[runs at once with the adjacent concurrent steps]${c.off}` : ''
+    console.log(`      ${step.id.padEnd(28)} ${c.dim}${step.role}${c.off}${guard}${rev}${together}`)
     if (step.promptSource.kind === 'template') {
       console.log(`        ${c.dim}prompt${c.off}  ${step.promptSource.template}`)
     } else {
@@ -81,6 +82,8 @@ for (const phase of p.phases) {
     if (step.output) console.log(`        ${c.dim}output${c.off}  ${step.output} → ${sym(step.outputSlot)}`)
     const runtime = step.context.filter((x) => x.availability === 'runtime')
     if (runtime.length) console.log(`        ${c.dim}needs${c.off}   ${runtime.map((x) => sym(x.slot)).join(' ')}`)
+    const known = step.context.filter((x) => x.availability === 'now')
+    if (known.length) console.log(`        ${c.dim}context${c.off} ${known.map((x) => x.ref).join(' ')}`)
   }
   for (const b of phase.branches) {
     console.log(`      ${c.yellow}branch${c.off} ${c.dim}if${c.off} ${b.when} ${c.dim}→${c.off} ${b.to} ${c.dim}(${b.outcome})${c.off}`)

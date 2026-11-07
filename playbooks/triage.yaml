@@ -1,21 +1,24 @@
 id: triage
-version: 3
+version: 4
 title: Triage
-description: Coordinate once, investigate the reported claim, and return the result directly.
+description: Coordinate once, investigate and size the reported claim with two seats at once, and recommend the next playbook.
 strategy: triage
-strategyVersion: 2
+strategyVersion: 3
 participants:
   coordinator:
     model: opus-5-5
     effort: low      # the owner's default since 2026-11-07: a low-effort coordinator everywhere
   investigator:
     model: opus-5-5
-    effort: medium
+    effort: low
+  investigator-2:
+    model: gpt-6.1-sol
+    effort: low
 autoClose:
   minimumVerification: review-only
   justification: Completing triage records a disposition; the issue stays open for implementation.
 budgets:
-  maxSteps: 4
+  maxSteps: 6        # brief + two concurrent investigators leaves room for repair turns
   wallClockMinutes: 5
-  maxTokens: 60000
+  maxTokens: 120000
   maxCostUsd: 1

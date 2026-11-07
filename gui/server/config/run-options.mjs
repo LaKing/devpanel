@@ -43,6 +43,10 @@ const validate = new Ajv2020({ allErrors: true }).compile({
     // e.g. to implement an analysis's findings. Off by default: a new run sees
     // only human input.
     accumulate: { type: 'boolean' },
+    // A triage that closes autonomous starts the playbook its sizing recommends,
+    // through the ordinary admission (server/auto-start.mjs). Triage only; it
+    // changes nothing the run itself does, so it is left out of the configHash.
+    autoStart: { type: 'boolean' },
     // A supervisor inquiry (Phase 4): frozen into the snapshot so the run's
     // findings stay proposals and publish nothing. Only the engine's inquiry
     // path sets it; resolution accepts it for the analysis tactic alone.

@@ -5,6 +5,7 @@ import { engineFixture } from './fakes/fixture.mjs'
 import { setIssueDependencies, openDependencies } from '../server/issue-dependencies.mjs'
 import { buildOverview } from '../server/supervisor-overview.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
+import { startAdmission } from '../server/start-admission.mjs'
 
 export const name = 'issue dependencies — prerequisites order the backlog and hold supervisor starts'
 
@@ -84,7 +85,8 @@ export default async function (t) {
       start: async () => { started++; return { runId: 'r1', status: 'running' } },
       getRun: async () => ({ status: 'completed' }),
       setDependencies: async (a) => { recorded.push(a); return { dependsOn: a.dependsOn } },
-      openDependencies: async () => open
+      // The same admission start_run and an automatic start pass (start-admission.mjs).
+      startAdmission: async (a) => startAdmission({ issue: { id: 'second', project: 'p', dependsOn: { issues: open.map((d) => ({ project: d.project, id: d.id })) } }, playbook: a.playbook }, { read: async () => ({ id: 'first', name: 'First' }) })
     }
     const agent = await createTopSupervisor({ dir, models: async () => [{ id: 'm', title: 'M', model: 'm', verification: { status: 'verified' } }], adapter, tools, pollMs: 20 })
     script = [

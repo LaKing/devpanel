@@ -6,6 +6,7 @@ import crypto from 'node:crypto'
 import { constants } from 'node:fs'
 import { writeJson, writeAtomic } from './persistence.mjs'
 import { priorRunSources } from './prior-runs.mjs'
+import { readIssueSizing } from './triage-sizing.mjs'
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 
 export async function captureWindow ({ issuePath, runId, workspace, evidence = [], previous = null, reason = 'run start', limits = {}, accumulate = false }) {
@@ -103,7 +104,9 @@ export async function captureWindow ({ issuePath, runId, workspace, evidence = [
   for(const s of await packedSummaries(path.dirname(path.dirname(issuePath)),path.basename(path.dirname(issuePath)))){
     if(!known.has(s.issue.id))issues.push({id:s.issue.id,name:s.issue.name,status:s.issue.status,kind:s.issue.kind??null,archived:true})
   }
-  const window={id,manifest:path.join(dir,'window.json'),inputBudget:previous?.inputBudget??inputBudget,previous:previous?.id??null,reason,startedAt,capturedAt:new Date().toISOString(),source:{path:workspace.path,baseCommit:workspace.baseCommit,base:workspace.base},files,inputs:previous?.inputs??inputs,accumulated:previous?previous.accumulated??null:accumulated,issues,coverage:'Source is the recorded snapshot; logs are bounded captures at the recorded times, not a continuous live view.'}
+  // The issue's triage sizing as it stood when the run began (triage-sizing.mjs); a refresh keeps it.
+  const sizing=previous?(previous.sizing??null):await readIssueSizing(issuePath)
+  const window={id,manifest:path.join(dir,'window.json'),sizing,inputBudget:previous?.inputBudget??inputBudget,previous:previous?.id??null,reason,startedAt,capturedAt:new Date().toISOString(),source:{path:workspace.path,baseCommit:workspace.baseCommit,base:workspace.base},files,inputs:previous?.inputs??inputs,accumulated:previous?previous.accumulated??null:accumulated,issues,coverage:'Source is the recorded snapshot; logs are bounded captures at the recorded times, not a continuous live view.'}
   await writeJson(path.join(dir,'window.json'),window)
   return window
 }

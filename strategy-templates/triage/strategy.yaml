@@ -1,14 +1,19 @@
 id: triage
-version: 2
+version: 3
 title: Triage
-description: A short coordinator handoff followed by a precise investigator disposition.
+description: A short coordinator handoff, then two investigator seats at once, each recording a disposition and an order-of-magnitude size.
 tactic: triage
 roles:
   coordinator:
     description: Coordinates from supplied task, reports and engine evidence only; delegates technical work.
     invokesOthers: false
   investigator:
-    description: Checks the reported claim and records a short disposition.
+    description: Checks the reported claim, records a short disposition and sizes the issue (Minor or Major, affected modules).
+    writesCode: false
+    invokesOthers: false
+  investigator-2:
+    description: A second, independent sizing of the same issue, run at the same time. Its size and modules are folded with the first seat's; its findings are never published.
+    optional: true
     writesCode: false
     invokesOthers: false
 workspace:
@@ -28,9 +33,9 @@ checks:
   requirement: none
   boundToRevision: true
 budgets:
-  maxSteps: 4
+  maxSteps: 6
   wallClockMinutes: 10
-  maxTokens: 100000
+  maxTokens: 200000
   maxCostUsd: 1
   onExhausted: unresolved
 phases:
@@ -49,6 +54,21 @@ phases:
       role: investigator
       prompt: investigate.md
       output: triageDisposition
+      concurrent: true
+      context:
+        - issue
+        - project
+        - steps.brief.output.prompt
+        - window
+  # The second seat sizes the same issue at the same time (concurrent steps run
+  # at once); the run records major unless both seats say minor.
+  - id: investigate-2
+    step:
+      id: investigate-2
+      role: investigator-2
+      prompt: investigate.md
+      output: triageDisposition
+      concurrent: true
       context:
         - issue
         - project

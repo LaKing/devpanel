@@ -14,6 +14,7 @@ import { explainRun } from './runtime/run-explanation.mjs'
 import { closureWithAcceptances, readAcceptedRisks } from './runtime/residual-risks.mjs'
 import { ownerLiveness } from './runtime/lock.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
+import { readAutoStart } from './auto-start.mjs'
 
 /*
  * Read-only views of runs.
@@ -222,6 +223,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     integrity: run.integrity ?? null,
     currentWindow: run.currentWindow ?? null,
     reportDisposition: run.reportDisposition ?? null,
+    // What a triage's autoStart did once the run ended (auto-start.mjs), or null.
+    autoStart: await readAutoStart(issuePath, runId),
     release: run.release ?? null,
     // What the paid probes cost, kept even when they refused the launch.
     preflight: run.preflight ?? null,

@@ -44,7 +44,7 @@ Available actions:
 deploy_staging {project,issueId};
 inspect_environment {project,environment,resource};
 list_issues {project,offset?,limit?} (a page of rows, 50 by default; next names the following page); get_result {resultId,offset?} (reads on in a result shown truncated, by its JSON text); get_issue {project,issueId}; get_run {project,issueId,runId}; get_check_log {project,issueId,runId,check,command} (check is the zero-padded directory number, e.g. 004; command is the recorded command id, e.g. admin-context-selftest; use this for check logs, which are not issue-step files); get_step {project,issueId,runId,step}; get_file {project,issueId,step,name};
-preview {project,issueId,playbook,runOptions:{}} (runOptions.accumulate:true gives the run what earlier runs of the issue produced — e.g. an implementation of an analysis's findings; without it a run sees only the report and notes);
+preview {project,issueId,playbook,runOptions:{}} (runOptions.accumulate:true gives the run what earlier runs of the issue produced — e.g. an implementation of an analysis's findings; without it a run sees only the report and notes); a triage sizes the issue with two seats (Minor or Major, affected modules) and records sizing.recommendedPlaybook (prompt for Minor, plan-and-implement for Major) on the run's reportDisposition and on the issue (get_issue issue.sizing); a triage preview carries runOptions.autoStart:true unless you pass false, and then, when the triage closes with autonomy verdict autonomous, the panel starts that playbook itself through the same admission, limits and ledger as start_run, recorded on the triage run as autoStart (started run, or the refusal); otherwise the recommendation is yours to preview and start;
 refresh_checks_run {project,issueId,runId} (for a retained code run blocked at closure, or stopped only by failed checks on a revision every auditor approved (blockedReason checks-failed-unchanged; checks-inconclusive, where the base's own selftest run did not finish, so refresh drives a fresh base and an author round would change nothing; or rounds-exhausted with actions including "refresh-checks") after operator testDrive configuration changes; runs the installed checks against the unchanged candidate and requests fresh coordinator confirmation; never waives an unmet criterion); accept_check_result_run {project,issueId,runId,revision,failures,reason} (for a run you own whose actions include "accept-check-result": every auditor approved the revision and only its check stands in the way, and you judge the named failures unrelated to the change; copy revision and failures exactly from the run's acceptCheck; the engine refuses anything outside your authority: you may accept only named test failures, each new against a compared base, at most 3, nothing left not run, on a playbook whose minimumVerification is review-only; you may never accept a whole command, a timeout, a crash, a suite-level entry, a failure no comparison judged, or anything on a playbook that closes only on passed checks: those are the operator's, so ask_operator with your recommendation; try refresh_checks_run first when the failure may be flaky. The result accepted:false means nothing is accepted yet: the coordinator confirms this revision first, you are woken when the run changes, and closure.acceptedCheckRisk appears only if it confirmed; checkAcceptanceRefusal says why it did not, and repeating the action will not change that. An accepted run still goes through normal delivery and reads as not verified); reconcile_delivery_run {project,issueId,runId} (for a run you own whose actions include "reconcile-delivery": its approved patch was refused delivery because edits in the source conflict with the patch's own paths (delivery itself merges edits that do not overlap); the engine merges that patch three-way onto the current source, resolves a conflict only on a path the project declares workspace.reconcile append (keeping the source and appending the candidate's added lines), refuses any other conflict or any change to the reviewed delta, reruns the configured checks on the merged candidate, carries the approvals and delivers; a refusal leaves the run blocked with the paths or the gate's reason listed, and a new run of the issue still starts from the approved patch); continue_run {project,issueId,runId,instruction} (for a run you own whose actions include "continue": it stopped at closure with its candidate retained; the author gets another round in the same worktree and sessions, with your instruction, the closure record and the issue notes added since the run began; use it when the record shows what to fix, e.g. a failed or crashed test drive; never to waive a criterion); retry_input_run {project,issueId,runId} (only for a failed run with a confirmed input_too_large rejection and clear integrity; continues the existing run with bounded check evidence, preserving completed steps); recover_run {project,issueId,runId} (only for a run you own whose actions include "recover": the server restarted while it was live; reconciles in-flight invocations from the runtimes' records and continues only when nothing is uncertain, otherwise reports what still needs a person); start_run {project,issueId,previewId} (an issue with a report field came from a deployment's report: its trust decides what you may start — anonymous nothing, request only triage or analysis, fault per its reporter; the refusal says which, and the rest is an operator's); stop_run {project,issueId,runId}; answer_run {project,issueId,runId,answer,pauseId} (copy pause.id from the run you inspected) (only for a run with status paused; when pause.options is set the answer must be exactly one of them; decide from evidence you have read, and when it is not enough, read more (get_step, get_check_log, an inquiry) before asking; ask the user only for a reserved decision);
 ask_operator {question, project?, issueId?, options?} (records a question for the operator: options is an optional list of up to 6 short exact answers; name the project and issueId it concerns when there is one; the result gives its questionId);
 overview {stats?} (every project: open issues with age and priority, and what past runs did; the per-configuration and per-seat statistics only with stats: ["byPlaybook"], ["bySeat"] or true);
@@ -298,21 +298,24 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         const result = await tools.preview(a)
         if (!result.ok) return result
         const previewId = crypto.randomUUID()
+        // A triage starts the playbook its sizing recommends when it closes
+        // autonomous, unless the preview asked otherwise (autoStart: false). It is
+        // not part of the configHash, so the preview stays the one just made.
+        const runOptions = result.tactic === 'triage' && a.runOptions?.autoStart === undefined ? { ...(a.runOptions ?? {}), autoStart: true } : (a.runOptions ?? {})
         // The explicitly configured cost ceiling for this configuration, carried
         // from the preview to the reservation. Absent, the run is unpriced and
         // draws on that allowance instead — never on an average of past runs.
-        state.previews[previewId] = { project: a.project, issueId: a.issueId, playbook: a.playbook, runOptions: a.runOptions ?? {}, configHash: result.configHash, maxCostUsd: result.limits?.budgets?.maxCostUsd ?? null }
-        return { ...result, previewId }
+        state.previews[previewId] = { project: a.project, issueId: a.issueId, playbook: a.playbook, runOptions, configHash: result.configHash, maxCostUsd: result.limits?.budgets?.maxCostUsd ?? null }
+        return { ...result, runOptions, previewId }
       }
       case 'start_run': {
         const p = state.previews[a.previewId]
         if (!p || p.project !== a.project || p.issueId !== a.issueId) throw fail('A matching preview is required')
-        // A prerequisite still open means the run could only find out it must wait.
-        const waiting = tools.openDependencies ? await tools.openDependencies(a) : []
-        if (waiting.length) throw fail(`${a.issueId} waits for ${waiting.map((d) => d.project === a.project ? d.id : `${d.project}/${d.id}`).join(', ')}: start the prerequisite first, or clear the dependency with set_dependencies if it no longer holds`)
-        // A reported issue's text was written outside the panel; its trust bounds what may run on it (reporters.mjs).
-        const reportRefusal = tools.reportStartRefusal ? await tools.reportStartRefusal({ ...a, playbook: p.playbook }) : null
-        if (reportRefusal) throw fail(reportRefusal)
+        // An open prerequisite, or a reported issue whose trust does not reach this
+        // playbook: the same admission an automatic start after a triage passes
+        // (start-admission.mjs), asked before any budget or ledger.
+        const refused = tools.startAdmission ? await tools.startAdmission({ ...a, playbook: p.playbook }) : null
+        if (refused) throw fail(refused.message)
         // A start refused as occupied says this issue was wanted, whatever its earlier runs: it is offered when capacity frees.
         const key = `${a.project}/${a.issueId}`
         let r
@@ -916,7 +919,25 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       await save(); kick()
     } catch (e) { monitoringFault('poll', e.message); await save() }
   }
+  /*
+   * A triage this supervisor started closed autonomous with autoStart on
+   * (auto-start.mjs, after the shared start admission): its recommended playbook
+   * starts through the same gate as start_run — session limits, spending windows,
+   * concurrency, the ledger reservation and ownership — and only while the
+   * activation is running. A refusal is returned, never retried here.
+   */
+  async function autoStart ({ project, issueId, playbook, triageRunId }) {
+    if (!['active', 'working'].includes(state.status) || state.finishing || closing) throw fail(`The supervisor is ${state.finishing ? 'finishing' : state.status}; it starts nothing automatically`, 409)
+    const result = await tools.preview({ project, issueId, playbook, runOptions: {} })
+    if (!result?.ok) throw fail(`The recommended playbook ${playbook} does not resolve: ${(result?.errors ?? []).map((e) => e.message).join('; ') || 'unknown error'}`, 422)
+    const started = await startGate.start({ project, issueId, playbook, runOptions: {}, configHash: result.configHash, maxCostUsd: result.limits?.budgets?.maxCostUsd ?? null })
+    message('system', `Started ${playbook} on ${project}/${issueId} (run ${started.runId}), recommended by triage run ${triageRunId}.`)
+    await save()
+    return started
+  }
+
   return {
+    autoStart,
     get: view,
     status: brief,
     // The one ledger writer in this process, lent to advisory decisions so their

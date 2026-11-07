@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { addReporter, readReporters, removeReporter, reporterForKey, reportStartRefusal, setPolicy } from '../server/reporters.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
+import { startAdmission } from '../server/start-admission.mjs'
 
 const wait = async (ok, ms = 5000) => { const end = Date.now() + ms; while (!ok()) { if (Date.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 10)) } }
 
@@ -57,7 +58,7 @@ export default async function (t) {
         preview: async () => ({ ok: true, configHash: 'h' }),
         start: async (a) => { started.push(a.playbook); return { runId: `r${started.length}`, status: 'running' } },
         getRun: async () => ({ status: 'completed' }),
-        reportStartRefusal: async (a) => reportStartRefusal(reported, a.playbook, { reporters })
+        startAdmission: async (a) => startAdmission({ issue: reported, playbook: a.playbook }, { reporters })
       }
       const sup = await fs.mkdtemp(path.join(os.tmpdir(), 'sup-report-'))
       const agent = await createTopSupervisor({ dir: sup, models: async () => [{ id: 'm', title: 'M', model: 'm', verification: { status: 'verified' } }], adapter, tools, pollMs: 20 })

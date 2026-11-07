@@ -45,6 +45,7 @@ phases:
         - issue
         - project
         - window
+        - sizing
         - decisions
       recordsRevision: true
 completion:

@@ -198,6 +198,7 @@ export function summariseRun (detail) {
     checksVerdict: checksVerdict(detail),
     currentWindow: detail.currentWindow ? {id:detail.currentWindow.id,capturedAt:detail.currentWindow.capturedAt,source:detail.currentWindow.source,coverage:detail.currentWindow.coverage} : null,
     reportDisposition: detail.reportDisposition ? {...detail.reportDisposition,response:clip(detail.reportDisposition.response,3000)} : null,
+    autoStart: detail.autoStart ?? null,
     release: detail.release ? {runId:detail.release.runId,environment:detail.release.environment,status:detail.release.status,sha256:detail.release.sha256,checkpointVerified:detail.release.checkpointVerified,commands:detail.release.commands.map(c=>({id:c.id,status:c.status,error:c.error??null}))} : null,
     startedAt: detail.startedAt,
     endedAt: detail.endedAt ?? null,
@@ -269,6 +270,7 @@ export function summarisePreview (preview) {
     configHash: preview.configHash,
     playbook: preview.playbook ? { id: preview.playbook.id, title: preview.playbook.title, description: preview.playbook.description } : null,
     strategy: preview.strategy ? { id: preview.strategy.id, version: preview.strategy.version } : null,
+    tactic: preview.tactic ?? null,
     intent: preview.intent ?? null,
     intents: (preview.parameterDefinitions?.intents ?? []).map((i) => ({ id: i.id, title: i.title })),
     runOptions: preview.runOptions ?? {},
@@ -295,6 +297,8 @@ export function summariseIssue ({ issue, reports, runs }) {
     issue: {
       id: issue.id, name: issue.name, project: issue.project, status: issue.status, archived: issue.archived,
       openedOn: issue.openedOn, openedBy: issue.openedBy ?? null, report: issue.report ?? null, path: issue.path, disposition: issue.disposition ?? null,
+      // The latest triage's sizing: size, each seat's sentence, the modules and the recommended playbook.
+      sizing: issue.sizing ?? null,
       ...(issue.repeats ? { repeats: issue.repeats } : {}), ...(issue.repeatLookup ? { repeatLookup: issue.repeatLookup } : {}), ...(issue.sameTitleAs ? { sameTitleAs: issue.sameTitleAs } : {}),
       // Never clipped: a risk's text, like its id, names it in acceptRisks.
       unacceptedRisks: issue.unacceptedRisks ?? null, acceptedRisks: issue.acceptedRisks ?? [],

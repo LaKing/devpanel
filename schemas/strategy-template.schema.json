@@ -446,7 +446,7 @@
   "$defs": {
     "contextRef": {
       "type": "string",
-      "pattern": "^(window|reports|issue|project|playbook|acceptanceCriteria|decisions|findings\\.outstanding|findings\\.plan|plan\\.current|plan\\.approved|revision\\.current|revision\\.diff|checks\\.latest|steps\\.[a-z0-9-]+\\.(response|output(\\.[A-Za-z0-9_]+)*))$",
+      "pattern": "^(window|sizing|reports|issue|project|playbook|acceptanceCriteria|decisions|findings\\.outstanding|findings\\.plan|plan\\.current|plan\\.approved|revision\\.current|revision\\.diff|checks\\.latest|steps\\.[a-z0-9-]+\\.(response|output(\\.[A-Za-z0-9_]+)*))$",
       "description": "Named reference into run state. findings.plan is the substantial findings raised while the plan was under review, which an implementation reviewer must give a disposition for. plan.current is the latest plan the author produced (revisions included); plan.approved is the plan the approving audit examined, null until a plan review approves. steps.plan.response is only the first draft. {{previous.response}} is deliberately not expressible: a review usually needs the issue, the approved plan, the latest implementation response and the outstanding findings, which must be named individually."
     },
     "step": {
@@ -505,6 +505,11 @@
           "type": "boolean",
           "default": false,
           "description": "After this turn the engine fingerprints the workspace and binds the result to the step."
+        },
+        "concurrent": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only on a single-step phase: run at once with the consecutive single-step phases whose steps are also concurrent (the triage investigators). The loader refuses it on a step with transitions, a revision, a source-writing role, or one that reads another concurrent step's output."
         },
         "access": {
           "type": "string",
