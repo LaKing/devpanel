@@ -17,6 +17,7 @@
  */
 
 import { gatingResult } from './baseline-failures.mjs'
+import { countsForClosure } from './modules-tier.mjs'
 
 const ms = (iso) => { const t = Date.parse(iso ?? ''); return Number.isFinite(t) ? t : null }
 const interval = (from, to) => (from != null && to != null && to > from ? { from, to } : null)
@@ -371,7 +372,7 @@ function targetedMetrics (run) {
   if (!drives.length) return null
   const outcome = (h) => h?.gating ?? h?.result
   const passes = drives.filter((h) => outcome(h) === 'passed')
-  const fullOf = (revision) => history.filter((h) => h.revision === revision && (h.tier ?? 'full') === 'full' && h.result !== 'not-run').at(-1)
+  const fullOf = (revision) => history.filter((h) => h.revision === revision && countsForClosure(h) && h.result !== 'not-run').at(-1)
   return {
     drives: drives.length,
     passed: passes.length,

@@ -9,6 +9,7 @@ import { hostSettings } from '../server/config/host-settings.mjs'
 import { acquire } from '../server/runtime/lock.mjs'
 import { runChecks } from '../server/runtime/checks.mjs'
 import { holdDriveSlot, slotDirectory } from '../server/runtime/drive-slots.mjs'
+import { currentOwner } from '../server/runtime/lock.mjs'
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { systemClock } from '../server/runtime/clock.mjs'
@@ -367,6 +368,78 @@ export default async function (t) {
       const next = await Promise.all([0, 1].map((n) => acquire(path.join(dir, `slot-${n}.lock`), { purpose: 'test' })))
       t.eq('the next acquisition of every slot succeeds', next.length, 2)
       await Promise.all(next.map((lock) => lock.release()))
+    }
+
+    t.section('a modules-tier drive holds its whole host: one candidate at a time, never overlapped by another drive')
+    {
+      await reset()
+      const modules = async (name) => runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp,
+        target: { kind: 'ssh', tier: 'modules', ssh: { hostRef: 'ssh-config:host-m', workdir: await temp('ds-remote-') }, commands: held(name) }, runDir: await temp('ds-run-'), driveTiming: timing() })
+      const slotFile = (n) => path.join(slotDirectory('host-m', slotsDir), `slot-${n}.lock`)
+
+      // (i) a running modules drive holds both slots: a plain drive waits for it.
+      const m1 = modules('xm1')
+      await until('the modules drive', () => exists(started('xm1')))
+      const p1 = drive('ssh-config:host-m', 'xp1')
+      await settle()
+      t.eq('a plain drive does not start beside a modules drive, though the cap is 2', await exists(started('xp1')), false)
+      t.ok('the modules drive holds every slot', await exists(slotFile(0)) && await exists(slotFile(1)))
+      await go('xm1')
+      const first = await m1
+      t.eq('the modules drive passes', first.result, 'passed', first.error)
+      t.eq('recorded as exclusive over the host\'s slots', [first.driveSlot.exclusive, first.driveSlot.slots], [true, 2])
+      await until('the plain drive, once the host is free', () => exists(started('xp1')))
+      await go('xp1')
+      t.eq('the plain drive passes', (await p1).result, 'passed', (await p1).error)
+
+      // (ii) a running plain drive makes a modules drive wait, holding no slot meanwhile;
+      // (iii) and once it is pending no further drive is admitted, though a slot is free.
+      const p2 = drive('ssh-config:host-m', 'xp2')
+      await until('the plain drive', () => exists(started('xp2')))
+      const m2 = modules('xm2')
+      await settle()
+      t.eq('the modules drive waits for the running drive', await exists(started('xm2')), false)
+      t.eq('holding no slot while it waits', await exists(slotFile(1)), false)
+      const p3 = drive('ssh-config:host-m', 'xp3')
+      await settle()
+      t.eq('a later plain drive is not admitted while the modules drive is pending', await exists(started('xp3')), false)
+      await go('xp2')
+      await until('the modules drive, once the running drive ended', () => exists(started('xm2')))
+      await settle()
+      t.eq('the pending plain drive still waits', await exists(started('xp3')), false)
+      await go('xm2')
+      await until('the plain drive after it', () => exists(started('xp3')))
+      await go('xp3')
+      const [second, third, fourth] = await Promise.all([p2, m2, p3])
+      t.eq('all passed', [second.result, third.result, fourth.result], ['passed', 'passed', 'passed'], third.error)
+      t.ok('the modules drive\'s wait is on its record', third.driveSlot.waitMs > 0, JSON.stringify(third.driveSlot))
+
+      // (iv) two modules drives on one host run one after the other.
+      const m3 = modules('xm3')
+      await until('the first modules drive', () => exists(started('xm3')))
+      const m4 = modules('xm4')
+      await settle()
+      t.eq('the second modules drive waits', await exists(started('xm4')), false)
+      await go('xm3')
+      await until('the second, after the first', () => exists(started('xm4')))
+      await go('xm4')
+      t.eq('both passed', [(await m3).result, (await m4).result], ['passed', 'passed'])
+
+      // (v) an admission lock whose modules drive died is taken over, by a plain drive and a modules drive alike.
+      await reset()
+      const deadOwner = { ...(await currentOwner()), pid: 999999, processStartedAt: '1' }
+      const admissionFile = path.join(slotDirectory('host-m', slotsDir), 'exclusive.lock')
+      await fs.mkdir(path.dirname(admissionFile), { recursive: true })
+      await fs.writeFile(admissionFile, JSON.stringify({ purpose: 'test-drive-exclusive', token: 'dead', owner: deadOwner }))
+      const xp9 = drive('ssh-config:host-m', 'xp9')
+      await until('a plain drive past the dead admission', () => exists(started('xp9')))
+      await go('xp9')
+      t.eq('it passes', (await xp9).result, 'passed', (await xp9).error)
+      await fs.writeFile(admissionFile, JSON.stringify({ purpose: 'test-drive-exclusive', token: 'dead', owner: deadOwner }))
+      const xm9 = modules('xm9')
+      await until('a modules drive past the dead admission', () => exists(started('xm9')))
+      await go('xm9')
+      t.eq('it passes too', (await xm9).result, 'passed', (await xm9).error)
     }
 
     t.section('local checks are not capped')

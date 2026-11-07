@@ -446,6 +446,49 @@ never held or cached) and reruns the candidate's checks; Continue gives the
 author a round anyway; Resume is not offered, as replay reaches the same stop.
 The check history marks such a check `inconclusive: true`.
 
+### The modules tier
+
+On a Boilerplate project (one with `infrastructure`) every playbook that records
+revisions resolves its check target to the **modules tier** (`modulesTarget`,
+`tier: modules`, `timing: every-revision`), never to the smoke/full drive, which
+stays on the project for the full verification (docs/project-infrastructure.md
+"The modules tier"). Its drive runs beside the reviews like any every-revision
+target, in a fixed order: lint of the revision's changed `.mjs`/`.vue` files, load
+of the candidate into the stage instance, restart, readiness, one `selftest` run
+per affected module and per core directory (the root with `rootFilter`), the
+modules' browser runs when declared, then the finalizers.
+
+- **Affected modules** are the triage list (`run.currentWindow.sizing`) ∪ the
+  modules of the revision's changed paths; paths outside every module are core.
+  Each revision record carries `affectedModules` (`triage`, `fromPaths`, `modules`,
+  `unlisted`, `notInTree`, `core`) and `modules: { changed, checksums }`: each
+  module's sha256 over its files' path, mode and content hash, from the
+  fingerprint's entries; `changed` is checksum inequality against the base's,
+  recorded once on `run.modules.base`. Every auditor prompt names the changed and
+  tested modules and, when there are any, the unlisted ones; nothing about them
+  refuses.
+- **No base, every failure blocks.** The tier runs no base drive, reads no
+  baseline cache, makes no baseline comparison and records no selftest history,
+  because its instance is the shared stage loaded with this candidate and its
+  tests are only the affected modules'. `gatingResult` of a `tier: modules` record
+  is its result, except that a passing drive whose selftest report names a failed
+  test, or whose report cannot be read or was never shown (the declaration
+  must collect one), gates `failed`; there is no
+  baseline-known path. A failed drive returns the author through the ordinary
+  failed-check path above; a retry (`retryFailed`) runs as for any check.
+- **Closure** counts a modules record where the full drive would count
+  (`countsForClosure`); the check record carries `modules` (`affected`, `lint`,
+  the command → module map `tests`, `unusualFilters`, `selftestFailures`).
+- **Undeclared.** A project with `infrastructure` but no `testDrive.modules` gets
+  each revision's check recorded `unavailable` (`undeclared: true`) with the reason,
+  and nothing is driven; under `requirement: required` closure is unmet.
+- A modules drive holds its staging host whole: no other drive overlaps it
+  (docs/project-infrastructure.md "How many drives a host runs"). Refresh checks
+  of a modules run use the project's modules tier as configured now; a revision's
+  `modules` records the `collections` it was read under, and a drive under other
+  collections (or a newly declared tier) reads the revision's modules, affected
+  modules and the base's checksums again before it runs.
+
 ### Plan findings are owed by the implementation
 
 The substantial findings raised while the plan was under review are recorded as

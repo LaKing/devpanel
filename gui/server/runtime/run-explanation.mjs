@@ -4,6 +4,7 @@ import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
 import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 import { describeConflict } from './source-merge.mjs'
+import { countsForClosure } from './modules-tier.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -32,7 +33,7 @@ import { describeConflict } from './source-merge.mjs'
 function driveWords (run) {
   const revision = run.revisions?.at(-1)?.fingerprint
   const entries = (run.checkHistory ?? []).filter((h) => h.revision === revision)
-  const full = entries.filter((h) => (h.tier ?? 'full') === 'full').at(-1)
+  const full = entries.filter((h) => countsForClosure(h)).at(-1)
   const smoke = entries.filter((h) => h.tier === 'smoke' || h.tier === 'targeted').at(-1)
   const smokeFailed = (smoke?.gating ?? smoke?.result) === 'failed'
   const earlier = smoke?.tier === 'targeted' ? 'targeted tier' : 'smoke'
@@ -56,10 +57,10 @@ function awaitedDriveFailed (run) {
   const findings = run.outstandingFindings ?? []
   if (!findings.length || !findings.every((f) => f.awaitsCheck === true)) return null
   const revision = run.revisions?.at(-1)?.fingerprint
-  const full = (run.checkHistory ?? []).filter((h) => h.revision === revision && (h.tier ?? 'full') === 'full').at(-1)
+  const full = (run.checkHistory ?? []).filter((h) => h.revision === revision && countsForClosure(h)).at(-1)
   const outcome = full?.gating ?? full?.result
   if (!['failed', 'unavailable'].includes(outcome)) return null
-  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1)
+  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && countsForClosure(c)).at(-1)
   return { outcome, findings: findings.map((f) => f.id), timedOut: (check?.commands ?? []).filter((c) => c.timedOut).map((c) => c.id) }
 }
 

@@ -6,7 +6,7 @@ import YAML from 'yaml'
 import { Ajv2020 } from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
 import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-options.mjs'
-import { infrastructureErrors, localChecksErrors, localTarget, stagingTarget, tierErrors } from '../infrastructure.mjs'
+import { infrastructureErrors, localChecksErrors, localTarget, modulesErrors, modulesTarget, tierErrors } from '../infrastructure.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
@@ -234,7 +234,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     if (!validate(await validator(),'playbook', data, file, errors)) continue
     if (projectOnlyTooling(data, file, errors)) continue
     if (playbooks.has(data.id)) { err(errors, `duplicate playbook id "${data.id}"`, file, '/id'); continue }
-    const tiers = tierErrors(data.checks?.target)
+    const tiers = [...tierErrors(data.checks?.target), ...modulesErrors(data.checks?.target)]
     for (const message of tiers) err(errors, message, file, '/checks/target')
     if (tiers.length) continue
     playbooks.set(data.id, { ...data, file, hash })
@@ -685,7 +685,7 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     reviewPolicy: { ...strategy.reviewPolicy, protocolRepair: { ...strategy.reviewPolicy?.protocolRepair, maxAttempts: runOptions.repairAttempts ?? repairCap } },
     retryPolicy: { maxAttempts: 3, baseDelaySeconds: 30, maxDelaySeconds: 600, ...(strategy.retryPolicy ?? {}) },
     checks: infrastructure && steps.some(({ step }) => step.recordsRevision)
-      ? { requirement: REQUIREMENT_RANK[playbookReq] > REQUIREMENT_RANK[infrastructure.testDrive.requirement ?? 'required'] ? playbookReq : (infrastructure.testDrive.requirement ?? 'required'), target: stagingTarget(infrastructure), boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) }
+      ? { requirement: REQUIREMENT_RANK[playbookReq] > REQUIREMENT_RANK[infrastructure.testDrive.requirement ?? 'required'] ? playbookReq : (infrastructure.testDrive.requirement ?? 'required'), target: modulesTarget(infrastructure), boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) }
       : project?.checks && steps.some(({ step }) => step.recordsRevision)
         // A project's own local checks (no SSH staging) replace an absent playbook target the same way.
         ? { requirement: REQUIREMENT_RANK[playbookReq] > REQUIREMENT_RANK[project.checks.requirement ?? 'required'] ? playbookReq : (project.checks.requirement ?? 'required'), target: localTarget(project.checks), boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) }

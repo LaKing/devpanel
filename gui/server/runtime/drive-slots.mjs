@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { hostSettings } from '../config/host-settings.mjs'
@@ -24,6 +25,9 @@ const RESOLVE_ATTEMPT_MS = 30_000
 const RESOLVE_RETRY_MS = 5_000
 const RESOLVE_WINDOW_MS = 5 * 60_000
 const SLOT_POLL_MS = 1_000
+const ADMISSION_POLL_MS = 10
+// The purpose a modules-tier drive's admission lock carries (an ordinary drive's is 'test-drive-admission').
+const EXCLUSIVE = 'test-drive-exclusive'
 
 /** Where a host's slots are. */
 export const slotDirectory = (host, slotsDir = null) => path.join(slotsDir ?? process.env.DEVPANEL_DRIVE_SLOTS_DIR ?? path.join(issuesRoot(), '.drive-slots'), crypto.createHash('sha256').update(host).digest('hex').slice(0, 24))
@@ -66,7 +70,7 @@ const settingsDiffer = (a, b) => {
  * would change what connects) or when stopped: the drive is then `unavailable` or
  * cancelled, having connected to nothing and holding no slot.
  */
-export async function holdDriveSlot ({ target, result, clock, runId = null, signal = null, onWait = null,
+export async function holdDriveSlot ({ target, result, clock, runId = null, signal = null, onWait = null, exclusive = target?.tier === 'modules',
   attemptMs = RESOLVE_ATTEMPT_MS, retryMs = RESOLVE_RETRY_MS, windowMs = RESOLVE_WINDOW_MS, pollMs = SLOT_POLL_MS, slotsDir = null }) {
   const cap = hostSettings().testDrive.maxConcurrentDrives
   const record = { host: null, cap, waitMs: 0, waitedFrom: null, resolveAttempts: 0 }
@@ -115,27 +119,75 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
       await pause(retryMs, signal)
     }
     record.host = host
-
     const dir = slotDirectory(host, slotsDir)
-    let lock
-    for (;;) {
-      for (let slot = 0; slot < cap; slot++) {
-        if (signal?.aborted) throw aborted()
-        try {
-          lock = await acquire(path.join(dir, `slot-${slot}.lock`), { purpose: 'test-drive', runId, clock })
-        } catch (error) {
-          if (!(error instanceof LockHeld)) throw error
-          continue
-        }
-        // Held from here on: a failure before the caller has the handle must not keep it.
-        try {
-          await endWait()
-        } catch (error) {
-          await lock.release()
-          throw error
-        }
-        return { connection: pinned, host, release: () => lock.release() }
+    const take = async (name, purpose = 'test-drive') => {
+      try {
+        return await acquire(path.join(dir, name), { purpose, runId, clock })
+      } catch (error) {
+        if (!(error instanceof LockHeld)) throw error
+        return null
       }
+    }
+    // Held from here on: a failure before the caller has the handle must not keep them.
+    const handOver = async (locks) => {
+      try {
+        await endWait()
+      } catch (error) {
+        for (const l of locks) await l.release()
+        throw error
+      }
+      return { connection: pinned, host, release: async () => { for (const l of [...locks].reverse()) await l.release() } }
+    }
+    if (exclusive) {
+      // The modules tier loads its candidate into the host's stage instance: it holds
+      // the admission lock (so no other drive is admitted meanwhile, and modules drives
+      // queue on it), then every slot, taking none while any is held, so it never waits
+      // while holding a slot. docs/project-infrastructure.md "How many drives a host runs".
+      record.exclusive = true
+      record.slots = cap
+      let admission = null
+      try {
+        for (;;) {
+          if (signal?.aborted) throw aborted()
+          admission ??= await take('exclusive.lock', EXCLUSIVE)
+          if (admission) {
+            const slots = []
+            for (let slot = 0; slot < cap; slot++) {
+              const lock = await take(`slot-${slot}.lock`)
+              if (!lock) break
+              slots.push(lock)
+            }
+            if (slots.length === cap) return await handOver([admission, ...slots])
+            for (const l of slots) await l.release()
+          }
+          await beginWait(admission ? 'host-busy' : 'exclusive')
+          await pause(pollMs, signal)
+        }
+      } catch (error) {
+        await admission?.release()
+        throw error
+      }
+    }
+    for (;;) {
+      if (signal?.aborted) throw aborted()
+      // Admission: a slot is taken only while holding the admission lock, so once a
+      // modules drive holds it no other drive is admitted; it is never held while waiting.
+      const admission = await take('exclusive.lock', 'test-drive-admission')
+      if (!admission) {
+        // Another drive's admission lasts milliseconds and is no wait; a modules drive's is.
+        const holder = await fs.readFile(path.join(dir, 'exclusive.lock'), 'utf8').then((text) => JSON.parse(text).purpose, () => null)
+        if (holder !== EXCLUSIVE) { await pause(ADMISSION_POLL_MS, signal); continue }
+        await beginWait('exclusive')
+        await pause(pollMs, signal)
+        continue
+      }
+      let lock = null
+      try {
+        for (let slot = 0; slot < cap && !lock; slot++) lock = await take(`slot-${slot}.lock`)
+      } finally {
+        await admission.release()
+      }
+      if (lock) return await handOver([lock])
       await beginWait('host-full')
       await pause(pollMs, signal)
     }

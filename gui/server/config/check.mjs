@@ -57,6 +57,11 @@ for (const id of ['releases', 'live-reports']) {
 console.log(`${c.dim}host-config${c.off} ${config.hostDir} (${hostPresent ? 'present' : 'absent'})   ${Object.entries(counts).map(([id, n]) => `${c.dim}${id}${c.off} ${n.tree + n.host} (tree ${n.tree}, host ${n.host})`).join('   ')}`)
 for (const s of config.shadowed) console.log(`  ${mark('warn')} ${s.category}/${s.name}: host-config shadows the in-tree ${s.tree}`)
 for (const p of config.unmatchedPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} prices "${p.id}", which is not in the roster`)
+// Not a failure: coding playbooks run the modules tier on every Boilerplate project, and
+// one that declares none gets an unavailable check on each revision until it does.
+for (const [id, project] of config.projects) {
+  if (project.infrastructure && !project.infrastructure.testDrive?.modules) console.log(`  ${mark('warn')} ${id}: a Boilerplate project without testDrive.modules; coding playbooks record its per-revision check as unavailable until it declares one (docs/project-infrastructure.md "The modules tier")`)
+}
 for (const p of config.invalidPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} is not usable, so that model stays unpriced: ${p.message}`)
 // The host settings (docs/host-config.md "Host settings"): an invalid file is an error here as at server start.
 try {

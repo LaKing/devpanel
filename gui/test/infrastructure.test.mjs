@@ -21,7 +21,10 @@ export default async function (t) {
     kind: 'boilerplate', orientation: 'Application collection is App-modules; framework ownership is separate.',
     staging: { id: 'stage', ssh: { hostRef: 'ssh-config:stage', workdir: dir }, projectRoot: '/opt/stage', files: { log: path.join(dir, 'stage.log') }, statusCommand: 'printf staging-ready' },
     deployments: [{ id: 'production', ssh: { hostRef: 'ssh-config:production', workdir: '/srv' }, projectRoot: '/opt/production', files: {} }],
-    testDrive: { commands: [{ id: 'candidate', run: 'test -f source.txt && printf candidate-tested' }], finallyCommands: [{ id: 'cleanup', run: 'printf cleanup-confirmed' }] }
+    testDrive: { commands: [{ id: 'candidate', run: 'test -f source.txt && printf candidate-tested' }], finallyCommands: [{ id: 'cleanup', run: 'printf cleanup-confirmed' }],
+      // The coding playbooks' per-revision check (the modules tier); the commands above stay for the full verification.
+      modules: { collections: ['@*'], lint: { id: 'lint', run: 'ls {{files}}' }, load: { id: 'load', run: 'test -f source.txt && printf candidate-loaded' }, restart: { id: 'restart', run: 'true' }, ready: { id: 'ready', run: 'true' },
+        test: { id: 'module-selftest', run: 'ls -d {{filter}}' }, finallyCommands: [{ id: 'cleanup', run: "printf 'cleanup-confirmed\\n== runtime/selftest.report\\n{\"tests\":[]}\\n'", report: 'selftest' }] } }
   }
   const file = path.join(f.configRoot, 'projects/devpanel-project.yaml')
   const write = async value => { await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, YAML.stringify({ id: 'devpanel-project', infrastructure: value })) }
@@ -107,7 +110,8 @@ export default async function (t) {
     t.ok('implementer and auditor receive infrastructure', ['implementer', 'auditor-1'].every(role => prompts.some(p => p.role === role && p.prompt.includes(infra.orientation) && p.prompt.includes('inspection-only'))))
     t.ok('authored handoffs to working seats cannot omit the infrastructure brief', prompts.filter(p => p.role !== 'coordinator').every(p => p.prompt.includes(infra.orientation)))
     t.ok('tool-free coordinator turns are not given access they cannot use', prompts.filter(p => p.role === 'coordinator').every(p => !p.prompt.includes('inspection-only')))
-    t.ok('engine records successful revision-bound staging checks', engine.run.checkResults.length > 0 && engine.run.checkResults.every(c => c.result === 'passed' && c.revision && c.commands.some(cmd => cmd.id === 'cleanup')))
+    t.ok('engine records successful revision-bound modules-tier checks over SSH', engine.run.checkResults.length > 0 && engine.run.checkResults.every(c => c.result === 'passed' && c.tier === 'modules' && c.revision && c.commands.some(cmd => cmd.id === 'load') && c.commands.some(cmd => cmd.id === 'cleanup')), JSON.stringify(engine.run.checkResults.map(c => [c.result, c.tier, c.error])))
+    t.ok('the drive held its staging host exclusively', engine.run.checkResults.every(c => c.driveSlot?.exclusive === true))
     await write({ ...infra, orientation: 'Future runs only' })
     t.eq('active run keeps its original infrastructure snapshot', engine.snapshot.infrastructure.orientation, infra.orientation)
   } finally {

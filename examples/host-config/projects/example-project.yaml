@@ -36,10 +36,55 @@ infrastructure:
       notes: Read-only during authoring; promoted only through the Deployment playbook.
   testDrive:
     requirement: required
+    # The full verification (the daily cycle, the Deployment playbook): an isolated
+    # drive of the whole application. A `tiers.smoke` subset may stay declared here
+    # too; coding playbooks run neither per revision.
     commands:
       - id: selftest
         run: npm test
         timeoutSeconds: 900
+    # The modules tier: the per-revision check of the Implementation, Plan and
+    # implement, Prompt and Refactoring playbooks (docs/project-infrastructure.md
+    # "The modules tier"). Each drive runs in this order, every command in the
+    # drive's archived candidate directory on the staging host:
+    #   lint (the revision's changed .mjs/.vue files) -> load -> restart -> ready
+    #   -> test once per affected module and core directory -> browser (if declared)
+    #   -> finallyCommands.
+    # The candidate is loaded INTO the shared stage instance and stays running there
+    # until the next drive; a drive holds the whole staging host, so one candidate
+    # at a time. There is no base drive: a failing test of an affected module blocks.
+    # The framework has no per-module test script, so the commands are composed from
+    # what it has: quick-deploy.sh (load), the starter (restart) and the running
+    # instance's `selftest` CLI (test).
+    modules:
+      # Top-level directories that are collections; <collection>/<module>/ is a module.
+      collections: ['@*', '*-modules']
+      # A change at the repository root runs the framework's own selftests under this filter.
+      rootFilter: core
+      # The project's linter over the changed files, each passed as one quoted argument.
+      lint: { id: lint, run: 'node_modules/.bin/eslint --no-warn-ignored {{files}}', timeoutSeconds: 300 }
+      # quick-deploy.sh copies the application source from the candidate directory
+      # (its working directory) into the stage instance, keeping instance config,
+      # secrets, datastore and logs, as it does for a manual quick deploy.
+      load: { id: load, run: '/opt/staging.example.invalid/quick-deploy.sh --from "$PWD"', timeoutSeconds: 900 }
+      # The starter: the instance's own service, restarted on the loaded source.
+      restart: { id: restart, run: 'systemctl restart project.service', timeoutSeconds: 180 }
+      # Bounded readiness: the starter writes its ready line to the application log.
+      ready: { id: ready, run: 'timeout 300 sh -c "until grep -q ready /opt/staging.example.invalid/runtime/log/current/project.log; do sleep 2; done"', timeoutSeconds: 320 }
+      # The selftest CLI of the running instance, once per affected module
+      # (filter <collection>/<module>) and per core directory (filter = the directory).
+      test: { id: module-selftest, run: '/opt/staging.example.invalid/runtime/processes/cli/project.main selftest {{filter}}', timeoutSeconds: 900 }
+      # Browser scenarios of a module, when the project has a runner for them:
+      # browser: { id: module-browser, run: '/opt/staging.example.invalid/runtime/processes/cli/project.main browser {{filter}}', timeoutSeconds: 900 }
+      # The selftest report and the log tail, recorded as for any drive.
+      finallyCommands:
+        - id: collect-selftest-report
+          run: 'echo "== runtime/selftest.report"; cat /opt/staging.example.invalid/runtime/selftest.report'
+          report: selftest
+          timeoutSeconds: 60
+    # Under structured confinement (`kind` on every command) load, restart, ready,
+    # test and the collector are `kind: privileged`: they act on the stage instance,
+    # which a candidate command cannot see; lint may be `kind: candidate`.
   release:
     targets:
       staging:

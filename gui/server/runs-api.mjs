@@ -264,7 +264,9 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
       // A retained workspace still holds work nothing else captured.
       retainedReason: run.workspace.retainedReason ?? null
     },
+    // Each revision carries the modules tier's `modules` and `affectedModules`; the base's checksums once.
     revisions: run.revisions,
+    modulesBase: run.modules?.base ? { at: run.modules.base.at, modules: Object.keys(run.modules.base.checksums).length } : null,
     currentRevision,
     approvals,
     checkResults,

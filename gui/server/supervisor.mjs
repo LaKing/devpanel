@@ -3,7 +3,8 @@ import { writeRunResultStep } from './run-result-step.mjs'
 import { resumeArchivedCoverageNotes, resumeCoverageNotes, stagingRunCoverage, writeRunCoverageNotes } from './staging-coverage.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
 import { createPathOverlap, deliveryActionOf, worthRecording } from './runtime/path-overlap.mjs'
-import { projectInfrastructure, stagingTarget } from './infrastructure.mjs'
+import { modulesTarget, projectInfrastructure, stagingTarget } from './infrastructure.mjs'
+import { isModulesTarget } from './runtime/modules-tier.mjs'
 import { projectPath as projectDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
@@ -577,7 +578,7 @@ export function createSupervisor ({
         }
       }
       const setup = resume && awaitsSetup(engine.run)
-      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin, acceptShortWallClock }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets, acceptShortWallClock }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? stagingTarget(infra) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin, acceptShortWallClock }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets, acceptShortWallClock }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? (isModulesTarget(engine.snapshot.checks?.target) ? modulesTarget(infra) : stagingTarget(infra)) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
       // Stopped before it had a workspace: the setup it never finished, from its
       // own snapshot, and the turns after it, as a start would have gone on.
       if (setup) {

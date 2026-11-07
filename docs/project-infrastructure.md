@@ -219,6 +219,85 @@ later or set `tiers.continueSmoke: false`, which is also the choice when a smoke
 finalizer changes application data: a smoke's finalizers run before the commands that
 continue.
 
+The smoke and full tiers are the **full verification** of a project: the daily cycle and
+the Deployment playbook. The coding playbooks (Implementation, Plan and implement, Prompt,
+Refactoring) do not run them per revision on a Boilerplate project; they run the modules
+tier below, and no `timing: approved` full drive runs there.
+
+### The modules tier: lint, load, the affected modules' selftests
+
+On every project with `infrastructure` (a Boilerplate project) the check of every
+playbook that records revisions is the **modules tier** (`testDrive.modules`), run on each
+recorded revision beside its reviews. One drive does, in this order:
+
+1. **lint**: the project's lint command over the revision's changed `.mjs`/`.vue` files
+   (added or modified against the base), each passed as one quoted argument; left out,
+   and recorded so, when there are none;
+2. **load**, **restart**, **ready**: the candidate loaded into the project's stage
+   instance by the declared load command (it runs in the drive's archived candidate
+   directory), the instance restarted, and readiness awaited;
+3. **test**: the framework's `selftest` CLI once per affected module, with that module as
+   its filter, then once per core directory; and **browser** once per affected module
+   when the project declares how;
+4. the **finallyCommands** (log and selftest report collection). Result, per-command logs
+   and the selftest report are recorded as for any drive, with `tier: modules`.
+
+```yaml
+testDrive:
+  modules:
+    collections: ['@*', '*-modules']   # top-level directories that are collections
+    rootFilter: core                   # the filter a repository-root change gets; default '.'
+    lint:    { id: lint, run: 'node_modules/.bin/eslint --no-warn-ignored {{files}}' }
+    load:    { id: load, run: '<projectRoot>/quick-deploy.sh --from "$PWD"' }
+    restart: { id: restart, run: 'systemctl restart project.service' }
+    ready:   { id: ready, run: '...bounded wait...' }
+    test:    { id: module-selftest, run: '<projectRoot>/runtime/processes/cli/<starter>.<thread> selftest {{filter}}' }
+    browser: { id: module-browser, run: '... {{filter}}' }   # optional
+    finallyCommands: [ ... ]
+```
+
+`examples/host-config/projects/example-project.yaml` shows a whole declaration and how
+its commands are composed from `quick-deploy.sh`, the starter and the `selftest` CLI where
+the framework has no script.
+
+**What a revision affects.** A module is `<collection>/<module>/`, where a collection is
+a declared top-level directory. The affected modules are the issue's triage list
+(`sizing.affectedModules`) ∪ the modules of the revision's changed paths. A changed path
+outside every module is **core**: its directory gets a test run with the directory as the
+filter, and a repository-root path gets `rootFilter` (default `.`), so the framework's own
+selftests of the touched directories run. A changed module the triage did not list is
+recorded as `affectedModules.unlisted` and told to the auditor; a listed module the tree
+does not hold is `notInTree` and still tested. Nothing about the affected modules ever
+refuses a drive: the templates take `{{files}}`/`{{filter}}` as a word of their own (the
+targeted tier's rules), so whatever bytes a path holds it reaches the program as one
+argument; a filter a program might still read as an option (a leading `-`) is listed in
+`modules.unusualFilters` and runs anyway.
+
+**Checksums.** For the base (`run.modules.base`) and for every revision, each module's
+sha256 over its files' path, mode and content hash, read off the fingerprint's entries
+and so under its rule and excludes. A revision carries
+`modules: { changed, checksums }`; `changed` is the modules whose checksum differs from
+the base's. The issue page shows the latest revision's changed modules.
+
+**Why no baseline.** The tier has no base drive and no baseline comparison: a failing
+affected-module test, or a failed test in a report behind a passing exit, blocks the
+revision (a retry runs as for any check). The stage instance is the project's one shared
+instance: a base drive would have to load the base into it and evict the candidate, and the
+tests that run are only those of modules the revision touched or the triage named, where an
+inherited failure is the author's to see, not to pass over. The baseline machinery
+(`compareBaseline`, `baselineCache`, unstable selftests) stays with the full tier.
+
+**One candidate per host.** The candidate is loaded into the running instance, which stays
+running with the last candidate. A modules drive therefore holds its staging host whole
+("How many drives a host runs"). A project with `infrastructure` but no `testDrive.modules`
+gets each revision's check recorded `unavailable`, saying why, and no drive; under a
+required check closure blocks until the project declares one (`npm run config:check` warns).
+The tier carries no `tiers`, `compareBaseline`, `baselineCache` or `timing: approved`;
+every command is required and none is a service. The test slot or a finalizer must declare
+`report: selftest`: a passing drive whose report names a failed test, cannot be read, or was
+not shown at all gates failed. Test and browser commands are numbered `<id>-<n>`, so no
+declared id may take that form.
+
 ### The targeted tier: named selftests on a repair revision
 
 ```yaml
@@ -306,7 +385,16 @@ projects may share a host. `testDrive.maxConcurrentDrives` in the host settings
 processes. A drive over it waits, is never failed for waiting, and can be stopped. Every
 drive counts: candidate and base, smoke and full, a retry, a diagnostic drive. A base reused
 from the cache is not a drive, a kept smoke instance holds no slot while it waits for its
-full drive, and local checks are not capped. The wait is on the check result
+full drive, and local checks are not capped.
+
+A modules-tier drive loads its candidate into the host's stage instance, so it holds the
+host whole: it takes the host's admission lock (`exclusive.lock` beside the slots), then
+every slot, taking none while any is held, and keeps them all until it ends. Every other
+drive takes its one slot only while holding the admission lock for that moment, so once a
+modules drive holds the lock no other drive is admitted, a drive already running finishes
+first, and modules drives queue one after another. Drives that load nothing into the stage
+instance (isolated smoke, full and diagnostic drives) still share the host up to the cap
+among themselves; `maxConcurrentDrives: 1` serialises those too. The wait is on the check result
 (`driveSlot`), counted as check waiting in run metrics (`driveSlotWaitMs`) and, with no
 seat turn running, not charged to the wall-clock budget (execution-contract.md "What the
 wall clock counts").

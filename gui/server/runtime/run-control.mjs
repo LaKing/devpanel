@@ -1,4 +1,5 @@
 import { gatingResult, identifyCheckFailures } from './baseline-failures.mjs'
+import { countsForClosure } from './modules-tier.mjs'
 
 /*
  * An automatic reconcile applies and is undecided (auto-reconcile.mjs): the marker
@@ -124,7 +125,7 @@ const ACCEPTABLE_BLOCKS = ['closure-conditions-unmet', 'refreshed-checks-failed'
 /** The revision, and what accepting its latest full check would have to name. */
 export function acceptableCheck (run) {
   const revision = run.revisions?.at(-1)?.fingerprint ?? null
-  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1) ?? null
+  const check = (run.checkResults ?? []).filter((c) => c.revision === revision && countsForClosure(c)).at(-1) ?? null
   return { revision, check, ...identifyCheckFailures(check, run) }
 }
 

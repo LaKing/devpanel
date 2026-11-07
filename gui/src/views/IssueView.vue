@@ -1488,6 +1488,11 @@ watch(() => route.query.run, (runId) => {
                 <h3 class="block__sub">Candidate</h3>
                 <p v-if="!run.currentRevision" class="muted">No code candidate was produced.</p>
                 <p v-else class="kv"><span>Revision</span><code class="wrap">{{ run.currentRevision }}</code> <span class="muted">({{ run.revisions.length }} recorded)</span></p>
+                <template v-if="run.revisions.at(-1)?.modules">
+                  <p class="kv"><span>Changed modules</span><template v-if="run.revisions.at(-1).modules.changed.length"><code v-for="m in run.revisions.at(-1).modules.changed" :key="m" class="mr-2">{{ m }}</code></template><span v-else class="muted">none</span></p>
+                  <p v-if="run.revisions.at(-1).affectedModules?.unlisted?.length" class="kv"><span>Not in the triage list</span><code v-for="m in run.revisions.at(-1).affectedModules.unlisted" :key="m" class="mr-2">{{ m }}</code></p>
+                  <p v-if="run.revisions.at(-1).affectedModules?.core" class="kv"><span>Core directories</span><code v-for="d in run.revisions.at(-1).affectedModules.core.dirs" :key="d" class="mr-2">{{ d }}</code></p>
+                </template>
 
                 <h3 class="block__sub">Approvals</h3>
                 <p v-if="!run.approvals.length" class="muted">None.</p>
@@ -1496,8 +1501,9 @@ watch(() => route.query.run, (runId) => {
                 <h3 class="block__sub">Checks</h3>
                 <p class="muted">requirement {{ run.checks?.requirement ?? '—' }} · target {{ run.checks?.target?.kind ?? 'none' }}</p>
                 <div v-for="c in run.checkResults" :key="`${c.revision}:${c.at}`" class="check">
-                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="c.carriedFrom"> · carried from <code>{{ short(c.carriedFrom) }}</code>, no drive</template><template v-if="c.continuedFrom"> · continued the smoke's instance</template><template v-else-if="c.continuation"> · from scratch ({{ c.continuation.reason }})</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
+                  <p class="kv"><span>{{ c.result }}</span><code>{{ short(c.revision) }}</code> · {{ c.target ?? 'no target' }}<template v-if="c.tier"> · {{ c.tier }} tier</template><template v-if="c.materialization"> · candidate {{ c.materialization.verified ? 'verified' : 'NOT verified' }}</template><template v-if="c.carriedFrom"> · carried from <code>{{ short(c.carriedFrom) }}</code>, no drive</template><template v-if="c.continuedFrom"> · continued the smoke's instance</template><template v-else-if="c.continuation"> · from scratch ({{ c.continuation.reason }})</template><template v-if="!c.appliesToCurrentRevision"> · superseded</template></p>
                   <p v-if="c.error" class="muted">{{ c.error }}</p>
+                  <p v-for="m in c.modules?.tests ?? []" :key="m.id" class="kv kv--indent"><code>{{ m.id }}</code> {{ m.slot }} of <code>{{ m.module ?? `core ${m.core}` }}</code></p>
                   <p v-for="cmd in c.commands ?? []" :key="cmd.id" class="kv kv--indent">
                     <v-icon :icon="cmd.passed ? '$checkCircle' : '$alertCircle'" size="14" :color="cmd.passed ? 'success' : cmd.required ? 'error' : 'warning'" />
                     <code>{{ cmd.id }}</code> exit {{ cmd.exitCode ?? cmd.signal ?? '—' }}{{ cmd.timedOut ? ' (timed out)' : '' }}{{ cmd.required === false ? ' · optional' : '' }}<template v-if="cmd.durationMs != null"> · {{ Math.round(cmd.durationMs / 1000) }}s</template> · <code>{{ c.dir }}/{{ cmd.log }}</code>

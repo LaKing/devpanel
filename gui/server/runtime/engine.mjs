@@ -29,6 +29,7 @@ import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
+import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
@@ -383,7 +384,13 @@ const checksAfterApproval = (snapshot) => snapshot.checks?.requirement !== 'none
  * counts for closure; a record without a tier is a full one.
  */
 const tiered = (snapshot) => Array.isArray(snapshot.checks?.target?.tiers?.smoke)
-const isFull = (c) => (c?.tier ?? 'full') === 'full'
+// The tier a check of `target` records: modules for the modules tier, one of a
+// tiered target's (full unless the smoke or a targeted run with names is asked
+// for), none for an untiered target.
+const levelOf = (target, tier, { selection = null, fromRun = false } = {}) => isModulesTarget(target) ? 'modules'
+  : target?.tiers ? ((fromRun && tier === 'targeted' && !selection?.tests ? 'smoke' : tier) ?? 'full') : null
+// What closure and the gates read: the full drive, or the modules tier where it is the target.
+const isFull = countsForClosure
 // Only a revision that an OCCUPIED reviewer of its loop will approve can wait:
 // one from a phase without a review loop (the Prompt playbook), or from a loop
 // whose reviewer seats are all empty, is checked at once, or nobody would.
@@ -1852,12 +1859,15 @@ export class Engine {
     // refreshed since then may not, and a tier with no names to fill has nothing to run.
     const selection = configured.tiers?.targeted ? this.run.targetedSelections?.[current] ?? null : null
     // A tiered target runs one tier per call: the full drive unless the smoke or the targeted tier is asked for.
-    const level = configured.tiers ? ((tier === 'targeted' && !selection?.tests ? 'smoke' : tier) ?? 'full') : null
+    const level = levelOf(configured, tier, { selection, fromRun: true })
     if (!force && this.run.checkResults.some((c) => c.revision === current && (c.tier ?? null) === level)) return
-    const target = tierTarget(configured, level, selection?.tests)
     const step = [...this.run.steps].reverse().find((s) => s.revision === current)
+    if (level === 'modules' && !configured.modules) return await this.recordUndeclaredModules({ configured, current, step })
     const fp = await fingerprint(this.run.workspace.path, { baseCommit: this.run.workspace.baseCommit, baseline: this.baseline ?? new Map(), clock: this.clock, projection: workspaceProjection(this.run.workspace) })
     if (fp.fingerprint !== current) return   // the workspace moved on; nothing to check yet
+    // The modules tier is expanded for this revision: lint files and affected modules come from its own entries.
+    const drive = level === 'modules' ? this.modulesDriveFor(configured, fp) : null
+    const target = drive ? drive.target : tierTarget(configured, level, selection?.tests)
     // Whether the revision was already approved when its check began: run
     // metrics count the failures that came after agreement.
     const afterApproval = this.run.approvals.some((a) => a.revision === current)
@@ -1878,6 +1888,7 @@ export class Engine {
         result.error = `the targeted drive passed, but its selftest report does not show these named tests as run: ${missing.join(', ')}`
       }
     } else if (level === 'smoke' && selection?.declined) result.targetedDeclined = selection.declined
+    if (drive) result.modules = { affected: drive.affected, ...drive.plan, ...result.modules }
     // Why this full drive ran from scratch; the attempts say so when a retry replaced the drive that knew.
     if (level === 'full' && !result.continuedFrom) {
       const replaced = result.attempts?.find((a) => a.continuedFrom)
@@ -1906,11 +1917,45 @@ export class Engine {
       ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}),
       ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}),
       ...(result.targeted ? { targeted: result.targeted } : {}), ...(result.targetedDeclined ? { targetedDeclined: result.targetedDeclined } : {}),
+      ...(result.modules ? { modules: { tests: result.modules.tests.length, unlisted: result.modules.affected?.unlisted ?? [] } } : {}),
       // Survives a new revision, so the next one's targeted decision can read what failed.
       ...(configured.tiers?.targeted && namedFailuresOf(result).length ? { namedFailures: namedFailuresOf(result) } : {}) })
     await this.persist({ type: 'checks', revision: current, ...tierOf, ...namedTests, result: result.result, commands: result.commands?.length ?? 0,
       ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}) })
     if (level === 'full') await this.recordTargetedMiss(result, current)
+  }
+
+  /**
+   * One modules-tier drive of a fingerprinted candidate: the revision's recorded
+   * affected modules (computed again for a candidate no revision records yet)
+   * and its changed .mjs/.vue files, in the tier's fixed order.
+   */
+  modulesDriveFor (configured, fp) {
+    const recorded = this.run.revisions.findLast((r) => r.fingerprint === fp.fingerprint)
+    // Recorded under the collections being driven, or read again: a refresh may declare modules
+    // for an undeclared run, or other collections, and the revision then gets the new reading.
+    const sameMapping = JSON.stringify(recorded?.modules?.collections ?? null) === JSON.stringify(configured.modules.collections)
+    let affected = sameMapping ? recorded?.affectedModules : null
+    if (!affected) {
+      const computed = this.revisionModules(fp, { declared: configured.modules })
+      affected = computed.affectedModules
+      if (recorded) Object.assign(recorded, computed)
+    }
+    return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries) }), affected }
+  }
+
+  /**
+   * A Boilerplate project that declares no modules tier: the revision's check is
+   * unavailable, saying why, with nothing driven. Coding playbooks never fall back
+   * to the smoke/full drive (docs/project-infrastructure.md "The modules tier").
+   */
+  async recordUndeclaredModules ({ configured, current, step }) {
+    const at = this.clock.iso()
+    const error = `${this.run.issue?.project ?? 'this project'} declares no testDrive.modules: the modules tier, the per-revision check of coding playbooks on a Boilerplate project, has nothing to run (docs/project-infrastructure.md "The modules tier"). The smoke and full tiers are not run per revision by coding playbooks.`
+    const result = { revision: current, result: 'unavailable', target: configured.kind ?? null, tier: 'modules', at, durationMs: 0, materialization: null, commands: [], error, dir: null, undeclared: true }
+    this.run.checkResults.push({ ...result, step: step?.number ?? null })
+    ;(this.run.checkHistory ??= []).push({ revision: current, tier: 'modules', result: 'unavailable', gating: 'unavailable', at, step: step?.number ?? null, afterApproval: this.run.approvals.some((a) => a.revision === current), dir: null, runs: [] })
+    await this.persist({ type: 'checks', revision: current, tier: 'modules', result: 'unavailable', commands: 0, undeclared: true })
   }
 
   /** A full drive that failed where the targeted tier passed on the same bytes: what the tier's trade-off is measured by. */
@@ -1932,7 +1977,7 @@ export class Engine {
    * decided here; the rest is proved on the staging host (checks.mjs).
    */
   async instanceDecision ({ configured, level, target, force, overrideTarget, current, stale }) {
-    if (level === 'targeted') return {}
+    if (level === 'targeted' || level === 'modules') return {}
     const plan = continuationPlan(configured)
     if (!plan) return {}
     if (level === 'smoke') return !force && !overrideTarget && !plan.refusal ? { keep: { seconds: plan.keepSeconds } } : {}
@@ -1991,6 +2036,17 @@ export class Engine {
       platform: this.platform,
       runId: this.runId,
       onDriveWait: (wait) => this.noteDriveWait(wait)
+    }
+    // The modules tier has no base drive, cache, comparison or stability record: it
+    // drives the candidate (a failure retried as any check's), and a failed test in its
+    // reports blocks the revision (execution-contract.md "The modules tier").
+    if (target.tier === 'modules') {
+      const first = await runChecks({ ...common, revision: current, fingerprint: fp })
+      const result = await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target, earlier: [], base: null })
+      const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })
+      // Tagged before any caller gates it (maybeRunChecks, reconcile): gatingResult reads the tier.
+      Object.assign(result, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
+      return result
     }
     // The baseline: the same target (of a tier: the same tier) on the base
     // commit (the source revision), once per run and target, reused by later
@@ -2168,9 +2224,9 @@ export class Engine {
     const ws = this.run.workspace
     const current = this.run.revisions.at(-1)?.fingerprint ?? null
     const configured = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
-    const tier = request.tier ?? 'full'
+    const tier = isModulesTarget(configured) ? 'modules' : request.tier ?? 'full'
     const record = { n, diagnostic: true, requestStep, requestedBy: step.role, phase: phase.id, round, stepId: step.id, ofRevision: current, reason: request.reason, patch: request.patch,
-      ...(configured?.tiers || request.tier ? { tier } : {}), status: 'running', result: null, at: this.clock.iso(), durationMs: null, dir: `checks/${dirName}` }
+      ...(configured?.tiers || request.tier || tier === 'modules' ? { tier } : {}), status: 'running', result: null, at: this.clock.iso(), durationMs: null, dir: `checks/${dirName}` }
     const refuse = async (code, detail) => {
       Object.assign(record, { status: 'refused', refused: { code, detail }, error: detail, durationMs: 0 })
       drives.push(record)
@@ -2180,7 +2236,8 @@ export class Engine {
     if (ws?.isolation === 'in-place') return refuse('in-place', 'an in-place run has no base and patch to rebuild a variant from; run the issue isolated to use a diagnostic drive')
     if (['quarantined', 'abandoned'].includes(this.run.integrity?.status)) return refuse('integrity', `the run's source integrity is ${this.run.integrity.status}`)
     if (!configured) return refuse('no-target', 'this project has no check target to drive')
-    if (tier === 'smoke' && !configured.tiers) return refuse('no-smoke-tier', 'this check target has no smoke tier')
+    if (request.tier === 'smoke' && !configured.tiers) return refuse('no-smoke-tier', 'this check target has no smoke tier')
+    if (tier === 'modules' && !configured.modules) return refuse('no-target', 'this project declares no testDrive.modules, so the modules tier has nothing to drive')
     const baseline = this.baseline ?? new Map()
     const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline, clock: this.clock, projection: workspaceProjection(ws) })
     if (!current || fp.fingerprint !== current) return refuse('workspace-moved', 'the worktree is no longer the revision this request was made on')
@@ -2195,7 +2252,7 @@ export class Engine {
     drives.push(record)
     await this.persist({ type: 'diagnostic-drive-started', n, ofRevision: current, ...(record.tier ? { tier } : {}) })
     await this.hook('beforeDiagnosticDrive')
-    const target = tierTarget(configured, configured.tiers ? tier : null)
+    const target = tier === 'modules' ? this.modulesDriveFor(configured, fp).target : tierTarget(configured, configured.tiers ? tier : null)
     let result
     try {
       result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), dirName, variant: { patchFile } }))
@@ -2206,6 +2263,29 @@ export class Engine {
     Object.assign(record, rest, { status: result.refused ? 'refused' : 'finished', result: result.refused ? null : result.result, variant: { ...frozen, ...variant } })
     await this.persist({ type: 'diagnostic-drive', n, status: record.status, result: record.result, commands: record.commands?.length ?? 0 })
     await this.hook('afterDiagnosticDrive')
+  }
+
+  /**
+   * The modules tier's record of a revision (execution-contract.md "The modules
+   * tier"): each module's checksum, the modules whose checksum differs from the
+   * base's (recorded once on `run.modules.base`), and what the revision affects.
+   * Read off the fingerprint's entries and the run's baseline, so under the
+   * fingerprint's rule. Nothing when the project declares no modules tier.
+   */
+  revisionModules (fp, { entries = fp.entries, declared = (this.run.checkRefresh?.target ?? this.snapshot.checks?.target)?.modules } = {}) {
+    if (!declared) return {}
+    this.run.modules ??= {}
+    // The base's checksums under the collections in force: a refreshed declaration may name others.
+    const sameCollections = JSON.stringify(this.run.modules.base?.collections ?? null) === JSON.stringify(declared.collections)
+    if (!this.run.modules.base || (this.run.modules.base.collections && !sameCollections)) {
+      this.run.modules.base = { rule: fp.rule, collections: declared.collections, checksums: moduleChecksums(baseFiles(this.baseline), declared.collections), at: this.clock.iso(), ...(this.baselineMissing ? { baselineMissing: true } : {}) }
+    }
+    const checksums = moduleChecksums(revisionFiles(fp.entries), declared.collections)
+    return {
+      // `collections`: the mapping these were read under, so a drive under another declaration reads them again.
+      modules: { changed: changedModules(this.run.modules.base.checksums, checksums), checksums, collections: declared.collections },
+      affectedModules: affectedModules({ triage: this.run.currentWindow?.sizing?.affectedModules ?? [], entries, collections: declared.collections, checksums })
+    }
   }
 
   /** Fingerprint the workspace and bind it to the step that produced it. */
@@ -2220,7 +2300,7 @@ export class Engine {
     })
     const step = this.run.steps.find((s) => s.number === number)
     if (step) step.revision = fp.fingerprint
-    this.run.revisions.push({ fingerprint: fp.fingerprint, byStep: number, at: this.clock.iso(), rule: fp.rule })
+    this.run.revisions.push({ fingerprint: fp.fingerprint, byStep: number, at: this.clock.iso(), rule: fp.rule, ...this.revisionModules(fp) })
 
     // A new candidate invalidates every approval and check result taken against
     // an older one. They are never carried forward.
@@ -2465,6 +2545,9 @@ export class Engine {
       append('tooling', `Source workspace: ${this.run.workspace.path}. ${tooling.writesCode ? 'You may edit and stage source; do not change Git HEAD or create commits.' : 'Source and Git state are read-only for your role. Write temporary files and output only in the scratch directory.'}${tooling.allowedRoots.length ? ` You may also read ${tooling.allowedRoots.join(', ')}.` : ''} ${tooling.allowLiveCheckout ? 'You may read the project\'s live checkout.' : `Do not read or run anything from the project's live checkout${tooling.liveCheckout ? ` at ${tooling.liveCheckout}` : ''}: tooling loaded from there is code outside the candidate.`}`)
       if (this.run.checkResults.length) append('check-logs', `The run's check logs are readable (read-only): ${path.join(store.runDir(this.issuePath, this.runId), 'checks')}, one directory per check (a check record's \`dir\`), each command's full .log and .stdout, the base drive under base-*. When a criterion needs a test name, a timing or a log line the summary does not hold, read it there and quote it; do not report it as unreadable or ask for it.`)
     }
+    // The modules tier: what the revision under review affects, and what the triage did not list.
+    const revisionRecord = this.run.revisions.at(-1)
+    if (step.output === 'reviewResult' && revisionRecord?.affectedModules) append('affected-modules', affectedModulesNotice(revisionRecord))
     // Diagnostic drives: how to ask, the answer to an asking, and what every later seat must not mistake for a check.
     const diagnosticDrives = this.run.diagnosticDrives ?? []
     const diagnosticTarget = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
@@ -3422,7 +3505,7 @@ export class Engine {
   startChecks (tier = null) {
     if (this.checksInFlight) return this.checksInFlight
     const current = this.run.revisions.at(-1)?.fingerprint ?? null
-    const level = this.snapshot.checks?.target?.tiers ? (tier ?? 'full') : null
+    const level = levelOf(this.snapshot.checks?.target, tier)
     if (!current || this.run.checkResults.some((c) => c.revision === current && (c.tier ?? null) === level)) return null
     this.checksRevision = current
     this.checksTier = tier
@@ -4016,7 +4099,7 @@ export class Engine {
     for (const c of this.run.checkResults) if (c.revision === approvedRevision) { c.revision = fresh.fingerprint; c.migratedFrom = approvedRevision }
     for (const step of this.run.steps) if (step.revision === approvedRevision) step.revision = fresh.fingerprint
     for (const a of [this.run.closure?.acceptedCheckRisk, this.run.checkAcceptanceRequest]) if (a?.revision === approvedRevision) { a.revision = fresh.fingerprint; a.migratedFrom = approvedRevision }
-    this.run.revisions.push({ fingerprint: fresh.fingerprint, byStep: recorded.byStep, at, rule: fresh.rule, migratedFrom: approvedRevision, migratedRule: rule })
+    this.run.revisions.push({ fingerprint: fresh.fingerprint, byStep: recorded.byStep, at, rule: fresh.rule, migratedFrom: approvedRevision, migratedRule: rule, ...this.revisionModules(fresh) })
     await this.persist({ type: 'revision-migrated', from: approvedRevision, to: fresh.fingerprint, rule: fresh.rule, previousRule: rule })
     return true
   }
@@ -4110,7 +4193,7 @@ export class Engine {
       } else {
         // Revalidation: the configured checks on the merged candidate, judged as closure judges them.
         configured = this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
-        const target = configured?.tiers ? tierTarget(configured, 'full') : configured
+        const target = isModulesTarget(configured) ? (configured.modules ? this.modulesDriveFor(configured, candidate.fingerprint).target : null) : configured?.tiers ? tierTarget(configured, 'full') : configured
         const requirement = this.snapshot.checks.requirement
         const runs = Boolean(target) && (target.kind === 'local' || requirement === 'required')
         check = runs ? await this.checkCandidate({ target, revision, fingerprint: candidate.fingerprint, baseCommit: candidate.baseCommit, baseline: candidate.baseline, workspacePath: candidate.path }) : null
@@ -4133,11 +4216,11 @@ export class Engine {
       // Accepted: the merged candidate is the run's revision, with the approvals carried.
       const original = this.run.approvals.filter((a) => a.revision === approved.revision && !a.reconciledFrom)
       this.run.approvals = [...original, ...original.map((a) => ({ ...a, revision, reconciledFrom: approved.revision }))]
-      const driven = check ? [{ ...check, ...(configured?.tiers ? { tier: 'full' } : {}), reconciledFrom: approved.revision, step: null }] : []
+      const driven = check ? [{ ...check, ...(configured?.tiers ? { tier: 'full' } : isModulesTarget(configured) ? { tier: 'modules' } : {}), reconciledFrom: approved.revision, step: null }] : []
       const result = carried ? [{ ...carried, revision, reconciledFrom: approved.revision, carriedFrom: approved.revision, carriedBecause: 'inert-drift-only', carriedAt: this.clock.iso(), step: null }] : driven
       this.run.checkResults = [...this.run.checkResults.filter((c) => c.revision === approved.revision), ...result]
       this.run.revisions.push({ fingerprint: revision, byStep: this.run.revisions.find((r) => r.fingerprint === approved.revision)?.byStep ?? null, at: this.clock.iso(),
-        rule: candidate.fingerprint.rule, reconciledFrom: approved.revision, baseCommit: candidate.baseCommit })
+        rule: candidate.fingerprint.rule, reconciledFrom: approved.revision, baseCommit: candidate.baseCommit, ...this.revisionModules(candidate.fingerprint) })
       Object.assign(entry, { state: 'accepted', endedAt: this.clock.iso() })
       this.run.status = 'running'
       this.run.blockedReason = null
@@ -4340,7 +4423,7 @@ export class Engine {
         // Same rule as any other new candidate: approvals and checks do not carry.
         this.run.approvals = this.run.approvals.filter((a) => a.revision === current)
         this.run.checkResults = this.run.checkResults.filter((c) => c.revision === current)
-        this.run.revisions.push({ fingerprint: current, byStep: null, at: this.clock.iso(), detectedAt: 'closure' })
+        this.run.revisions.push({ fingerprint: current, byStep: null, at: this.clock.iso(), detectedAt: 'closure', ...this.revisionModules(fresh) })
       }
     }
 

@@ -417,6 +417,9 @@
             "tiers": {
               "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/tiers"
             },
+            "modules": {
+              "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/modules"
+            },
             "baselineCache": {
               "type": "object",
               "additionalProperties": false,

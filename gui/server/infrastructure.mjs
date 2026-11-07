@@ -19,6 +19,8 @@ export function infrastructureErrors (infra) {
   for (const c of infra.testDrive.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
   errors.push(...reportingErrors(infra.testDrive))
   errors.push(...tierErrors(infra.testDrive))
+  // The project's tiers and baseline are the full verification; the modules tier stands beside them.
+  errors.push(...modulesErrors({ modules: infra.testDrive.modules, confinement: infra.testDrive.confinement }))
   for (const name of infra.testDrive.baselineCache?.stagingFiles ?? []) if (!infra.staging.files?.[name]) errors.push(`testDrive.baselineCache.stagingFiles: ${name} is not in infrastructure.staging.files`)
   const deployment = [...(infra.stagingDeployment?.commands ?? []), ...(infra.stagingDeployment?.diagnostics ?? [])]
   if (new Set(deployment.map(c => c.id)).size !== deployment.length) errors.push('stagingDeployment command ids must be unique')
@@ -77,14 +79,15 @@ const NOT_A_TEST_COMMAND = new Set([...SHELL_WORDS, ...RUNNERS])
  * a called program does with its arguments cannot be seen from here
  * (docs/project-infrastructure.md "The targeted tier").
  */
-function templateProblem (run) {
-  const count = run.split('{{tests}}').length - 1
-  if (count !== 1) return `must hold {{tests}} exactly once, found ${count}`
+function templateProblem (run, placeholder = 'tests') {
+  const slot = `{{${placeholder}}}`
+  const count = run.split(slot).length - 1
+  if (count !== 1) return `must hold ${slot} exactly once, found ${count}`
   const [command, ...words] = run.split(' ')
   if (!TEMPLATE_COMMAND.test(command)) return `must start with a literally named command, not ${JSON.stringify(command)}: anything more complex belongs in a script`
   if (NOT_A_TEST_COMMAND.has(command.slice(command.lastIndexOf('/') + 1))) return `must name a program that takes the tests as arguments; ${command} is a shell word or runs its arguments`
   for (const word of words) {
-    if (word !== '{{tests}}' && !TEMPLATE_WORD.test(word)) return `must be plain words separated by single spaces, with {{tests}} as a word of its own, not ${JSON.stringify(word)}: anything more complex belongs in a script`
+    if (word !== slot && !TEMPLATE_WORD.test(word)) return `must be plain words separated by single spaces, with ${slot} as a word of its own, not ${JSON.stringify(word)}: anything more complex belongs in a script`
   }
   return null
 }
@@ -111,6 +114,51 @@ function targetedErrors (target, all) {
   if (!selected.some(c => isSelftestReport(c.report))) errors.push('tiers.targeted: no command of the tier declares report: selftest, so nothing could prove the named tests ran')
   const problem = templateProblem(targeted.run)
   if (problem) errors.push(`tiers.targeted.run ${problem}`)
+  return errors
+}
+
+/** The modules tier's slots in drive order (`modules-tier.mjs` expands test and browser per filter). */
+export const MODULE_SLOTS = ['lint', 'load', 'restart', 'ready', 'test', 'browser']
+
+/**
+ * A modules tier (`modules`, docs/project-infrastructure.md "The modules tier"):
+ * the templates take their placeholder once in the targeted tier's plain-word
+ * form, so every file and filter reaches its program as one argument; every slot
+ * is required and none is a service; and it carries no tiers or baseline, which
+ * belong to the full verification.
+ */
+export function modulesErrors (target) {
+  const modules = target?.modules
+  if (!modules) return []
+  const errors = []
+  const slots = MODULE_SLOTS.filter((slot) => modules[slot]).map((slot) => ({ slot, ...modules[slot] }))
+  const all = [...slots, ...(modules.finallyCommands ?? [])]
+  if (new Set(all.map((c) => c.id)).size !== all.length) errors.push('modules: command ids must be unique')
+  for (const c of slots) {
+    if (c.required === false) errors.push(`modules.${c.slot}: every command of the modules tier is required`)
+    if (c.service === true) errors.push(`modules.${c.slot}: a modules command cannot be a service (the stage instance is the project's own)`)
+    if (c.needs || c.join) errors.push(`modules.${c.slot}: the modules tier runs in a fixed order; needs and join do not apply`)
+  }
+  for (const c of modules.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
+  // The selftest report is the tier's evidence: a drive that collects none could pass unexamined.
+  if (!all.some((c) => isSelftestReport(c.report))) errors.push('modules: no command declares report: selftest (the test slot or a finalizer), so nothing would show which tests ran or failed')
+  // Test and browser expand to `<id>-<n>`: no declared id may be one of those, or a log would overwrite another's.
+  const expanding = ['test', 'browser'].filter((slot) => modules[slot]).map((slot) => modules[slot].id)
+  if (modules.browser && modules.browser.id === modules.test.id) errors.push('modules: test and browser need different ids, they expand to the same <id>-<n>')
+  for (const c of all) {
+    for (const id of expanding) if (new RegExp(`^${id}-[0-9]+$`).test(c.id)) errors.push(`modules: ${c.id} is the id a generated ${id} command takes (${id}-<n>); rename one`)
+  }
+  const placeholder = { lint: 'files', test: 'filter', browser: 'filter' }
+  for (const c of slots) {
+    if (placeholder[c.slot]) {
+      const problem = templateProblem(c.run, placeholder[c.slot])
+      if (problem) errors.push(`modules.${c.slot}.run ${problem}`)
+    } else if (/\{\{(files|filter|tests)\}\}/.test(c.run)) errors.push(`modules.${c.slot}.run: only lint takes {{files}} and only test and browser take {{filter}}`)
+  }
+  if (target.tiers) errors.push('modules and tiers do not go on one target: the modules tier is the per-revision check, tiers are the full verification')
+  if (target.compareBaseline || target.baselineCache) errors.push('the modules tier has no base drive: compareBaseline and baselineCache do not apply')
+  if (target.timing === 'approved') errors.push('the modules tier runs on every revision beside the reviews; timing: approved contradicts it')
+  errors.push(...confinedCommandErrors({ commands: slots.map(({ slot, ...c }) => c), finallyCommands: modules.finallyCommands, confinement: target.confinement }).filter((e) => !e.startsWith('testDrive.confinement is set')))
   return errors
 }
 
@@ -163,6 +211,24 @@ export function stagingTarget (infra) {
     ...(infra.testDrive.baselineCache ? { baselineCache: (({ stagingFiles = [], ...rest }) => ({ ...rest, files: stagingFiles.map((n) => infra.staging.files?.[n]).filter(Boolean) }))(infra.testDrive.baselineCache) } : {}),
     // The command-level fence (0e) is only as strong as its probe; the target
     // names the project root so the probe can prove it invisible.
+    ...(infra.staging.projectRoot ? { projectRoot: infra.staging.projectRoot } : {}) }
+}
+
+/**
+ * The check target of every playbook that records revisions on a Boilerplate
+ * project (every project with `infrastructure`): the modules tier, beside the
+ * reviews, never the smoke/full drive (those stay on the project for the full
+ * verification). Without `testDrive.modules` the target has no `modules` and
+ * the engine records each revision's check as unavailable, naming why.
+ */
+export function modulesTarget (infra) {
+  const modules = infra.testDrive.modules
+  return { kind: 'ssh', materialize: 'archive', ssh: infra.staging.ssh, tier: 'modules', timing: 'every-revision',
+    commands: modules ? MODULE_SLOTS.filter((slot) => modules[slot]).map((slot) => modules[slot]) : [],
+    ...(modules ? { modules } : {}),
+    ...(modules?.finallyCommands ? { finallyCommands: modules.finallyCommands } : {}),
+    ...(infra.testDrive.confinement ? { confinement: infra.testDrive.confinement } : {}),
+    ...(Number.isInteger(infra.testDrive.retryFailed) ? { retryFailed: infra.testDrive.retryFailed } : {}),
     ...(infra.staging.projectRoot ? { projectRoot: infra.staging.projectRoot } : {}) }
 }
 

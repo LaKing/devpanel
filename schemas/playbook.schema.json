@@ -605,11 +605,79 @@
             }
           }
         },
+        "modules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "collections",
+            "lint",
+            "load",
+            "restart",
+            "ready",
+            "test"
+          ],
+          "anyOf": [
+            {
+              "properties": { "test": { "required": ["report"] } }
+            },
+            {
+              "required": ["finallyCommands"],
+              "properties": { "finallyCommands": { "contains": { "required": ["report"] } } }
+            }
+          ],
+          "description": "The modules tier (docs/project-infrastructure.md \"The modules tier\"): the per-revision check of coding playbooks on a Boilerplate project. Each drive runs, in this order: lint of the revision's changed .mjs/.vue files, load of the candidate into the stage instance, restart, readiness, one `test` command per affected module and per core directory (and one `browser` command per affected module when declared), then finallyCommands. No base drive and no baseline comparison: a failing affected-module test blocks the revision. A drive holds every drive slot of its stage host. The test slot or a finalizer must declare `report: selftest`; a passing drive whose report names a failed test, or shows none, gates failed. No declared id may be a generated `<test.id>-<n>` or `<browser.id>-<n>`.",
+          "properties": {
+            "collections": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9@*._-]+$"
+              },
+              "description": "Top-level directory names that are collections (`*` matches any run of characters, e.g. `@*`, `*-modules`). A module is `<collection>/<module>/`; every other path is core."
+            },
+            "rootFilter": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_@%+=:,./-]+$",
+              "description": "The selftest filter a change at the repository root gets (the root's own core selftests). Default `.`."
+            },
+            "lint": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "The project's lint command over the revision's changed .mjs/.vue files: `command word... {{files}} word...` (the targeted template's rules), each file shell-quoted. Left out of a drive with no such files."
+            },
+            "load": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "Loads the candidate (the drive's archived directory, the command's working directory) into the project's stage instance, which keeps running it."
+            },
+            "restart": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "Restarts the stage instance on the loaded candidate."
+            },
+            "ready": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "Waits, bounded, until the restarted instance is ready."
+            },
+            "test": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "The framework's selftest CLI for one filter: `command word... {{filter}} word...`; run once per affected module (filter `<collection>/<module>`) and per core directory, the filter shell-quoted as one argument. Ids are `<id>-<n>`."
+            },
+            "browser": {
+              "$ref": "#/$defs/checkTarget/properties/commands/items",
+              "description": "Optional: the browser scenarios of one module, `{{filter}}` as for test; run once per affected module."
+            },
+            "finallyCommands": {
+              "$ref": "#/$defs/checkTarget/properties/commands",
+              "description": "Log and report collection, attempted after every drive."
+            }
+          }
+        },
         "tier": {
           "enum": [
             "smoke",
             "targeted",
-            "full"
+            "full",
+            "modules"
           ],
           "description": "Set by the engine on the target of one tier's drive; never configured."
         },

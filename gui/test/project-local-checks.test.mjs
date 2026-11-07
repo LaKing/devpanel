@@ -6,7 +6,7 @@ import { promisify } from 'node:util'
 import YAML from 'yaml'
 
 import { CONFIG_ROOT, resolvePlaybook } from '../server/config/load.mjs'
-import { stagingTarget } from '../server/infrastructure.mjs'
+import { modulesTarget } from '../server/infrastructure.mjs'
 import { runChecks } from '../server/runtime/checks.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { gitWorktreeProvider, releaseWorkspace, startRun } from '../server/runtime/launch.mjs'
@@ -129,11 +129,11 @@ export default async function (t) {
       t.ok('a set without a required command is refused', await refused({ checks: { commands: [{ id: 'x', run: 'true', required: false }] } }, /at least one required command/))
       t.ok('duplicate ids are refused', await refused({ checks: { commands: [{ id: 'x', run: 'true' }], finallyCommands: [{ id: 'x', run: 'true' }] } }, /ids must be unique/))
 
-      t.section('2. P1-ssh-unchanged: an infrastructure project resolves as before')
+      t.section('2. an infrastructure (Boilerplate) project resolves to the modules tier')
       await writeProject(f.configRoot, { infrastructure: infra })
       const ssh = await resolvePlaybook('implementation', { root: f.configRoot, projectId: P })
       t.ok('it resolves', ssh.ok, JSON.stringify(ssh.errors))
-      t.eq('its checks are the staging test drive, exactly', ssh.resolved?.checks, { requirement: 'required', target: stagingTarget(infra), boundToRevision: true })
+      t.eq('its checks are the modules tier, exactly', ssh.resolved?.checks, { requirement: 'required', target: modulesTarget(infra), boundToRevision: true })
     }
 
     t.section('3. P1-gate: required project checks run per revision and a failure gates approval')

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { isSelftestReport, isSuiteLevel, passedSelftests, failedSelftests, readReport, selftestStates } from './baseline-failures.mjs'
+import { countsForClosure } from './modules-tier.mjs'
 
 /*
  * Unstable selftests, from recorded drives (execution-contract.md "Unstable
@@ -338,7 +339,7 @@ export function ignoredSelftests (run) {
   const closing = run?.closure?.checks?.selftest
   if (closing) return closing.unstable ?? []
   const revision = run?.revisions?.at(-1)?.fingerprint
-  const check = (run?.checkResults ?? []).filter((c) => c.revision === revision && (c.tier ?? 'full') === 'full').at(-1)
+  const check = (run?.checkResults ?? []).filter((c) => c.revision === revision && countsForClosure(c)).at(-1)
   return check?.baselineComparison?.selftest?.unstable ?? []
 }
 

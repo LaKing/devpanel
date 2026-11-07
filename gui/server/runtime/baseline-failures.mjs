@@ -512,6 +512,9 @@ export function inconclusiveBase (check, run) {
   return gatingResult({ ...check, baselineComparison: { ...check.baselineComparison, selftest: null } }, run) === 'passed'
 }
 
+/** Whether a modules drive's reports name a failed test, or could not be read. */
+const modulesReportBlocks = (check) => Boolean(check.modules?.selftestFailures?.length || check.modules?.reportUnreadable?.length)
+
 /** Whether a check's selftest reports name a failure it may not pass over. */
 const selftestBlocks = (check) => ['new-failures', 'not-made'].includes(check?.baselineComparison?.selftest?.verdict)
 
@@ -523,6 +526,9 @@ const selftestBlocks = (check) => ['new-failures', 'not-made'].includes(check?.b
  * pass. `result` itself always stays what ran.
  */
 export function gatingResult (check, run) {
+  // The modules tier has no base: a failure blocks, and so does a failed test or an
+  // unreadable report behind a passing exit (execution-contract.md "The modules tier").
+  if (check?.tier === 'modules') return check.result === 'passed' && modulesReportBlocks(check) ? 'failed' : check?.result
   if (check?.result === 'passed') return selftestBlocks(check) ? 'failed' : 'passed'
   if (check?.result !== 'failed') return check?.result
   const f = check.baselineComparison?.failures
@@ -538,6 +544,14 @@ export function gateReason (check, run) {
   if (gatingResult(check, run) === 'passed') return null
   if (!['passed', 'failed'].includes(check?.result)) return `the check did not complete (${check?.result ?? 'no result'})${check?.error ? `: ${check.error}` : ''}`
   const named = (list) => `${list.slice(0, 5).map((f) => `${f.command ?? '?'}: ${f.test}${f.message ? ` (${f.message})` : ''}`).join(', ')}${list.length > 5 ? ` and ${list.length - 5} more` : ''}`
+  if (check.tier === 'modules') {
+    const parts = []
+    const failed = (check.commands ?? []).filter((c) => c.required !== false && !c.passed).map((c) => c.id)
+    if (check.result === 'failed') parts.push(failed.length ? `required ${failed.length === 1 ? 'command' : 'commands'} ${failed.join(', ')} failed` : check.error ?? 'the check failed')
+    if (check.modules?.selftestFailures?.length) parts.push(`the selftest report names failed tests: ${named(check.modules.selftestFailures)}`)
+    if (check.modules?.reportUnreadable?.length) parts.push(`selftest report unreadable: ${check.modules.reportUnreadable.map((r) => `${r.command} (${r.error})`).join(', ')}`)
+    return parts.join('; ') + ' (the modules tier has no base: every failure blocks)'
+  }
   const parts = []
   const f = check.baselineComparison?.failures
   if (check.result === 'failed' && !(f?.verdict === 'baseline-known' && Boolean(f.sourceRevision) && f.sourceRevision === run?.workspace?.baseCommit)) {
