@@ -27,7 +27,7 @@ export const CUMULATIVE_COST_SINCE = '2.1.277'
  * Sessions are PRE-ASSIGNED: `--session-id <uuid>` lets the engine choose the id
  * before the turn starts, so a crash mid-invocation is always reconcilable by id.
  *
- * The `glm` and `deepseek` profiles use this adapter with endpoint and credential
+ * Provider profiles (`deepseek`) use this adapter with endpoint and credential
  * substituted from the roster's references — not a separate runtime.
  */
 
@@ -132,7 +132,7 @@ const CONFIG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
  *
  * Shared by probe() and invoke() on purpose: a probe that echoes a profile but
  * launches with the default provider proves nothing about that profile, and a
- * default-provider success would be reported under a GLM label.
+ * default-provider success would be reported under a provider label.
  */
 export function resolveConnection ({ profile = 'default', endpointRef = null, credentialRef = null, account = null, hygiene = false } = {}) {
   // Under hygiene the child starts from an allow-list, not the panel's whole
@@ -193,7 +193,6 @@ export function resolveConnection ({ profile = 'default', endpointRef = null, cr
   const namespace = crypto.createHash('sha256').update(`${profile}\n${endpoint}`).digest('hex').slice(0, 16)
   env.CLAUDE_CONFIG_DIR = path.join(process.env.DEVPANEL_CLAUDE_PROFILE_ROOT ?? path.join(os.homedir(), '.config/devpanel/claude-profiles'), namespace)
   env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
-  if (profile === 'glm') env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.GLM_CONTEXT_WINDOW ?? '1000000'
   if (profile === 'deepseek') env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.DEEPSEEK_CONTEXT_WINDOW ?? '1000000'
   return { env, applied, error: null }
 }
@@ -547,7 +546,7 @@ async function invokeOnce ({
     Object.assign(costTotals, totals)
   }
   const usage = {
-    provider: profile === 'default' ? 'anthropic' : profile === 'glm' ? 'zai' : profile,
+    provider: profile === 'default' ? 'anthropic' : profile,
     inputTokens: u.input_tokens ?? null,
     outputTokens: u.output_tokens ?? null,
     cacheCreationTokens: u.cache_creation_input_tokens ?? null,

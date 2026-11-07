@@ -85,9 +85,9 @@ export default async function (t) {
   {
     for (const [label, conn] of [
       ['a credential', { account: 'ana', credentialRef: 'file:~/key' }],
-      ['an endpoint', { account: 'ana', endpointRef: 'file:providers/glm.endpoint' }]
+      ['an endpoint', { account: 'ana', endpointRef: 'file:providers/deepseek.endpoint' }]
     ]) {
-      const refused = claudeConnection({ profile: 'glm', ...conn })
+      const refused = claudeConnection({ profile: 'deepseek', ...conn })
       t.ok(`naming an account and ${label} is refused`, Boolean(refused.error), refused.error)
       t.ok('saying why the two are different', /never both/.test(refused.error ?? ''), refused.error)
     }
@@ -253,7 +253,7 @@ export default async function (t) {
   t.section('10. a conflicting connection never reaches a process at all')
   {
     const runs = await spawned(claude, 'DEVPANEL_CLAUDE_BIN', (a, cwd) =>
-      a.invoke({ model: 'claude-opus-5', prompt: 'hi', cwd, account: 'ana', credentialRef: 'file:~/k', profile: 'glm', marker: 'm', meta: { invocationId: 'i' } }))
+      a.invoke({ model: 'claude-opus-5', prompt: 'hi', cwd, account: 'ana', credentialRef: 'file:~/k', profile: 'deepseek', marker: 'm', meta: { invocationId: 'i' } }))
     t.eq('nothing was spawned', runs.length, 0)
   }
 

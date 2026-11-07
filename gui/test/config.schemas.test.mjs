@@ -53,6 +53,6 @@ export default async function (t) {
     t.ok(`${model} has verified selectable efforts`, read(`${model}.yaml`).efforts?.length > 0)
     t.eq(`${model} retains the runtime default`, read(`${model}.yaml`).defaultEffort, null)
   }
-  t.eq('glm effort levels remain unknown', read('glm-via-claude.yaml').efforts, null)
+  t.eq('deepseek effort levels remain unknown', read('deepseek-flash.yaml').efforts, null)
   t.eq('gpt-6-astra verification', read('gpt-6-astra.yaml').verification.status, 'verified')
 }

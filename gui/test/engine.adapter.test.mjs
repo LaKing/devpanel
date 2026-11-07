@@ -136,27 +136,27 @@ export default async function (t) {
 
   t.section('1c. a provider profile reaches the runtime through the engine')
   {
-    process.env.GLM_BASE_URL = 'https://glm.example.invalid/v1'
-    process.env.GLM_AUTH_TOKEN = 'glm-secret'
+    process.env.DEEPSEEK_BASE_URL = 'https://deepseek.example.invalid/v1'
+    process.env.DEEPSEEK_AUTH_TOKEN = 'deepseek-secret'
     const f = await adapterFixture()
-    const rosterFile = path.join(f.configRoot, 'roster/glm-via-claude.yaml')
+    const rosterFile = path.join(f.configRoot, 'roster/deepseek-flash.yaml')
     const roster = await fs.readFile(rosterFile, 'utf8')
-    await fs.writeFile(rosterFile, roster.replace(/^endpointRef: .*$/m, 'endpointRef: env:GLM_BASE_URL').replace(/^credentialRef: .*$/m, 'credentialRef: env:GLM_AUTH_TOKEN'))
-    // Bind the auditor to the glm profile of the same adapter.
+    await fs.writeFile(rosterFile, roster.replace(/^endpointRef: .*$/m, 'endpointRef: env:DEEPSEEK_BASE_URL').replace(/^credentialRef: .*$/m, 'credentialRef: env:DEEPSEEK_AUTH_TOKEN'))
+    // Bind the auditor to the deepseek profile of the same adapter.
     const pb = path.join(f.configRoot, 'playbooks', 'implementation.yaml')
     const text = await fs.readFile(pb, 'utf8')
-    await fs.writeFile(pb, text.replace('model: haiku-4-5', 'model: glm-via-claude'))
+    await fs.writeFile(pb, text.replace('model: haiku-4-5', 'model: deepseek-flash'))
 
     const engine = await start(f)
     await engine.drive()
     const calls = (await readRecord(f.record)).filter((c) => c.marker)
-    const viaGlm = calls.filter((c) => c.received.baseUrl === 'https://glm.example.invalid/v1')
-    t.ok('the auditor\'s turns went through the profile endpoint', viaGlm.length > 0, `${viaGlm.length} of ${calls.length}`)
-    t.eq('with the profile credential', viaGlm[0]?.received.authToken, 'present')
-    t.eq('and the profile wire model', viaGlm[0]?.received.model, 'glm-5.3')
-    t.ok('default-profile turns did not inherit it', calls.some((c) => c.received.baseUrl !== 'https://glm.example.invalid/v1'))
-    delete process.env.GLM_BASE_URL
-    delete process.env.GLM_AUTH_TOKEN
+    const viaProfile = calls.filter((c) => c.received.baseUrl === 'https://deepseek.example.invalid/v1')
+    t.ok('the auditor\'s turns went through the profile endpoint', viaProfile.length > 0, `${viaProfile.length} of ${calls.length}`)
+    t.eq('with the profile credential', viaProfile[0]?.received.authToken, 'present')
+    t.eq('and the profile wire model', viaProfile[0]?.received.model, 'deepseek-flash')
+    t.ok('default-profile turns did not inherit it', calls.some((c) => c.received.baseUrl !== 'https://deepseek.example.invalid/v1'))
+    delete process.env.DEEPSEEK_BASE_URL
+    delete process.env.DEEPSEEK_AUTH_TOKEN
     await releaseWorkspace(engine)
   }
 

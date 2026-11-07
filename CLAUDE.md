@@ -491,7 +491,7 @@ LOGIN fails rather than skips, since that is exactly the regression. The account
 probe never vouches for another's, and changing it archives the supervisor's native session instead of resuming
 it. The account/provider conflict is enforced in `roster-model.schema.json` (account implies `profile: default`
 and forbids endpoint/credential refs), not only in the adapter. `overview.bySeat` groups by roster entry, not
-by account — per-account totals would need an explicit `byAccount` grouping, which does not exist. `glm-via-claude` is the `claude` adapter under its `glm`
+by account — per-account totals would need an explicit `byAccount` grouping, which does not exist. `deepseek-flash` is the `claude` adapter under its `deepseek`
 profile with endpoint/credential substituted from roster *references* (`env:NAME` etc.); credential values
 are never stored, logged or written to run metadata. Adapters export `id`, `capabilities`, `probe()`,
 `invoke()` and `reconcile()`. `claude` and `gemini` pre-assign session ids (`--session-id`, resumed by that

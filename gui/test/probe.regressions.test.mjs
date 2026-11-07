@@ -77,40 +77,40 @@ export default async function (t) {
   {
     const record = path.join(await temp(), 'calls')
     const claude = await shim({ record })
-    process.env.GLM_BASE_URL = 'https://glm.example.invalid/v1'
-    process.env.GLM_AUTH_TOKEN = 'glm-secret'
+    process.env.DEEPSEEK_BASE_URL = 'https://deepseek.example.invalid/v1'
+    process.env.DEEPSEEK_AUTH_TOKEN = 'deepseek-secret'
 
     const probed = await claude.probe({
-      depth: 'model', models: ['glm-4.6'],
-      profile: 'glm', endpointRef: 'env:GLM_BASE_URL', credentialRef: 'env:GLM_AUTH_TOKEN'
+      depth: 'model', models: ['deepseek-flash'],
+      profile: 'deepseek', endpointRef: 'env:DEEPSEEK_BASE_URL', credentialRef: 'env:DEEPSEEK_AUTH_TOKEN'
     })
 
     const call = (await readRecord(record))[0]
-    t.eq('the probe launched against the profile endpoint', call.received.baseUrl, 'https://glm.example.invalid/v1')
+    t.eq('the probe launched against the profile endpoint', call.received.baseUrl, 'https://deepseek.example.invalid/v1')
     t.eq('with the profile credential', call.received.authToken, 'present')
     t.eq('and reports what it APPLIED, not merely what was asked',
       probed.connection.applied.endpoint, true)
-    t.eq('access is reported for that connection', probed.modelAccess['glm-4.6'].status, 'ok')
-    delete process.env.GLM_BASE_URL
-    delete process.env.GLM_AUTH_TOKEN
+    t.eq('access is reported for that connection', probed.modelAccess['deepseek-flash'].status, 'ok')
+    delete process.env.DEEPSEEK_BASE_URL
+    delete process.env.DEEPSEEK_AUTH_TOKEN
   }
 
   t.section('2b. an unresolvable profile is NOT probed against the default provider')
   {
     const record = path.join(await temp(), 'calls')
     const claude = await shim({ record })
-    delete process.env.GLM_BASE_URL
-    delete process.env.GLM_AUTH_TOKEN
+    delete process.env.DEEPSEEK_BASE_URL
+    delete process.env.DEEPSEEK_AUTH_TOKEN
 
     const probed = await claude.probe({
-      depth: 'model', models: ['glm-4.6'],
-      profile: 'glm', endpointRef: 'env:GLM_BASE_URL', credentialRef: 'env:GLM_AUTH_TOKEN'
+      depth: 'model', models: ['deepseek-flash'],
+      profile: 'deepseek', endpointRef: 'env:DEEPSEEK_BASE_URL', credentialRef: 'env:DEEPSEEK_AUTH_TOKEN'
     })
 
     t.eq('nothing was invoked', (await readRecord(record)).length, 0)
     t.eq('authentication is an error, not a success', probed.authentication.status, 'error')
-    t.ok('naming the unresolved reference', /GLM_BASE_URL/.test(probed.authentication.detail), probed.authentication.detail)
-    t.eq('and model access stays unknown', probed.modelAccess['glm-4.6'].status, 'unknown')
+    t.ok('naming the unresolved reference', /DEEPSEEK_BASE_URL/.test(probed.authentication.detail), probed.authentication.detail)
+    t.eq('and model access stays unknown', probed.modelAccess['deepseek-flash'].status, 'unknown')
     t.ok('so a default-provider success can never be reported under this profile', true)
   }
 

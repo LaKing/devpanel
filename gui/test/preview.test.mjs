@@ -78,13 +78,13 @@ export default async function (t) {
   t.section('a profile connection is distinguished from the default')
   {
     const root = await sandbox(async (d) => {
-      await occupySeat(path.join(d, 'playbooks/implementation.yaml'), '  auditor-1:\n    model: glm-via-claude')
+      await occupySeat(path.join(d, 'playbooks/implementation.yaml'), '  auditor-1:\n    model: deepseek-flash')
     })
     const g = await previewRun({ playbookId: 'implementation', configRoot: root, issue, project })
     const auditor = g.participants.find((q) => q.role === 'auditor-1')
-    t.eq('the label names the profile', auditor.connection.label, 'claude[glm]')
-    t.eq('and the endpoint reference is shown, not the secret', auditor.connection.endpointRef, 'file:providers/glm.endpoint')
-    t.eq('credential reference likewise', auditor.connection.credentialRef, 'file:~/.config/zai/key')
+    t.eq('the label names the profile', auditor.connection.label, 'claude[deepseek]')
+    t.eq('and the endpoint reference is shown, not the secret', auditor.connection.endpointRef, 'file:providers/deepseek.endpoint')
+    t.eq('credential reference likewise', auditor.connection.credentialRef, 'file:~/.config/deepseek/key')
   }
 
   // ------------------------------------------------------------ plan

@@ -38,7 +38,7 @@ export default async function (t) {
     ['unknown role', { participants: { stranger: { model: 'haiku-4-5' } } }],
     ['unknown model', { participants: { implementer: { model: 'invented' } } }],
     ['unsupported effort', { participants: { 'auditor-1': { model: 'haiku-4-5', effort: 'high' } } }],
-    ['unknown efforts', { participants: { 'auditor-1': { model: 'glm-via-claude', effort: 'high' } } }],
+    ['unknown efforts', { participants: { 'auditor-1': { model: 'deepseek-flash', effort: 'high' } } }],
     ['instructions path', { participants: { implementer: { instructions: '/etc/passwd' } } }],
     ['null arguments', null], ['array arguments', []]
   ]) t.eq(`${label} rejected`, (await resolvePlaybook(id, { runOptions })).ok, false)

@@ -1,8 +1,8 @@
-# GLM, DeepSeek and Gemini
+# DeepSeek and Gemini
 
-The roster includes GLM-5.3 (`glm-via-claude`), DeepSeek V4.1 Flash
-(`deepseek-flash`), and DeepSeek V4 Pro (`deepseek-v4-pro`). All three run through
-Claude Code, using their provider's Anthropic-compatible API. They can be selected
+The roster includes DeepSeek V4.1 Flash (`deepseek-flash`) and DeepSeek V4 Pro
+(`deepseek-v4-pro`). Both run through Claude Code, using the provider's
+Anthropic-compatible API. They can be selected
 for playbook participants (including coordinators) and the dashboard supervisor.
 Existing playbook selections are unchanged.
 
@@ -10,7 +10,6 @@ Existing playbook selections are unchanged.
 
 | Provider | Endpoint file | Credential file |
 |---|---|---|
-| Z.ai | `providers/glm.endpoint` | `~/.config/zai/key` |
 | DeepSeek | `providers/deepseek.endpoint` | `~/.config/deepseek/key` |
 
 Endpoint files contain a URL. Credential files contain only the API key and should
@@ -45,7 +44,7 @@ The adapter preserves worktree/scratch handling, cancellation, runtime output,
 and tooling restrictions. Provider author turns use Claude's `acceptEdits`
 permission mode; supervisor turns disable tools. Effort overrides remain disabled
 in these roster entries until their runtime mapping is separately verified.
-Token usage is recorded under `zai` or `deepseek`; monetary cost is unknown because
+Token usage is recorded under the profile name (`deepseek`); monetary cost is unknown because
 Claude's Anthropic price estimate is not the provider's bill.
 
 ## Verification
@@ -61,20 +60,23 @@ Run `cd gui && npm run config:check` to validate configuration. Restart the
 running devpanel service after updating adapter code so cached supervisor modules
 use the new implementation.
 
-Provider references: [GLM-5.3](https://docs.z.ai/guides/llm/glm-5.3) and
-[DeepSeek's Anthropic API](https://api-docs.deepseek.com/guides/anthropic_api/).
+Provider reference: [DeepSeek's Anthropic API](https://api-docs.deepseek.com/guides/anthropic_api/).
+The GLM entries that used the same route (Z.ai's endpoint) were retired on 2026-11-07;
+the `profile` mechanism is unchanged, so another Anthropic-compatible provider can be
+added the same way.
 
 
 # Gemini
 
 Gemini models run through Google's own **Gemini CLI** (`harness/gemini.mjs`), not
 through a compatibility endpoint. Google publishes no Anthropic-compatible API, so
-the GLM/DeepSeek route — the claude adapter with an endpoint substituted — does not
+the DeepSeek route — the claude adapter with an endpoint substituted — does not
 apply, and putting a translating proxy in the path would add a permanent moving
-part to every run. The roster carries `gemini-3.1-pro` and `gemini-3.1-flash-lite`;
-an installation verifies them with its configured API key through session-resume
-checks and live fence checks, supplemented by installed-runtime policy evidence
-(`npm run policy:gemini`), and keeps the reports with its own roster copies.
+part to every run. The roster carries `gemini-4-argon` (the Gemini 3.x entries were retired on
+2026-11-07); an installation verifies it with its configured API key through
+session-resume checks and live fence checks, supplemented by installed-runtime
+policy evidence (`npm run policy:gemini`), and keeps the reports with its own roster
+copy. The tracked entry is unverified until then.
 
 ## Installing and authenticating
 
@@ -272,8 +274,8 @@ Two bounded checks establish model access, session continuity and the permission
 Run from `gui/`; `--credential-ref` selects the same key as the roster:
 
 ```sh
-DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-3.1-pro-preview --credential-ref 'file:~/.config/gemini/key'
-DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-3.1-pro-preview --credential-ref 'file:~/.config/gemini/key' --fence
+DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-4-argon --credential-ref 'file:~/.config/gemini/key'
+DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-4-argon --credential-ref 'file:~/.config/gemini/key' --fence
 ```
 
 The first is the two-turn session check: access, and continuity across processes.

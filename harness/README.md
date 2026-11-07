@@ -1,10 +1,9 @@
 # Harness adapters
 
 A harness is a *runtime* — the thing that runs a model and keeps a session. It is
-not a model, and not a provider. `glm-via-claude` is not an adapter; it is the
-`claude` adapter under its `glm` profile, which substitutes the endpoint and
-credential referenced by the roster entry. DeepSeek uses the same adapter with
-its `deepseek` profile. `gemini` IS an adapter: Google publishes no
+not a model, and not a provider. `deepseek-flash` is not an adapter; it is the
+`claude` adapter under its `deepseek` profile, which substitutes the endpoint and
+credential referenced by the roster entry. `gemini` IS an adapter: Google publishes no
 Anthropic-compatible endpoint, so there is nothing to substitute, and its
 permission model is different enough to need its own code. See
 [provider configuration](../docs/model-providers.md).

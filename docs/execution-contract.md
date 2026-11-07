@@ -1755,7 +1755,7 @@ A roster entry distinguishes the two, because the fix differs:
 `verification.status` gates execution rather than loading. An unverified entry
 **resolves for preview** — you can inspect a playbook, read its prompts and see its
 budgets offline — but a live run refuses it. `haiku-4-5` is verified with
-`efforts: []`; `glm-via-claude` has unknown effort levels (`efforts: null`)
+`efforts: []`; `deepseek-flash` has unknown effort levels (`efforts: null`)
 despite verified model access.
 GPT roster entries list the effort levels verified through fresh and resumed
 Codex invocations, with evidence reports referenced in each entry. The Codex

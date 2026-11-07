@@ -1,0 +1,33 @@
+id: gemini-4-argon
+title: Gemini 4 Argon (via Gemini CLI)
+harness: gemini
+model: gemini-4-argon
+efforts: []
+defaultEffort: null
+contextWindow: 1048576
+credentialRef: file:~/.config/gemini/key
+verification:
+  status: unverified
+  verifiedAt: ~
+  method: ~
+  notes: >
+    Listed by the provider's model endpoint (inputTokenLimit 1048576); the
+    installed Gemini CLI passes the identifier through to the API. The two-turn
+    session check and the live --fence check have not passed on any installation
+    yet, so this entry resolves for preview and is refused for live runs. An
+    installation verifies it from gui/ with
+    `DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-4-argon --credential-ref 'file:~/.config/gemini/key'`
+    (then the same with `--fence`) and keeps the reports with its own roster copy.
+notes: >
+  Runs through Google's Gemini CLI. `efforts: []` is a fact about this runtime,
+  not an unknown: the CLI exposes no effort or thinking control, by flag or by
+  setting, so a playbook naming an effort is refused rather than silently run at
+  whatever the runtime picked. Cost is unknown rather than estimated: the CLI
+  reports tokens only, so runs on this entry draw on the unpriced allowance.
+  A role that does not write source gets no write and no shell tools at all on
+  this harness — the fence is a policy — so a Gemini seat cannot run tests or
+  write scratch notes unless it is the author; an author given read-only roots
+  runs with them bind-mounted read-only through bubblewrap (proved before launch;
+  a host without it refuses the turn) and loses the shell for that turn. Each
+  turn is accepted only after the runtime acknowledged the policy file on stderr;
+  the API key is pinned as the auth method through system settings.

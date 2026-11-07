@@ -305,29 +305,29 @@ export default async function (t) {
     const record = path.join(await temp(), 'calls')
     const claude = await adapterUnderTest('claude', { record })
     const cwd = await temp()
-    process.env.GLM_BASE_URL = 'https://glm.example.invalid/v1'
-    process.env.GLM_AUTH_TOKEN = 'glm-secret'
+    process.env.DEEPSEEK_BASE_URL = 'https://deepseek.example.invalid/v1'
+    process.env.DEEPSEEK_AUTH_TOKEN = 'deepseek-secret'
 
-    const glm = await claude.invoke({
-      prompt: 'x', model: 'glm-5.3', cwd, ledgerDir: cwd + '-ledger', marker: 'devpanel:t:g',
-      profile: 'glm', endpointRef: 'env:GLM_BASE_URL', credentialRef: 'env:GLM_AUTH_TOKEN',
-      meta: { invocationId: 'inv-glm' }
+    const viaProfile = await claude.invoke({
+      prompt: 'x', model: 'deepseek-flash', cwd, ledgerDir: cwd + '-ledger', marker: 'devpanel:t:g',
+      profile: 'deepseek', endpointRef: 'env:DEEPSEEK_BASE_URL', credentialRef: 'env:DEEPSEEK_AUTH_TOKEN',
+      meta: { invocationId: 'inv-deepseek' }
     })
 
     const got = (await readRecord(record))[0].received
-    t.eq('the endpoint reached the runtime', got.baseUrl, 'https://glm.example.invalid/v1')
+    t.eq('the endpoint reached the runtime', got.baseUrl, 'https://deepseek.example.invalid/v1')
     t.eq('the credential was supplied', got.authToken, 'present')
-    t.eq('and the wire model is the profile\'s', got.model, 'glm-5.3')
-    t.eq('provider usage is attributed to Z.ai', glm.usage.provider, 'zai')
-    t.eq('Anthropic price estimates are not recorded as provider billing', glm.usage.costUsd, null)
+    t.eq('and the wire model is the profile\'s', got.model, 'deepseek-flash')
+    t.eq('provider usage is attributed to the profile', viaProfile.usage.provider, 'deepseek')
+    t.eq('Anthropic price estimates are not recorded as provider billing', viaProfile.usage.costUsd, null)
 
     // The default profile must NOT inherit it.
     const plain = await temp()
     await claude.invoke({ prompt: 'x', model: 'claude-opus-5', cwd: plain, ledgerDir: plain + '-ledger', marker: 'devpanel:t:h', meta: { invocationId: 'inv-plain' } })
     const second = (await readRecord(record))[1].received
     t.eq('a default-profile turn does not carry the override', second.baseUrl, process.env.ANTHROPIC_BASE_URL ?? null)
-    delete process.env.GLM_BASE_URL
-    delete process.env.GLM_AUTH_TOKEN
+    delete process.env.DEEPSEEK_BASE_URL
+    delete process.env.DEEPSEEK_AUTH_TOKEN
   }
 
   t.section('4b2. provider files, isolated sessions and fail-closed credentials')
@@ -359,7 +359,7 @@ export default async function (t) {
       t.eq('resume uses the same provider session directory', calls[1].received.configDir, got.configDir)
       t.eq('resume retains the session', calls[1].received.resumed, first.session.id)
       t.ok('supervisor tools remain disabled', calls[1].received.argv.includes('--tools') && calls[1].received.argv[calls[1].received.argv.indexOf('--tools') + 1] === '')
-      t.ok('GLM and DeepSeek sessions are separate', claude.resolveConnection({ ...connection, profile: 'glm' }).env.CLAUDE_CONFIG_DIR !== got.configDir)
+      t.ok('another profile\'s sessions are separate', claude.resolveConnection({ ...connection, profile: 'other' }).env.CLAUDE_CONFIG_DIR !== got.configDir)
       await fs.writeFile(endpoint, 'https://another.example.invalid/anthropic')
       t.ok('changing endpoint isolates sessions too', claude.resolveConnection(connection).env.CLAUDE_CONFIG_DIR !== got.configDir)
       await fs.rm(credential)

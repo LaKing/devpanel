@@ -30,7 +30,7 @@
     "profile": {
       "type": "string",
       "default": "default",
-      "description": "Configuration profile on that adapter. GLM-via-Claude is a profile of the claude adapter, not a separate adapter."
+      "description": "Configuration profile on that adapter. DeepSeek-via-Claude (`deepseek`) is a profile of the claude adapter, not a separate adapter."
     },
     "model": {
       "type": "string",
@@ -88,7 +88,7 @@
     "endpointRef": {
       "type": "string",
       "pattern": "^(env|file):",
-      "description": "Reference to a base URL override, for provider profiles such as GLM."
+      "description": "Reference to a base URL override, for provider profiles such as DeepSeek."
     },
     "notes": {
       "type": "string"

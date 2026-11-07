@@ -233,9 +233,11 @@ export default async function (t) {
     t.section('7. P4: every Gemini seat refused on macOS, in preview, preflight and the adapter itself, before any probe or launch')
     {
       const f = await engineFixture()
-      const roster = path.join(f.configRoot, 'roster', 'gemini-3.1-pro.yaml')
-      await fs.writeFile(roster, (await fs.readFile(roster, 'utf8')).replace(/^harness: .*$/m, 'harness: gemini'))
-      const runOptions = { participants: { 'auditor-1': { model: 'gemini-3.1-pro' } } }
+      // The tracked entry is unverified until an installation runs the live checks; this fixture asks about the
+      // platform, not the verification, so its sandbox copy is marked verified.
+      const roster = path.join(f.configRoot, 'roster', 'gemini-4-argon.yaml')
+      await fs.writeFile(roster, (await fs.readFile(roster, 'utf8')).replace(/^harness: .*$/m, 'harness: gemini').replace(/^  status: .*$/m, '  status: verified'))
+      const runOptions = { participants: { 'auditor-1': { model: 'gemini-4-argon' } } }
       const onMac = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, platform: darwin() })
       const blocker = onMac.resolved.liveExecution.blockers.find((b) => b.kind === 'platform-unsupported')
       t.ok('resolution: a blocker for the Gemini seat, naming macOS and the confinement', blocker?.role === 'auditor-1' && blocker.reason.includes('macOS (darwin)') && blocker.reason.includes('bubblewrap'), JSON.stringify(onMac.resolved.liveExecution.blockers))
@@ -259,7 +261,7 @@ export default async function (t) {
       const shim = path.join(dir, 'gemini')
       await fs.writeFile(shim, `#!/bin/sh\n: > '${marker}'\n`, { mode: 0o755 })
       await withEnv({ DEVPANEL_GEMINI_BIN: shim }, async () => {
-        const error = await gemini.invoke({ prompt: 'hello', model: 'gemini-3.1-pro', cwd: dir, platform: darwin(), meta: { invocationId: 'macos-1' } }).then(() => null, (e) => e)
+        const error = await gemini.invoke({ prompt: 'hello', model: 'gemini-4-argon', cwd: dir, platform: darwin(), meta: { invocationId: 'macos-1' } }).then(() => null, (e) => e)
         t.ok('gemini.invoke on darwin throws an environment fault, not started, naming macOS', error?.kind === 'environment-error' && error.started === false && error.message.includes('macOS'), error?.message)
         t.eq('and the CLI never ran', await exists(marker), false)
       })

@@ -98,7 +98,7 @@ export default async function (t) {
   {
     const codex = { provider: 'openai', inputTokens: 1000, outputTokens: 100, cacheReadTokens: 400, tokensBasis: 'first', tokensReported: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 400 } }
     t.eq('OpenAI counts cached input inside input', estimateCallCost(codex, PRICE).usd, (600 * 2 + 400 * 1 + 100 * 10) / 1e6)
-    const additive = { provider: 'zai', inputTokens: 100, outputTokens: 10, cacheReadTokens: 1000, cacheCreationTokens: 200 }
+    const additive = { provider: 'unpriced-provider', inputTokens: 100, outputTokens: 10, cacheReadTokens: 1000, cacheCreationTokens: 200 }
     t.eq('other providers report each category apart, and a cache write falls back to the input rate', estimateCallCost(additive, PRICE).usd, (100 * 2 + 1000 * 1 + 200 * 2 + 10 * 10) / 1e6)
     t.eq('a cache-write rate is used when given', estimateCallCost(additive, { ...PRICE, cacheWriteUsdPerMillionTokens: 5 }).usd, (100 * 2 + 1000 * 1 + 200 * 5 + 10 * 10) / 1e6)
     t.ok('counts without a thread total are the invocation\'s own, in a fork as well', estimateCallCost(additive, PRICE, { resumed: true, fork: true }) !== null)
@@ -331,7 +331,7 @@ export default async function (t) {
     await empty.close()
 
     t.eq('no usage object at all', estimateCallCost(null, PRICE), null)
-    t.eq('no counts in it', estimateCallCost({ provider: 'zai', inputTokens: null, outputTokens: null }, PRICE), null)
+    t.eq('no counts in it', estimateCallCost({ provider: 'unpriced-provider', inputTokens: null, outputTokens: null }, PRICE), null)
   }
 
   for (const dir of temps) await fs.rm(dir, { recursive: true, force: true })

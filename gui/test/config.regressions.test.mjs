@@ -32,11 +32,11 @@ export default async function (t) {
 
   t.section('3. probes must not merge distinct provider connections')
   const root = await sandbox((d) =>
-    occupySeat(path.join(d, 'playbooks/implementation.yaml'), '  auditor-1:\n    model: glm-via-claude'))
+    occupySeat(path.join(d, 'playbooks/implementation.yaml'), '  auditor-1:\n    model: deepseek-flash'))
   // Both roster entries are verified; eligibility must not stop the probe.
   const { resolved: mixed } = await resolvePlaybook('implementation', { root })
-  t.ok('fixture mixes default and glm on one harness',
-    Object.values(mixed.participants).some((p) => p.model.profile === 'glm') &&
+  t.ok('fixture mixes default and deepseek on one harness',
+    Object.values(mixed.participants).some((p) => p.model.profile === 'deepseek') &&
     Object.values(mixed.participants).some((p) => (p.model.profile ?? 'default') === 'default'))
 
   const seen = []
@@ -44,8 +44,8 @@ export default async function (t) {
   await preflight(mixed, { probe: recording })
   t.eq('one probe per connection, not per harness', seen.length, 2)
   t.ok('probe receives the profile', seen.every((s) => typeof s.profile === 'string'), JSON.stringify(seen.map((s) => s.profile)))
-  t.ok('the glm connection is probed separately', seen.some((s) => s.profile === 'glm'))
-  t.ok('endpoint reference is passed through', seen.some((s) => s.endpointRef === 'file:providers/glm.endpoint'))
+  t.ok('the deepseek connection is probed separately', seen.some((s) => s.profile === 'deepseek'))
+  t.ok('endpoint reference is passed through', seen.some((s) => s.endpointRef === 'file:providers/deepseek.endpoint'))
 
   t.section('4. invalid workflow references must be rejected')
   const strategyFile = 'strategy-templates/implementation/strategy.yaml'
@@ -83,7 +83,7 @@ export default async function (t) {
   t.eq('the real root is unaffected by the sandbox', real.errors.length, 0)
 
   t.section('6. a probe answering for a different connection must not vouch for this one')
-  // The fixture mixes a default and a glm connection on the same harness.
+  // The fixture mixes a default and a deepseek connection on the same harness.
   const swapped = async (harness, opts) => {
     const base = await fakeProbe()(harness, opts)
     return { ...base, connection: { profile: 'someone-else', endpointRef: 'env:OTHER', credentialRef: 'env:OTHER_KEY' } }

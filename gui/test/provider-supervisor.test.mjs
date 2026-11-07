@@ -5,7 +5,7 @@ import { createTopSupervisor } from '../server/top-supervisor.mjs'
 
 export default async function (t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-supervisor-'))
-  let model = { id: 'provider', harness: 'claude', model: 'glm-5.3', profile: 'glm', endpointRef: 'env:GLM_URL', credentialRef: 'env:GLM_KEY', verification: { status: 'verified' } }
+  let model = { id: 'provider', harness: 'claude', model: 'provider-model', profile: 'provider', endpointRef: 'env:PROVIDER_URL', credentialRef: 'env:PROVIDER_KEY', verification: { status: 'verified' } }
   const calls = []
   const agent = await createTopSupervisor({
     dir, models: async () => [{ ...model }],
@@ -30,8 +30,8 @@ export default async function (t) {
   try {
     t.ok('verified provider is selectable for supervisor', (await agent.models())[0].launchReady)
     const first = await turn()
-    t.eq('supervisor forwards the provider profile', first.profile, 'glm')
-    t.eq('supervisor forwards connection references', [first.endpointRef, first.credentialRef], ['env:GLM_URL', 'env:GLM_KEY'])
+    t.eq('supervisor forwards the provider profile', first.profile, 'provider')
+    t.eq('supervisor forwards connection references', [first.endpointRef, first.credentialRef], ['env:PROVIDER_URL', 'env:PROVIDER_KEY'])
     t.eq('same provider resumes the native session', (await turn()).session?.id, 'session-1')
     model = { ...model, endpointRef: 'env:OTHER_URL' }
     t.eq('changing the endpoint reference starts fresh', (await turn()).session, null)

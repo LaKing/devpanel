@@ -14,7 +14,7 @@
  *   DEVPANEL_LIVE=1 npm run live -- --harness codex  --model gpt-6-astra --effort high --resume-effort low
  *   DEVPANEL_LIVE=1 npm run live -- --harness codex  --model gpt-6-astra \
  *       --efforts low,medium,high,xhigh,max --max-invocations 10
- *   DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-3.1-pro-preview --fence
+ *   DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-4-argon --fence
  *   DEVPANEL_LIVE=1 npm run live -- --harness claude --model claude-haiku-4-5 --tooling --project devpanel-project --max-invocations 1
  *   DEVPANEL_LIVE=1 npm run live -- --harness codex  --model gpt-5.6-luna --tooling --project <project-id> --max-invocations 1
  *   DEVPANEL_LIVE=1 npm run live -- --jev      (the Jev decision provider: one request)
