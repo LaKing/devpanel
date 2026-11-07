@@ -7,17 +7,17 @@ defaultEffort: null
 contextWindow: 1048576
 credentialRef: file:~/.config/gemini/key
 verification:
-  status: unverified
+  status: verified
   verifiedAt: ~
-  method: ~
+  method: API model listing, session resume, live fence and installed runtime policy verification
   notes: >
     Listed by the provider's model endpoint (inputTokenLimit 1048576); the
-    installed Gemini CLI passes the identifier through to the API. The two-turn
-    session check and the live --fence check have not passed on any installation
-    yet, so this entry resolves for preview and is refused for live runs. An
-    installation verifies it from gui/ with
-    `DEVPANEL_LIVE=1 npm run live -- --harness gemini --model gemini-4-argon --credential-ref 'file:~/.config/gemini/key'`
-    (then the same with `--fence`) and keeps the reports with its own roster copy.
+    installed Gemini CLI passes the identifier through to the API. API
+    authentication and session continuity passed through the adapter's admin
+    policy. The live read-only workspace stayed unchanged: the installed CLI's
+    policy engine excluded write, shell and mode-transition tools and denied
+    forced calls above a permissive control, and the proof matched the SHA-256
+    of the policy acknowledged by the live turn. The runtime reported no cost.
 notes: >
   Runs through Google's Gemini CLI. `efforts: []` is a fact about this runtime,
   not an unknown: the CLI exposes no effort or thinking control, by flag or by

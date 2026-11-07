@@ -76,7 +76,7 @@ part to every run. The roster carries `gemini-4-argon` (the Gemini 3.x entries w
 2026-11-07); an installation verifies it with its configured API key through
 session-resume checks and live fence checks, supplemented by installed-runtime
 policy evidence (`npm run policy:gemini`), and keeps the reports with its own roster
-copy. The tracked entry is unverified until then.
+copy.
 
 ## Installing and authenticating
 

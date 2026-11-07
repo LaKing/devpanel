@@ -233,10 +233,8 @@ export default async function (t) {
     t.section('7. P4: every Gemini seat refused on macOS, in preview, preflight and the adapter itself, before any probe or launch')
     {
       const f = await engineFixture()
-      // The tracked entry is unverified until an installation runs the live checks; this fixture asks about the
-      // platform, not the verification, so its sandbox copy is marked verified.
       const roster = path.join(f.configRoot, 'roster', 'gemini-4-argon.yaml')
-      await fs.writeFile(roster, (await fs.readFile(roster, 'utf8')).replace(/^harness: .*$/m, 'harness: gemini').replace(/^  status: .*$/m, '  status: verified'))
+      await fs.writeFile(roster, (await fs.readFile(roster, 'utf8')).replace(/^harness: .*$/m, 'harness: gemini'))
       const runOptions = { participants: { 'auditor-1': { model: 'gemini-4-argon' } } }
       const onMac = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, platform: darwin() })
       const blocker = onMac.resolved.liveExecution.blockers.find((b) => b.kind === 'platform-unsupported')
