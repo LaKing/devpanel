@@ -1,5 +1,6 @@
-import { resolvePlaybook } from '../config/load.mjs'
+import { resolveWithRelease } from '../release-selection.mjs'
 import { sizingSummary } from './triage-sizing.mjs'
+import { evaluate } from './engine.mjs'
 
 /*
  * Dry-run preview.
@@ -81,8 +82,10 @@ function indexSteps (phases) {
  * @param project  optional { id, path }
  * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null } = {}) {
-  const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform })
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null } = {}) {
+  // A production release with no named releaseId is filled from the issues
+  // (release-selection.mjs selectStagedRelease), the same way the start fills it.
+  const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
   if (!resolution.ok) return { ok: false, errors: resolution.errors }
 
   const r = resolution.resolved
@@ -148,6 +151,8 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     id: phase.id,
     title: phase.title ?? null,
     kind: phase.loop ? 'loop' : 'step',
+    // Guarded by the release plan (staging-then-production's production half).
+    ...(phase.when ? { when: phase.when, runs: evaluate(phase.when, { release: r.release ?? {} }) } : {}),
     loop: phase.loop
       ? { maxRounds: phase.loop.maxRounds, until: phase.loop.until, onExhausted: phase.loop.onExhausted }
       : null,
@@ -166,6 +171,8 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   // --- prerequisites ------------------------------------------------------
   const prerequisites = []
   for (const b of r.liveExecution.blockers) {
+    // No green staging release matches: the sentence, and the latest green release the page can offer.
+    if (b.kind === 'no-green-staging') { prerequisites.push({ category: 'blocking', kind: b.kind, detail: b.reason, remedy: b.remedy ?? null, latestGreen: b.latestGreen ?? null, file: b.file }); continue }
     prerequisites.push({ category: 'blocking', kind: b.kind ?? (b.model ? 'unverified-model' : 'release-configuration'), detail: b.kind ? `${b.role}: ${b.model} — ${b.reason}. ${b.remedy ?? ''}`.trim() : b.model ? `${b.role}: ${b.model} ${b.reason}. Verify the roster entry before starting.` : b.reason, file: b.file })
   }
   if (r.checks.requirement === 'required' && !r.checks.target) {
@@ -225,6 +232,8 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     playbook: r.playbook,
     strategy: r.strategy,
     tactic: r.tactic ?? null,
+    // Where a staging or deployment run releases, and the releaseId production promotes (filled or named).
+    release: r.release ?? null,
     intent: r.intent && { id: r.intent.id, title: r.intent.title, description: r.intent.description, source: r.intent.source, steps: Object.keys(r.intent.guidance) },
     participants,
     phases,

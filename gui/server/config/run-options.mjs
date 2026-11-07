@@ -26,6 +26,10 @@ const validate = new Ajv2020({ allErrors: true }).compile({
         }
       }
     },
+    // A deployment's environment: staging (the default), production or
+    // staging-then-production, or a configured environment id; releaseId names
+    // the staged release production promotes instead of the filled one
+    // (config/release-plan.mjs, resolved against the project there).
     releaseId: { type: 'string', pattern: '^[a-zA-Z0-9-]+$' },
     environment: { type: 'string', pattern: '^[a-z0-9-]+$' },
     repairAttempts: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },

@@ -146,6 +146,60 @@ export default async function(t){
  t.ok('verifier sees operation evidence',releaseSeen.find(x=>x.role==='verifier-1')?.prompt.includes('checkpointVerified'))
  t.ok('command logs are durable files',await fs.access(rse.run.release.commands[0].logFile).then(()=>true,()=>false))
  await releaseWorkspace(rse)
+ t.section('deployment environments: staging by default, and staging-then-production touches production only after staging passed')
+ {
+  const ids=['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test','restore','verifyRestore']
+  // Every release command appends its environment and id to a log, so the test reads what ran where.
+  const deploymentRun=async({releaseEnvironment,failStagingApply=false,stagingConcern=false})=>{
+   const seen=[];const df=await engineFixture({playbook:'deployment',script:turn=>{
+    if(stagingConcern&&turn.stepId==='investigate-verifier-1')return fence({verdict:'changes-needed',summary:'The staged instance fails its smoke check',findings:[{id:'verifier-1-smoke',description:'Smoke check failed',severity:'major',blocking:true,evidence:['observe log']}],openQuestions:[]})
+    return script({seen})(turn)
+   }})
+   const log=path.join(df.projectPath,'..',`release-${crypto.randomUUID()}.log`)
+   const target=env=>({workdir:df.projectPath,ownership:'Fixture source only',rollback:'automatic',commands:Object.fromEntries(ids.map(id=>[id,{run:env==='stage'&&id==='apply'&&failStagingApply?`echo ${env}:${id} >> '${log}'; exit 1`:`echo ${env}:${id} >> '${log}'`,timeoutSeconds:10}]))})
+   const infra={kind:'boilerplate',orientation:'Isolated fixture; no real hosts',staging:environment('stage'),deployments:[environment('production-a')],testDrive:{requirement:'optional',commands:[{id:'noop',run:'true',required:true}],notes:'Fixture only'},release:{targets:{stage:target('stage'),'production-a':target('production-a')}}}
+   await fs.mkdir(path.join(df.configRoot,'projects'),{recursive:true})
+   await fs.writeFile(path.join(df.configRoot,'projects/devpanel-project.yaml'),YAML.stringify({id:'devpanel-project',evidence:[],infrastructure:infra}))
+   const options={participants:{'verifier-1':{model:'gpt-6-astra'}},...(releaseEnvironment?{environment:releaseEnvironment}:{})}
+   const de=await start(df,options);await de.drive()
+   const lines=(await fs.readFile(log,'utf8').catch(()=>'')).split('\n').filter(Boolean)
+   return {de,df,seen,lines}
+  }
+  {
+   const {de,seen,lines}=await deploymentRun({})
+   t.eq('a deployment with no environment releases to staging and completes (AC1)',[de.run.status,de.run.release.environment,de.run.release.tactic],['completed','stage','staging'])
+   t.ok('it records what it carries, so a production start can match it',Boolean(de.run.release.content?.identity))
+   t.ok('and never touches production (AC6)',!lines.some(l=>l.startsWith('production-a:'))&&!de.run.productionRelease)
+   t.ok('no production phase runs for it',!seen.some(x=>x.stepId.startsWith('investigate-production-')))
+   await releaseWorkspace(de)
+  }
+  {
+   const {de,df,seen,lines}=await deploymentRun({releaseEnvironment:'staging-then-production'})
+   t.eq('staging-then-production completes (AC5)',de.run.status,'completed')
+   t.eq('staging first, then production',[lines.findIndex(l=>l==='stage:test')<lines.findIndex(l=>l==='production-a:inspect'),lines.filter(l=>l.startsWith('production-a:')).length],[true,8])
+   t.eq('production promotes this run\'s own staging archive',[de.run.productionRelease.sourceRelease,de.run.productionRelease.sha256],[de.runId,de.run.release.sha256])
+   t.ok('the staging gate is recorded',de.run.release.gate?.passed===true)
+   const order=seen.map(x=>x.stepId)
+   t.ok('production is assessed after the staging assessments',order.indexOf('investigate-production-operator')>order.indexOf('investigate-verifier-1')&&order.includes('investigate-production-verifier-1'))
+   t.ok('the production receipt is its own file',await fs.access(path.join(df.issuePath,'runs',de.runId,'release-production.json')).then(()=>true,()=>false))
+   await releaseWorkspace(de)
+  }
+  {
+   const {de,df,lines}=await deploymentRun({releaseEnvironment:'staging-then-production',failStagingApply:true})
+   t.eq('a failed staging ends the run (AC5)',[de.run.status,de.run.outcome],['blocked','unresolved'])
+   t.ok('production commands never run',!lines.some(l=>l.startsWith('production-a:')))
+   t.ok('and there is no production receipt',!de.run.productionRelease&&!(await fs.access(path.join(df.issuePath,'runs',de.runId,'release-production.json')).then(()=>true,()=>false)))
+   await releaseWorkspace(de)
+  }
+  {
+   const {de,seen,lines}=await deploymentRun({releaseEnvironment:'staging-then-production',stagingConcern:true})
+   t.eq('a staging verifier concern stops before production',[de.run.status,de.run.blockedReason],['blocked','release-staging-not-passed'])
+   t.ok('staging is recovered under its policy',['rolled-back','recovery-required'].includes(de.run.release.status))
+   t.ok('production commands never run, and no production seat is asked',!lines.some(l=>l.startsWith('production-a:'))&&!seen.some(x=>x.stepId.startsWith('investigate-production-')))
+   t.ok('the explanation says production was not touched',explainRun(de.run).headline.includes('production was not touched'))
+   await releaseWorkspace(de)
+  }
+ }
  t.section('release checkpoints, recovery and promotion identity')
  const tmp=await fs.mkdtemp(path.join(os.tmpdir(),'devpanel-release-test-'))
  try{

@@ -472,12 +472,88 @@ operation lock and excludes concurrent project actions. Once application mutatio
 invoke that recovery policy. Successful rollback still leaves the release run
 unresolved. Inspect the durable receipt before any manual retry.
 
-Deployment requires `runOptions.releaseId` (the successful staging run ID) and
-must choose `runOptions.environment` when several deployment targets exist. A sole configured target may be selected automatically. It finds
-the receipt only inside the same project, requires the staging run and every
-verification seat to have completed successfully, verifies the retained archive's
-hash and promotes those exact bytes. Newer development files never enter that
-promotion. Run deployment separately for each production container as needed.
+### Deployment environments
+
+The Deployment playbook releases to one of three environments, named in
+`runOptions.environment` (the start dialog's **Release environment**):
+
+| Environment | What the run does | releaseId |
+|---|---|---|
+| `staging` (**Staging**, the default) | Releases this run's snapshot of the project checkout to the staging target, like the Staging playbook, and records what it carried (`run.release.coverage`, `run.release.content`). A green one counts as a staging release for later production starts. | none; naming one is refused |
+| `production` (**Production**) | Promotes the archive of a green staging release, byte for byte, to the production target. | filled automatically, or the one you name |
+| `staging-then-production` (**Staging first, Deployment on success**) | One run, two releases: the staging release of this snapshot, then, only if it passed, the same archive to production. | none: production promotes this run's own staging archive |
+
+Production is never chosen automatically. A run started without an environment
+releases to staging; no default, triage recommendation, automatic start or
+schedule names `production` or `staging-then-production`. The three names keep
+their meaning whatever the project calls its environments: they are matched
+before any configured id, and the infrastructure check refuses a deployment
+environment called `staging` or `staging-then-production` and a staging
+environment called `production` or `staging-then-production` (a staging
+environment called `staging` and a deployment called `production` are fine). Any
+other deployment environment id still selects that production target, and with several production
+targets `production` must name one by its id (`staging-then-production` then
+needs a single production target).
+
+**When releaseId is filled.** For `production` without a releaseId, the panel
+fills it with the newest green staging release whose content is the content of
+the project's development checkout. Green means the Staging (or Deployment to
+staging) run completed resolved, its release completed and every verifier
+accepted it. Releases in open and archived (packed) issues are compared newest
+first. The checkout is read the way that release's run snapshotted it (its
+materialized links, excludes and nested repositories) and compared as a tree
+identity of path, executable bit and content. A release records that identity on
+its receipt (`content`); one recorded before identities existed is read from its
+retained archive after the archive's hash is verified, and an archive that is
+missing or changed makes that release unverifiable: it never matches. The fill
+is part of the run's configHash, and the preview shows it ("Filled
+automatically: <run> (<issue>)"); the start resolves it again, so a newer green
+release appearing between preview and start asks for a new preview. A release in
+a packed issue is extracted from the bundle into the run and verified against
+its recorded hash before it is promoted.
+
+**When the start is refused.** When no green staging release matches (a delivery
+since the last green staging release, a hand edit in the checkout, or no green
+staging release at all) the preview and the start are refused with: *No green
+staging release matches the content of this project's checkout: run Staging (or
+'Staging first, Deployment on success'), or name a releaseId.* Nothing is
+reserved and nothing is spent (`NO_GREEN_STAGING`, 422). The start dialog then
+offers the latest green staging release ("Use this release") or says there is no
+green staging release in this project.
+
+**Overriding it.** Name a releaseId (`runOptions.releaseId`, the dialog's
+**Staged release ID**, or "Use this release"): that staging run's archive is
+promoted instead of the filled one. It must still be a green staging run of this
+project, and its archive must still have its recorded hash.
+
+**Staging first, Deployment on success.** The run releases its snapshot to
+staging, and the release operator and every occupied verifier assess it as for
+any release. Only when the staging release completed and every one of those
+assessments accepted it does the engine record the gate (`run.release.gate`) and
+promote the same archive, verified against the staging receipt's hash, to
+production (`runs/<id>/release-production.json`, `run.productionRelease`). The
+same seats then assess the production release in their own phases (strategy
+phases guarded by `when: release.mode == staging-then-production`). A failed
+staging release, or any staging assessment that does not accept it, ends the run
+(`release-staging-not-passed`) after the staging recovery policy; production is
+never touched. A production release that fails, or that the verifiers or the
+coordinator do not accept, is recovered under its own policy; a staging release
+that passed its gate is not rolled back.
+
+**The top-level supervisor** may preview any environment, but a production or
+staging-then-production start is the operator's decision: it calls
+`ask_release_authorization` with the preview, the panel writes the question
+(project, issue, environment, releaseId) with the answers Authorize and Decline,
+and `start_run` starts that preview only after the operator answers Authorize.
+A Decline, an unanswered question, a plain `ask_operator` answer, a question
+bound to another preview, issue, environment, release or configuration, and an
+authorization that already started a run are all refused.
+
+The deployment finds a named receipt only inside the same project, requires the
+staging run and every verification seat to have completed successfully, verifies
+the retained archive's hash and promotes those exact bytes. Newer development
+files never enter that promotion. Run deployment separately for each production
+container as needed.
 
 An installation wires its targets to its own installed
 [release procedures](../tools/releases/README.md). A thorough procedure

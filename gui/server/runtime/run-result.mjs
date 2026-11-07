@@ -122,7 +122,9 @@ function achieved (run, triage, outputs) {
   }
   const strategy = run.playbook?.strategy
   if (strategy === 'staging') return { result: 'staged', resultReason: null, resultLabel: 'Staged — candidate installed and test-driven' }
-  if (strategy === 'deployment') return { result: 'deployed', resultReason: null, resultLabel: 'Deployed — release applied and verified' }
+  // A deployment run released to staging only (its default environment) staged; production, or both, deployed.
+  if (strategy === 'deployment' && run.release?.tactic === 'staging' && !run.productionRelease) return { result: 'staged', resultReason: 'staging-environment', resultLabel: 'Staged — candidate installed and test-driven' }
+  if (strategy === 'deployment') return { result: 'deployed', resultReason: run.productionRelease ? 'staging-then-production' : null, resultLabel: run.productionRelease ? 'Deployed — staged, then promoted to production' : 'Deployed — release applied and verified' }
   if (run.delivery?.completedAt && run.revisions?.length) {
     if (run.delivery.action === 'in-place') return { result: 'delivered', resultReason: 'in-place', resultLabel: 'Changed in place — project checkout' }
     return { result: 'delivered', resultReason: run.delivery.action ?? null, resultLabel: 'Source updated — approved patch applied' }

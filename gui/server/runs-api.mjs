@@ -226,6 +226,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     // What a triage's autoStart did once the run ended (auto-start.mjs), or null.
     autoStart: await readAutoStart(issuePath, runId),
     release: run.release ?? null,
+    // The production half of staging-then-production, after staging passed.
+    productionRelease: run.productionRelease ?? null,
     // What the paid probes cost, kept even when they refused the launch.
     preflight: run.preflight ?? null,
     startedAt: run.startedAt,

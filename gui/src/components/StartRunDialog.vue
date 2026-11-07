@@ -66,10 +66,22 @@ const startable = computed(() =>
 const blockers = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'blocking'))
 // Catalogue resolution has no project or run settings. Only the matching
 // project preview can say whether this particular run needs attention.
-const awaitingStagedRelease = computed(() => previewMatches.value &&
-  previewData.value.parameterDefinitions?.release?.tactic === 'deployment' &&
-  !runOptions.value.releaseId && blockers.value.length === 1 &&
-  blockers.value[0].kind === 'release-configuration')
+// A production release no green staging release matches: the page offers the
+// latest green staging release, or says there is none (release-selection.mjs).
+const noGreenStaging = computed(() => (previewMatches.value && blockers.value.find((p) => p.kind === 'no-green-staging')) || null)
+// The environment the run would release to: the chosen one, else the default (staging, never production).
+const releaseEnvironment = computed(() => runOptions.value.environment ?? parameterData.value?.parameterDefinitions?.release?.default ?? '')
+const productionChosen = computed(() => parameterData.value?.parameterDefinitions?.release?.tactic === 'deployment' &&
+  Boolean(releaseEnvironment.value) && !['staging', 'staging-then-production'].includes(releaseEnvironment.value))
+const filledRelease = computed(() => (previewMatches.value && previewData.value?.release?.releaseIdSource === 'filled') ? previewData.value.release.filledFrom : null)
+function setEnvironment (value) {
+  const { releaseId: _releaseId, ...rest } = runOptions.value
+  // A named releaseId belongs to production only; another environment drops it.
+  runOptions.value = { ...(value === 'production' || !['staging', 'staging-then-production'].includes(value) ? runOptions.value : rest), environment: value }
+}
+function useLatestGreen () {
+  if (noGreenStaging.value?.latestGreen) runOptions.value = { ...runOptions.value, releaseId: noGreenStaging.value.latestGreen.runId }
+}
 const outcomes = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'outcome'))
 const notices = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'information' && !(p.kind === 'path-overlap' && p.status === 'warning')))
 const overlapWarning = computed(() => (previewData.value?.prerequisites ?? []).find((p) => p.kind === 'path-overlap' && p.status === 'warning') ?? null)
@@ -334,9 +346,8 @@ async function start (override = false) {
               <span class="chosen__id">{{ chosen }}</span>
               <span class="chosen__sub">{{ selected?.ok ? (selected.title || selected.strategy) : 'does not resolve' }}</span>
             </span>
-            <v-chip v-if="previewMatches && blockers.length" size="x-small" variant="tonal"
-                    :color="awaitingStagedRelease ? undefined : 'warning'">
-              {{ awaitingStagedRelease ? 'select staged release' : 'cannot start' }}
+            <v-chip v-if="previewMatches && blockers.length" size="x-small" variant="tonal" color="warning">
+              {{ noGreenStaging ? 'no green staging release' : 'cannot start' }}
             </v-chip>
             <v-btn size="small" variant="text" prepend-icon="$chevronLeft" :disabled="starting" @click="changePlaybook">Change playbook</v-btn>
           </div>
@@ -417,14 +428,15 @@ async function start (override = false) {
                 <small>{{ chosenIntent ? chosenIntent.description : (intentChoice === NONE ? 'No overlay: participants get the strategy prompts alone.' : 'What kind of work this is. Briefs every participant for it; the phase shape and review rules stay the playbook\'s.') }}</small>
               </label>
               <label v-if="parameterData.parameterDefinitions.release" class="setting"><span>Release environment</span>
-                <select aria-label="Release environment" :value="runOptions.environment ?? (parameterData.parameterDefinitions.release.environments.length === 1 ? parameterData.parameterDefinitions.release.environments[0]?.id : '')" @change="runOptions = { ...runOptions, environment: $event.target.value }">
-                  <option v-if="parameterData.parameterDefinitions.release.environments.length > 1" value="" disabled>Select deployment environment</option>
-                  <option v-for="e in parameterData.parameterDefinitions.release.environments" :key="e.id" :value="e.id">{{ e.id }} · {{ e.description }}</option>
+                <select aria-label="Release environment" data-setting="environment" :value="releaseEnvironment" @change="setEnvironment($event.target.value)">
+                  <option v-for="e in parameterData.parameterDefinitions.release.environments" :key="e.id" :value="e.id">{{ e.title ?? e.id }}</option>
                 </select>
+                <small>{{ parameterData.parameterDefinitions.release.environments.find((e) => e.id === releaseEnvironment)?.description ?? '' }}</small>
               </label>
-              <label v-if="parameterData.parameterDefinitions.release?.tactic === 'deployment'" class="setting"><span>Successfully staged release ID</span>
-                <input aria-label="Successfully staged release ID" :value="runOptions.releaseId ?? ''" @input="runOptions = { ...runOptions, releaseId: $event.target.value }" />
-                <small>Use the run ID from a completed staging playbook. Production promotes that exact archive.</small>
+              <label v-if="productionChosen" class="setting"><span>Staged release ID (optional)</span>
+                <input aria-label="Staged release ID" :value="runOptions.releaseId ?? ''" @input="runOptions = { ...runOptions, releaseId: $event.target.value || undefined }" />
+                <small v-if="filledRelease">Filled automatically: {{ filledRelease.runId }}<template v-if="filledRelease.issueId"> ({{ filledRelease.issueId }}{{ filledRelease.packed ? ', archived issue' : '' }})</template>, the newest green staging release of this content. Name another to use it instead.</small>
+                <small v-else>Left empty, the panel fills it with the newest green staging release whose content matches this project's checkout. Production promotes that exact archive.</small>
               </label>
               <label class="setting setting--wide">
                 <span>Workspace</span>
@@ -535,10 +547,14 @@ async function start (override = false) {
           </div>
           <p class="dim mt-1">requires {{ previewData.completion.requires.join(', ') }}</p>
 
-          <v-alert v-if="blockers.length" :type="awaitingStagedRelease ? 'info' : 'error'" variant="tonal" density="compact" class="mt-4"
-                   :title="awaitingStagedRelease ? 'Select a successfully staged release' : 'Cannot start'">
+          <v-alert v-if="blockers.length" type="error" variant="tonal" density="compact" class="mt-4" title="Cannot start">
             <p v-for="pre in blockers" :key="pre.kind + pre.detail" class="readiness-note">{{ pre.detail }}</p>
-            <p v-if="!awaitingStagedRelease && blockers.some(pre => pre.kind === 'release-configuration')" class="readiness-note">Release procedures belong in the project's infrastructure configuration. The runtime executes checkpoint, restore and health checks; the coordinator assesses the results. No manual playbook verification is required.</p>
+            <p v-if="noGreenStaging && noGreenStaging.latestGreen" class="readiness-note" data-latest-green>
+              Latest green staging release: {{ noGreenStaging.latestGreen.runId }}<template v-if="noGreenStaging.latestGreen.issueId"> ({{ noGreenStaging.latestGreen.issueId }})</template>
+              <v-btn size="x-small" variant="tonal" class="ml-2" @click="useLatestGreen">Use this release</v-btn>
+            </p>
+            <p v-else-if="noGreenStaging" class="readiness-note" data-latest-green>There is no green staging release in this project.</p>
+            <p v-if="blockers.some(pre => pre.kind === 'release-configuration')" class="readiness-note">Release procedures belong in the project's infrastructure configuration. The runtime executes checkpoint, restore and health checks; the coordinator assesses the results. No manual playbook verification is required.</p>
           </v-alert>
           <v-alert v-if="outcomes.length" type="warning" variant="tonal" density="compact" class="mt-3" title="Will not close automatically">
             <p v-for="pre in outcomes" :key="pre.kind" class="readiness-note">{{ pre.detail }}</p>

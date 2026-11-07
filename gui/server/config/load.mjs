@@ -6,6 +6,7 @@ import YAML from 'yaml'
 import { Ajv2020 } from 'ajv/dist/2020.js'
 import addFormats from 'ajv-formats'
 import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-options.mjs'
+import { releasePlan, RELEASE_ENVIRONMENTS } from './release-plan.mjs'
 import { infrastructureErrors, localChecksErrors, localTarget, modulesErrors, modulesTarget, tierErrors } from '../infrastructure.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
@@ -415,7 +416,7 @@ function checkWorkflow (strategy, errors) {
  */
 const offHarness = (cfg, id) => cfg.disabledModels?.has(id) ? ` (its harness, ${cfg.disabledModels.get(id)}, is disabled in the host settings; override this playbook in host-config/playbooks/)` : ''
 
-export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, runOptions = {}, projectId = null, platform = hostPlatform() } = {}) {
+export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, runOptions = {}, projectId = null, platform = hostPlatform(), stagedRelease = null } = {}) {
   const optionErrors = runOptionErrors(runOptions)
   if (optionErrors.length) return { ok: false, errors: optionErrors }
   const cfg = config ?? await loadConfig({ root })
@@ -501,12 +502,14 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
 
   if (runOptions.inquiry && strategy.tactic !== 'analysis') err(errors, `an inquiry runs the analysis tactic only, not ${strategy.tactic ?? strategy.id}`, playbook.file, '/runOptions/inquiry')
   if (runOptions.autoStart !== undefined && strategy.tactic !== 'triage') err(errors, `autoStart only applies to a triage, not ${strategy.tactic ?? strategy.id}`, playbook.file, '/runOptions/autoStart')
+  // Where a release goes and which staged release production promotes (release-plan.mjs).
+  // The selection is read from the issues by the caller and passed in.
+  let release = null
   if (['staging','deployment'].includes(strategy.tactic)) {
-    const environment = runOptions.environment ?? (strategy.tactic === 'staging' ? infrastructure?.staging?.id : infrastructure?.deployments?.[0]?.id)
-    if (strategy.tactic === 'deployment' && (infrastructure?.deployments?.length ?? 0) > 1 && !runOptions.environment) blockers.push({role:'release-operator',model:null,reason:'Select a deployment environment explicitly when multiple targets are configured',file:project?.file??null})
-    const allowed = strategy.tactic === 'staging' ? [infrastructure?.staging?.id] : (infrastructure?.deployments ?? []).map(e => e.id)
-    if (!allowed.includes(environment) || !infrastructure?.release?.targets?.[environment]) blockers.push({ role:'release-operator', model:null, reason:'Release target requires installed checkpoint, restore, ownership and verification commands', file:project?.file ?? null })
-    if (strategy.tactic === 'deployment' && !runOptions.releaseId) blockers.push({role:'release-operator',model:null,reason:'Deployment requires the releaseId of a successfully staged release',file:project?.file ?? null})
+    const planned = releasePlan({ tactic: strategy.tactic, infrastructure, runOptions, stagedRelease, file: project?.file ?? null })
+    release = planned.plan
+    blockers.push(...planned.blockers)
+    for (const message of planned.errors) err(errors, message, playbook.file, '/runOptions/releaseId')
   } else if (runOptions.releaseId || runOptions.environment) err(errors,'releaseId/environment only apply to staging or deployment',playbook.file,'/runOptions')
 
   // Checks: a playbook may strengthen the requirement, never weaken it.
@@ -629,6 +632,8 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   // with it stays in the same configuration group as one without.
   const { autoStart: _autoStart, ...hashedOptions } = runOptions
   if (Object.keys(hashedOptions).length) contributing.push(sha256(JSON.stringify(canonicalOptions(hashedOptions))))
+  // A filled releaseId is what the run promotes: a different fill is a different run.
+  if (release?.releaseIdSource === 'filled') contributing.push(sha256(`filled-release:${release.releaseId}`))
   // The seat-access policy a run executes under is part of what it is, so a
   // policy step starts a new configuration group (harness/README.md "Seat hygiene").
   contributing.push(sha256(`fence:${JSON.stringify(FENCE_POLICY)}`))
@@ -642,9 +647,19 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     windowLimits: {maxInputFiles:100,maxInputBytes:26214400,maxInputFileBytes:26214400,maxPromptChars:60000,...(project?.windowLimits??{})},
     evidence: project?.evidence ?? (infrastructure ? [infrastructure.staging, ...infrastructure.deployments].flatMap(e => Object.entries(e.files ?? {}).map(([name, p]) => ({name:`${e.id}-${name}`,path:p,required:false}))) : []),
     runOptions: canonicalOptions(runOptions),
+    ...(release ? { release } : {}),
     parameterDefinitions: {
       ...(sourceDeliveryChoice ? { delivery: ['apply-to-source', 'worktree-diff'] } : {}),
-      release: ['staging','deployment'].includes(strategy.tactic) ? { tactic: strategy.tactic, environments: (strategy.tactic === 'staging' ? [infrastructure?.staging] : infrastructure?.deployments ?? []).filter(Boolean).map(e => ({id:e.id,description:e.description})) } : null,
+      release: ['staging','deployment'].includes(strategy.tactic) ? {
+        tactic: strategy.tactic,
+        // The three environments by name, staging first and the default; with several
+        // production targets each is offered by its id as well (an explicit choice).
+        environments: strategy.tactic === 'staging'
+          ? [infrastructure?.staging].filter(Boolean).map(e => ({ id: e.id, title: 'Staging', description: e.description ?? null }))
+          : [...RELEASE_ENVIRONMENTS.map(e => ({ ...e })), ...((infrastructure?.deployments?.length ?? 0) > 1 ? infrastructure.deployments.map(e => ({ id: e.id, title: `Production: ${e.id}`, description: e.description ?? null })) : [])],
+        default: strategy.tactic === 'staging' ? infrastructure?.staging?.id ?? null : 'staging',
+        plan: release
+      } : null,
       seats: Object.entries(strategy.roles).map(([role, spec]) => ({ role, optional: spec.optional === true, description: spec.description, model: participants[role]?.model.id ?? null })),
       budgetCaps: strategy.budgets ?? {},
       repairCap,

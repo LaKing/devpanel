@@ -39,7 +39,7 @@ export async function sourceTarget (projectPath) {
   }
 }
 
-export async function destinationFingerprint (workspace, baseline, clock = systemClock, candidatePaths = []) {
+export async function destinationFingerprint (workspace, baseline, clock = systemClock, candidatePaths = [], { excludes: walkExcludes = undefined } = {}) {
   const materialize = workspace.symlinks?.materialized ?? []
   const excludes = workspace.base?.excludes ?? []
   const baselinePaths = [...baseline.keys()]
@@ -69,7 +69,7 @@ export async function destinationFingerprint (workspace, baseline, clock = syste
     for (let parent = path.posix.dirname(rel); parent !== '.'; parent = path.posix.dirname(parent)) ancestors.add(parent)
   }
   return fingerprint(workspace.source.path, {
-    baseline, baseCommit: workspace.baseCommit, clock, strict: true,
+    baseline, baseCommit: workspace.baseCommit, clock, strict: true, ...(walkExcludes ? { excludes: walkExcludes } : {}),
     projection: {
       materialize,
       // A stub left in the checkout (a killed session there) is neither drift nor

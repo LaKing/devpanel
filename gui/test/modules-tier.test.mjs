@@ -237,7 +237,7 @@ export default async function (t) {
         }
         const staging = await resolvePlaybook('staging', { root: f.configRoot, projectId: 'devpanel-project' })
         t.eq(`${label}: staging has no check target`, staging.resolved?.checks?.target ?? null, null)
-        const deployment = await resolvePlaybook('deployment', { root: f.configRoot, projectId: 'devpanel-project', runOptions: { releaseId: 'staged' } })
+        const deployment = await resolvePlaybook('deployment', { root: f.configRoot, projectId: 'devpanel-project', runOptions: { releaseId: 'staged', environment: 'production' } })
         t.eq(`${label}: deployment has no check target`, deployment.resolved?.checks?.target ?? null, null)
         t.eq(`${label}: the smoke and full tiers stay on the project`, deployment.resolved?.infrastructure?.testDrive?.tiers, { smoke: ['boot'] })
       }

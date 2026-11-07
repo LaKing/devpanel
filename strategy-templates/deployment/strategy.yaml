@@ -188,6 +188,90 @@ phases:
         - findings.outstanding
         - decisions
         - steps.brief.output.prompt
+  # staging-then-production ("Staging first, Deployment on success"): the engine
+  # promotes this run's own staging archive to production only after the staging
+  # release completed and every staging assessment above accepted it; then the
+  # same seats assess the production release. Other environments skip these.
+  - id: investigate-production-operator
+    when: release.mode == staging-then-production
+    step:
+      id: investigate-production-operator
+      role: release-operator
+      prompt: investigate.md
+      output: releaseAssessment
+      context:
+        - issue
+        - project
+        - acceptanceCriteria
+        - window
+        - reports
+        - findings.outstanding
+        - decisions
+        - steps.brief.output.prompt
+  - id: investigate-production-verifier-1
+    when: release.mode == staging-then-production
+    step:
+      id: investigate-production-verifier-1
+      role: verifier-1
+      prompt: investigate.md
+      output: releaseAssessment
+      context:
+        - issue
+        - project
+        - acceptanceCriteria
+        - window
+        - reports
+        - findings.outstanding
+        - decisions
+        - steps.brief.output.prompt
+  - id: investigate-production-verifier-2
+    when: release.mode == staging-then-production
+    step:
+      id: investigate-production-verifier-2
+      role: verifier-2
+      prompt: investigate.md
+      output: releaseAssessment
+      context:
+        - issue
+        - project
+        - acceptanceCriteria
+        - window
+        - reports
+        - findings.outstanding
+        - decisions
+        - steps.brief.output.prompt
+  - id: investigate-production-verifier-3
+    when: release.mode == staging-then-production
+    step:
+      id: investigate-production-verifier-3
+      role: verifier-3
+      prompt: investigate.md
+      output: releaseAssessment
+      context:
+        - issue
+        - project
+        - acceptanceCriteria
+        - window
+        - reports
+        - findings.outstanding
+        - decisions
+        - steps.brief.output.prompt
+  - id: investigate-production-verifier-4
+    when: release.mode == staging-then-production
+    step:
+      id: investigate-production-verifier-4
+      role: verifier-4
+      prompt: investigate.md
+      output: releaseAssessment
+      context:
+        - issue
+        - project
+        - acceptanceCriteria
+        - window
+        - reports
+        - findings.outstanding
+        - decisions
+        - steps.brief.output.prompt
   - id: confirm
     step:
       id: confirm

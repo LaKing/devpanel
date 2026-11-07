@@ -641,7 +641,8 @@ function completed (run, outputs) {
   if (action === 'in-place' && delivered) return { tone: 'success', headline: 'Done: changed directly in the project', next }
   const strategy = run.playbook?.strategy
   if (strategy === 'staging') return { tone: 'success', headline: 'Done: installed and tested on staging', next }
-  if (strategy === 'deployment') return { tone: 'success', headline: 'Done: deployed and verified', next }
+  if (strategy === 'deployment' && run.release?.tactic === 'staging' && !run.productionRelease) return { tone: 'success', headline: 'Done: installed and tested on staging', next }
+  if (strategy === 'deployment') return { tone: 'success', headline: run.productionRelease ? 'Done: staged, then deployed to production and verified' : 'Done: deployed and verified', next }
   if (run.reportDisposition) {
     const n = run.reportDisposition.issues?.length ?? 0
     const said = firstLine(run.reportDisposition.response, 600)
@@ -758,6 +759,9 @@ function blocked (run, outputs, kept) {
     const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it, unless only declared inert paths drifted; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
     const conflicts = reason === 'source-delivery-blocked' ? mergeSummary(run.delivery).conflicts : null
     return { ...base, headline: d.headline, detail: (d.detail ?? '') + (conflicts ? ` ${conflicts}` : '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
+  }
+  if (reason === 'release-staging-not-passed') {
+    return { ...base, headline: 'Stopped: staging did not pass, so production was not touched', detail: 'The staging release or one of its assessments did not pass; staging was recovered under its configured policy.', next: 'Read the staging assessments and release commands in the technical details.' }
   }
   if (typeof reason === 'string' && reason.startsWith('release-')) {
     return { ...base, headline: `Stopped: the release ${reason.slice(8).replace(/-/g, ' ')}`, next: 'Check the release commands in the technical details.' }

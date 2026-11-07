@@ -21,6 +21,7 @@ import { certDir, logDir, projectPath } from './project-path.mjs'
 import { loadToken, requireToken, socketAuth, tokenFile } from './auth.mjs'
 import { localLogin, localLoginMiddleware } from './local-login.mjs'
 import { getRun, listPlaybooks, listRuns, preview, readLiveOutput, readStepResponse } from './runs-api.mjs'
+import { selectStagedRelease } from './release-selection.mjs'
 import { sourceState } from './staleness.mjs'
 import { topSupervisorService } from './top-supervisor-service.mjs'
 import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
@@ -601,6 +602,7 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
     projectRef = { id: project, path: projectPath(project) }
   }
   const result = await preview(req.params.id, { issue, project: projectRef, deliveryActions: supervisor.deliveryActions, runOptions,
+    selectRelease: projectRef ? () => selectStagedRelease({ project, projectPath: projectRef.path, listIssues: (p, o) => listIssues(p, o) }) : null,
     pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null })
   res.status(result.ok ? 200 : 422).json(result)
 }))

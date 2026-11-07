@@ -42,6 +42,7 @@ import { createAvailabilityStore } from './runtime/failure.mjs'
 import { inspectSourceRepository, repositoryFaultError, usesSourceRepository } from './runtime/source-repository.mjs'
 import { createQuotaFallback } from './runtime/model-fallback.mjs'
 import { resolvePlaybook, loadConfig } from './config/load.mjs'
+import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
 import { forgetRunDrives } from './runtime/selftest-history.mjs'
@@ -253,7 +254,14 @@ export function createSupervisor ({
       // A model this host has seen exhausted is not started again before its
       // recorded reset. Checked before anything is reserved, so a refused start
       // leaves no failed run behind.
-      const resolution = await resolvePlaybook(playbookId, { root, runOptions, projectId: project })
+      // A production release names the green staging release it promotes; when the
+      // operator named none, it is filled here from the newest one whose content
+      // is the checkout's (release-selection.mjs), as the preview showed.
+      let stagedRelease = null
+      const resolution = await resolveWithRelease(playbookId, { root, runOptions, projectId: project },
+        async () => (stagedRelease = await selectStagedRelease({ project, projectPath, listIssues: (p, o) => issues.listIssues(p, o) })))
+      const noGreen = resolution.ok ? resolution.resolved.liveExecution.blockers.find((b) => b.kind === 'no-green-staging') : null
+      if (noGreen) throw Object.assign(err(422, noGreen.reason, { code: 'NO_GREEN_STAGING', latestGreen: noGreen.latestGreen ?? null, unverifiable: noGreen.unverifiable ?? [] }), { started: false, retryable: false })
       if (resolution.ok) {
         // Admission serializes reservations, so what this reads cannot race another start.
         const holder = await exclusiveHolder(project, issueId, exclusivityOf(resolution.resolved))
@@ -314,6 +322,7 @@ export function createSupervisor ({
         configRoot: root,
         expectConfigHash,
         runOptions,
+        stagedRelease: stagedRelease?.releaseId ? stagedRelease : null,
         unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path))
       })
     }) } catch (error) {

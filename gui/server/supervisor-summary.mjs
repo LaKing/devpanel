@@ -199,7 +199,8 @@ export function summariseRun (detail) {
     currentWindow: detail.currentWindow ? {id:detail.currentWindow.id,capturedAt:detail.currentWindow.capturedAt,source:detail.currentWindow.source,coverage:detail.currentWindow.coverage} : null,
     reportDisposition: detail.reportDisposition ? {...detail.reportDisposition,response:clip(detail.reportDisposition.response,3000)} : null,
     autoStart: detail.autoStart ?? null,
-    release: detail.release ? {runId:detail.release.runId,environment:detail.release.environment,status:detail.release.status,sha256:detail.release.sha256,checkpointVerified:detail.release.checkpointVerified,commands:detail.release.commands.map(c=>({id:c.id,status:c.status,error:c.error??null}))} : null,
+    release: detail.release ? releaseSummary(detail.release) : null,
+    productionRelease: detail.productionRelease ? releaseSummary(detail.productionRelease) : null,
     startedAt: detail.startedAt,
     endedAt: detail.endedAt ?? null,
     budgets: detail.budgets ?? null,
@@ -263,6 +264,8 @@ function compactTarget (target) {
   return out
 }
 
+const releaseSummary = (r) => ({runId:r.runId,environment:r.environment,stage:r.stage??null,status:r.status,sha256:r.sha256,sourceRelease:r.sourceRelease??null,checkpointVerified:r.checkpointVerified,...(r.gate?{gate:r.gate}:{}),commands:(r.commands??[]).map(c=>({id:c.id,status:c.status,error:c.error??null}))})
+
 export function summarisePreview (preview) {
   if (!preview?.ok) return preview
   return {
@@ -275,7 +278,11 @@ export function summarisePreview (preview) {
     intents: (preview.parameterDefinitions?.intents ?? []).map((i) => ({ id: i.id, title: i.title })),
     runOptions: preview.runOptions ?? {},
     seats: preview.parameterDefinitions?.seats ?? [],
-    release: preview.parameterDefinitions?.release ?? null,
+    // The environments by name (release.environments) and what this preview resolved:
+    // releasePlan.mode, releaseId and whether it was filled or named.
+    release: preview.parameterDefinitions?.release ? { tactic: preview.parameterDefinitions.release.tactic, environments: preview.parameterDefinitions.release.environments, default: preview.parameterDefinitions.release.default ?? null } : null,
+    releasePlan: preview.release ?? null,
+    prerequisitesBlocking: (preview.prerequisites ?? []).filter((p) => p.category === 'blocking').map((p) => ({ kind: p.kind, detail: p.detail, ...(p.latestGreen !== undefined ? { latestGreen: p.latestGreen } : {}) })),
     participants: (preview.participants ?? []).map((p) => ({ role: p.role, model: p.model, harness: p.connection?.harness ?? null, effort: p.effort, verification: p.verification })),
     phases: (preview.phases ?? []).map((p) => ({ id: p.id, kind: p.kind, maxRounds: p.loop?.maxRounds ?? null, steps: p.steps.map((s) => `${s.role}:${s.id}`) })),
     workspace: preview.workspace ?? null,

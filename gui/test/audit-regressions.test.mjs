@@ -97,7 +97,7 @@ export default async function(t){
   const target={workdir:'/tmp',ownership:'fixture',rollback:'manual',commands:Object.fromEntries(['inspect','checkpoint','verifyCheckpoint','apply','verifyRelease','restart','observe','test','restore','verifyRestore'].map(id=>[id,{run:'true',timeoutSeconds:10}]))}
   await fs.mkdir(path.join(dir,'projects'));await fs.writeFile(path.join(dir,'projects/test-project.yaml'),YAML.stringify({id:'test-project',infrastructure:{kind:'boilerplate',orientation:'Fixture',staging:environment('stage'),deployments:[environment('prod-a'),environment('prod-b')],testDrive:{commands:[{id:'test',run:'true'}]},release:{targets:{'prod-a':target,'prod-b':target}}}}))
  })
- const multiple=await resolvePlaybook('deployment',{root,projectId:'test-project',runOptions:{releaseId:'staged'}})
+ const multiple=await resolvePlaybook('deployment',{root,projectId:'test-project',runOptions:{releaseId:'staged',environment:'production'}})
  t.ok('multiple deployments demand explicit target',multiple.resolved?.liveExecution.blockers.some(b=>b.reason.includes('explicitly')))
  const explicit=await resolvePlaybook('deployment',{root,projectId:'test-project',runOptions:{releaseId:'staged',environment:'prod-b'}})
  t.ok('explicit target resolves',explicit.ok&&!explicit.resolved.liveExecution.blockers.some(b=>!b.model))

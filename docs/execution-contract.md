@@ -2754,3 +2754,13 @@ in history. An optional replacement check target must retain the same destinatio
 and is recorded separately so subsequent checks use the corrected commands.
 This is an operator maintenance helper, not a model-exposed action. Resume still
 requires fresh review and the usual closure conditions.
+
+## Release plans and guarded phases
+
+A staging or deployment run resolves a release plan (`resolved.release`, `config/release-plan.mjs`):
+`mode` (`staging`, `production` or `staging-then-production`), the staging and production targets, and for
+production the `releaseId` with its `releaseIdSource` (`operator` when named, `filled` when the panel chose the
+newest green staging release whose content is the checkout's, `server/release-selection.mjs`). A filled releaseId
+is part of the configHash. A strategy phase may carry `when:` over that plan (`release.mode == …`, the same tiny
+evaluator as transitions); replay skips the phase when it does not hold. A snapshot resolved before plans existed
+derives the old plan from its run options, so a run in flight releases as it always would have.

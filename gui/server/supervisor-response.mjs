@@ -31,6 +31,8 @@ const fields = {
   readiness: ['project'],
   // A question for the operator, shown in Needs attention; answered later as an event.
   ask_operator: ['question'],
+  // The operator's Authorize/Decline for one previewed production release, written by the server.
+  ask_release_authorization: ['previewId'],
   finish: []
 }
 function validate (value) {

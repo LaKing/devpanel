@@ -97,6 +97,24 @@ successful Staging run's bytes establish it. A person reads this list, and there
 dismissal. It does not count towards `batch.ready`, so a hand-edited path cannot prompt
 batches for ever.
 
+**A Deployment run to staging counts.** A Deployment run with environment `staging`
+(its default), and the staging half of `staging-then-production`, release this
+run's snapshot exactly as a Staging run does: they record coverage and count as
+Staging runs for everything in this section. Their receipt also records the
+snapshot's content identity (`run.release.content`).
+
+**Production and coverage.** A production Deployment run with no named releaseId
+is filled with the newest green staging release whose content is the checkout's
+([Tactical playbooks](tactical-playbooks.md#deployment-environments) "When
+releaseId is filled"). Coverage explains why there may be none (a run still
+pending is content no green release carried) but decides nothing: the match is
+read from the release's own bytes, because coverage records which deliveries a
+release carried, not what one archive holds. With no match the start is refused
+with *No green staging release matches the content of this project's checkout:
+run Staging (or 'Staging first, Deployment on success'), or name a releaseId.*,
+and the start dialog offers the latest green staging release or says there is
+none. An operator may still name a releaseId explicitly.
+
 **Only a Staging run clears a run.** `deploy_staging` runs opaque saved commands and
 leaves no shipped bytes to compare, so reading the instance or the checkout around them
 would not prove what shipped. Its record (`coverage` on the operation) names every

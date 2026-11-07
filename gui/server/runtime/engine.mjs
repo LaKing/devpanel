@@ -6,6 +6,7 @@ import { ignoredWords, openStability, owedAsRisk } from './selftest-history.mjs'
 import { writeJson } from './persistence.mjs'
 import fs from 'node:fs/promises'
 import { executeRelease, recoverRelease } from './release.mjs'
+import { planOf as releasePlanOf } from '../config/release-plan.mjs'
 import { hostConfigDir, DEFAULT_CONFIG_ROOT } from '../config/host-config.mjs'
 import { captureWindow } from './current-window.mjs'
 import { publishFindings } from './tactical-issues.mjs'
@@ -539,6 +540,9 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
   }
 
   for (const phase of snapshot.phases) {
+    // A phase guarded by the release plan (the production half of
+    // staging-then-production) runs only when its plan says so.
+    if (phase.when && !evaluate(phase.when, { release: releasePlanOf(snapshot) })) continue
     if (phase.step) {
       if (!snapshot.participants[phase.step.role]) continue
       // A concurrent step already chosen to run alongside (reviewBatch): look past it.
@@ -870,8 +874,11 @@ export function boundedReports (snapshot, run, steps, outputs, { coordinationOnl
     return {role:s.role,phase:s.phase,round:s.round,number:s.number,fullReport:s.reportFile??null,
       ...(truncated?{excerpt:clip(response+'\n'+serialized),truncated:true,instruction:'Read fullReport before relying on this seat or approving its conclusions.'}: {response,output:out})}
   })
-  if(run.release)reports.unshift({role:'engine',release:{checkpointVerified:run.release.checkpointVerified,runId:run.release.runId,sha256:run.release.sha256,status:run.release.status,environment:run.release.environment,
-    commands:run.release.commands.slice(-12).map(c=>({id:c.id,status:c.status,logFile:c.logFile,stdout:c.stdout?.slice(-500),stderr:c.stderr?.slice(-500)}))}})
+  const receipt=r=>({checkpointVerified:r.checkpointVerified,runId:r.runId,sha256:r.sha256,status:r.status,environment:r.environment,stage:r.stage??null,sourceRelease:r.sourceRelease??null,
+    commands:r.commands.slice(-12).map(c=>({id:c.id,status:c.status,logFile:c.logFile,stdout:c.stdout?.slice(-500),stderr:c.stderr?.slice(-500)}))})
+  // The production half of staging-then-production is assessed from its own receipt, beside the staging one.
+  if(run.productionRelease)reports.unshift({role:'engine',productionRelease:receipt(run.productionRelease)})
+  if(run.release)reports.unshift({role:'engine',release:receipt(run.release),...(snapshot.release?{plan:snapshot.release}:{})})
   if(run.reportDisposition)reports.unshift({role:'engine',disposition:clip(run.reportDisposition)})
   return reports
 }
@@ -2501,10 +2508,13 @@ export class Engine {
         if (brief) append('tooling-commands', `${brief}${NL}Hold the seats to this: a report that a listed command could not be run must quote the attempted command line and its output.`)
       }
       if (['staging', 'deployment'].includes(this.snapshot.tactic)) {
+        const plan = releasePlanOf(this.snapshot)
         append('release-identity', JSON.stringify({ tactic: this.snapshot.tactic,
-          environment: this.snapshot.runOptions?.environment ?? (this.snapshot.tactic === 'staging' ? this.snapshot.infrastructure?.staging?.id : this.snapshot.infrastructure?.deployments?.length === 1 ? this.snapshot.infrastructure.deployments[0].id : null),
-          stagedReleaseId: this.snapshot.runOptions?.releaseId ?? null,
-          instruction: 'The release operator inspects the installed procedures and target; decide from its preparation report and recorded operation evidence.' }))
+          mode: plan.mode, environment: plan.mode === 'staging' ? plan.staging : plan.production, staging: plan.staging ?? null, production: plan.production ?? null,
+          stagedReleaseId: plan.releaseId ?? null, stagedReleaseSource: plan.releaseIdSource ?? null, ...(plan.filledFrom ? { filledFrom: plan.filledFrom } : {}),
+          instruction: plan.mode === 'staging-then-production'
+            ? 'The engine releases this snapshot to staging, and only after staging completed and every staging assessment accepted it, promotes the same archive to production; production is then assessed in its own phase. Decide from the preparation report and recorded operation evidence.'
+            : 'The release operator inspects the installed procedures and target; decide from its preparation report and recorded operation evidence.' }))
       }
       append('captured-input', JSON.stringify(await coordinationInput(this.run.currentWindow)))
     }
@@ -3820,12 +3830,33 @@ export class Engine {
           this.run.status='blocked';this.run.blockedReason=`release-${this.run.release.status}`;this.run.outcome='unresolved';await this.persist();break
         }
       }
-      if (this.run.release?.status === 'completed' && next.step.id === 'confirm') {
-        const concerns=effectiveAgentSteps(this.activeSteps()).filter(s=>['releaseAssessment','investigationResult'].includes(this.outputs[s.number]?.contract) && !releaseAssessmentAccepted(this.outputs[s.number]))
-        if (concerns.length) {
-          this.run.release=await recoverRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),snapshot:this.snapshot,reason:'Release verifiers reported unresolved concerns'})
-          await this.persist({type:'release-recovery',status:this.run.release.status})
+      // staging-then-production: production only after this run's staging release
+      // completed and every staging assessment accepted it. Anything less recovers
+      // staging and ends the run; production is never touched.
+      // A replay after a crash reaches here again: the receipt on disk is returned
+      // (an interrupted one as recovery-required), never a second production release.
+      if (this.snapshot.tactic === 'deployment' && next.step.id === 'investigate-production-operator' && this.run.productionRelease?.status !== 'completed') {
+        if (!this.run.release?.gate?.passed) {
+          const assessments=this.releaseAssessments('staging')
+          const passed=this.run.release?.status==='completed' && assessments.length>0 && assessments.every(s=>releaseAssessmentAccepted(this.outputs[s.number]))
+          if (!passed) {
+            await this.recoverUnacceptedRelease('Staging did not pass its release assessments; production was not touched')
+            this.run.status='blocked';this.run.blockedReason='release-staging-not-passed';this.run.outcome='unresolved';await this.persist();break
+          }
+          this.run.release={...this.run.release,gate:{passed:true,at:this.clock.iso(),assessments:assessments.map(s=>s.number)}}
+          await this.persist({type:'release-gate',passed:true})
         }
+        this.run.productionRelease = await executeRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),workspace:this.run.workspace,snapshot:this.snapshot,signal:this.controller.signal,stage:'production',onUpdate:async state=>{this.run.productionRelease=structuredClone(state);await this.persist({type:'release-command',stage:'production',command:state.commands.at(-1)?.id,status:state.commands.at(-1)?.status})},verifySource:async()=>{
+          if(!await this.beginIntegrity('release-operator',{invocationId:`release-${uuid()}`}))throw new Error('release source integrity changed')
+        }})
+        await this.persist({type:'release-operation',stage:'production',status:this.run.productionRelease.status})
+        if (this.run.productionRelease.status !== 'completed') {
+          this.run.status='blocked';this.run.blockedReason=`release-production-${this.run.productionRelease.status}`;this.run.outcome='unresolved';await this.persist();break
+        }
+      }
+      if (next.step.id === 'confirm' && (this.run.productionRelease?.status === 'completed' || (this.run.release?.status === 'completed' && !this.run.release.gate?.passed))) {
+        const concerns=this.releaseAssessments(this.run.productionRelease ? 'production' : 'all').filter(s=>!releaseAssessmentAccepted(this.outputs[s.number]))
+        if (concerns.length) await this.recoverUnacceptedRelease('Release verifiers reported unresolved concerns')
       }
       // Checks run beside review turns only. Anything else — a coordinator's
       // brief or confirmation, closure — decides with their result in hand, so
@@ -3882,10 +3913,26 @@ export class Engine {
     return this.run
   }
 
+  /**
+   * The release this run may still undo: the production half of a two-stage run
+   * when it completed, else the run's (staging or production) release, unless it
+   * is a staging release that already passed its gate into production.
+   */
   async recoverUnacceptedRelease (reason) {
-    if (this.run.release?.status !== 'completed') return
+    if (this.run.productionRelease?.status === 'completed') {
+      this.run.productionRelease=await recoverRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),snapshot:this.snapshot,reason,stage:'production'})
+      await this.persist({type:'release-recovery',stage:'production',status:this.run.productionRelease.status})
+      return
+    }
+    if (this.run.release?.status !== 'completed' || this.run.release.gate?.passed) return
     this.run.release=await recoverRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),snapshot:this.snapshot,reason})
     await this.persist({type:'release-recovery',status:this.run.release.status})
+  }
+
+  /** Release assessments of this run: of its staging release, of its production half, or all. */
+  releaseAssessments (which) {
+    return effectiveAgentSteps(this.activeSteps()).filter((s) => ['releaseAssessment','investigationResult'].includes(this.outputs[s.number]?.contract) &&
+      (which === 'all' || (which === 'production') === String(s.stepId).startsWith('investigate-production-')))
   }
 
   activeSteps () {
@@ -4358,7 +4405,7 @@ export class Engine {
 
   /** The `coordinatorConfirmation` closure condition; accepting a check result reads the same one. */
   coordinatorConfirmed (confirmation, { identities, hasCandidate }) {
-    return (!this.snapshot.tactic || buildContext(this.snapshot,this.run,this.activeSteps(),this.outputs).acceptanceCriteria.every(c => confirmation?.criteria?.some(r => r.id === c.id && r.met === true))) && (!['staging','deployment'].includes(this.snapshot.tactic) || (this.run.release?.status === 'completed' && effectiveAgentSteps(this.activeSteps()).filter(s => s.role !== 'coordinator').every(s => releaseAssessmentAccepted(this.outputs[s.number])))) && confirmation?.satisfied === true && (hasCandidate ? identities.has(confirmation?.revision) : true)
+    return (!this.snapshot.tactic || buildContext(this.snapshot,this.run,this.activeSteps(),this.outputs).acceptanceCriteria.every(c => confirmation?.criteria?.some(r => r.id === c.id && r.met === true))) && (!['staging','deployment'].includes(this.snapshot.tactic) || (this.run.release?.status === 'completed' && (releasePlanOf(this.snapshot).mode !== 'staging-then-production' || this.run.productionRelease?.status === 'completed') && effectiveAgentSteps(this.activeSteps()).filter(s => s.role !== 'coordinator').every(s => releaseAssessmentAccepted(this.outputs[s.number])))) && confirmation?.satisfied === true && (hasCandidate ? identities.has(confirmation?.revision) : true)
   }
 
   /**
@@ -4457,9 +4504,8 @@ export class Engine {
     // A strategy that never fingerprints a candidate (analysis work) has no
     // revision for the confirmation to name; one that does must name the exact
     // content it confirmed.
-    if (this.run.release?.status === 'completed' && confirmation?.satisfied !== true) {
-      this.run.release=await recoverRelease({issuePath:this.issuePath,runId:this.runId,hostDir:this.hostDir(),snapshot:this.snapshot,reason:'Coordinator did not accept release'})
-      await this.persist({type:'release-recovery',status:this.run.release.status})
+    if ((this.run.release?.status === 'completed' || this.run.productionRelease?.status === 'completed') && confirmation?.satisfied !== true) {
+      await this.recoverUnacceptedRelease('Coordinator did not accept release')
     }
     const hasCandidate = this.run.revisions.length > 0
     const disposition = this.run.reportDisposition

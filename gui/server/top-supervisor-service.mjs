@@ -6,6 +6,7 @@ import { acquire } from './runtime/lock.mjs'
 import { createTopSupervisor } from './top-supervisor.mjs'
 import { CONFIG_ROOT, loadConfig, resolvePlaybook } from './config/load.mjs'
 import { getRun, listPlaybooks, listRuns, preview, readStepResponse } from './runs-api.mjs'
+import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { summariseIssue, summarisePackedRun, summarisePreview, summariseRun, summariseStep } from './supervisor-summary.mjs'
 import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
 import { inspectLaunchState } from './supervisor-launch-state.mjs'
@@ -154,10 +155,11 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    preview:async a=>{
     const issue=await issues.getIssue(a.project,a.issueId)
     return summarisePreview(await preview(a.playbook,{configRoot,issue,project:{id:a.project,path:projectPath(a.project)},runOptions:a.runOptions??{},deliveryActions:supervisor.deliveryActions,
+     selectRelease:()=>selectStagedRelease({project:a.project,projectPath:projectPath(a.project),listIssues:(p,o)=>issues.listIssues(p,o)}),
      pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue.path,...args})}))
    },
    launchState:async p=>{
-    const resolved=await resolvePlaybook(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project})
+    const resolved=await resolveWithRelease(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project},()=>selectStagedRelease({project:p.project,projectPath:projectPath(p.project),listIssues:(q,o)=>issues.listIssues(q,o)}))
     if(!resolved.ok)return {blockedReason:resolved.errors.map(e=>e.message).join('; ')}
     if(resolved.resolved.configHash!==p.configHash)return {blockedReason:'Configuration changed since preview; preview again before starting'}
     return inspectLaunchState({projectPath:projectPath(p.project),workspace:resolved.resolved.workspace,configHash:p.configHash})

@@ -1,4 +1,5 @@
 import { isSelftestReport } from './runtime/baseline-failures.mjs'
+import { reservedEnvironmentErrors } from './config/release-plan.mjs'
 
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 
@@ -7,6 +8,7 @@ export function infrastructureErrors (infra) {
   const environments = [infra.staging, ...infra.deployments]
   const errors = []
   if (new Set(environments.map(e => e.id)).size !== environments.length) errors.push('environment ids must be unique')
+  errors.push(...reservedEnvironmentErrors(infra))
   if (infra.deployments.some(e => e.ssh.hostRef === infra.staging.ssh.hostRef)) errors.push('staging and deployment containers must have different SSH host references')
   if (!infra.testDrive.commands.some(c => c.required !== false)) errors.push('testDrive needs at least one required command')
   const commands = [...infra.testDrive.commands, ...(infra.testDrive.finallyCommands ?? [])]

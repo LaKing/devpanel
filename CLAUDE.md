@@ -371,6 +371,16 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   may also version, publish, restart or deploy.
 - `runtime/path-overlap.mjs` — would this candidate write files another live run, of its project or another, is touching? Compared at the real destination, through links (`related` plays no part): expected paths from the issue's earlier runs (retained worktree, patch, plan text; none reads `unknown`, never `none`), a live run's from its worktree now and its plan. On readiness and preview as `pathOverlap`, an information prerequisite; every start reads it again and records `run.startOverlap`. It refuses nothing, for operator and supervisor alike. docs/top-level-supervisor.md "Readiness".
 - `staging-coverage.mjs` — which delivered runs a staging release carried, from content: each delivery's patch names its blobs per path, a Staging run compares its snapshot once as it releases (`run.release.coverage`), an older green one is read from its retained archive. `stagingPendingReport` is `GET /api/projects/:project/staging-pending` and `overview`'s `stagingPending`: `pending`, `indeterminate`, `batch.ready`, and deliveries from before `COVERAGE_BASELINE` only as `history.count` (their content is never read). It starts nothing. `deploy_staging` names its candidates `indeterminate` (`deployed-content-unproven`) and clears nothing: only a Staging run does. Notes go through `issues.createEngineNote`, kept beside an archived issue until restored. docs/staging-deployment.md "What a release covers".
+- `config/release-plan.mjs` + `release-selection.mjs` — where a staging or deployment run releases: the Deployment
+  playbook's `runOptions.environment` is `staging` (default), `production` or `staging-then-production`, never
+  production by default. For production without a releaseId, `selectStagedRelease` fills it with the newest green
+  staging release (open or packed issue) whose content identity equals the checkout's, read through that release's
+  own projection (`destinationFingerprint`); old receipts are read from their verified archive. No match refuses the
+  start before reservation (`NO_GREEN_STAGING`) and the start dialog offers the latest green release; a named
+  releaseId overrides. staging-then-production promotes the run's own staging archive only after the staging release
+  and every staging assessment passed (phases guarded by `when: release.mode == …`, `run.productionRelease`). The
+  supervisor starts production only on an Authorize to `ask_release_authorization` bound to that preview.
+  docs/tactical-playbooks.md "Deployment environments".
 - `runtime/call-cost.mjs` — a supervisor call's estimated cost from its own tokens and `roster-pricing/<id>.yaml` (unhashed, beside the entry), when the runtime reports none; a Codex delta counts only after a turn that proved a clean baseline (`state.ownUsageSession`). Marked `estimated` on the ledger, `cost` on the view; else unknown and counted.
 - `runtime/ledger.mjs` — append-only spending ledger (`issues/.supervisor/ledger.jsonl`): `reserve`/`settle`/
   `release`/`wake` lines, replayed on load, a torn final line truncated and reported. An outstanding

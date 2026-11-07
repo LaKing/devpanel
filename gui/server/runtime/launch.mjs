@@ -1,4 +1,5 @@
 import { stagedRelease } from './release.mjs'
+import { planOf } from '../config/release-plan.mjs'
 import { captureWindow } from './current-window.mjs'
 import { freezeHostGuidance } from './host-guidance.mjs'
 import { DEFAULT_CONFIG_ROOT } from '../config/host-config.mjs'
@@ -690,12 +691,15 @@ export async function reserveRun ({
   status = 'preflighting',
   expectConfigHash = null,
   runOptions = {},
+  // The staged release a production start was filled with (release-selection.mjs),
+  // resolved again here so the snapshot names the release the start was shown.
+  stagedRelease = null,
   platform = hostPlatform(),
   // Open cleanup entries the barrier file could not be written with (the
   // supervisor holds them): they bar an in-place start like the file's own.
   unrecordedBarrier = []
 }) {
-  const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: issue?.project })
+  const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: issue?.project, stagedRelease })
   if (!resolution.ok) {
     const error = new Error(resolution.errors.map((e) => `${e.field}: ${e.message}`).join('; '))
     error.status = 422
@@ -860,8 +864,11 @@ export async function provisionRun (reservation, {
   const { runId, runLock, run, issuePath, clock } = reservation
   projectPath = await fs.realpath(projectPath)
 
-  const staged = reservation.resolution.resolved.tactic === 'deployment'
-    ? await stagedRelease(path.dirname(issuePath),reservation.resolution.resolved.runOptions.releaseId) : null
+  // Only a production release works from a staged archive; staging and
+  // staging-then-production release this run's own snapshot of the checkout.
+  const plan = reservation.resolution.resolved.tactic === 'deployment' ? planOf(reservation.resolution.resolved) : null
+  const staged = plan?.mode === 'production'
+    ? await stagedRelease(path.dirname(issuePath),plan.releaseId,{extractTo:path.join(store.runDir(issuePath, runId),'artifacts','staged-source.tar')}) : null
   if (staged) workspaceProvider = {
     async create ({root,runId}) {
       const dir=path.join(root,`workspace-${runId}`)

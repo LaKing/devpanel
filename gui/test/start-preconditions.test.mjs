@@ -5,6 +5,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 
 import { engineFixture } from './fakes/fixture.mjs'
+import { NO_GREEN_STAGING } from '../server/config/release-plan.mjs'
 import {
   REPOSITORY_FAULTS, inspectSourceRepository, repositoryFaultError, usesSourceRepository
 } from '../server/runtime/source-repository.mjs'
@@ -145,6 +146,49 @@ export default async function (t) {
     t.eq('implementation needs the source checkout', usesSourceRepository({ tactic: null }), true)
     t.eq('so does staging, which is cut from it', usesSourceRepository({ tactic: 'staging' }), true)
     t.eq('deployment does not', usesSourceRepository({ tactic: 'deployment' }), false)
+    t.eq('a production deployment does not', usesSourceRepository({ tactic: 'deployment', release: { mode: 'production' } }), false)
+    t.eq('a deployment to staging is cut from it', usesSourceRepository({ tactic: 'deployment', release: { mode: 'staging' } }), true)
+    t.eq('so is staging-then-production', usesSourceRepository({ tactic: 'deployment', release: { mode: 'staging-then-production' } }), true)
+  }
+
+  t.section('4b. a production start with no matching green staging release is refused before reservation, probing or spending (AC3)')
+  {
+    const s = await supervisorOver(undefined, { playbook: 'deployment' })
+    const environment = (id) => ({ id, ssh: { hostRef: `ssh-config:${id}.invalid`, workdir: '/tmp' }, projectRoot: '/tmp/fixture', files: {} })
+    const target = { workdir: '/tmp', ownership: 'fixture', rollback: 'manual', commands: Object.fromEntries(['inspect', 'checkpoint', 'verifyCheckpoint', 'apply', 'verifyRelease', 'restart', 'observe', 'test', 'restore', 'verifyRestore'].map((id) => [id, { run: 'true', timeoutSeconds: 10 }])) }
+    await fs.mkdir(path.join(s.f.configRoot, 'projects'), { recursive: true })
+    await fs.writeFile(path.join(s.f.configRoot, 'projects', 'devpanel-project.yaml'), JSON.stringify({ id: 'devpanel-project', evidence: [], infrastructure: { kind: 'boilerplate', orientation: 'Fixture', staging: environment('stage'), deployments: [environment('prod')], testDrive: { requirement: 'optional', commands: [{ id: 'noop', run: 'true' }] }, release: { targets: { stage: target, prod: target } } } }))
+    const error = await refusal(() => s.start({ runOptions: { environment: 'production' } }))
+    t.eq('the start is refused with the sentence', [error?.status, error?.code, error?.message], [422, 'NO_GREEN_STAGING', NO_GREEN_STAGING])
+    t.eq('as a start that never happened', [error?.started, error?.retryable], [false, false])
+    t.eq('naming no latest green release, since there is none', error?.latestGreen ?? null, null)
+    t.eq('no model was probed', await s.probes(), 0)
+    t.eq('no run was reserved', await s.runs(), [])
+    await s.supervisor.settle()
+  }
+
+  t.section('4c. a green release whose identity matches but whose archive is gone is not filled: the start is refused before reservation')
+  {
+    const repo = await checkout()
+    const s = await supervisorOver(repo, { playbook: 'deployment' })
+    const environment = (id) => ({ id, ssh: { hostRef: `ssh-config:${id}.invalid`, workdir: '/tmp' }, projectRoot: '/tmp/fixture', files: {} })
+    const target = { workdir: '/tmp', ownership: 'fixture', rollback: 'manual', commands: Object.fromEntries(['inspect', 'checkpoint', 'verifyCheckpoint', 'apply', 'verifyRelease', 'restart', 'observe', 'test', 'restore', 'verifyRestore'].map((id) => [id, { run: 'true', timeoutSeconds: 10 }])) }
+    await fs.mkdir(path.join(s.f.configRoot, 'projects'), { recursive: true })
+    await fs.writeFile(path.join(s.f.configRoot, 'projects', 'devpanel-project.yaml'), JSON.stringify({ id: 'devpanel-project', evidence: [], infrastructure: { kind: 'boilerplate', orientation: 'Fixture', staging: environment('stage'), deployments: [environment('prod')], testDrive: { requirement: 'optional', commands: [{ id: 'noop', run: 'true' }] }, release: { targets: { stage: target, prod: target } } } }))
+    // A green staging release of exactly this checkout's content, recorded, whose archive was deleted since.
+    const { checkoutIdentity } = await import('../server/release-selection.mjs')
+    const content = await checkoutIdentity(repo, {})
+    const runDir = path.join(s.f.issuePath, 'runs', 'green-run')
+    await fs.mkdir(path.join(runDir, 'artifacts'), { recursive: true })
+    const release = { runId: 'green-run', tactic: 'staging', stage: 'staging', status: 'completed', startedAt: '2026-11-06T10:00:00.000Z', sha256: '0'.repeat(64), content }
+    await fs.writeFile(path.join(runDir, 'release.json'), JSON.stringify(release))
+    await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify({ runId: 'green-run', status: 'completed', outcome: 'resolved', startedAt: release.startedAt, release, workspace: {} }))
+    const error = await refusal(() => s.start({ runOptions: { environment: 'production' } }))
+    t.eq('refused, not filled', [error?.status, error?.code], [422, 'NO_GREEN_STAGING'])
+    t.eq('naming the release as unverifiable', (error?.unverifiable ?? []).map((u) => u.runId), ['green-run'])
+    t.eq('no model was probed', await s.probes(), 0)
+    t.eq('no run was reserved beside it', await s.runs(), ['green-run'])
+    await s.supervisor.settle()
   }
 
   t.section('5. a start on an empty checkout is refused before reservation, before probing, before spending')

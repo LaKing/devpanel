@@ -1414,6 +1414,15 @@ watch(() => route.query.run, (runId) => {
                 <pre class="mono-block">{{ command.stdout }}{{ command.stderr }}</pre>
               </details>
             </template>
+            <!-- The production half of "Staging first, Deployment on success", after staging passed. -->
+            <template v-if="run.productionRelease">
+              <h3 class="block__sub">Then production release to {{ run.productionRelease.environment }}: {{ run.productionRelease.status }}</h3>
+              <details v-for="command in run.productionRelease.commands" :key="'production' + command.startedAt + command.id" class="more">
+                <summary>{{ command.id }}: {{ command.status }}</summary>
+                <p v-if="command.error" class="error-text">{{ command.error }}</p>
+                <pre class="mono-block">{{ command.stdout }}{{ command.stderr }}</pre>
+              </details>
+            </template>
 
             <!-- What the coordinator said remains. Never summarised away. -->
             <template v-if="orderedRisks.length">

@@ -549,6 +549,11 @@
         "title": {
           "type": "string"
         },
+        "when": {
+          "type": "string",
+          "pattern": "^release\\.",
+          "description": "Run this phase only when the declarative guard holds over the run's resolved release plan, e.g. release.mode == staging-then-production. Absent, the phase always runs."
+        },
         "step": {
           "$ref": "#/$defs/step"
         },
