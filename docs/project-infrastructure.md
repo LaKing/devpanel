@@ -549,7 +549,7 @@ value is its rule, or the rule with `inert`:
 workspace:
   reconcile:
     'docs/notes.txt': append                     # merged by the rule, then the checks run
-    '**/changelog.txt': { rule: prepend, inert: true }
+    '**/changelog/**': { rule: prepend, inert: true }      # a Boilerplate changelog directory, one newest-first file per day and version
 ```
 
 The merge is the same either way: `inert` does not change how a path composes,
