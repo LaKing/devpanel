@@ -301,6 +301,47 @@ every command is required and none is a service. The test slot or a finalizer mu
 not shown at all gates failed. Test and browser commands are numbered `<id>-<n>`, so no
 declared id may take that form.
 
+### Module pool and hook reader
+
+An application that composes a framework through symlinked collections names it:
+
+```yaml
+# projects/instance-a-project.yaml
+id: instance-a-project
+framework: framework-project      # a configured project that names no framework itself
+```
+
+The framework and every project naming it share one pool of modules, read from the
+members' checkouts under each member's `testDrive.modules.collections`; each module
+belongs to the member whose real checkout holds it. A coding run locks the modules it
+affects in the pool, so issues touching disjoint modules run in parallel and issues
+sharing one wait (docs/execution-contract.md "Module locks").
+
+The framework may declare how hooks are read, so that a revision changing a hook's
+argument signature widens its affected set to every subscriber in the pool:
+
+```yaml
+# projects/framework-project.yaml
+modulePool:
+  hookReader:
+    run: node @framework/tooling/hooks-as-json.mjs   # a wrapper around the framework's declaration tooling
+    timeoutSeconds: 120
+```
+
+The command runs with its working directory at a candidate tree (the run's revision,
+its base, or another member at its HEAD with the candidate's framework collections),
+inside the panel's local check fence, read-only and offline, and must print one JSON
+object:
+
+```json
+{ "declarations": [{ "module": "@c/a", "hook": "saved", "signature": "(record, user)" }],
+  "subscribers":  [{ "module": "app-modules/shop", "hook": "saved", "parameters": "(record, user)" }] }
+```
+
+Declared, a reading that fails blocks the revision's modules check (`unavailable`); a
+subscriber in another member is tested by that member's own modules tier on its staging
+host (a subscriber drive). Without a reader anywhere in the pool, hooks are not read.
+
 ### The targeted tier: named selftests on a repair revision
 
 ```yaml

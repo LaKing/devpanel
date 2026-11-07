@@ -1,6 +1,7 @@
 import { resolveWithRelease } from '../release-selection.mjs'
 import { sizingSummary } from './triage-sizing.mjs'
 import { evaluate } from './engine.mjs'
+import { locksModules } from './module-locks.mjs'
 
 /*
  * Dry-run preview.
@@ -82,7 +83,7 @@ function indexSteps (phases) {
  * @param project  optional { id, path }
  * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null } = {}) {
   // A production release with no named releaseId is filled from the issues
   // (release-selection.mjs selectStagedRelease), the same way the start fills it.
   const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
@@ -218,6 +219,13 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   if (overlap?.state === 'overlap' || overlap?.state === 'unknown') {
     prerequisites.push({ kind: 'path-overlap', category: 'information', status: overlap.state === 'overlap' || overlap.possible.length ? 'warning' : 'unknown', detail: overlap.detail })
   }
+  // The module pool (module-locks.mjs): a module the issue's triage named that another live run
+  // holds refuses a coding playbook's start until that run ends; the preview names the holder.
+  const locks = moduleLocks && locksModules(r) ? await Promise.resolve().then(moduleLocks).catch((error) => ({ unavailable: error.message })) : null
+  if (locks?.conflicts?.length) {
+    // Information, like path-overlap: occupancy is not a configuration fault, and the start's own refusal is retryable.
+    prerequisites.push({ kind: 'module-lock', category: 'information', status: 'occupied', detail: `${locks.conflicts.map((c) => `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; ')}: the start waits until that run ends (retryable; the supervisor's ready queue shows blockedBy module-lock)`, holders: locks.conflicts })
+  }
   prerequisites.push({
     kind: 'not-probed',
     category: 'information',
@@ -249,6 +257,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     configHash: r.configHash,
     prerequisites,
     ...(overlap ? { pathOverlap: overlap } : {}),
+    ...(locks ? { moduleLocks: locks } : {}),
     configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
     liveEligible: r.liveExecution.eligible
   }

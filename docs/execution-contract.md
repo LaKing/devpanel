@@ -488,6 +488,34 @@ modules' browser runs when declared, then the finalizers.
   `modules` records the `collections` it was read under, and a drive under other
   collections (or a newly declared tier) reads the revision's modules, affected
   modules and the base's checksums again before it runs.
+- **Hook expansion.** In a module pool (see "Module locks") whose framework
+  declares `modulePool.hookReader` (`runtime/module-hooks.mjs`), each revision is
+  read with that command: on the base once per run, on the revision's rebuild, and,
+  when a hook changed, on every other pool member at its committed HEAD with the
+  framework's collections replaced by the candidate's. A command run with its
+  working directory at the tree, inside the panel's local check fence (read-only,
+  offline), it prints `{declarations: [{module, hook, signature}], subscribers:
+  [{module, hook, parameters}]}`: a wrapper around the framework's own declaration
+  tooling. A hook whose declaration signature, or any `hooks/` handler's
+  parameters, differ from the base is changed, and **every** subscriber of a changed
+  hook in the pool is named in `affectedModules.viaHooks` as `{module, project,
+  hooks, inTree}` — including one the triage or the changed paths already made
+  affected, so the record keeps where each came from. Duplicates go only from the
+  combined sets: the run's lock (each module once), the drive's filters (each
+  in-tree module tested once) and, per other project, a **subscriber drive**: that
+  project's own modules tier on its staging host, on its HEAD with the candidate's
+  framework (`runChecks`' `prepared` tree: every framework collection of that HEAD is
+  removed first, so one the candidate deleted does not survive; `identity.dropped`),
+  filtered to its subscribers. Each
+  subscriber drive is folded into the revision's modules check (`subscribers` on
+  the record): a failed one fails it, one that cannot run (no modules tier on that
+  project) leaves it unavailable. A reading that fails — non-zero exit, output not
+  in that form, timeout, a fence not proved, or a changed hook while a pool member's
+  checkout cannot be read (its subscribers would be unknown) — is `hooks.state: unavailable` with the
+  reason and `viaHooks: null` (unknown, never empty), and the revision's modules
+  check is `unavailable`: the round is vetoed and closure cannot pass on it.
+  `undeclared` (an empty `viaHooks`, nothing blocked) only when no pool member
+  declares a reader.
 
 ### Plan findings are owed by the implementation
 
@@ -1674,6 +1702,72 @@ sequentially and wraps at 99999, so a pid comes back within the same second
 only after the whole range was used in that second — and recorded on every run
 as `host.startTimePrecision`. It is unproved until a Mac runs
 `cd ~/devpanel/gui && node test/run.mjs lock`.
+
+### Module locks
+
+A framework project and the instances whose `projects/<id>.yaml` names it
+(`framework: <id>`, refused when unknown, the project itself, or a project that
+names a framework too) form one **module pool** (`runtime/module-pool.mjs`); a
+project with a modules tier and no framework is a pool of its own, and one
+without a modules declaration has none. The pool's modules are read from the
+members' checkouts — `<collection>/<module>/` under each member's
+`testDrive.modules.collections` — and each belongs to the member whose real
+checkout holds its real directory: a framework collection an instance reaches
+through a symlink is the framework's, an instance's own collections are its own.
+The module's name is the lock key, so a framework module locked by one instance's
+run is locked for the framework's and every other instance's runs.
+
+Runs whose playbook records revisions lock modules (`runtime/module-locks.mjs`):
+one lock file per module under `<issues>/.module-locks/<pool>/`, with this
+section's owner identity, plus the module, project and issue.
+
+- **At start** `supervisor.start()` reads the pool's locks against the issue's
+  triage modules (`issue.json` `sizing.affectedModules`). A module another live run
+  holds refuses the start before anything is reserved: 409, retryable, `code:
+  MODULE_LOCKED`, the message and `holders` naming module, run and issue. It never
+  fails the issue; the supervisor's ready queue shows it waiting
+  (docs/top-level-supervisor.md "The ready queue"). Otherwise the set is taken all
+  or nothing under the run id the reservation then takes (`run.moduleLocks`,
+  `run.modulePool`), and given back if the reservation fails. Disjoint sets start
+  side by side; an issue with no sizing takes nothing at start.
+- **Growth.** Each revision's affected modules (`affectedModules.modules` and
+  `viaHooks`, "The modules tier") not yet held are `revision.moduleLocks.pending`,
+  and the drive loop takes them before any review, check or turn
+  (`holdRevisionModules`, which every check launch also awaits, so no drive or
+  subscriber drive runs on modules the run does not hold); a replay after a crash
+  finds them pending and does the same. A module another live run holds is waited for — never while holding part
+  of the new set — with `run.moduleLocks.waiting {modules, holders, since}`, a wait
+  record beside the locks, `module-lock-wait` events, and the time excused from the
+  wall clock like a drive-slot wait (`run.moduleLockWaits`). Before each poll the
+  run walks the waits-for graph; when it leads back to itself, the **youngest** run
+  on the cycle (latest `startedAt`, then run id) gives up every lock it holds
+  (`run.moduleLocks.yielded`, told to the next auditor) and waits to take its whole
+  set again holding nothing, so no cycle stands; the others keep waiting. Once
+  taken, the revision records `moduleLocks.added`.
+- **Release** at every run end (`releaseRunLocks`, recorded as
+  `run.moduleLocks.released`); a paused run keeps its locks. A lock whose owner
+  process is proved dead is taken over like a drive slot; one whose owner is
+  `unknown` is never taken over; one whose owner is alive but whose run's
+  `run.json` no longer reads live is stale and taken over too — unless it is a
+  continuation's: a continuation of an ended run first writes a marker
+  (`run.moduleLocks.continuation`) on the run record, then takes its locks
+  carrying it, and a lock whose marker matches the record's stays held while the
+  status still reads ended. The marker goes when the continuation proceeds or gives
+  its locks back, so a run that has really ended leaves stale locks; no clock is
+  compared. Every continuation of
+  a run — resume, recover, continue, refresh checks, accept a check result, and an
+  integrity `restored` or `accept-partial` (only `abandon` ends it) — takes its
+  recorded set again under the current process (a restart made the earlier owner
+  dead) before the run goes on. A module another run took meanwhile refuses it,
+  naming the holder, and the set stays required on the record
+  (`run.moduleLocks.released`, `reason: reclaim-refused`), so the next attempt must
+  take it again; a continuation refused after the set was taken gives an ended
+  run's locks back.
+- **Visible** as `moduleLocks` on readiness and preview (the pool, every lock with
+  its state, the issue's expected modules and conflicts; a conflict is a
+  `module-lock` prerequisite of a coding configuration in readiness and an
+  information prerequisite in preview) and on the project page
+  (`GET /api/projects/:project/module-locks`).
 
 ## Escaped descendants
 

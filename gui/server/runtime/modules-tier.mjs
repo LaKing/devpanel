@@ -101,8 +101,10 @@ export function modulesDrive (target, { affected, files = [] }) {
   const commands = []
   if (files.length) commands.push(fill(m.lint, 'files', files))
   commands.push(m.load, m.restart, m.ready)
+  // Hook subscribers in this tree (affectedModules.viaHooks, module-hooks.mjs) are tested here too, once each.
+  const modules = [...new Set([...(affected?.modules ?? []), ...(affected?.viaHooks ?? []).filter((v) => v.inTree).map((v) => v.module)])].sort()
   const filters = [
-    ...(affected?.modules ?? []).map((module) => ({ module, filter: module })),
+    ...modules.map((module) => ({ module, filter: module })),
     ...(affected?.core?.dirs ?? []).map((dir) => ({ core: dir, filter: dir === '.' ? (m.rootFilter ?? '.') : dir }))
   ]
   const tests = []
@@ -135,6 +137,9 @@ export function affectedModulesNotice (revision) {
   const list = (xs) => xs?.length ? xs.map((x) => JSON.stringify(x)).join(', ') : 'none'
   const lines = [`Modules tier, revision ${revision.fingerprint}: changed modules (checksum differs from the base) ${list(revision.modules?.changed)}; affected modules tested (the triage list ∪ the modules of the changed paths) ${list(a.modules)}; core directories ${list(a.core?.dirs)}.`]
   if (a.unlisted?.length) lines.push(`Changed modules the triage did not list: ${list(a.unlisted)} (recorded as affectedModules.unlisted; this refuses nothing — judge whether the change belongs there).`)
+  if (revision.hooks?.state === 'read' && revision.hooks.changed?.length) lines.push(`Hook signatures this revision changes: ${list(revision.hooks.changed)}; every subscriber in the module pool is affected and locked (affectedModules.viaHooks): ${(a.viaHooks ?? []).map((v) => `${JSON.stringify(v.module)} (${v.project}; ${v.hooks.join(', ')}; ${v.inTree ? 'tested in this drive' : 'tested in a subscriber drive of its project'})`).join(', ') || 'none'}.`)
+  if (revision.hooks?.state === 'unavailable') lines.push(`The pool's hook reader could not read this revision (${revision.hooks.error}): which subscribers a hook change affects is unknown, so the modules check is unavailable.`)
+  if (revision.moduleLocks?.yielded?.length) lines.push(`While waiting for module locks this run gave up its locks on ${list(revision.moduleLocks.yielded)} to break a wait cycle and took them again; another run may have changed them meanwhile.`)
   if (a.notInTree?.length) lines.push(`Listed by the triage but not in this revision's tree: ${list(a.notInTree)} (their filters still ran).`)
   return lines.join(' ')
 }

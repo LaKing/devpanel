@@ -1,4 +1,5 @@
 import { inspectSourceRepository } from './runtime/source-repository.mjs'
+import { locksModules } from './runtime/module-locks.mjs'
 
 /*
  * Could a run start here, and if not, what exactly is in the way?
@@ -46,10 +47,11 @@ function ownershipOf (fault) {
  * @param resolve      resolvePlaybook, injected so this module stays testable
  * @param inspectLaunch  inspectLaunchState, likewise
  * @param pathOverlap  ({ deliveryAction }) => the reading of runtime/path-overlap.mjs
+ * @param moduleLocks  () => supervisor.moduleLockReading: the project's module pool and its locks
  */
 export async function launchReadiness ({
   project, issueId = null, projectPath, budget = null, perIssueLeft = null,
-  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null,
+  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null,
   now = Date.now(), inspect = inspectSourceRepository
 }) {
   const fault = await inspect({ projectPath })
@@ -89,6 +91,15 @@ export async function launchReadiness ({
   // Not a prerequisite: nothing here refuses a start, so baselineReady does not hear of it.
   const overlap = pathOverlap ? await pathOverlap({ deliveryAction: configuration?.delivery?.action ?? null }) : null
 
+  // The module pool's locks (module-locks.mjs). A module the issue's triage named that another
+  // live run holds refuses a coding playbook's start, so with such a playbook named it is a
+  // prerequisite of that configuration; otherwise it is reported beside the reading.
+  const locks = moduleLocks ? await Promise.resolve().then(moduleLocks).catch((error) => ({ unavailable: error.message })) : null
+  if (locks?.conflicts?.length && configuration?.locksModules) {
+    configuration.prerequisites.push({ condition: 'module-lock', state: locks.conflicts.map((c) => `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; '), needs: 'the holding run ends (the supervisor\'s ready queue waits for it: blockedBy module-lock)', holders: locks.conflicts })
+    configuration.ready = false
+  }
+
   return {
     project,
     issueId,
@@ -104,6 +115,7 @@ export async function launchReadiness ({
     prerequisites,
     configuration,
     ...(overlap ? { pathOverlap: overlap } : {}),
+    ...(locks ? { moduleLocks: locks } : {}),
     means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing.',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
@@ -124,7 +136,7 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
   const resolved = resolution.resolved
   const action = resolved.workspace?.isolation === 'in-place' ? 'in-place' : resolved.completion?.delivery?.action
   const writesSource = ['apply-to-source', 'in-place'].includes(action)
-  const identity = { playbook, intent: resolved.intent?.id ?? null, configHash: resolved.configHash, base: resolved.workspace?.base ?? 'head',
+  const identity = { playbook, intent: resolved.intent?.id ?? null, configHash: resolved.configHash, base: resolved.workspace?.base ?? 'head', locksModules: locksModules(resolved),
     delivery: { action: action ?? null, destination: writesSource ? projectPath : null, writesSource,
       authority: writesSource ? 'Starting this playbook authorizes engine-owned source writes at this destination and the bound Git-owner checkouts behind its materialized symlinks.' : 'This delivery does not update the project checkout.' } }
 

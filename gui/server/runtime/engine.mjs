@@ -35,6 +35,8 @@ import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-t
 import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
+import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
+import { changedHooks, combinedSets, composeTree, parseReading, subscribersOf } from './module-hooks.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { autoReconcileRefusal } from './auto-reconcile.mjs'
 import { infrastructureBrief } from '../infrastructure.mjs'
@@ -1866,6 +1868,8 @@ export class Engine {
     if (this.run.workspace?.isolation === 'in-place') return
     const current = this.run.revisions.at(-1)?.fingerprint ?? null
     if (!current) return
+    // Whoever asks for a check, it never runs on modules the run does not hold yet (module-locks.mjs).
+    if (!await this.holdRevisionModules()) return
     const configured = overrideTarget ?? this.run.checkRefresh?.target ?? this.snapshot.checks?.target ?? null
     if (!configured) return
     // This revision's targeted decision, when the target declares the tier; a target
@@ -1952,6 +1956,8 @@ export class Engine {
     if (!affected) {
       const computed = this.revisionModules(fp, { declared: configured.modules })
       affected = computed.affectedModules
+      // The hook reading is the revision's own (readRevisionHooks); a new collection mapping keeps it.
+      if (recorded?.affectedModules && 'viaHooks' in recorded.affectedModules) affected.viaHooks = recorded.affectedModules.viaHooks
       if (recorded) Object.assign(recorded, computed)
     }
     return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries) }), affected }
@@ -2059,6 +2065,7 @@ export class Engine {
       const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })
       // Tagged before any caller gates it (maybeRunChecks, reconcile): gatingResult reads the tier.
       Object.assign(result, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
+      await this.subscriberChecks(result, { revision: current, common })
       return result
     }
     // The baseline: the same target (of a tier: the same tier) on the base
@@ -2301,6 +2308,178 @@ export class Engine {
     }
   }
 
+  /**
+   * The pool's hook reading of a revision (module-hooks.mjs, execution-contract.md "The
+   * modules tier"): the reader on the base (once per run), on this revision's rebuild, and,
+   * when a hook changed, on each other member at its HEAD with the candidate's framework.
+   * Every subscriber of a changed hook goes into affectedModules.viaHooks with its project
+   * and hooks. A reading that fails is `unavailable` (viaHooks unknown, the modules check
+   * unavailable); `undeclared` only when no member declares a reader.
+   */
+  async readRevisionHooks (record, fp) {
+    const pool = this.run.modulePool
+    if (!pool || !record.affectedModules) return
+    if (!pool.hookReader) { record.hooks = { state: 'undeclared' }; record.affectedModules.viaHooks = []; return }
+    const ws = this.run.workspace
+    const runDir = store.runDir(this.issuePath, this.runId)
+    const target = { kind: 'local', commands: [{ id: 'hook-reader', run: pool.hookReader.run, ...(pool.hookReader.timeoutSeconds ? { timeoutSeconds: pool.hookReader.timeoutSeconds } : {}) }] }
+    const read = async (options, dirName) => {
+      const result = await runChecks({ target, baseCommit: ws.baseCommit, baseline: this.baseline ?? new Map(), workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, dirName, ...options })
+      if (result.result !== 'passed') throw new Error(`${dirName}: ${result.error ?? result.commands?.[0]?.stderr?.trim().slice(-300) ?? result.result}`)
+      return parseReading(await fs.readFile(path.join(runDir, result.dir, 'hook-reader.stdout'), 'utf8'))
+    }
+    try {
+      const own = this.run.issue?.project ?? null
+      if (this.run.hooks?.base?.baseCommit !== ws.baseCommit || this.run.hooks?.base?.reader !== pool.hookReader.run) {
+        this.run.hooks = { base: { baseCommit: ws.baseCommit, reader: pool.hookReader.run, reading: await read({ base: true }, 'hooks-base') } }
+      }
+      const reading = await read({ revision: fp.fingerprint, fingerprint: fp }, `hooks-${record.byStep}`)
+      const changed = changedHooks(this.run.hooks.base.reading, reading)
+      const readings = [{ project: own, inTree: true, reading }]
+      if (changed.length) {
+        // A changed hook's subscribers may live in any member: one that cannot be read leaves the analysis
+        // incomplete, which is unavailable, never a reading without its subscribers. With no hook changed,
+        // the run's own tree (where every change is) is the whole answer.
+        const unreadable = pool.members.filter((m) => m.project !== own && (!m.path || (pool.unreadable ?? []).includes(m.project))).map((m) => m.project)
+        if (unreadable.length) throw new Error(`hook ${changed.join(', ')} changed, and the checkout of pool member ${unreadable.join(', ')} could not be read, so its subscribers are unknown`)
+        for (const member of pool.members.filter((m) => m.project !== own && m.path)) {
+          const into = path.join(runDir, 'compose', `${record.byStep}-${member.project}`)
+          try {
+            const prepared = await composeTree({ project: member.project, memberPath: member.path, frameworkCollections: pool.frameworkCollections, from: ws.path, into, revision: fp.fingerprint, signal: this.controller.signal })
+            readings.push({ project: member.project, inTree: false, reading: await read({ revision: fp.fingerprint, prepared }, `hooks-${record.byStep}-${member.project}`) })
+          } finally { await fs.rm(into, { recursive: true, force: true }).catch(() => {}) }
+        }
+      }
+      record.hooks = { state: 'read', changed }
+      record.affectedModules.viaHooks = subscribersOf(changed, readings, pool.owners ?? {})
+    } catch (error) {
+      record.hooks = { state: 'unavailable', error: error.name === 'AbortError' ? 'cancelled' : error.message }
+      record.affectedModules.viaHooks = null
+    }
+  }
+
+  /** What this revision needs locked that the run does not hold yet, as pending (module-locks.mjs). */
+  markPendingModules (record) {
+    const locks = this.run.moduleLocks
+    if (!locks || !record.affectedModules) return
+    const held = new Set(locks.held.map((h) => h.module))
+    const missing = combinedSets(record.affectedModules).lock.filter((m) => !held.has(m))
+    if (missing.length) record.moduleLocks = { pending: missing }
+  }
+
+  /**
+   * Take the latest revision's pending modules before anything else happens (execution-contract.md
+   * "Module locks"). Waits while another live run holds one, recorded on `run.moduleLocks.waiting`,
+   * a wait record beside the locks and the events, excused from the wall clock like a drive-slot
+   * wait. When the waits-for graph closes a cycle the youngest run on it gives up everything it
+   * holds and takes its whole set again, so no cycle stands. False when stopped while waiting.
+   */
+  holdRevisionModules () {
+    // One wait at a time: the drive loop and a check launched beside it share it.
+    this.holdingModules ??= this.takePendingModules().finally(() => { this.holdingModules = null })
+    return this.holdingModules
+  }
+
+  async takePendingModules () {
+    const record = this.run.revisions?.at(-1)
+    const locks = this.run.moduleLocks
+    if (!locks || !record?.moduleLocks?.pending?.length) return true
+    const common = { pool: locks.pool, runId: this.runId, project: locks.project, issueId: locks.issueId, issuePath: this.issuePath, startedAt: this.run.startedAt, clock: this.clock, platform: this.platform }
+    const waitId = uuid()
+    let from = null
+    let yielded = []
+    const endWait = () => {
+      if (!from) return
+      this.openDriveWaits.delete(waitId)
+      ;(this.run.moduleLockWaits ??= []).push({ from, to: this.clock.iso(), modules: record.moduleLocks.pending })
+    }
+    for (;;) {
+      if (this.controller.signal.aborted) {
+        endWait()
+        locks.waiting = null
+        await clearWait(locks.pool, this.runId).catch(() => {})
+        await this.persist({ type: 'module-lock-wait-stopped' })
+        return false
+      }
+      const pending = record.moduleLocks.pending
+      const got = await takeModules({ ...common, modules: pending, already: locks.held })
+      if (!got.conflicts.length) {
+        locks.held.push(...got.held)
+        endWait()
+        locks.waiting = null
+        await clearWait(locks.pool, this.runId)
+        record.moduleLocks = { added: pending, ...(from ? { waitedFrom: from } : {}), ...(yielded.length ? { yielded } : {}) }
+        await this.persist({ type: 'module-locks-taken', modules: pending, revision: record.fingerprint })
+        return true
+      }
+      if (!from) {
+        from = this.clock.iso()
+        this.openDriveWaits.set(waitId, { from: Date.parse(from) })
+      }
+      locks.waiting = { modules: pending, holders: got.conflicts, since: from }
+      await writeWait(locks.pool, { runId: this.runId, project: locks.project, issueId: locks.issueId, startedAt: this.run.startedAt, wants: pending, holders: got.conflicts }, { clock: this.clock })
+      await this.persist({ type: 'module-lock-wait', modules: pending, holders: got.conflicts })
+      if (locks.held.length && await yieldsIn(locks.pool, { runId: this.runId, startedAt: this.run.startedAt, wants: pending }, { platform: this.platform })) {
+        const given = locks.held.map((h) => h.module)
+        await releaseModules({ pool: locks.pool, held: locks.held })
+        locks.held = []
+        yielded = [...new Set([...yielded, ...given])].sort()
+        ;(locks.yielded ??= []).push({ modules: given, to: [...new Set(got.conflicts.map((c) => c.runId))], at: this.clock.iso(), revision: record.fingerprint })
+        record.moduleLocks.pending = [...new Set([...pending, ...given])].sort()
+        await this.persist({ type: 'module-lock-yield', modules: given })
+        continue
+      }
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, this.moduleLockPollMs ?? 5000)
+        this.controller.signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+      })
+    }
+  }
+
+  /**
+   * A modules check's hook and subscriber parts (module-hooks.mjs), folded into the drive's
+   * result so it gates and counts for closure as one: an unavailable hook reading makes the
+   * check unavailable; each other project with subscribers gets a drive of its own modules
+   * tier on its HEAD with the candidate's framework, and a drive that does not pass fails
+   * (or leaves unavailable) the whole check. `result.subscribers` keeps each drive.
+   */
+  async subscriberChecks (result, { revision, common }) {
+    const record = this.run.revisions.findLast((r) => r.fingerprint === revision)
+    const pool = this.run.modulePool
+    if (!record || !pool) return
+    const worse = (to, error) => {
+      result.error = [result.error, error].filter(Boolean).join('; ')
+      if (result.result === 'passed' || (to === 'failed' && result.result !== 'failed')) result.result = to
+    }
+    if (record.hooks?.state === 'unavailable') worse('unavailable', `the pool's hook reader could not read this revision, so the subscribers a hook change affects are unknown: ${record.hooks.error}`)
+    const drives = combinedSets(record.affectedModules).subscriberDrives
+    if (!Object.keys(drives).length) return
+    result.subscribers = []
+    for (const [project, modules] of Object.entries(drives)) {
+      const member = pool.members.find((m) => m.project === project)
+      const configured = pool.targets?.[project] ?? null
+      if (!member?.path || !configured?.modules) {
+        result.subscribers.push({ project, modules, result: 'unavailable', gating: 'unavailable', error: `${project} declares no modules tier, so its hook subscribers cannot be tested` })
+        worse('unavailable', `subscribers of ${project} (${modules.join(', ')}) could not be tested: it declares no modules tier`)
+        continue
+      }
+      const into = path.join(common.runDir, 'compose', `drive-${record.byStep}-${project}`)
+      let drive
+      try {
+        const prepared = await composeTree({ project, memberPath: member.path, frameworkCollections: pool.frameworkCollections, from: this.run.workspace.path, into, revision, signal: this.controller.signal })
+        const { target } = modulesDrive(configured, { affected: { modules, core: null }, files: [] })
+        drive = await runChecks({ ...common, target, revision, prepared })
+        const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: drive })
+        Object.assign(drive, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
+      } catch (error) {
+        drive = { result: 'unavailable', error: error.message, dir: null }
+      } finally { await fs.rm(into, { recursive: true, force: true }).catch(() => {}) }
+      const gate = drive.tier ? gatingResult(drive, this.run) : drive.result
+      result.subscribers.push({ project, modules, result: drive.result, gating: gate, dir: drive.dir ?? null, prepared: drive.prepared ?? null, ...(drive.error ? { error: drive.error } : {}), ...(drive.modules?.selftestFailures?.length ? { selftestFailures: drive.modules.selftestFailures } : {}) })
+      if (gate !== 'passed') worse(gate === 'failed' ? 'failed' : 'unavailable', `the subscriber drive of ${project} (${modules.join(', ')}) ${gate === 'failed' ? 'failed' : `did not complete: ${drive.error ?? gate}`}${drive.dir ? ` (${drive.dir})` : ''}`)
+    }
+  }
+
   /** Fingerprint the workspace and bind it to the step that produced it. */
   async recordRevision (number) {
     const existing = this.run.steps.find((s) => s.number === number)?.revision
@@ -2314,6 +2493,12 @@ export class Engine {
     const step = this.run.steps.find((s) => s.number === number)
     if (step) step.revision = fp.fingerprint
     this.run.revisions.push({ fingerprint: fp.fingerprint, byStep: number, at: this.clock.iso(), rule: fp.rule, ...this.revisionModules(fp) })
+    const record = this.run.revisions.at(-1)
+    // The pool's hook reading widens the affected set (module-hooks.mjs); then what this
+    // revision needs and the run does not hold yet is pending, and the drive loop takes it
+    // before any review, check or turn (holdRevisionModules).
+    await this.readRevisionHooks(record, fp)
+    this.markPendingModules(record)
 
     // A new candidate invalidates every approval and check result taken against
     // an older one. They are never carried forward.
@@ -3784,6 +3969,8 @@ export class Engine {
       // Escaped descendants not proved gone: no turn, check or delivery starts.
       if (this.cleanupHold()) { await this.blockForCleanup(); break }
       if (await this.pauseAtBoundary()) break
+      // A revision whose modules another live run holds: nothing goes on until they are this run's.
+      if (!await this.holdRevisionModules()) continue
 
       // A finished triage needs no further paid turn, even if the last answer
       // used the remaining turn/token allowance. Publish and finish its result.
@@ -3957,6 +4144,8 @@ export class Engine {
       // Read again: the revision this turn recorded did not exist when `early` was.
       const recorded = next.step.recordsRevision && !asking ? this.earlyChecks(next.phase) : null
       if (recorded) {
+        // The revision's modules first: no check or subscriber drive runs on modules another run holds.
+        if (!await this.holdRevisionModules()) continue
         if (this.concurrentChecks()) this.startChecks(recorded.tier)
         else await this.maybeRunChecks({ tier: recorded.tier })
       }

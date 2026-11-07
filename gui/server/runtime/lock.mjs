@@ -77,12 +77,17 @@ export async function acquire (file, {
   waitMs = 0,
   pollMs = 10,
   // Stops a wait behind a live owner: a stopped run must not sit in the queue.
-  signal = null
+  signal = null,
+  // Extra fields published with the record (module-locks.mjs: what is locked, by which issue).
+  detail = null,
+  // async (held) => true when a LIVE owner's lock no longer stands for anything (the run it
+  // names has ended): taken over like a dead one. Never consulted for 'unknown' or 'dead'.
+  stale = null
 } = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true })
   const owner = await currentOwner(runId, { platform })
   const token = crypto.randomUUID()
-  const record = { purpose, token, owner, acquiredAt: clock.iso(), heartbeatAt: clock.iso() }
+  const record = { ...(detail ?? {}), purpose, token, owner, acquiredAt: clock.iso(), heartbeatAt: clock.iso() }
   const deadline = Date.now() + waitMs
 
   const handle = {
@@ -112,9 +117,12 @@ export async function acquire (file, {
     if (signal?.aborted) throw abortedWait(file)
     if (await createWith(file, record)) return handle
 
-    const { held, liveness } = await examine(file, platform)
-    if (liveness === 'dead' && takeOverDead) {
-      if (await takeOver(file, held, platform)) continue
+    const examined = await examine(file, platform)
+    const { held } = examined
+    let { liveness } = examined
+    if (liveness === 'alive' && stale && held && await stale(held)) liveness = 'stale'
+    if (['dead', 'stale'].includes(liveness) && takeOverDead) {
+      if (await takeOver(file, held, platform, stale)) continue
       if (Date.now() < contendedUntil) { await new Promise((r) => setTimeout(r, pollMs)); continue }
     } else if (Date.now() < deadline) {
       // Queue behind a live owner until the deadline, then give up.
@@ -175,7 +183,7 @@ async function examine (file, platform = hostPlatform()) {
  * the dead owner and both unlink — which would let one delete the other's newly
  * acquired lock and leave two holders believing they own it.
  */
-async function takeOver (file, held, platform = hostPlatform()) {
+async function takeOver (file, held, platform = hostPlatform(), stale = null) {
   const gate = `${file}.takeover`
   const token = crypto.randomUUID()
   if (!await createWith(gate, { purpose: 'takeover', token, owner: await currentOwner(null, { platform }), at: new Date().toISOString() })) {
@@ -200,7 +208,8 @@ async function takeOver (file, held, platform = hostPlatform()) {
       return true
     }
     if (!held || current.token !== held.token) return false          // replaced since we looked
-    if (await ownerLiveness(current.owner, { platform }) !== 'dead') return false  // no longer dead
+    const now = await ownerLiveness(current.owner, { platform })
+    if (now !== 'dead' && !(now === 'alive' && stale && await stale(current))) return false  // no longer dead
     await fs.rm(file, { force: true })
     return true
   } finally {

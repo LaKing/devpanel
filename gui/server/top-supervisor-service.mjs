@@ -15,6 +15,7 @@ import { setIssueDependencies, openDependencies } from './issue-dependencies.mjs
 import { readReporters, reportStartLevel } from './reporters.mjs'
 import { startAdmission } from './start-admission.mjs'
 import { launchReadiness } from './supervisor-readiness.mjs'
+import { conflictsWith, readWaits } from './runtime/module-locks.mjs'
 import { projectPath } from './project-path.mjs'
 import { performanceForModel } from './model-performance.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
@@ -98,19 +99,30 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    startAdmission:async a=>startAdmission({issue:await issues.getIssue(a.project,a.issueId),playbook:a.playbook}),
    // What the ready queue cannot read off the listings: which live run holds each project's checkout, by the test a start is refused on, and how far a report's trust reaches.
    readyQueueFacts:async issuesByProject=>{
-    const holders={},reportLevels={}
+    const holders={},reportLevels={},moduleConflicts={},moduleWaits={}
     let reporters=null
+    // One configuration read per queue reading, shared by every project's pool reading.
+    const config=await loadConfig({root:configRoot}).catch(()=>null)
     for(const [project,rows] of Object.entries(issuesByProject)){
      holders[project]=await supervisor.checkoutHolder(project,rows)
      for(const issue of rows)if(issue.report){reporters??=await readReporters();reportLevels[`${project}/${issue.id}`]=await reportStartLevel(issue,{reporters})}
+     // Module locks of the project's pool (module-locks.mjs): what each issue's triage named that another live run holds, and live runs waiting for a module.
+     const locks=config&&supervisor.moduleLockReading?await supervisor.moduleLockReading({project,config}).catch(()=>null):null
+     if(!locks)continue
+     for(const issue of rows){
+      const conflicts=conflictsWith(locks.held,issue.sizing?.affectedModules??[],{project,issueId:issue.id})
+      if(conflicts.length)moduleConflicts[`${project}/${issue.id}`]=conflicts
+     }
+     for(const wait of await readWaits(locks.pool))if(wait.project===project&&wait.issueId)moduleWaits[`${project}/${wait.issueId}`]=wait
     }
-    return {holders,reportLevels}
+    return {holders,reportLevels,moduleConflicts,moduleWaits}
    },
    readiness:async a=>{
     const issue=a.issueId?await issues.getIssue(a.project,a.issueId).catch(()=>null):null
     return launchReadiness({...a,projectPath:projectPath(a.project),
      resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState,
-     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue?.path??null,...args})})
+     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue?.path??null,...args}),
+     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId??null})})
    },
    infrastructure:project=>projectInfrastructure(project,{root:configRoot}),
    inspectEnvironment:a=>inspectEnvironment(a,{root:configRoot}),
@@ -156,7 +168,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     const issue=await issues.getIssue(a.project,a.issueId)
     return summarisePreview(await preview(a.playbook,{configRoot,issue,project:{id:a.project,path:projectPath(a.project)},runOptions:a.runOptions??{},deliveryActions:supervisor.deliveryActions,
      selectRelease:()=>selectStagedRelease({project:a.project,projectPath:projectPath(a.project),listIssues:(p,o)=>issues.listIssues(p,o)}),
-     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue.path,...args})}))
+     pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue.path,...args}),
+     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId})}))
    },
    launchState:async p=>{
     const resolved=await resolveWithRelease(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project},()=>selectStagedRelease({project:p.project,projectPath:projectPath(p.project),listIssues:(q,o)=>issues.listIssues(q,o)}))

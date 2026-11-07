@@ -41,6 +41,8 @@ process.env.DEVPANEL_PROJECTS_DIR = PROJECTS
 // Nor the host's test-drive slots: a suite that names no issue root would otherwise
 // count against, and write into, the checkout's issues/ (runtime/drive-slots.mjs).
 process.env.DEVPANEL_DRIVE_SLOTS_DIR = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-drive-slots-'))
+// Nor its module locks (runtime/module-locks.mjs), shared across projects like the slots.
+process.env.DEVPANEL_MODULE_LOCKS_DIR = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-module-locks-'))
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 // runner.test.mjs points this at its fixture suites.

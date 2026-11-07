@@ -47,6 +47,8 @@ import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
 import { forgetRunDrives } from './runtime/selftest-history.mjs'
 import { routeAutoStart } from './auto-start.mjs'
+import { poolOf, poolRecord } from './runtime/module-pool.mjs'
+import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules } from './runtime/module-locks.mjs'
 
 /*
  * Owns the lifecycle of running playbooks.
@@ -296,6 +298,8 @@ export function createSupervisor ({
     let pregateRecord = null
     let startOverlap = null
     let home = false
+    let modulePool = null
+    let moduleExpected = []
     try { await admission(project, async () => {
       const issue = await holderOf(project, issueId)
       home = Boolean(issue.home)
@@ -321,6 +325,19 @@ export function createSupervisor ({
         // Admission serializes reservations, so what this reads cannot race another start.
         const holder = await exclusiveHolder(project, issueId, exclusivityOf(resolution.resolved))
         if (holder) throw occupied(conflictMessage(holder), holder)
+        // A coding run shares its project's module pool (module-locks.mjs): a module of the
+        // issue another live run holds refuses the start, naming the holder, before anything
+        // exists. The supervisor's ready queue shows the same as a module-lock wait.
+        if (locksModules(resolution.resolved)) {
+          const read = await modulePoolOf(project, root)
+          if (read) {
+            const expected = issue.sizing?.affectedModules ?? []
+            const conflicting = conflictsWith(await readPoolLocks(read.pool.id), expected, { project, issueId })
+            if (conflicting.length) throw occupied(lockedMessage(conflicting), { code: 'MODULE_LOCKED', holders: conflicting })
+            modulePool = read
+            moduleExpected = expected
+          }
+        }
         for (const [role, participant] of Object.entries(resolution.resolved.participants)) {
           const cooling = await availability.check(participant.model.id)
           if (cooling) throw occupied(`model ${participant.model.id} (${role}) is exhausted until ${cooling.exhaustedUntil}${cooling.assumed ? ' (assumed hold)' : ''}: ${cooling.reason}${cooling.runId ? ` (observed in run ${cooling.runId})` : ''}. Wait, choose another model, or clear the record.`, { availability: cooling })
@@ -366,7 +383,20 @@ export function createSupervisor ({
         const overlap = await pathOverlap({ project, projectPath, issuePath: issue.path, deliveryAction: deliveryActionOf(resolution.resolved) })
         if (worthRecording(overlap)) startOverlap = { ...overlap, by: supervisorLaunchId ? 'supervisor' : 'operator' }
       }
+      // The locks first, under the run id the reservation will take, so a refused set leaves no run.
+      let moduleLocks = null
+      const presetRunId = modulePool ? store.newRunId() : null
+      if (modulePool) {
+        const startedAt = new Date().toISOString()
+        const got = await takeModules({ pool: modulePool.pool.id, modules: moduleExpected, runId: presetRunId, project, issueId, issuePath: issue.path, startedAt, platform })
+        if (got.conflicts.length) throw occupied(lockedMessage(got.conflicts), { code: 'MODULE_LOCKED', holders: got.conflicts })
+        moduleLocks = { pool: modulePool.pool.id, project, issueId, held: got.held, waiting: null, takenAtStart: moduleExpected }
+      }
+      try {
       reservation = await reserveRun({
+        runId: presetRunId,
+        moduleLocks,
+        modulePool: modulePool?.record ?? null,
         playbookId,
         supervisorLaunchId,
         startOverlap,
@@ -381,6 +411,10 @@ export function createSupervisor ({
         unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)),
         fullVerification: cycle ? { cycleId: cycle } : null
       })
+      } catch (error) {
+        if (moduleLocks) await releaseModules({ pool: moduleLocks.pool, held: moduleLocks.held }).catch(() => {})
+        throw error
+      }
     }) } catch (error) {
       starting.delete(k)
       throw translate(error)
@@ -463,6 +497,46 @@ export function createSupervisor ({
    */
   function checkoutHolder (project, listed = null) {
     return exclusiveHolder(project, null, NOT_EXCLUSIVE, listed)
+  }
+
+  /**
+   * The project's module pool read now (module-pool.mjs), with each member's modules-tier
+   * target for subscriber drives: `{ pool, record }`, or null when the project has none.
+   */
+  async function modulePoolOf (project, root = configRoot, loaded = null) {
+    const config = loaded ?? await loadConfig({ root })
+    const pool = await poolOf(project, { projects: config.projects, resolvePath: (p) => resolveProjectPath(p, { projectsDir }) })
+    if (!pool) return null
+    const targets = {}
+    for (const m of pool.members) {
+      const infra = config.projects.get(m.project)?.infrastructure
+      targets[m.project] = infra?.testDrive?.modules ? modulesTarget(infra) : null
+    }
+    return { pool, record: { ...poolRecord(pool), targets } }
+  }
+
+  /**
+   * `moduleLocks` for readiness, preview and the project page: the pool, every lock in it
+   * and, for an issue, the modules its triage named and which of them another live run
+   * holds. Read-only; null when the project has no pool. An observation: start() decides.
+   */
+  async function moduleLockReading ({ project, issueId = null, playbook = null, config = null }) {
+    const read = await modulePoolOf(project, configRoot, config)
+    if (!read) return null
+    const { pool } = read
+    const held = (await readPoolLocks(pool.id, { platform })).map((l) => ({ ...l, owner: pool.modules.get(l.module)?.owner ?? null }))
+    const issue = issueId ? await issues.getIssue(project, issueId).catch(() => null) : null
+    const expected = issue?.sizing?.affectedModules ?? []
+    return {
+      pool: pool.id,
+      members: pool.members.map((m) => m.project),
+      modules: pool.modules.size,
+      ...(pool.ambiguous.length ? { ambiguous: pool.ambiguous } : {}),
+      ...(pool.unreadable.length ? { unreadable: pool.unreadable } : {}),
+      held,
+      ...(issueId ? { expected: { modules: expected, source: issue?.sizing ? 'sizing' : 'none' }, conflicts: conflictsWith(held, expected, { project, issueId }) } : {}),
+      ...(playbook ? { locks: playbook } : {})
+    }
   }
 
   /** Preflight, provision, run, settle. Everything after the response is sent. */
@@ -625,6 +699,15 @@ export function createSupervisor ({
           availability,
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })
+        // Its modules again, under this process (module-locks.mjs): a module another run took
+        // meanwhile refuses the resume, naming it, as a start would be refused.
+        // Every continuation re-takes them, an integrity restore or accept-partial included; only an
+        // abandon, which ends the run, does not.
+        if (engine.run.moduleLocks && integrity?.disposition !== 'abandon') {
+          const { conflicts } = await reclaimRunLocks(engine.run, { project, issueId, issuePath: issue.path, platform, persist: (run) => store.writeRun(issue.path, runId, run) })
+          await store.writeRun(issue.path, runId, engine.run)
+          if (conflicts.length) throw occupied(lockedMessage(conflicts), { code: 'MODULE_LOCKED', holders: conflicts })
+        }
       })
       armAutoReconcile(engine, project)
       if (integrity) {
@@ -635,6 +718,7 @@ export function createSupervisor ({
           await engine.resolveIntegrity({ disposition: integrity.disposition, expectedStateHash: integrity.expectedStateHash, reason: integrity.reason, actor: actor ?? 'operator' })
         } catch (error) { throw err(409, error.message) }
         if (integrity.disposition === 'abandon') {
+          await releaseEndedRunLocks(engine.run, issue.path)
           await engine.runLock?.release().catch(() => {})
           starting.delete(k)
           await announceEnd(project, issueId, runId)
@@ -645,7 +729,9 @@ export function createSupervisor ({
       if (recover) {
         const outcome = await engine.recoverOwnerLoss({ budgets, actor, origin })
         if (!outcome.resumed) {
-          // Reconciliation is recorded; what is left needs a person.
+          // Reconciliation is recorded; what is left needs a person. The locks re-taken for it go back
+          // (still required on the record, so the next recovery takes them again).
+          await releaseEndedRunLocks(engine.run, issue.path)
           await engine.runLock?.release().catch(() => {})
           starting.delete(k)
           emit?.({ type: 'run-recovery-required', project, issueId, runId })
@@ -654,6 +740,8 @@ export function createSupervisor ({
       }
       const setup = resume && awaitsSetup(engine.run)
       const decision = integrity ? { integrity: integrity.disposition } : recover ? { recovered: true } : resume ? await engine.resumeExecution({ budgets, unrecordedBarrier: await unrecordedBarrier(path.dirname(issue.path)), actor, origin, acceptShortWallClock }) : acceptCheck ? await engine.acceptCheckResult({ ...acceptCheck, actor }) : continueRun ? await engine.continueRun({ text, actor, budgets, acceptShortWallClock }) : refreshChecks ? await engine.refreshClosureChecks(await projectInfrastructure(project, { root: configRoot }).then((infra) => infra ? (isModulesTarget(engine.snapshot.checks?.target) ? modulesTarget(infra) : stagingTarget(infra)) : null)) : retryInput ? await engine.retryInputFailure() : await engine.answer({ text, actor, pauseId })
+      // The continuation went on (the run reads live again): its re-taken locks no longer need the marker.
+      endContinuation(engine.run)
       // Stopped before it had a workspace: the setup it never finished, from its
       // own snapshot, and the turns after it, as a start would have gone on.
       if (setup) {
@@ -694,7 +782,11 @@ export function createSupervisor ({
       return { runId, status: 'pending', decision }
     } catch (error) {
       starting.delete(k)
-      if (engine && !active.has(k)) await engine.runLock?.release().catch(() => {})
+      if (engine && !active.has(k)) {
+        // Locks re-taken for a continuation that did not go on: an ended run gives them back (a paused one keeps its own).
+        await releaseEndedRunLocks(engine.run, engine.issuePath)
+        await engine.runLock?.release().catch(() => {})
+      }
       throw translate(error)
     }
   }
@@ -1149,17 +1241,34 @@ export function createSupervisor ({
     })
   }
 
+  /**
+   * A run's module locks go at its end (module-locks.mjs); a paused run keeps them, since it
+   * resumes on the same modules. Written to the run record, and the release is announced so
+   * the supervisor's ready queue reads the freed modules.
+   */
+  async function releaseEndedRunLocks (run, issuePath) {
+    if (!run?.moduleLocks || run.status === 'paused') return
+    try {
+      if (await releaseRunLocks(run)) {
+        await store.writeRun(issuePath, run.runId, run)
+        emit?.({ type: 'module-locks-released', project: run.issue?.project ?? null, issueId: run.issue?.id ?? null, runId: run.runId, modules: run.moduleLocks.released?.modules ?? [] })
+      }
+    } catch (error) { console.warn(`module locks of run ${run.runId} could not be released: ${error.message}`) }
+  }
+
   async function settleWorkspace (record) {
     const { engine, reservation } = record
 
     // Never provisioned: there is no workspace, only the lock, which
     // abandonReservation has already released.
     if (!engine) {
+      await releaseEndedRunLocks(reservation.run, reservation.issuePath)
       await reservation.runLock.release().catch(() => {})
       return
     }
 
     const run = engine.run
+    await releaseEndedRunLocks(run, engine.issuePath)
     // A barrier write that failed during a turn leaves the entry on the run
     // only: held here until the file takes it.
     await keepOnBarrier(path.dirname(engine.issuePath), run)
@@ -1918,7 +2027,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy }
+  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading }
 }
 
 /**

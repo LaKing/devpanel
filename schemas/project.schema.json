@@ -26,6 +26,28 @@
     "notes": {
       "type": "string"
     },
+    "framework": {
+      "type": "string",
+      "pattern": "^[a-z0-9.-]+$",
+      "description": "The framework project this instance composes (its `@` collections link into the framework's checkout). The framework and every project naming it share one pool of modules, and a run of any of them locks the modules it affects in that pool (docs/execution-contract.md \"Module locks\"). Must name another configured project that names no framework itself."
+    },
+    "modulePool": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Declared on the framework (or a project that is a pool of its own): what the pool's runs use to read hooks. See docs/project-infrastructure.md \"Module pool and hook reader\".",
+      "properties": {
+        "hookReader": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run"],
+          "description": "A command run with its working directory at a candidate tree, inside the panel's local check fence (read-only, offline), that prints the tree's hook declarations and subscriptions as one JSON object: {\"declarations\":[{\"module\",\"hook\",\"signature\"}],\"subscribers\":[{\"module\",\"hook\",\"parameters\"}]}. Typically a wrapper around the framework's own declaration tooling. Declared, a reading that fails blocks the revision's modules check (unavailable).",
+          "properties": {
+            "run": { "type": "string", "minLength": 1 },
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 3600 }
+          }
+        }
+      }
+    },
     "workspace": {
       "$ref": "https://devpanel/schemas/playbook.schema.json#/properties/workspace",
       "description": "Workspace policy for this project's runs. `tooling.mounts` and `tooling.commands` are set only here: host directories (the project's node_modules, a browser, a formatter install) bind-mounted read-only into every seat fence at worktree-relative targets, and the commands seats run with them through the offline wrapper. A mount source that does not exist refuses this project's seat turns naming it; targets never enter the snapshot, fingerprint or patch. See docs/project-infrastructure.md \"Seat tooling: mounts and commands\". `reconcile` is also set only here: per-path policy for `reconcile-delivery` (path or glob -> `append` | `prepend`, e.g. `@boilerplate/documentation/changelog.txt: prepend` for a newest-first changelog); a merge conflict on a declared path keeps the source's content and adds the candidate's added lines after it (`append`) or before it (`prepend`), every other conflict refuses. Read when the action runs and recorded on the attempt; see docs/execution-contract.md \"Reconciling a delivery with drifted source\"."
@@ -730,6 +752,16 @@
     {
       "required": [
         "actions"
+      ]
+    },
+    {
+      "required": [
+        "framework"
+      ]
+    },
+    {
+      "required": [
+        "modulePool"
       ]
     }
   ]

@@ -66,6 +66,8 @@ function checkIntervals (run) {
     ...(run.diagnosticDrives ?? []).map(span),
     // A wait for a slot is check waiting, whether or not the drive left a result.
     ...(run.driveSlotWaits ?? []).map((w) => interval(ms(w.from), ms(w.to))),
+    // A run waiting for a module another run holds (module-locks.mjs): no seat turn runs, like a slot wait.
+    ...(run.moduleLockWaits ?? []).map((w) => interval(ms(w.from), ms(w.to))),
     ...(run.checkHistory ?? []).flatMap((h) => (h.runs ?? []).map(span))
   ].filter(Boolean)
 }

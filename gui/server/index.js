@@ -179,6 +179,12 @@ app.get('/api/projects/:project/checkout-overlap', route(async (req, res) => {
   res.json(await supervisor.pathOverlap({ project: req.params.project, projectPath: dir, paths }))
 }))
 
+// The project's module pool and every lock in it (module-locks.mjs). Reads; null when the project has no pool.
+app.get('/api/projects/:project/module-locks', route(async (req, res) => {
+  await issues.requireProject(req.params.project)
+  res.json(await supervisor.moduleLockReading({ project: req.params.project }))
+}))
+
 // Delivered runs no successful staging release has covered (staging-coverage.mjs). Reads; starts nothing.
 app.get('/api/projects/:project/staging-pending', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
@@ -614,7 +620,8 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
   }
   const result = await preview(req.params.id, { issue, project: projectRef, deliveryActions: supervisor.deliveryActions, runOptions,
     selectRelease: projectRef ? () => selectStagedRelease({ project, projectPath: projectRef.path, listIssues: (p, o) => listIssues(p, o) }) : null,
-    pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null })
+    pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null,
+    moduleLocks: projectRef ? () => supervisor.moduleLockReading({ project, issueId }) : null })
   res.status(result.ok ? 200 : 422).json(result)
 }))
 

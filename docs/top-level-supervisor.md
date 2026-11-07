@@ -647,6 +647,7 @@ time only when one is known, and null otherwise; nothing is estimated.
 | --- | --- | --- | --- |
 | `dependency` | the open prerequisites | each gets a disposition or is archived | null |
 | `checkout-held` | the issue and run of the live in-place run holding the checkout | that run settles (a wall-clock budget is a limit, and pauses suspend it) | null |
+| `module-lock` | `modules` the issue's triage named that another live run of the same module pool holds, and `holders` (module, run, project, issue) | `module-lock`: the holding run ends and its locks are released | null |
 | `own-run` | the run, its status | it settles, or its question is answered | null |
 | `owner-input` | the run | the owner answers on the issue page | null |
 | `report-trust` | | an operator starts it from the panel (a report the supervisor may only assess stays `ready`, with `allowedPlaybooks`) | null |
@@ -654,6 +655,18 @@ time only when one is known, and null otherwise; nothing is estimated.
 | `failed-launch` | the reason; `advisory`, as the guard is keyed on inputs the queue does not read | the inputs change, or an operator authorizes a retry | null |
 | `start-limit` | used, limit | an operator raises `maxStartsPerIssue` or begins a New session | null |
 | `unreadable-run` | the run records | a person establishes what they hold | null |
+
+**Module locks.** A framework project and its instances (`framework:` in
+`projects/<id>.yaml`) share one pool of modules, the framework's modules plus each
+instance's own, and a coding run locks the modules it affects in it
+(docs/execution-contract.md "Module locks"). The queue reads the pool's locks against
+each issue's triage modules (`sizing.affectedModules`): a module another live run holds
+is a `module-lock` block, `until: {event: "module-lock", at: null}`, and `start_run` of
+that issue is refused as occupied (retryable, `MODULE_LOCKED`, the holder named) — it
+waits and never fails the issue. Issues whose modules are disjoint stay `ready` and start
+side by side without anyone being asked. A `running` row whose run waits for a module its
+revision now needs carries `module-lock` with `waiting: true`; that run takes the module
+itself when it frees.
 
 What stops every start is said once, as `canStartNow` and `because[]`: `finishing`,
 `session-starts`, `concurrency` (a live run settles) and, only where allowances are
@@ -668,10 +681,12 @@ previews are not in the queue: they need a playbook and git, so `readiness` and
 The poll reads which live in-place run holds each project's checkout, by the test a start
 is refused on (`supervisor.checkoutHolder`: a live run with a live lock owner, however it
 was started, and this process's own), so it sees runs the supervisor does not own. Another
-issue's ordinary run holds nothing. If an issue that waited at the last reading for a
-checkout, a concurrency slot, a spending window or a prerequisite could start now, a
-`capacity-freed` event wakes the supervisor, with `freed` (`checkout-released`, `concurrency-freed`, `spending-window-rolled`,
-`dependency-settled`) and `next`. It never goes through the wake filter, which can hold a
+issue's ordinary run holds nothing. It reads the module pools' locks the same way
+(`supervisor.moduleLockReading`). If an issue that waited at the last reading for a
+checkout, a module lock, a concurrency slot, a spending window or a prerequisite could start now, a
+`capacity-freed` event wakes the supervisor, with `freed` (`checkout-released`, `module-lock-released`, `concurrency-freed`, `spending-window-rolled`,
+`dependency-settled`) and `next`. A run's module locks are released when it ends (a paused
+run keeps them), so the release of a module is told like the release of a checkout. It never goes through the wake filter, which can hold a
 resolved ending for 15 minutes; what the filter holds rides along. An event already queued
 in that poll carries it as `capacityFreed` instead of costing a second call. It is an offer:
 the mission decides, and `action: null` is a fine answer.
@@ -768,6 +783,20 @@ reading is a launch guarantee: both observe a checkout that can change a moment
 later, which is why `start_run` re-checks every condition for itself. A reading is
 also explicitly **not a preview** — a preview binds a configuration, and one taken
 before these conditions changed is not evidence that a run is launchable now.
+
+A reading of a project in a module pool, and a preview, also carry `moduleLocks`
+(docs/execution-contract.md "Module locks"): `pool` (the framework's id), `members`,
+`modules` (how many the pool has), `held` (every lock: `module`, its `owner` project,
+the holding `runId`, `project` and `issueId`, `since`, `state` held | dead | stale |
+unknown, `waiting` when that run waits for another module) and, for an issue,
+`expected` (its triage modules, `source: sizing | none`) and `conflicts`: the expected
+modules another live run holds. Two issues with disjoint modules read with empty
+`conflicts`; two sharing a module read with the holder named. With a coding playbook
+named, a conflict is a `module-lock` prerequisite of `configuration` (`ready: false`):
+`start_run` would be refused as occupied, and the ready queue shows it as
+`blockedBy: [{kind: "module-lock", until: {event: "module-lock"}}]`. A baseline reading
+does not count it, since occupancy is no repository fault; in a preview it is an
+information prerequisite, so the configuration stays ready to start once the holder ends.
 
 A reading naming an issue, and a preview, also carry `pathOverlap`
 (`runtime/path-overlap.mjs`): whether this candidate's expected files are being

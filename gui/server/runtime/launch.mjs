@@ -699,7 +699,12 @@ export async function reserveRun ({
   // supervisor holds them): they bar an in-place start like the file's own.
   unrecordedBarrier = [],
   // The daily full verification cycle that starts this run ({ cycleId }), or null.
-  fullVerification = null
+  fullVerification = null,
+  // Chosen by the caller when it took the run's module locks first (module-locks.mjs),
+  // so the locks name the run that is about to exist.
+  runId: presetRunId = null,
+  moduleLocks = null,
+  modulePool = null
 }) {
   const resolution = await resolvePlaybook(playbookId, { root: configRoot, runOptions, projectId: issue?.project, stagedRelease })
   if (!resolution.ok) {
@@ -722,7 +727,7 @@ export async function reserveRun ({
     )
   }
 
-  const runId = store.newRunId(clock)
+  const runId = presetRunId ?? store.newRunId(clock)
 
   // One active run per issue. Taken before any durable state exists, so a refused
   // acquisition cannot leave a stray run directory behind.
@@ -758,6 +763,9 @@ export async function reserveRun ({
     // What another live run was touching as this start went ahead (path-overlap.mjs).
     if (startOverlap) run.startOverlap = startOverlap
     if (fullVerification) run.fullVerification = { cycleId: fullVerification.cycleId }
+    // The module pool as this start read it, and the locks the start took (execution-contract.md "Module locks").
+    if (modulePool) run.modulePool = modulePool
+    if (moduleLocks) run.moduleLocks = moduleLocks
     // A run on a host without the fence, under the install's opt-in, says so
     // from its first record (confinement-policy.mjs; result.md, the run page).
     const fence = fencePolicy({ platform })

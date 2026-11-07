@@ -264,6 +264,22 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     projects.set(data.id, { ...data, file, hash })
   }
 
+  // The module pool (runtime/module-pool.mjs): a framework names no framework itself,
+  // and a hook reader belongs to a project whose modules tier declares collections.
+  for (const project of [...projects.values()]) {
+    const problems = []
+    if (project.framework) {
+      const framework = projects.get(project.framework)
+      if (project.framework === project.id) problems.push('a project cannot be its own framework')
+      else if (!framework) problems.push(`framework "${project.framework}" is not a configured project`)
+      else if (framework.framework) problems.push(`framework "${project.framework}" names a framework itself (${framework.framework}); a pool has one framework`)
+    }
+    if (project.modulePool?.hookReader && !project.infrastructure?.testDrive?.modules?.collections) problems.push('modulePool.hookReader needs infrastructure.testDrive.modules: hooks are read for module pools')
+    if (project.modulePool?.hookReader && project.framework) problems.push('modulePool.hookReader is declared on the framework, not on an instance')
+    for (const message of problems) err(errors, message, project.file, project.framework ? '/framework' : '/modulePool')
+    if (problems.length) projects.delete(project.id)
+  }
+
   return { root, hostDir, unmatchedPricing, invalidPricing, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, disabledModels }
 }
 

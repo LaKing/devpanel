@@ -95,6 +95,8 @@ const countLabel = computed(() => {
 let loadSeq = 0
 // Uncommitted changes in the checkout that a live run is also touching (path-overlap.mjs): a warning, never a block.
 const checkoutOverlap = ref(null)
+// The project's module pool and the locks live runs hold in it (module-locks.mjs); null without a pool.
+const moduleLocks = ref(null)
 
 async function load () {
   const seq = ++loadSeq
@@ -107,6 +109,7 @@ async function load () {
     issues.value = next
     // Only a warning: a failed reading shows nothing and blocks nothing.
     api.checkoutOverlap(project.value).then((reading) => { if (seq === loadSeq) checkoutOverlap.value = reading }, () => { if (seq === loadSeq) checkoutOverlap.value = null })
+    api.moduleLocks(project.value).then((reading) => { if (seq === loadSeq) moduleLocks.value = reading }, () => { if (seq === loadSeq) moduleLocks.value = null })
   } catch (err) {
     if (seq !== loadSeq) return
     loadError.value = err.message
@@ -277,6 +280,16 @@ watch([project, archived], () => {
       Uncommitted changes in this checkout are also being changed by a live run:
       <span v-for="(o, i) in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`">{{ i ? '; ' : ' ' }}run {{ o.runId }} of {{ o.issueId }} touches {{ o.files.map((f) => f.path).join(', ') }}{{ o.more ? ` and ${o.more} more` : '' }}</span>.
       Nothing is blocked: its delivery merges with these edits and stops only on lines both changed.
+    </v-alert>
+
+    <v-alert v-if="moduleLocks?.held?.length" type="info" variant="tonal" density="compact" class="mb-3"
+             data-test="module-locks">
+      Module locks in the pool of {{ moduleLocks.pool }} ({{ moduleLocks.members.join(', ') }}): a start that needs one of these modules waits until its run ends.
+      <div v-for="l in moduleLocks.held" :key="l.module" class="mt-1">
+        <code>{{ l.module }}</code>
+        <span v-if="l.owner"> ({{ l.owner }})</span>
+        — run {{ l.runId }} of {{ l.project }}/{{ l.issueId }}<span v-if="l.state !== 'held'">, {{ l.state }}</span><span v-if="l.waiting">, waiting for another module</span>
+      </div>
     </v-alert>
 
     <v-alert v-if="deleteError" type="error" variant="tonal" density="compact" closable

@@ -75,6 +75,10 @@ export async function runChecks ({
   // revision, only `ofRevision`: it is evidence about a variant, and nothing
   // bound to a fingerprint can read it.
   variant = null,
+  // A tree the caller composed (module-hooks.mjs: another pool project at its HEAD with
+  // the candidate's framework collections): `{ tree, identity }`. Copied in place of the
+  // rebuild; recorded as `prepared`, with no claim to equal the revision's own bytes.
+  prepared = null,
   // Told as a wait for a test-drive slot begins and ends (drive-slots.mjs).
   onDriveWait = null,
   // Injected by tests: the slot directory and how long resolving and polling take.
@@ -108,14 +112,19 @@ export async function runChecks ({
   result.materialization = materialized
   try {
     let patch
-    if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
-    else patch = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
-    await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
-    let check = await fingerprint(rebuilt, { baseCommit, baseline, clock })
+    if (prepared) await fs.cp(prepared.tree, rebuilt, { recursive: true, verbatimSymlinks: true })
+    else {
+      if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
+      else patch = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
+      await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
+    }
+    let check = await fingerprint(rebuilt, prepared ? { clock } : { baseCommit, baseline, clock })
+    if (prepared) Object.assign(result, { prepared: prepared.identity })
     // The base is the commit itself, checked out unchanged; its fingerprint is
     // recorded rather than compared with a revision it does not have.
     if (base) Object.assign(result, { baseCommit, baseFingerprint: check.fingerprint })
-    materialized.verified = base || check.fingerprint === revision
+    materialized.verified = base || Boolean(prepared) || check.fingerprint === revision
+    if (prepared) materialized.detail = 'a composed tree (prepared), not a rebuild of the revision'
     if (!materialized.verified) {
       materialized.detail = `rebuilt candidate fingerprints to ${check.fingerprint.slice(0, 23)}…, not the revision under check`
       result.error = 'candidate could not be materialised to the revision'
@@ -147,7 +156,7 @@ export async function runChecks ({
     // or a path the candidate deleted that reappeared — invalidates the
     // evidence. Verified locally by re-fingerprinting, remotely by listing.
     const afterEntries = target.kind === 'local'
-      ? (await fingerprint(rebuilt, { baseCommit, baseline, clock })).entries
+      ? (await fingerprint(rebuilt, prepared ? { clock } : { baseCommit, baseline, clock })).entries
       : materialized.remoteEntries
     if (afterEntries) {
       const drift = compareCandidate(check.entries, afterEntries)

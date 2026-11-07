@@ -31,6 +31,7 @@ const enc = encodeURIComponent
 export const api = {
   infrastructure: project => request(`/api/projects/${encodeURIComponent(project)}/infrastructure`),
   checkoutOverlap: project => request(`/api/projects/${encodeURIComponent(project)}/checkout-overlap`),
+  moduleLocks: project => request(`/api/projects/${encodeURIComponent(project)}/module-locks`),
   inspectEnvironment: (project, environment, resource) => request(`/api/projects/${encodeURIComponent(project)}/infrastructure/${encodeURIComponent(environment)}/${encodeURIComponent(resource)}`),
   /** checkpoint.sh and other operator scripts on the live checkout; output streams as `project:action` socket events. */
   projectActions: project => request(`/api/projects/${enc(project)}/actions`),

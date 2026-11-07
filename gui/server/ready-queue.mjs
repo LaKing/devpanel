@@ -28,7 +28,7 @@ const DISPLAY_ROWS = 30
 // Which rows the display cap keeps first; shown in queue order all the same.
 const STATE_RANK = { running: 0, ready: 1, blocked: 2, decide: 3 }
 // What a wake can announce the end of. Everything else is ended by a person, or by the model's own act.
-const CAPACITY_BLOCKS = ['checkout-held', 'dependency']
+const CAPACITY_BLOCKS = ['checkout-held', 'dependency', 'module-lock']
 const CAPACITY_PANEL = ['concurrency', 'spending-window']
 
 const until = (event, at = null) => ({ event, at })
@@ -64,7 +64,7 @@ function panelBlocks ({ state, spending, usage, now }) {
   return out
 }
 
-async function rowOf (project, issue, { state, holders, reportLevels, lookup }) {
+async function rowOf (project, issue, { state, holders, reportLevels, lookup, moduleConflicts = {}, moduleWaits = {} }) {
   const key = keyOf(project, issue.id), latest = issue.latestRun ?? null, blocks = []
   const level = reportLevels[key] ?? 'any'
   if (issue.unreadableNewerRuns?.length) blocks.push({ kind: 'unreadable-run', runs: issue.unreadableNewerRuns, until: until('a person establishes what the unreadable run record holds') })
@@ -85,10 +85,18 @@ async function rowOf (project, issue, { state, holders, reportLevels, lookup }) 
   const holder = holders[project] ?? null
   if (holder && holder.issueId !== issue.id) blocks.push({ kind: 'checkout-held', issueId: holder.issueId, runId: holder.runId ?? null, until: until('that run settles') })
 
+  // Modules its triage named that another live run of the pool holds (module-locks.mjs): the start
+  // would be refused as occupied, so it waits, and the release wakes the supervisor (capacity-freed).
+  const locked = moduleConflicts[key] ?? []
+  if (!latest?.live && locked.length) blocks.push({ kind: 'module-lock', modules: [...new Set(locked.map((c) => c.module))], holders: locked.map(({ module, runId, project: p, issueId }) => ({ module, runId, project: p, issueId })), until: until('module-lock') })
+
   let rowState
   if (latest?.live) {
     rowState = 'running'
     blocks.unshift({ kind: 'own-run', runId: latest.runId, status: latest.status, until: until(latest.status === 'paused' ? 'its question is answered' : 'the run settles') })
+    // A started run waiting for a module its revision needs: it takes it itself when freed.
+    const wait = moduleWaits[key]
+    if (wait) blocks.push({ kind: 'module-lock', waiting: true, runId: wait.runId, modules: wait.wants ?? [], holders: wait.holders ?? [], until: until('module-lock') })
   } else rowState = latest ? 'decide' : blocks.length ? 'blocked' : 'ready'
 
   return {
@@ -131,8 +139,10 @@ function inDependencyOrder (members, focus) {
  * @param reportLevels     {project/id: any | assess | none}, for the issues with a report
  * @param ownedIssues      project/id of issues with an open owned run: always in the queue, as in splitByCampaign
  * @param refused          {project/id: at}: starts refused as occupied, so an issue with an ended run was asked for
+ * @param moduleConflicts  {project/id: [{module, runId, project, issueId}]}: modules its triage named another live run holds
+ * @param moduleWaits      {project/id: wait record}: a live run waiting for a module its revision needs (module-locks.mjs)
  */
-export async function buildReadyQueue ({ issuesByProject, holders = {}, reportLevels = {}, state, spending = null, usage = null, ownedIssues = [], refused = {}, now = Date.now() }) {
+export async function buildReadyQueue ({ issuesByProject, holders = {}, reportLevels = {}, moduleConflicts = {}, moduleWaits = {}, state, spending = null, usage = null, ownedIssues = [], refused = {}, now = Date.now() }) {
   const campaign = state.campaign ?? null, focus = state.focus ?? []
   const lookup = new Map(), members = []
   const outside = { issues: 0, projects: [] }
@@ -144,7 +154,7 @@ export async function buildReadyQueue ({ issuesByProject, holders = {}, reportLe
     for (const issue of rest?.issues ?? []) members.push({ project, issue })
   }
   const rows = []
-  for (const { project, issue } of inDependencyOrder(members, focus)) rows.push(await rowOf(project, issue, { state, holders, reportLevels, lookup }))
+  for (const { project, issue } of inDependencyOrder(members, focus)) rows.push(await rowOf(project, issue, { state, holders, reportLevels, lookup, moduleConflicts, moduleWaits }))
   const because = panelBlocks({ state, spending, usage, now })
   const canStartNow = because.length === 0
   return {
@@ -204,6 +214,7 @@ export function freedSince (previous, queue, { refused = {} } = {}) {
     const kinds = previous.rows[keyOf(row.project, row.id)] ?? []
     if (kinds.includes('checkout-held')) add(row.project, 'checkout-released', previous.holders?.[row.project] ?? null)
     if (kinds.includes('dependency')) add(row.project, 'dependency-settled')
+    if (kinds.includes('module-lock')) add(row.project, 'module-lock-released')
     if (previous.panel.includes('concurrency')) add(row.project, 'concurrency-freed')
     if (previous.panel.includes('spending-window')) add(row.project, 'spending-window-rolled')
   }
