@@ -7,6 +7,8 @@ import { resolvePlaybook } from '../server/config/load.mjs'
 import { previewRun } from '../server/runtime/preview.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import { engineFixture, cleanupFixtures } from './fakes/fixture.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { CONFIG_ROOT } from './helpers.mjs'
 
 export const name = 'prompt — one seat, one model, every input, no coordination'
 
@@ -165,6 +167,94 @@ export default async function (t) {
         t.eq('on the seat\'s completion', again.run.closure.conditions.workerCompletion, true)
       }
       await releaseWorkspace(again)
+    }
+
+    // 8–11: the engine's own return of a single seat's work (engine.workerReturn). A local check stands in for the modules tier.
+    const answer = (o) => `\`\`\`json${NL}${JSON.stringify(o)}${NL}\`\`\``
+    const revisionIn = (p) => (p.match(/Current revision: (sha256:[a-f0-9]{64})/) ?? [])[1] ?? null
+    // Passes on the base, so a failure is the candidate's own and nothing inherits it.
+    const GUARD = 'echo "source.txt must not say broken"; ! grep -q broken source.txt'
+    const checked = async (run, seat) => {
+      const g = await engineFixture({ playbook: 'prompt' })
+      await fs.appendFile(path.join(g.configRoot, 'playbooks/prompt.yaml'), `${NL}checks: ${JSON.stringify({ requirement: 'optional', target: { kind: 'local', retryFailed: 0, commands: [{ id: 'unit', run }] } })}${NL}`)
+      const turns = []
+      const scripted = g.fake.invoke
+      g.fake.invoke = async (args) => {
+        turns.push(args.prompt)
+        const out = await seat({ n: turns.length, cwd: args.cwd, prompt: args.prompt })
+        return { ...await scripted(args), response: answer({ summary: 'did it', basedOnRevision: revisionIn(args.prompt), ...out }) }
+      }
+      const run_ = await start(g)
+      await run_.drive()
+      return { g, engine: run_, turns }
+    }
+
+    t.section('8. a failed check returns to the seat once with the failure quoted; the fixed candidate is checked and delivered')
+    {
+      const { g, engine: e, turns } = await checked(GUARD, async ({ n, cwd }) => {
+        await fs.writeFile(path.join(cwd, 'source.txt'), (n === 1 ? 'broken' : 'mended') + NL)
+        return { completed: true }
+      })
+      t.eq('completed', e.run.status, 'completed', `${e.run.blockedReason} ${JSON.stringify(e.run.closure)}`)
+      t.eq('two seat turns, the second in round 1', e.run.steps.filter((s) => s.stepId === 'execute').map((s) => s.round), [0, 1])
+      t.eq('one engine decision between them', e.run.steps.filter((s) => s.decision).map((s) => [s.decision.key, s.decision.actor, s.decision.automatic]), [['execute:return', 'engine', true]])
+      t.eq('recorded on the run', e.run.workerReturns.map((r) => r.reasons), [['check-failed']])
+      t.ok('the second turn is told which command failed, its output and where the logs are', /Command unit \(exit 1\)/.test(turns[1]) && /must not say broken/.test(turns[1]) && /checks\/001/.test(turns[1]), turns[1].slice(-1500))
+      t.eq('the second revision passed its own check', [e.run.checkHistory.map((h) => h.result), e.run.closure.conditions.checksSatisfied], [['failed', 'passed'], true])
+      t.eq('delivered once', g.delivery.calls.length, 1)
+      await releaseWorkspace(e)
+    }
+
+    t.section('9. unfinished only for want of the engine\'s check, and the check passed: one more turn, then closed')
+    {
+      const { g, engine: e, turns } = await checked('true', async ({ n, cwd }) => {
+        if (n === 1) await fs.writeFile(path.join(cwd, 'source.txt'), 'work' + NL)
+        return n === 1 ? { completed: false, blockers: [{ description: 'the browser scenario has not run; this seat cannot start the drive', needs: 'environment' }] } : { completed: true }
+      })
+      t.eq('completed', e.run.status, 'completed', `${e.run.blockedReason} ${JSON.stringify(e.run.closure)}`)
+      t.eq('two turns on one revision', [turns.length, e.run.revisions.every((r) => r.fingerprint === e.run.revisions[0].fingerprint)], [2, true])
+      t.eq('returned as task-incomplete', e.run.workerReturns.map((r) => r.reasons), [['task-incomplete']])
+      t.ok('the seat is told the check has run and passed', /it passed/.test(turns[1]) && /no longer a blocker/.test(turns[1]), turns[1].slice(-1200))
+      t.eq('one check drive, not two', e.run.checkHistory.length, 1)
+      t.eq('delivered', g.delivery.calls.length, 1)
+      await releaseWorkspace(e)
+    }
+
+    t.section('10. a blocker that needs a person is not returned, whatever the check says')
+    {
+      const { g, engine: e, turns } = await checked('true', async ({ cwd }) => {
+        await fs.writeFile(path.join(cwd, 'source.txt'), 'work' + NL)
+        return { completed: false, blockers: [{ description: 'which of two wordings is wanted', needs: 'operator-decision' }] }
+      })
+      t.eq('blocked as unfinished after one turn', [e.run.blockedReason, turns.length], ['task-incomplete', 1])
+      t.eq('the closure says why it was not returned', e.run.closure.workerNotReturned, 'a blocker needs a person (operator-decision)')
+      t.ok('and so does the explanation', /not returned to the agent: a blocker needs a person/.test(explainRun(e.run).detail ?? ''), explainRun(e.run).detail)
+      t.eq('nothing delivered', g.delivery.calls.length, 0)
+      await releaseWorkspace(e)
+    }
+
+    t.section('11. bounded: two returns, then the run stops; an unchanged answer stops it at once')
+    {
+      const always = await checked(GUARD, async ({ n, cwd }) => { await fs.writeFile(path.join(cwd, 'source.txt'), `broken, attempt ${n}` + NL); return { completed: true } })
+      t.eq('three turns, then blocked at closure', [always.turns.length, always.engine.run.status, always.engine.run.blockedReason], [3, 'blocked', 'closure-conditions-unmet'])
+      t.eq('the bound is the reason', always.engine.run.closure.workerNotReturned, 'bound-reached')
+      t.ok('the explanation names the failing command and the bound', /unit/.test(explainRun(always.engine.run).detail) && /at most twice/.test(explainRun(always.engine.run).detail), explainRun(always.engine.run).detail)
+      t.eq('nothing delivered', always.g.delivery.calls.length, 0)
+      await releaseWorkspace(always.engine)
+
+      const same = await checked(GUARD, async ({ n, cwd }) => { if (n === 1) await fs.writeFile(path.join(cwd, 'source.txt'), 'broken once' + NL); return { completed: true } })
+      t.eq('two turns only', [same.turns.length, same.engine.run.blockedReason], [2, 'closure-conditions-unmet'])
+      t.ok('refused as unchanged', /^unchanged/.test(same.engine.run.closure.workerNotReturned ?? ''), same.engine.run.closure.workerNotReturned)
+      await releaseWorkspace(same.engine)
+    }
+
+    t.section('12. the shipped playbook delivers to the project checkout')
+    {
+      const shipped = await fs.readFile(path.join(CONFIG_ROOT, 'playbooks/prompt.yaml'), 'utf8')
+      t.ok('prompt.yaml chooses apply-to-source', /^delivery:\n  action: apply-to-source$/m.test(shipped))
+      const g = await engineFixture({ playbook: 'prompt', delivery: 'apply-to-source' })
+      const r2 = await resolvePlaybook('prompt', { root: g.configRoot })
+      t.eq('and the loader accepts it for this tactic', [r2.ok, r2.resolved?.completion.delivery.action], [true, 'apply-to-source'], JSON.stringify(r2.errors))
     }
   } finally {
     await cleanupFixtures()

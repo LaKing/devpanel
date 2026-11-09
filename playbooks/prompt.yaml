@@ -11,6 +11,9 @@ participants:
 autoClose:
   minimumVerification: review-only
   justification: A single seat does the work and nobody reviews it. Closure records the absence of independent review; absent tests never count as passed.
+# The Minor path ends in the project checkout (uncommitted), like Implementation: a patch nobody applies resolves nothing.
+delivery:
+  action: apply-to-source
 budgets:
-  maxSteps: 4
+  maxSteps: 6
   wallClockMinutes: 120

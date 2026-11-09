@@ -505,12 +505,24 @@ export async function compareSelftestReports ({ runDir, target, base, candidate,
  * the selftest comparison it would pass. Such a result says nothing about the candidate. The review loop stops
  * on it (`checks-inconclusive`) instead of giving the author a round, and Refresh checks drives a fresh base,
  * since an unfinished base is never kept or cached (engine.checkCandidate).
+ *
+ * The modules tier has no base, and its like case is `unreadableReportOnly`: the same stop, for the same reason.
+ * Before this, three runs of 2026-11-07 whose every command and test passed gave their author a round for a
+ * report line the staging script did not print, and ended `checks-failed-unchanged`.
  */
 export function inconclusiveBase (check, run) {
+  if (unreadableReportOnly(check)) return true
   const selftest = check?.baselineComparison?.selftest
   if (selftest?.verdict !== 'not-made' || !selftest.baseUnfinished) return false
   return gatingResult({ ...check, baselineComparison: { ...check.baselineComparison, selftest: null } }, run) === 'passed'
 }
+
+/**
+ * A modules drive whose commands all passed and whose readable reports name no failed test, gated only because
+ * a selftest report could not be read. It still blocks (a pass nobody could examine proves no test), but it is
+ * the drive's tooling that failed to show its report, not the candidate that failed a test.
+ */
+export const unreadableReportOnly = (check) => check?.tier === 'modules' && check.result === 'passed' && !check.modules?.selftestFailures?.length && Boolean(check.modules?.reportUnreadable?.length)
 
 /** Whether a modules drive's reports name a failed test, or could not be read. */
 const modulesReportBlocks = (check) => Boolean(check.modules?.selftestFailures?.length || check.modules?.reportUnreadable?.length)

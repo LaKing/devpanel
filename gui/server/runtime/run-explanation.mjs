@@ -5,6 +5,7 @@ import { riskStatement } from './residual-risks.mjs'
 import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 import { describeConflict } from './source-merge.mjs'
 import { countsForClosure } from './modules-tier.mjs'
+import { gateReason, unreadableReportOnly } from './baseline-failures.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -245,6 +246,12 @@ function checkFailureWords (failures, commands = []) {
 }
 
 /** Which selftests stopped a run: the new ones by name, or why they could not be compared. */
+/** What gated a modules drive, in the gate's own words: it has no base comparison for the other helpers to read. */
+function modulesWords (check, run) {
+  const why = check?.tier === 'modules' ? gateReason(check, run) : null
+  return why ? `${why[0].toUpperCase()}${why.slice(1)}. ` : ''
+}
+
 function selftestWords (selftest) {
   if (selftest?.verdict === 'new-failures') {
     const known = selftest.baselineKnown?.length ?? 0
@@ -273,6 +280,15 @@ function notReturnedWords (reason) {
   return `It was not returned to the author: ${reason}.`
 }
 
+/** Why a single seat got no further turn for a failed check or an unfinished task (engine.workerReturn), and how many it had. */
+function workerNotReturnedWords (run) {
+  const had = run.workerReturns?.length ?? 0
+  const reason = run.closure?.workerNotReturned
+  const before = had ? `The engine had returned it to the agent ${had === 1 ? 'once' : `${had} times`}. ` : ''
+  if (!reason) return before.trim()
+  return `${before}${reason === 'bound-reached' ? 'It was not returned again: the engine returns a single seat\'s work at most twice.' : `It was not returned to the agent: ${reason}.`}`
+}
+
 /** Why closure did not happen, from the first condition that failed. */
 function closureUnmet (run, confirmation) {
   const c = run.closure?.conditions ?? {}
@@ -286,7 +302,8 @@ function closureUnmet (run, confirmation) {
   if (c.checksSatisfied === false) {
     const checks = run.closure?.checks
     const words = (checks?.comparison ? checkFailureWords({ verdict: checks.comparison, reason: checks.reason, newFailures: checks.newFailures, baselineKnown: checks.baselineKnown }) : '') + selftestWords(checks?.selftest)
-    return { headline: 'Not finished: the automated checks did not pass', detail: words.trim() || 'The final version failed the project\'s checks, or they could not be run.', unmet: [] }
+    const gate = checks?.gate ? `${checks.gate[0].toUpperCase()}${checks.gate.slice(1)}.` : ''
+    return { headline: 'Not finished: the automated checks did not pass', detail: [words.trim() || gate || 'The final version failed the project\'s checks, or they could not be run.', workerNotReturnedWords(run)].filter(Boolean).join(' '), unmet: [] }
   }
   if (c.noOutstandingBlockingFindings === false) {
     return {
@@ -700,6 +717,11 @@ function blocked (run, outputs, kept) {
         next: 'Recover picks up where it stopped. Abandon keeps the work and lets you start fresh.' }
     case 'checks-inconclusive': {
       const check = (run.checkResults ?? []).filter((c) => c.revision === run.revisions?.at(-1)?.fingerprint).at(-1)
+      if (unreadableReportOnly(check)) {
+        return { ...base, headline: 'Stopped: the reviewers approved and every check command passed, but a selftest report could not be read',
+          detail: `${modulesWords(check, run)}No test is known to have failed. No author round was spent on it, since no source change answers a report the drive did not show.`,
+          next: 'Look at the staging drive first: the selftest command must print its report (a "== …/selftest.report" line and the JSON array). Then Refresh checks reruns the checks on this candidate. Continue gives the author a round anyway.' }
+      }
       return { ...base, headline: 'Stopped: the reviewers approved, but the comparison base did not finish its tests',
         detail: `${selftestWords(check?.baselineComparison?.selftest)}The base was driven twice. No author round was spent on it, since no source change can answer it.`,
         next: 'Refresh checks drives a fresh base and reruns the checks on this candidate. If the base keeps stopping early, look at the staging drive (timeouts, load) first. Continue gives the author a round anyway.' }
@@ -710,7 +732,7 @@ function blocked (run, outputs, kept) {
       if (checksOnlyBlock(run)) {
         const check = (run.checkResults ?? []).filter((c) => c.revision === run.revisions?.at(-1)?.fingerprint).at(-1)
         return { ...base, headline: 'Stopped: the reviewers approved, but the automated checks failed',
-          detail: `${checkFailureWords(check?.baselineComparison?.failures, check?.commands)}${selftestWords(check?.baselineComparison?.selftest)}${reason === 'checks-failed-unchanged' ? 'The author answered the failure with an unchanged candidate, so another round could only repeat it.' : 'The review loop reached its round limit.'}`,
+          detail: `${check?.tier === 'modules' ? modulesWords(check, run) : checkFailureWords(check?.baselineComparison?.failures, check?.commands)}${selftestWords(check?.baselineComparison?.selftest)}${reason === 'checks-failed-unchanged' ? 'The author answered the failure with an unchanged candidate, so another round could only repeat it.' : 'The review loop reached its round limit.'}`,
           next: `Refresh checks reruns them on this candidate (after a flaky or environmental failure is fixed). ${reason === 'checks-failed-unchanged' ? 'Continue gives the author another round with your instruction.' : 'Resume gives the author one more round.'}${acceptCheckUnavailable(run) ? '' : ' If these failures are unrelated to this change, Accept check result names them with your reason; once the coordinator confirms this version, it goes through normal delivery.'}` }
       }
       const awaited = reason === 'rounds-exhausted' ? awaitedDriveFailed(run) : null
@@ -740,7 +762,7 @@ function blocked (run, outputs, kept) {
         next: 'Decide yourself: record the outcome, or configure checks and run again.' }
     case 'task-incomplete':
       return { ...base, headline: 'Not finished: the agent says the task is not done',
-        detail: firstLine((run.closure?.blockers ?? [])[0]) || null,
+        detail: [firstLine(((b) => typeof b === 'string' ? b : b?.description)((run.closure?.blockers ?? [])[0])), workerNotReturnedWords(run)].filter(Boolean).join(' ') || null,
         unmet: (run.closure?.blockers ?? []).map((b) => ({ id: null, text: typeof b === 'string' ? b : (b.description ?? JSON.stringify(b)) })),
         next: 'Start a new run once the blockers are addressed.' }
     case 'candidate-changed-since-approval':

@@ -34,7 +34,7 @@ every project on the panel; a named project is checked for *existence* only, and
 an unknown one is a 404, not a refusal. Safety is carried by the capabilities
 themselves: budgets, concurrency, per-issue retry caps, archive policy, and an
 action vocabulary with no direct checkout command. There is a deliberate indirect
-write capability: starting Implementation, Plan and implement, or Refactoring
+write capability: starting Implementation, Plan and implement, Refactoring or Prompt
 with `apply-to-source` authorizes the engine to apply the approved patch to the
 destination shown in readiness/preview and verify it before resolution. Select
 `worktree-diff` for patch-only delivery. Changed files under materialized symlinks are dispatched to their bound Git-owner

@@ -49,6 +49,7 @@ export function checkSummary (check, fullEvidence = null) {
     // No second drive: an earlier revision of this run already answered what it would.
     ...(check.retrySkipped ? { retrySkipped: check.retrySkipped,
       retryNote: check.retrySkipped.reason === 'selftest-reproduced-earlier' ? 'Not driven a second time: every new selftest failure here already failed in two drives of an earlier revision of this run (retrySkipped.failures names that revision).'
+        : check.retrySkipped.reason === 'tests-failed' ? 'Not driven a second time: the modules drive ran its tests and they failed (retrySkipped.commands); the same revision would fail them again.'
         : 'Not driven a second time: every failed required command failed the same way on an earlier revision of this run and the base passed it (retrySkipped.commands names the way and the revision).' } : {}),
     instruction: 'Summary only. Full evidence includes the file manifest and command details; inspect it when needed. A passed smoke test is not proof of all acceptance criteria. A command\'s `results` lists every PASS/FAIL-style line of its whole output, including non-gating collectors: quote those lines as evidence instead of saying the report is unreadable.'
   }

@@ -5,8 +5,10 @@ description: >
   One seat, one model, no coordination. For simple tasks that do not need a
   multi-agent workflow: the worker receives the issue and every captured input
   file, does the work in the isolated candidate, and reports. The candidate is
-  fingerprinted and delivered like any other; nobody reviews it, and closure
-  records that plainly.
+  fingerprinted, checked where the project has checks, and delivered like any
+  other; nobody reviews it, and closure records that plainly. A failed check, or
+  a task the seat called unfinished for want of that check, returns to the seat
+  for at most two more turns (execution-contract.md "The single seat").
 roles:
   worker:
     description: The only seat. Reads the task and every input, does the work, reports what it did and did not do.
@@ -31,7 +33,7 @@ checks:
   requirement: optional
   boundToRevision: true
 budgets:
-  maxSteps: 4
+  maxSteps: 6
   wallClockMinutes: 120
   onExhausted: unresolved
 phases:
@@ -47,6 +49,7 @@ phases:
         - window
         - sizing
         - decisions
+        - checks.latest
       recordsRevision: true
 completion:
   requires:

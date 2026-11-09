@@ -25,7 +25,7 @@ const FLAKY = '      - id: flaky\n        run: test ! -f work.txt\n'
  * nothing to change: the run stops checks-failed-unchanged with no confirmation
  * on record (test/checks-only-block.test.mjs).
  */
-async function stopped ({ confirm = true, deliveryProvider = null, minimumVerification = null } = {}) {
+async function stopped ({ confirm = true, deliveryProvider = null, minimumVerification = null, audit = null } = {}) {
   const prompts = []
   const evidence = []
   let engine = null
@@ -37,7 +37,7 @@ async function stopped ({ confirm = true, deliveryProvider = null, minimumVerifi
       if (round === 0) await fs.writeFile(path.join(engine.run.workspace.path, 'work.txt'), 'work\n')
       return fence({ summary: 'Implemented', basedOnRevision: revisionIn(prompt) })
     }
-    if (stepId.startsWith('audit-')) return fence({ verdict: 'approved', artifactRevision: revisionIn(prompt), findings: [], priorFindings: [] })
+    if (stepId.startsWith('audit-')) return fence(audit?.(round, revisionIn(prompt)) ?? { verdict: 'approved', artifactRevision: revisionIn(prompt), findings: [], priorFindings: [] })
     if (stepId === 'confirm') {
       evidence.push(prompt)
       return fence(confirm
@@ -134,6 +134,29 @@ export default async function (t) {
     t.ok('the explanation says it is accepted and unverified', /with accepted check failures/.test(said.headline) && /not verified/.test(said.detail), JSON.stringify(said))
     const md = renderResult(engine.run, {})
     t.ok('result.md has the section', /## Accepted check failures/.test(md) && /`flaky`/.test(md) && md.includes(REASON), md)
+    await done()
+  }
+
+  t.section('an earlier round of the accepted revision awaited the check: the acceptance still reaches the confirmation')
+  {
+    // The shape of a run of 2026-11-07: the audit of the last revision's first round held only a finding awaiting the
+    // drive, the drive failed, two unchanged answers were approved, and the loop stopped. Reading the accepted
+    // revision's check as passed must not make replay ask that first round for the re-review a passing drive gets.
+    const awaiting = (round, revision) => round === 0
+      ? { verdict: 'changes-needed', artifactRevision: revision, priorFindings: [], findings: [{ id: 'f-await', severity: 'minor', blocking: true, awaitsCheck: true, description: 'only the drive can show it', criterion: 'AC1', location: 'work.txt:1' }] }
+      : null
+    const { engine, f, asking, count, done } = await stopped({ audit: awaiting })
+    t.eq('stopped by the check alone, after the awaiting round', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked checks-failed-unchanged')
+    t.eq('three audit rounds on one revision', [count('audit-implement-1'), engine.run.revisions.every((r) => r.fingerprint === asking.revision)], [3, true])
+    const audits = count('audit-implement-1')
+    await engine.acceptCheckResult(asking)
+    await engine.drive()
+    t.eq('not refused', (engine.run.checkAcceptanceRefusals ?? []).map((r) => r.because), [])
+    t.eq('no audit turn was planned', count('audit-implement-1'), audits)
+    t.eq('one confirmation', count('confirm'), 1)
+    t.eq('completed', engine.run.status, 'completed', `${engine.run.blockedReason} ${JSON.stringify(engine.run.closure?.conditions)}`)
+    t.eq('the acceptance is on the closure', engine.run.closure?.acceptedCheckRisk?.failures.map((x) => x.key), ['flaky'])
+    t.eq('delivered once', f.delivery.calls.length, 1)
     await done()
   }
 

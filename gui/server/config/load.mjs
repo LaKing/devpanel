@@ -615,12 +615,13 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   // a playbook that explicitly chose review-only.
   const { autoClose: _strategyAutoClose, ...completionBase } = strategy.completion
   const completion = structuredClone(completionBase)
-  const sourceDeliveryChoice = ['implementation', 'plan-and-implement'].includes(strategy.tactic)
+  // The single seat (prompt) is the Minor path: its checked change goes to the source checkout like any other.
+  const sourceDeliveryChoice = ['implementation', 'plan-and-implement', 'prompt'].includes(strategy.tactic)
   if (playbook.delivery?.action) {
     const order = ['none', 'worktree-diff', 'commit', 'merge']
     const sourceSelection = [playbook.delivery.action, completion.delivery.action].includes('apply-to-source')
     if ((sourceSelection || runOptions.delivery !== undefined) && !sourceDeliveryChoice) {
-      err(errors, 'source delivery choices belong to Implementation, Plan and implement, and Refactoring', playbook.file, '/delivery/action')
+      err(errors, 'source delivery choices belong to Implementation, Plan and implement, Refactoring and Prompt', playbook.file, '/delivery/action')
     } else if (!sourceSelection && order.indexOf(playbook.delivery.action) < order.indexOf(completion.delivery.action)) {
       err(errors, `playbook weakens delivery from "${completion.delivery.action}" to "${playbook.delivery.action}"; a playbook may only strengthen it`, playbook.file, '/delivery/action')
     } else completion.delivery = { ...completion.delivery, action: playbook.delivery.action, source: 'playbook' }

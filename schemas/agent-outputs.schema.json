@@ -1414,7 +1414,7 @@
         },
         "completed": {
           "type": "boolean",
-          "description": "true only when everything the task asked for is done and in the workspace. Partial work, work that needs a decision, or work that could not be verified is false."
+          "description": "true only when everything the task asked for is done and in the workspace. Partial work or work that needs a decision is false. Work that is done but that only the engine's own check after the turn can verify is true, with the open verification listed under unverified."
         },
         "blockers": {
           "type": "array",

@@ -446,6 +446,15 @@ never held or cached) and reruns the candidate's checks; Continue gives the
 author a round anyway; Resume is not offered, as replay reaches the same stop.
 The check history marks such a check `inconclusive: true`.
 
+The modules tier has no base, and its like case is a drive whose every command
+passed and whose readable reports name no failed test, gated only because a
+selftest report could not be read or was never shown (`unreadableReportOnly`).
+It still blocks, since a pass nobody could examine proves no test, but it stops
+the same way and for the same reason: `checks-inconclusive`, no author round, the
+explanation naming the unreadable report and that no test is known to have
+failed. A drive with a named failed test, or a failed command, is an ordinary
+failed check.
+
 ### The modules tier
 
 On a Boilerplate project (one with `infrastructure`) every playbook that records
@@ -475,7 +484,17 @@ modules' browser runs when declared, then the finalizers.
   test, or whose report cannot be read or was never shown (the declaration
   must collect one), gates `failed`; there is no
   baseline-known path. A failed drive returns the author through the ordinary
-  failed-check path above; a retry (`retryFailed`) runs as for any check.
+  failed-check path above.
+- **A failed test is not driven twice.** A second drive holds the staging host
+  whole again, and the same bytes on the same instance fail the same test. When
+  every failed required command of the drive is one of its test or browser
+  commands and exited on its own (`failedInTests`, modules-tier.mjs), the result
+  stands at once: `retrySkipped {reason: tests-failed, commands}` on the check, a
+  `checks-retry-skipped` event, and the author hears of it in the next round. A
+  failed lint, load, restart or ready, a timeout, a signal or ssh's own exit 255
+  is not the tests' answer: those keep the retry (`retryFailed`, default 1) as
+  for any check. A project's `retryFailed` therefore bounds the infrastructural
+  reruns of this tier only.
 - **Closure** counts a modules record where the full drive would count
   (`countsForClosure`); the check record carries `modules` (`affected`, `lint`,
   the command → module map `tests`, `unusualFilters`, `selftestFailures`).
@@ -1197,6 +1216,34 @@ exist for strategies without the seats above: **report disposition recorded**
 that reports the task unfinished, with its blockers, blocks the run as
 `task-incomplete` and delivers nothing; nobody else on such a run can say the
 work is done.
+
+### The single seat
+
+A single-seat run (Prompt) has no review loop to send a failure back through,
+so the engine returns the work to the seat itself (`engine.workerReturn`,
+`returnToWorker`), at most twice per run (`MAX_WORKER_RETURNS`,
+`run.workerReturns`). Two things are returned, decided at closure with every
+check settled:
+
+- the check of the current revision **failed at the gate**: the seat gets the
+  gate's reason, each failed command's exit and the end of its output, the named
+  failed tests and the directory of the logs;
+- the seat reported `completed: false` and none of its blockers needs a person
+  (`operator-decision`, `missing-information`, `out-of-scope`), while a check of
+  this revision has a result: a seat cannot start the drive, so "not verified
+  here" is answered by the drive the engine ran after it.
+
+The return is one automatic decision step with key `<phase>:return` (actor
+`engine`), which replay reads as one more round of that single step; its text
+reaches the seat through the step's `decisions` context, beside `checks.latest`.
+A changed candidate is fingerprinted and checked as any revision, and closure is
+evaluated again. It is not returned, and the run blocks as before with the
+reason on `closure.workerNotReturned`, when a blocker needs a person, the check
+did not complete or could not be judged (inconclusive, above), another closure
+condition is unmet, the seat answered the last return with the same candidate
+(`unchanged`), or the bound is reached (`bound-reached`). An in-place run is
+never returned. Operator steps spend no step budget, so three seat turns fit the
+strategy's `maxSteps`.
 
 Delivery is explicit, because these are different completion points:
 
@@ -2665,6 +2712,13 @@ named stay accepted, and any other is `revalidation-failed`. The inert-drift
 shortcut carries only a passing result, so an accepted run takes a real drive.
 Refresh checks, Continue, a check that now passes, moved content or a failure nobody
 named withdraw it to `run.checkAcceptanceHistory`.
+
+Replay reads the accepted revision's failed check as passed, marked `accepted`
+(`checkEvidence`), and only to walk past the loop: a round of that revision whose
+every substantial finding awaited the check was decided by the failed drive, with
+no re-review, and stays decided that way. Without the mark replay asked that round
+for the re-review a passing drive gets, and every acceptance on such a run was
+refused with "replay needs a audit-implement-1 turn".
 
 ### The first brief can be written at triage
 

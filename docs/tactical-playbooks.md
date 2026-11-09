@@ -368,7 +368,13 @@ issue input.
 
 ## Prompt
 
-`prompt` is the single-seat playbook for tasks that do not need coordination:
+`prompt` is the single-seat playbook for tasks that do not need coordination (the
+Minor path of triage sizing). The shipped playbook delivers `apply-to-source`: the
+checked change is applied to the project checkout, uncommitted, like an
+Implementation's; `worktree-diff` stays selectable. The project's check runs on
+what the seat leaves (the modules tier on a Boilerplate project); a failed check,
+or a task the seat called unfinished only for want of that check, goes back to
+the seat for at most two more turns (execution-contract.md "The single seat"). It has
 no coordinator, no plan, no audit. The one `worker` seat receives the issue, the
 captured-input excerpts and the window manifest, so every attached file is in
 reach, and does the work directly in the isolated candidate in one turn (one

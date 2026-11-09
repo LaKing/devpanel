@@ -144,6 +144,22 @@ export function affectedModulesNotice (revision) {
   return lines.join(' ')
 }
 
+/**
+ * Whether a failed modules drive failed in its tests alone: every failed required
+ * command is one of the drive's test or browser commands (modulesDrive's
+ * `<id>-<n>`) and exited on its own. The same bytes on the same instance answer
+ * the same, so the engine returns to the author without a second drive, which
+ * would hold the staging host whole again. A failed lint, load, restart or ready,
+ * a timeout, a signal or ssh's own exit 255 is not the tests' answer and keeps
+ * the retry (`retryFailed`).
+ */
+export function failedInTests (target, check) {
+  const prefixes = [target?.modules?.test?.id, target?.modules?.browser?.id].filter(Boolean)
+  const isTest = (id) => prefixes.some((p) => typeof id === 'string' && id.startsWith(`${p}-`) && /^\d+$/.test(id.slice(p.length + 1)))
+  const failed = (check?.commands ?? []).filter((c) => c.required !== false && !c.passed)
+  return check?.result === 'failed' && failed.length > 0 && failed.every((c) => isTest(c.id) && !c.timedOut && !c.signal && Number.isInteger(c.exitCode) && c.exitCode !== 255)
+}
+
 /** Check records that count for closure: the full drive, or the modules tier where it is the target. */
 export const countsForClosure = (c) => ['full', 'modules'].includes(c?.tier ?? 'full')
 

@@ -9,8 +9,9 @@ import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents, runDir } from '../server/runtime/store.mjs'
 import { modulesErrors, modulesTarget } from '../server/infrastructure.mjs'
-import { gateReason, gatingResult } from '../server/runtime/baseline-failures.mjs'
-import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
+import { gateReason, gatingResult, inconclusiveBase } from '../server/runtime/baseline-failures.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, failedInTests, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
 import { fingerprint, workspaceProjection } from '../server/runtime/fingerprint.mjs'
 
 export const name = 'modules tier — module mapping, the union with the triage list, unlisted, checksums and changed modules, the drive\'s order, its recording, no base drive, and the coding playbooks\' default'
@@ -284,6 +285,71 @@ export default async function (t) {
       t.eq('affectedModules on the revision: union, unlisted, notInTree, core', [second.affectedModules?.modules, second.affectedModules?.unlisted, second.affectedModules?.notInTree, second.affectedModules?.core?.dirs],
         [['@c/a', '@c/listed'], ['@c/a'], ['@c/listed'], ['.', 'lib']])
       t.ok('the auditor was told what the triage did not list', prompts.some((p) => p.prompt.includes('Changed modules the triage did not list: "@c/a"')), prompts.map((p) => p.role).join(','))
+      await releaseWorkspace(engine)
+    }
+
+    t.section('no second drive for tests that ran and failed; a failed load, restart or ready, a timeout or ssh keeps the retry')
+    {
+      const target = { modules: declared({ browser: { id: 'browser-check', run: 'browse {{filter}}' } }) }
+      const cmd = (id, extra = {}) => ({ id, required: true, passed: false, exitCode: 1, signal: null, timedOut: false, ...extra })
+      const failed = (...commands) => ({ result: 'failed', commands: [{ id: 'load', required: true, passed: true, exitCode: 0 }, ...commands] })
+      t.eq('a failed module selftest', failedInTests(target, failed(cmd('module-selftest-2'))), true)
+      t.eq('a failed browser run', failedInTests(target, failed(cmd('browser-check-1'))), true)
+      t.eq('a failed ready', failedInTests(target, failed(cmd('ready'))), false)
+      t.eq('a failed lint', failedInTests(target, failed(cmd('lint'))), false)
+      t.eq('a test beside a failed restart', failedInTests(target, failed(cmd('restart'), cmd('module-selftest-1'))), false)
+      t.eq('a test that timed out', failedInTests(target, failed(cmd('module-selftest-1', { timedOut: true, exitCode: null }))), false)
+      t.eq('a test killed by a signal', failedInTests(target, failed(cmd('module-selftest-1', { signal: 'SIGKILL', exitCode: null }))), false)
+      t.eq('ssh\'s own exit', failedInTests(target, failed(cmd('module-selftest-1', { exitCode: 255 }))), false)
+      t.eq('a failed optional collector alone is no test failure', failedInTests(target, failed(cmd('collect', { required: false }))), false)
+      t.eq('a drive that failed with no command record', failedInTests(target, { result: 'failed', commands: [] }), false)
+      t.eq('a passed drive', failedInTests(target, { result: 'passed', commands: [] }), false)
+
+      const dir = await temp('devpanel-modules-retry-')
+      const collect = { id: 'collect', run: 'echo "== runtime/selftest.report"; echo \'{"tests":[{"test":"@c/a: works"}]}\'', report: 'selftest' }
+      const ok = path.join(dir, 'ok')
+      const later = path.join(dir, 'later')
+      await fs.writeFile(ok, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      await fs.writeFile(later, '#!/bin/sh\ntest -f round-1.txt\n', { mode: 0o755 })
+      const base = { collections: ['@*'], lint: { id: 'lint', run: `${ok} {{files}}` }, load: { id: 'load', run: 'true' }, restart: { id: 'restart', run: 'true' } }
+      // Default retryFailed (1). The test fails on the first revision's bytes and passes on the second's.
+      const tests = await scenario({ target: { kind: 'local', modules: { ...base, ready: { id: 'ready', run: 'true' },
+        test: { id: 'module-selftest', run: `${later} {{filter}}` }, finallyCommands: [collect] } } })
+      t.eq('the run completes on the second revision', [tests.engine.run.status, tests.engine.run.revisions.length], ['completed', 2], tests.engine.run.blockedReason)
+      t.eq('no rerun of the failed tests', tests.events.filter((e) => e.type === 'checks-retry').length, 0)
+      t.eq('the skip is an event naming the test command', tests.events.filter((e) => e.type === 'checks-retry-skipped').map((e) => [e.reason, e.commands.map((c) => c.command)]), [['tests-failed', ['module-selftest-1']]])
+      t.eq('one drive per revision on the record', tests.engine.run.checkHistory.map((h) => [h.result, h.runs.length]), [['failed', 1], ['passed', 1]])
+      await releaseWorkspace(tests.engine)
+
+      // ready fails once, whatever the bytes: infrastructure, so the same revision is driven again and passes.
+      const infra = await scenario({ target: { kind: 'local', modules: { ...base, ready: { id: 'ready', run: `if [ -f '${dir}/ready' ]; then exit 0; fi; touch '${dir}/ready'; exit 1` },
+        test: { id: 'module-selftest', run: `${ok} {{filter}}` }, finallyCommands: [collect] } } })
+      t.eq('one revision, completed', [infra.engine.run.status, infra.engine.run.revisions.length], ['completed', 1], infra.engine.run.blockedReason)
+      t.eq('the failed ready was retried once', infra.events.filter((e) => e.type === 'checks-retry').length, 1)
+      t.eq('and the pass is recorded flaky, two drives', [infra.engine.run.checkResults.at(-1).flaky, infra.engine.run.checkHistory.at(-1).runs.length], [true, 2])
+      await releaseWorkspace(infra.engine)
+    }
+
+    t.section('every command passed but a selftest report could not be read: inconclusive, no author round, said in words')
+    {
+      const check = (result, modules) => ({ tier: 'modules', result, modules })
+      t.eq('an unreadable report behind a pass is inconclusive', inconclusiveBase(check('passed', { selftestFailures: [], reportUnreadable: [{ command: 'collect', error: 'x' }] }), {}), true)
+      t.eq('a named failed test is not', inconclusiveBase(check('passed', { selftestFailures: [{ command: 'collect', test: 't' }], reportUnreadable: [{ command: 'collect', error: 'x' }] }), {}), false)
+      t.eq('a failed drive is not', inconclusiveBase(check('failed', { selftestFailures: [], reportUnreadable: [{ command: 'collect', error: 'x' }] }), {}), false)
+      t.eq('it still gates failed', gatingResult(check('passed', { selftestFailures: [], reportUnreadable: [{ command: 'collect', error: 'x' }] }), {}), 'failed')
+
+      // The collector prints no report line: what the staging script did on 2026-11-07.
+      const ok = path.join(await temp('devpanel-modules-unread-'), 'ok')
+      await fs.writeFile(ok, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      const target = { kind: 'local', modules: { collections: ['@*'], lint: { id: 'lint', run: `${ok} {{files}}` }, load: { id: 'load', run: 'true' }, restart: { id: 'restart', run: 'true' }, ready: { id: 'ready', run: 'true' },
+        test: { id: 'module-selftest', run: `${ok} {{filter}}` }, finallyCommands: [{ id: 'collect', run: 'echo "3 tests, 0 failed"', report: 'selftest' }] } }
+      const { engine, events } = await scenario({ target })
+      t.eq('stopped as inconclusive, not as a failed check', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked checks-inconclusive')
+      t.eq('the author got no round for it', engine.run.steps.filter((s) => s.stepId === 'implement').length, 1)
+      t.eq('the record: passed, gated failed, inconclusive', engine.run.checkHistory.map((h) => [h.result, h.gating, h.inconclusive]), [['passed', 'failed', true]])
+      t.eq('no rerun either', events.filter((e) => e.type === 'checks-retry').length, 0)
+      const said = explainRun(engine.run)
+      t.ok('the explanation names the unreadable report and that no test failed', /selftest report could not be read/.test(said.headline) && /selftest report unreadable: collect/i.test(said.detail) && /No test is known to have failed/.test(said.detail), JSON.stringify(said))
       await releaseWorkspace(engine)
     }
 

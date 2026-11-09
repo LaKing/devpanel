@@ -32,7 +32,7 @@ import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
-import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
+import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
@@ -171,6 +171,8 @@ const classifiesUnmet = (snapshot) => ['implementation', 'plan-and-implement'].i
 /** Unmet criteria the engine returns to the author rather than to the operator. */
 const RETURNABLE = ['missing-work', 'missing-evidence']
 export const MAX_CLOSURE_RETURNS = 2
+/** Further turns the engine gives a single seat whose check failed or whose task it called unfinished (workerReturn). */
+export const MAX_WORKER_RETURNS = 2
 
 /** Why a closure confirmation cannot be accepted as it stands, or null. */
 export function confirmationProblem (output) {
@@ -551,7 +553,9 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       if (!snapshot.participants[phase.step.role]) continue
       // A concurrent step already chosen to run alongside (reviewBatch): look past it.
       if (skip?.has(turnKey(phase, phase.step, 0))) continue
-      const r = inspect(phase, phase.step, 0)
+      // Each automatic return of a single seat's work (engine.returnToWorker) gives
+      // the step one more round; a phase nothing returned stays at round 0.
+      const r = inspect(phase, phase.step, decisions.filter((d) => d.key === returnKey(phase)).length)
       if (r.need) return r.need
       for (const t of phase.transitions ?? []) {
         if (evaluate(t.when, { output: r.output })) {
@@ -652,7 +656,10 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       {
         const ofReviewed = t.reviewed ? checkResults.filter((c) => c.revision === t.reviewed) : []
         const full = ofReviewed.filter(isFull).at(-1)?.result
-        if (t.substantial > 0 && t.awaiting === t.substantial && full != null && ofReviewed.at(-1)?.result !== 'failed' && !continued.has(round)) {
+        // An accepted failure reads as passed (checkEvidence) but the drive failed, so the
+        // round was decided without this re-review: replay must not ask for it now, or an
+        // acceptance could never reach the confirmation past a round that awaited the check.
+        if (t.substantial > 0 && t.awaiting === t.substantial && full != null && ofReviewed.at(-1)?.result !== 'failed' && !ofReviewed.some((c) => c.accepted) && !continued.has(round)) {
           const again = tally()
           for (const { step, r, blocking } of t.reviews) {
             if (!blocking) { count(again, step, r); continue }
@@ -2061,7 +2068,11 @@ export class Engine {
     // reports blocks the revision (execution-contract.md "The modules tier").
     if (target.tier === 'modules') {
       const first = await runChecks({ ...common, revision: current, fingerprint: fp })
-      const result = await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target, earlier: [], base: null })
+      // Tests that ran and failed are the answer for these bytes: no second drive (failedInTests).
+      const inTests = failedInTests(target, first) && !this.controller.signal.aborted
+      const retrySkipped = inTests ? { reason: 'tests-failed', commands: first.commands.filter((c) => c.required !== false && !c.passed).map((c) => ({ command: c.id })) } : null
+      if (retrySkipped) await this.persist({ type: 'checks-retry-skipped', revision: current, ...retrySkipped })
+      const result = retrySkipped ? { ...first, retrySkipped } : await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target, earlier: [], base: null })
       const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })
       // Tagged before any caller gates it (maybeRunChecks, reconcile): gatingResult reads the tier.
       Object.assign(result, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
@@ -3729,7 +3740,7 @@ export class Engine {
     return [...(this.run.checkHistory ?? []).map((h) => ({ ...h, result: h.gating ?? h.result })),
       ...this.run.checkResults.map((c) => ({ revision: c.revision, ...(c.tier ? { tier: c.tier } : {}), result: gatingResult(c, this.run), ...(inconclusiveBase(c, this.run) ? { inconclusive: true } : {}),
         ...(c.baselineComparison?.selftest?.unstable?.length ? { dir: c.dir, unstableIgnored: c.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}) }))]
-      .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false } : c)
+      .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false, ...(c.result === 'passed' ? {} : { accepted: true }) } : c)
   }
 
   /** What replay reads besides the steps. A plan without the drives would ask for every answered one again. */
@@ -4656,6 +4667,87 @@ export class Engine {
     await this.persist({ type: 'closure-returned', ...entry })
   }
 
+  /**
+   * Whether a single seat's work goes back to that seat (strategies requiring
+   * `workerCompletion`, whose candidate a single-step phase produced): null where
+   * it does not apply, `{ refusal }` saying why not here, else what to return.
+   * Two things another turn can answer: a check of this revision that failed at
+   * the gate, and a seat that called the task unfinished for want of something
+   * the check has since run. A blocker that needs a person, a check that did not
+   * complete or could not be judged (inconclusiveBase), a candidate the seat
+   * left unchanged after the last return, and the bound all end the run instead.
+   */
+  workerReturn ({ conditions, check, gating, gateRun, workerTurn, workerResult, current }) {
+    if (!this.snapshot.completion.requires.includes('workerCompletion') || !workerTurn || this.run.workspace?.isolation === 'in-place') return null
+    const phase = this.snapshot.phases.find((p) => p.step && p.id === workerTurn.step.phase && p.step.id === workerTurn.step.stepId)
+    if (!phase) return null
+    const refuse = (refusal) => ({ refusal })
+    const others = this.snapshot.completion.requires.filter((c) => !['workerCompletion', 'checksSatisfied', 'deliveryCompleted'].includes(c) && !conditions[c])
+    if (others.length) return refuse(`other closure conditions are unmet: ${others.join(', ')}`)
+    const reasons = []
+    if (!conditions.checksSatisfied) {
+      if (gating !== 'failed') return refuse(`the check did not complete (${gating ?? 'no result'})`)
+      if (inconclusiveBase(check, gateRun)) return refuse('the check could not be judged: nothing in the candidate answers that')
+      reasons.push({ kind: 'check-failed', detail: gateReason(check, gateRun) })
+    }
+    if (conditions.workerCompletion === false) {
+      if (workerResult?.completed !== false) return refuse('the completion does not describe the current candidate')
+      const owner = (workerResult.blockers ?? []).find((b) => ['operator-decision', 'missing-information', 'out-of-scope'].includes(b.needs))
+      if (owner) return refuse(`a blocker needs a person (${owner.needs})`)
+      if (!check.revision || !['passed', 'failed'].includes(gating)) return refuse('no check result of this revision exists to answer the blockers with')
+      reasons.push({ kind: 'task-incomplete', detail: (workerResult.blockers ?? []).map((b) => b.description).join(' | ') })
+    }
+    if (!reasons.length) return null
+    const returns = this.run.workerReturns ?? []
+    if (returns.length >= MAX_WORKER_RETURNS) return refuse('bound-reached')
+    if (returns.at(-1)?.revision === current) return refuse('unchanged: the seat answered the last return with the same candidate')
+    return { phase, byStep: workerTurn.step, reasons, check, gating, revision: current }
+  }
+
+  /**
+   * The automatic return of a single seat's work: one engine decision step
+   * (`<phase>:return`, replayed by plan() as one more round of that step) quoting
+   * what failed, in the same worktree and session. The step's `decisions` context
+   * carries the text to the seat; a changed candidate is checked as any revision.
+   */
+  async returnToWorker ({ phase, byStep, reasons, check, gating, revision }) {
+    const at = this.clock.iso()
+    const count = (this.run.workerReturns?.length ?? 0) + 1
+    const dir = check.dir ? path.join(store.runDir(this.issuePath, this.runId), check.dir) : null
+    const failed = (check.commands ?? []).filter((c) => c.required !== false && !c.passed)
+    const tail = (text) => { const t = String(text ?? '').trim(); return t.length > 1500 ? `…${t.slice(-1500)}` : t }
+    const lines = [`The engine returns this task to you for one more turn (automatic return ${count} of ${MAX_WORKER_RETURNS}). Nobody else acts on it: fix what is named here in the workspace and return singleSeatResult again.`]
+    for (const r of reasons) {
+      if (r.kind === 'check-failed') {
+        lines.push(`The engine's check of revision ${revision} failed: ${r.detail}.${dir ? ` Its logs, one .log per command, are in ${dir}.` : ''}`)
+        for (const c of failed) lines.push(`Command ${c.id} (exit ${c.exitCode ?? 'none'}${c.timedOut ? ', timed out' : ''}), end of its output:${NL}${tail(c.stdout) || tail(c.stderr) || '(no output recorded)'}`)
+        for (const f of check.modules?.selftestFailures ?? []) lines.push(`Failed test: ${f.command}: ${f.test}`)
+        lines.push('Change the candidate so the check passes. An unchanged candidate ends the run.')
+      } else {
+        lines.push(`You reported the task unfinished: ${r.detail}.`)
+        lines.push(gating === 'passed'
+          ? `Since then the engine ran the project's check on revision ${revision} and it passed${dir ? ` (logs in ${dir})` : ''}. What only that drive could verify is no longer a blocker: read the result, finish anything still open, and set completed true when the work asked for is in the workspace. Keep completed false only for work that is really not done, and name it.`
+          : 'Finish what is open; keep completed false only for work that is really not done, and name it.')
+      }
+    }
+    const answer = lines.join(NL + NL)
+    const decision = { pauseId: null, key: returnKey(phase), question: `Return "${phase.title ?? phase.id}" to its seat: ${reasons.map((r) => r.kind).join(', ')}.`, options: null, answer,
+      actor: 'engine', automatic: true, askedBy: { phase: phase.id, stepId: phase.step.id, step: byStep.number }, askedAt: at, at }
+    const invocationId = `decision-${uuid()}`
+    const response = `# Engine: return to the seat${NL}${NL}${answer}${NL}${NL}Recorded by the engine at ${at}.${NL}`
+    const created = await this.stepStore.create({ name: 'return', response, invocationId })
+    this.run.steps.push({
+      number: created.number, slug: created.slug, basedOnRevision: null, stepId: 'decision', role: 'operator', phase: phase.id, round: 0, attempt: 1,
+      invocationId, startedAt: at, endedAt: at, durationMs: null, durationUnknown: null, revision: null, outputRef: null, usage: null, response, decision
+    })
+    const entry = { at, step: created.number, phase: phase.id, revision, reasons: reasons.map((r) => r.kind), check: check.dir ?? null }
+    this.run.workerReturns ??= []
+    this.run.workerReturns.push(entry)
+    this.run.blockedReason = null
+    this.run.closure = null
+    await this.persist({ type: 'worker-returned', ...entry })
+  }
+
   /** The coordinator's closure confirmation in force: `[step, output]`, or empty. */
   activeConfirmation () {
     return Object.entries(this.outputs).filter(([number]) => !(this.run.supersededSteps ?? []).includes(number) && (!this.snapshot.tactic || Number(number) > (this.run.windowResetAfter ?? -1)))
@@ -4831,6 +4923,7 @@ export class Engine {
 
     let blockedReason = null
     let notReturned = null
+    let workerNotReturned = null
 
     // Written whole, because a crash during delivery must leave a true record.
     const reportOnly = this.snapshot.completion.requires.includes('reportDispositionRecorded')
@@ -4848,8 +4941,12 @@ export class Engine {
         residualRisks: confirmation?.residualRisks ?? [],
         // Why an unmet confirmation was not returned to the author.
         ...(notReturned ? { notReturned } : {}),
+        // Why a single seat's failed check or unfinished task got no further turn.
+        ...(workerNotReturned ? { workerNotReturned } : {}),
         // The checks as closure counted them, with the inherited-failure comparison.
         ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
+          // The modules tier has no comparison to explain its gate: the gate's own words.
+          ...(check.tier === 'modules' && gating !== 'passed' ? { gate: gateReason(check, gateRun) } : {}),
           ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
           ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown, unstable, flakyFailures }) => ({ verdict, reason, newFailures, baselineKnown, ...(unstable ? { unstable } : {}), ...(flakyFailures ? { flakyFailures } : {}) }))(check.baselineComparison.selftest) } : {}) } } : {}),
         // What the seat said stopped it, kept where closure explains itself.
@@ -4878,6 +4975,14 @@ export class Engine {
       if (back?.refusal) notReturned = back.refusal
       else if (back && mayReturn) {
         await this.returnToReview({ ...back, confirmationStep })
+        return 'returned'
+      }
+      // A single seat has no review loop to go back to: its own step gets the turn.
+      const again = !back && !acceptance && !drifted && ['task-incomplete', 'closure-conditions-unmet'].includes(blockedReason)
+        ? this.workerReturn({ conditions, check, gating, gateRun, workerTurn, workerResult, current }) : null
+      if (again?.refusal) workerNotReturned = again.refusal
+      else if (again && mayReturn) {
+        await this.returnToWorker(again)
         return 'returned'
       }
     } else if (this.run.workspace?.isolation === 'in-place') {
