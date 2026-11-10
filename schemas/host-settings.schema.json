@@ -101,6 +101,11 @@
           "minimum": 1,
           "description": "How many remote test drives one staging host (the SSH host as `ssh -G` resolves it) runs at a time, counted across projects. A drive over it waits. Default 2."
         },
+        "maxInstances": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How many stage instances (a modules tier declaring `instance`: one per run, from its first drive to its end or pause) this panel keeps on one staging host at a time, counted across projects. A run over it waits for one to be destroyed. Keep it at or below the stage's own cap of running instances. Default 4."
+        },
         "confinement": {
           "type": "object",
           "additionalProperties": false,

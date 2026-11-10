@@ -39,6 +39,7 @@ import { issueStats } from './issue-stats.mjs'
 import { CONFIG_ROOT, loadDecisionProvider } from './decisions/index.mjs'
 import { loadConfig } from './config/load.mjs'
 import { hostSettings } from './config/host-settings.mjs'
+import { sweepAtStart } from './runtime/stage-instances.mjs'
 import { createAdvisor, decisionProviderStatus } from './decisions/advisor.mjs'
 import { createFailureAdvisor } from './decisions/failure-advisor.mjs'
 import { createPregate } from './decisions/pregate.mjs'
@@ -1001,6 +1002,16 @@ modelPerformance = await createModelPerformanceService({ file: path.join(issues.
  * knew about.
  */
 const recovered = await supervisor.reconcile()
+// Stage instances of runs whose owning process is gone are destroyed, and each staging host's
+// own collector runs once (runtime/stage-instances.mjs). In the background: it is SSH work,
+// and a run that needs an instance meanwhile waits on the same slot locks.
+loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT })
+  .then((config) => sweepAtStart({ infrastructures: [...config.projects.values()].map((p) => p.infrastructure) }))
+  .then(({ cleared, collected }) => {
+    for (const c of cleared) console[c.passed ? 'log' : 'warn'](`[devpanel] stage instance ${c.name} on ${c.host} (run ${c.runId}, owner gone) ${c.passed ? 'destroyed' : `could not be destroyed: ${c.error}`}`)
+    for (const c of collected) console[c.passed ? 'log' : 'warn'](`[devpanel] stage instance collector on ${c.host}: ${c.passed ? '' : 'FAILED '}${c.output}`)
+  })
+  .catch((error) => console.warn(`[devpanel] stage instance sweep: ${error.message}`))
 // A cycle the last process left unfinished is marked interrupted, and the runs its
 // freeze paused are resumed, before anything else can start.
 fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction })

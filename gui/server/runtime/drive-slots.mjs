@@ -19,6 +19,9 @@ import { pinConnection, resolvedHostname, sshConnection } from './ssh.mjs'
  * issues/), so the count holds across projects and processes and a dead owner's slot is taken over. A slot is
  * held for one drive and no drive waits on another while holding one, so they
  * cannot deadlock. docs/project-infrastructure.md "How many drives a host runs".
+ *
+ * A modules drive on a stage instance of its own takes none of them: its host is
+ * bounded by the instance slots beside these (stage-instances.mjs).
  */
 
 const RESOLVE_ATTEMPT_MS = 30_000
@@ -70,7 +73,7 @@ const settingsDiffer = (a, b) => {
  * would change what connects) or when stopped: the drive is then `unavailable` or
  * cancelled, having connected to nothing and holding no slot.
  */
-export async function holdDriveSlot ({ target, result, clock, runId = null, signal = null, onWait = null, exclusive = target?.tier === 'modules',
+export async function holdDriveSlot ({ target, result, clock, runId = null, signal = null, onWait = null, exclusive = target?.tier === 'modules' && !target?.stageInstance,
   attemptMs = RESOLVE_ATTEMPT_MS, retryMs = RESOLVE_RETRY_MS, windowMs = RESOLVE_WINDOW_MS, pollMs = SLOT_POLL_MS, slotsDir = null }) {
   const cap = hostSettings().testDrive.maxConcurrentDrives
   const record = { host: null, cap, waitMs: 0, waitedFrom: null, resolveAttempts: 0 }
@@ -138,8 +141,16 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
       }
       return { connection: pinned, host, release: async () => { for (const l of [...locks].reverse()) await l.release() } }
     }
+    if (target?.stageInstance) {
+      // A drive on its run's own stage instance loads nothing into the shared one and boots
+      // nothing per drive: the host is bounded by how many instances exist, which the
+      // instance's slot counts for the run's whole life (stage-instances.mjs). It takes no
+      // drive slot and no admission, only the pinned connection.
+      record.instance = true
+      return await handOver([])
+    }
     if (exclusive) {
-      // The modules tier loads its candidate into the host's stage instance: it holds
+      // The modules tier in base-instance mode loads its candidate into the host's one stage instance: it holds
       // the admission lock (so no other drive is admitted meanwhile, and modules drives
       // queue on it), then every slot, taking none while any is held, so it never waits
       // while holding a slot. docs/project-infrastructure.md "How many drives a host runs".

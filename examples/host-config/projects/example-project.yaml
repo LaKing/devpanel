@@ -50,9 +50,11 @@ infrastructure:
     #   lint (the revision's changed .mjs/.vue files) -> load -> restart -> ready
     #   -> test once per affected module and core directory -> browser (if declared)
     #   -> finallyCommands.
+    # This declaration is the BASE-INSTANCE MODE: its commands name one fixed instance.
     # The candidate is loaded INTO the shared stage instance and stays running there
     # until the next drive; a drive holds the whole staging host, so one candidate
-    # at a time. There is no base drive: a failing test of an affected module blocks.
+    # at a time. The commented `instance` block below shows the other mode, a stage
+    # instance per run. There is no base drive: a failing test of an affected module blocks.
     # The framework has no per-module test script, so the commands are composed from
     # what it has: quick-deploy.sh (load), the starter (restart) and the running
     # instance's `selftest` CLI (test).
@@ -84,6 +86,27 @@ infrastructure:
           run: 'echo "== runtime/selftest.report"; cat /opt/staging.example.invalid/runtime/selftest.report'
           report: selftest
           timeoutSeconds: 60
+      # A stage instance per run (docs/project-infrastructure.md "A stage instance per
+      # run"), for a stage host whose tooling can make instances. Every command above
+      # then names the run's instance instead of a fixed path: {{instance}} is its root
+      # (<root>/<name>), {{instanceName}} its name, derived from the run id. The run's
+      # first drive runs create (in the candidate directory), lint, start, ready and
+      # the tests; later drives load and restart on the same instance; the engine runs
+      # destroy when the run ends or pauses. Such a tier is unstructured (no `kind`).
+      # lint:    { id: lint, run: '/opt/stage-tools/lint.sh {{instance}} {{files}}' }
+      # load:    { id: load, run: '/opt/stage-tools/load.sh {{instance}}' }
+      # restart: { id: restart, run: '/opt/stage-tools/reload.sh {{instance}}' }
+      # ready:   { id: ready, run: '/opt/stage-tools/instance.sh ready {{instanceName}} --wait 300' }
+      # test:    { id: module-selftest, run: '/opt/stage-tools/selftest.sh {{instance}} {{filters}}', report: selftest }
+      # instance:
+      #   root: /var/lib/stage-instances
+      #   max: 4                      # the stage's own cap of running instances
+      #   # Exit 3: the candidate changes dependencies and cannot share the installed ones.
+      #   create:  { run: '/opt/stage-tools/instance.sh create {{instanceName}} "$PWD"', unavailableExitCodes: [3], unavailableReason: 'the candidate changes dependency manifests; the full tier verifies it' }
+      #   # Exit 4: the stage runs its cap of instances; asked again, never a failure.
+      #   start:   { run: '/opt/stage-tools/instance.sh start {{instanceName}}', busyExitCodes: [4], busyRetrySeconds: 30 }
+      #   destroy: { run: '/opt/stage-tools/instance.sh destroy {{instanceName}}' }
+      #   gc:      { run: '/opt/stage-tools/instance.sh gc' }
     # Under structured confinement (`kind` on every command) load, restart, ready,
     # test and the collector are `kind: privileged`: they act on the stage instance,
     # which a candidate command cannot see; lint may be `kind: candidate`.

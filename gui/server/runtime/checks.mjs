@@ -12,6 +12,8 @@ import { fingerprint, treeIdentity } from './fingerprint.mjs'
 import { runProcess } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
 import { exitedOnItsOwn } from './modules-tier.mjs'
+import { driveCommands, instanceTimings, instanceVerdict } from './instance-drive.mjs'
+import { destroyInstance, holdInstance, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
 import { discardReconstruction, reconstructInto, worktreeDiffDelivery } from './launch.mjs'
 import { applyFence, PANEL_ROOT } from '../../../harness/fence.mjs'
@@ -139,12 +141,14 @@ export async function runChecks ({
     result.treeIdentity = treeIdentity(check.entries)
 
     // 2. Commands, in the isolated candidate, or on the target host.
+    // A tier on a stage instance (instance-drive.mjs) runs between taking the instance and settling what the drive left of it.
+    const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming }
     if (target.kind === 'local') {
-      await runCommandsLocally({ target, cwd: rebuilt, dir, result, clock, signal, platform, runId })
+      await withStageInstance({ ...instanced, host: LOCAL_HOST }, (driven) => runCommandsLocally({ target: driven, cwd: rebuilt, dir, result, clock, signal, platform, runId, onDriveWait }))
     } else {
       const drive = await holdDriveSlot({ target, result, clock, runId, signal, onWait: onDriveWait, ...driveTiming })
       try {
-        await runCommandsOverSsh({ connection: drive.connection, host: drive.host, target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId })
+        await withStageInstance({ ...instanced, host: drive.host, connection: drive.connection }, (driven) => runCommandsOverSsh({ connection: drive.connection, host: drive.host, target: driven, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId, onDriveWait }))
       } finally {
         await drive.release()
       }
@@ -182,6 +186,64 @@ export async function runChecks ({
     await discardReconstruction({ dir: rebuilt, workspacePath, gitDir })
   }
   return finish()
+}
+
+/**
+ * One drive on the run's stage instance (stage-instances.mjs). The instance is taken
+ * before any command: a slot of its host, waited for, and `fresh` when this process
+ * does not hold it yet, in which case the drive creates and starts it instead of
+ * loading into it. What the drive leaves decides its fate (instanceVerdict): up, it
+ * stays for the run's next drive; in doubt, it is destroyed here, so a retry of the
+ * drive starts from a new one. `result.stageInstance` records all of it.
+ */
+async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming }, run) {
+  const instance = target.stageInstance
+  if (!instance) return run(target)
+  const slot = await holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
+    ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir: driveTiming.slotsDir ?? null })
+  const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}) }
+  try {
+    await run({ ...target, commands: driveCommands(target, slot.fresh) })
+  } finally {
+    Object.assign(record, instanceTimings(target, slot.fresh, result))
+    const verdict = instanceVerdict(target, slot.fresh, result)
+    if (verdict === 'live') await markLive(instance.name, { revision: result.revision ?? result.ofRevision ?? null, clock })
+    else if (verdict === 'doubt') record.destroyed = await destroyInstance(instance.name, { reason: slot.fresh ? 'did-not-come-up' : 'reload-failed', clock })
+    else if (slot.fresh) await releaseInstance(instance.name)
+    record.state = verdict === 'doubt' ? 'destroyed' : verdict === 'untouched' && slot.fresh ? 'not-created' : 'live'
+  }
+}
+
+/**
+ * A command that may answer "the host is full" (`busyExitCodes`: a stage that runs its cap
+ * of instances) is asked again until it answers anything else. That is a wait for
+ * capacity, told to `onWait` like a wait for a drive slot, never a failure; a stopped
+ * drive ends it with the busy answer on record.
+ */
+async function runBusy (command, once, { clock, signal, onWait, host = null, dir = null }) {
+  let record = await once()
+  if (!command.busyExitCodes?.length) return record
+  let wait = null
+  let attempts = 1
+  while (command.busyExitCodes.includes(record.exitCode) && !signal?.aborted) {
+    if (!wait) {
+      wait = { id: crypto.randomUUID(), startedAt: clock.now(), from: clock.iso() }
+      await onWait?.({ phase: 'start', id: wait.id, host, reason: 'stage-full', from: wait.from, dir })
+    }
+    await new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve() }
+      const timer = setTimeout(done, (command.busyRetrySeconds ?? 20) * 1000)
+      signal?.addEventListener('abort', done, { once: true })
+    })
+    if (signal?.aborted) break
+    record = await once()
+    attempts++
+  }
+  if (wait) {
+    await onWait?.({ phase: 'end', id: wait.id, host, from: wait.from, to: clock.iso(), dir })
+    Object.assign(record, { busyWaitMs: Math.max(0, clock.now() - wait.startedAt), attempts })
+  }
+  return record
 }
 
 /**
@@ -344,7 +406,7 @@ async function localFence ({ target, cwd, signal, platform }) {
   return { level: 'local-refused', reason: fence.reason, wrap: null, refused: true }
 }
 
-async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, platform, runId = null }) {
+async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, platform, runId = null, onDriveWait = null }) {
   const { wrap, refused = false, ...confinement } = await localFence({ target, cwd, signal, platform })
   result.confinement = confinement
   if (refused) {
@@ -356,7 +418,7 @@ async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, pl
   const env = { ...childEnvironment('none'), HOME: os.homedir(), ...(wrap ? { TMPDIR: '/tmp' } : {}), ...(runId ? { DEVPANEL_RUN_ID: runId } : {}) }
   const spawn = c => ({ ...(wrap ? wrap('/bin/sh', ['-c', c.run]) : { command: '/bin/sh', args: ['-c', c.run] }), env })
   try {
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => runOne({ command, cwd, dir, clock, signal, spawn }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => runBusy(command, () => runOne({ command, cwd, dir, clock, signal, spawn }), { clock, signal, onWait: onDriveWait, host: LOCAL_HOST, dir: result.dir }) })
   } finally {
     for (const command of target.finallyCommands ?? []) result.commands.push(await runOne({ command, cwd, dir, clock, spawn }))
   }
@@ -391,7 +453,7 @@ export async function discardInstance ({ target, instance, connection = null, si
   } catch (error) { return { passed: false, error: error.message } }
 }
 
-async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null, runId = null }) {
+async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries, keep = null, continueFrom = null, runId = null, onDriveWait = null }) {
   // Pinned to the host whose slot this drive holds: every invocation below uses it.
   const { command: SSH, args: sshArgs } = connection
   // A directory that is ours alone: named for the revision AND a fresh random
@@ -555,7 +617,7 @@ async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, run
     // and only does not execute what the smoke ran, so comparison and gating
     // read the records a fresh drive with these outcomes would leave: a smoke
     // command a fresh drive would have skipped reads as not run.
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? runOne({ command, cwd: null, dir, clock, signal, spawn: remoteSpawn }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? runBusy(command, () => runOne({ command, cwd: null, dir, clock, signal, spawn: remoteSpawn }), { clock, signal, onWait: onDriveWait, host, dir: result.dir }) })
   } finally {
     if (carried) {
       const { instance, smoke, plan } = continueFrom
@@ -711,6 +773,11 @@ async function runOne ({ command, cwd, dir, clock, signal, spawn }) {
     if (command.reportsUnavailable === true && command.required !== false && !record.passed && !record.timedOut && !out.cancelled && out.code !== null) {
       const reason = reportedReason(out)
       if (reason) record.unavailable = reason
+    }
+    // An exit the command's declaration reads as "this drive cannot be made" (`unavailableExitCodes`:
+    // a stage instance that cannot be created from this candidate), with what the command said of it.
+    if (command.unavailableExitCodes?.includes(out.code) && !out.cancelled) {
+      record.unavailable = `${command.unavailableReason ?? 'the command reported that the drive cannot be made'} (exit ${out.code})${out.stderr.trim() ? `: ${out.stderr.trim().slice(-600)}` : ''}`
     }
     // Check commands are not reaped: the record says no scan was made, which
     // is not the same as a scan that found nothing.

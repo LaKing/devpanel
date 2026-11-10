@@ -465,7 +465,9 @@ stays on the project for the full verification (docs/project-infrastructure.md
 target, in a fixed order: lint of the revision's changed `.mjs`/`.vue` files, load
 of the candidate into the stage instance, restart, readiness, one `selftest` run
 per affected module and per core directory (the root with `rootFilter`), the
-modules' browser runs when declared, then the finalizers.
+modules' browser runs when declared, then the finalizers. Which instance that is
+depends on the project: one fixed instance its commands name (base-instance mode),
+or an instance of the run's own ("A stage instance per run" below).
 
 - **Affected modules** are the triage list (`run.currentWindow.sizing`) ∪ the
   modules of the revision's changed paths; paths outside every module are core.
@@ -513,14 +515,14 @@ modules' browser runs when declared, then the finalizers.
   must collect one), gates `failed`; there is no
   baseline-known path. A failed drive returns the author through the ordinary
   failed-check path above.
-- **A failed test is not driven twice.** A second drive holds the staging host
-  whole again, and the same bytes on the same instance fail the same test. When
+- **A failed test is not driven twice.** A second drive costs the staging host
+  another drive, and the same bytes on the same instance fail the same test. When
   every failed required command of the drive is one of its test or browser
   commands and exited on its own (`failedInTests`, modules-tier.mjs; the same
   `exitedOnItsOwn` that lets the other tests run), the result
   stands at once: `retrySkipped {reason: tests-failed, commands}` on the check, a
   `checks-retry-skipped` event, and the author hears of it in the next round. A
-  failed lint, load, restart or ready, a timeout, a signal, a launch failure or
+  failed lint, load, restart or ready (or a stage instance's create or start), a timeout, a signal, a launch failure or
   ssh's own exit 255 is not the tests' answer: those keep the retry (`retryFailed`, default 1) as
   for any check. A project's `retryFailed` therefore bounds the infrastructural
   reruns of this tier only.
@@ -530,8 +532,9 @@ modules' browser runs when declared, then the finalizers.
 - **Undeclared.** A project with `infrastructure` but no `testDrive.modules` gets
   each revision's check recorded `unavailable` (`undeclared: true`) with the reason,
   and nothing is driven; under `requirement: required` closure is unmet.
-- A modules drive holds its staging host whole: no other drive overlaps it
-  (docs/project-infrastructure.md "How many drives a host runs"). Refresh checks
+- In base-instance mode a modules drive holds its staging host whole: no other
+  drive overlaps it (docs/project-infrastructure.md "How many drives a host runs").
+  On a stage instance of the run's own it takes no drive slot. Refresh checks
   of a modules run use the project's modules tier as configured now; a revision's
   `modules` records the `collections` it was read under, and a drive under other
   collections (or a newly declared tier) reads the revision's modules, affected
@@ -564,6 +567,55 @@ modules' browser runs when declared, then the finalizers.
   check is `unavailable`: the round is vetoed and closure cannot pass on it.
   `undeclared` (an empty `viaHooks`, nothing blocked) only when no pool member
   declares a reader.
+
+#### A stage instance per run
+
+A modules tier that declares `modules.instance` (docs/project-infrastructure.md "A
+stage instance per run") is driven on an instance that belongs to the run
+(`runtime/instance-drive.mjs`, `runtime/stage-instances.mjs`). The contract:
+
+- **Name.** Derived from the run id and nothing else (`instanceName`), valid for the
+  stage's tooling, the same in every process of the run. A subscriber drive of another
+  project gets a second name from the run id and that project. The engine substitutes
+  `{{instance}}` (the root) and `{{instanceName}}` into every command of the tier when
+  it expands the drive (`modulesDrive`), so the resolved snapshot holds templates and
+  no run's configuration names an instance.
+- **First drive, later drives.** The check runner takes the instance before any
+  command (`holdInstance`). When this process does not hold it, the drive is a first
+  drive: `instance-create` (in the candidate directory), lint, `instance-start`, ready,
+  tests. Otherwise it is lint, load, restart, ready, tests on the instance that runs.
+  This holds for every drive of the run alike: a revision's check, its retry, a
+  diagnostic drive, a reconciled candidate's revalidation.
+- **Doubt destroys.** After the drive, `instanceVerdict` reads its command records:
+  create, start and ready (first drive) or load, restart and ready (later) all passed
+  means the instance stays; none of them run means it is as it was; anything else
+  (failed, timed out, cancelled, skipped behind a failure) means what runs there is
+  unknown, and the instance is destroyed before the drive's result is returned. A
+  retry (`retryFailed`) therefore starts from a new instance.
+- **Create refused for a dependency change.** An exit listed in
+  `create.unavailableExitCodes` makes the check `unavailable` with the declared reason
+  and the command's own words; the candidate is tested nowhere else. No retry, no
+  author round; closure under `required` is unmet and names the reason.
+- **Stage full.** An exit listed in `start.busyExitCodes` is asked again
+  (`busyRetrySeconds`), and a run that finds every instance slot of its host taken
+  waits for one. Both are waits, on `run.driveSlotWaits` like a drive slot's and
+  excused from the wall clock under the same rule ("What the wall clock counts").
+- **Destroyed at every end, and at a pause.** The supervisor destroys a run's
+  instances wherever it releases an ended run's module locks, and when the run pauses
+  (the module locks stay, the instance does not): completed, blocked, failed,
+  cancelled, a service shutdown, and again when the run is deleted. A paused run's
+  next drive after its resume is a first drive.
+- **Liveness is the slot's lock.** A slot's lock is held by the process that drives
+  the run (`runtime/lock.mjs` identity). Nobody destroys an instance whose lock a live
+  owner holds, or whose owner cannot be proved dead. A dead owner's instance is
+  destroyed by the next taker of that lock: at the panel's start (`sweepAtStart`,
+  followed by the host's declared `gc`), by a drive looking for a slot, or by the same
+  run coming back, which removes its earlier instance before it creates another.
+- **Record.** `checkResults[].stageInstance` (and each attempt's) names the instance
+  and the time of each lifecycle step; `run.stageInstances` holds one entry per
+  instance the run ever had, with `destroyed {reason, at, durationMs, passed}`.
+  The tier records no selftest history and reads no baseline, so nothing keyed by
+  `treeIdentity` or `targetKey` across runs depends on an instance name.
 
 ### Plan findings are owed by the implementation
 
@@ -1755,6 +1807,9 @@ Locks carry owner identity — pid, boot id, process start time, host.
   and with no seat turn running the wall-clock budget does not count it, a wait in
   progress included: an armed deadline looks again when it fires ("What the wall
   clock counts"). Beside a seat turn the time counts. Local checks take no slot.
+  A modules drive on a stage instance of its run's own takes none either: its host
+  is bounded by instance slots (`testDrive.maxInstances`), each held from the run's
+  first drive until the instance is destroyed ("A stage instance per run").
 - **Step-allocation lock** — taken by *every* step-creating path, including manual
   creation through the API. Retry-on-`EEXIST` is not sufficient here: two
   concurrent creates with different slugs both succeed and both take the same
@@ -2877,6 +2932,10 @@ current invocation finishes and is recorded; no new turn starts afterwards.
 The request is durable and visible while the invocation finishes. The resulting
 pause has `kind: manual`. Stop remains a separate action that cancels an invocation.
 
+A paused run, whatever paused it, keeps its worktree and its module locks. A stage
+instance it had is destroyed when the pause is recorded, and the first modules drive
+after the resume creates a new one from the revision it checks ("A stage instance per run").
+
 A service shutdown (`supervisor.shutdown()`, on SIGTERM or SIGINT) stops every run
 the process drives, and what it records depends on the run. A run with
 `pauseRequested` is recorded as that manual pause (journal: `stopped-for-pause`),
@@ -3015,7 +3074,7 @@ Resume, Continue and the panel's figure all read the same number.
 
 - **Excluded:** time the run stood stopped or waited for an operator answer, and
   time spent waiting for checks while no seat turn runs, a drive's wait for a slot on
-  its staging host and a diagnostic drive included. That exemption holds during the
+  its staging host (a drive slot, a stage instance slot, or a stage that answers "full" to a start) and a diagnostic drive included. That exemption holds during the
   wait itself: a check not yet recorded is counted free from when it began, so a run
   is never stopped for time that would later be credited back.
 - **Counted:** everything else, including a check running beside a seat turn, a seat

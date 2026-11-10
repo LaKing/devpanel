@@ -6,6 +6,7 @@ import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 import { describeConflict } from './source-merge.mjs'
 import { countsForClosure } from './modules-tier.mjs'
 import { gateReason, unreadableReportOnly } from './baseline-failures.mjs'
+import { instanceWords } from './instance-drive.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
 //
@@ -249,7 +250,8 @@ function checkFailureWords (failures, commands = []) {
 /** What gated a modules drive, in the gate's own words: it has no base comparison for the other helpers to read. */
 function modulesWords (check, run) {
   const why = check?.tier === 'modules' ? gateReason(check, run) : null
-  return why ? `${why[0].toUpperCase()}${why.slice(1)}. ` : ''
+  const instance = instanceWords(check)
+  return `${why ? `${why[0].toUpperCase()}${why.slice(1)}. ` : ''}${why && instance ? `${instance} ` : ''}`
 }
 
 function selftestWords (selftest) {

@@ -46,6 +46,7 @@ import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
 import { forgetRunDrives } from './runtime/selftest-history.mjs'
+import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { routeAutoStart } from './auto-start.mjs'
 import { poolOf, poolRecord } from './runtime/module-pool.mjs'
 import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules } from './runtime/module-locks.mjs'
@@ -1247,6 +1248,7 @@ export function createSupervisor ({
    * the supervisor's ready queue reads the freed modules.
    */
   async function releaseEndedRunLocks (run, issuePath) {
+    await destroyStageInstances(run, issuePath)
     if (!run?.moduleLocks || run.status === 'paused') return
     try {
       if (await releaseRunLocks(run)) {
@@ -1254,6 +1256,27 @@ export function createSupervisor ({
         emit?.({ type: 'module-locks-released', project: run.issue?.project ?? null, issueId: run.issue?.id ?? null, runId: run.runId, modules: run.moduleLocks.released?.modules ?? [] })
       }
     } catch (error) { console.warn(`module locks of run ${run.runId} could not be released: ${error.message}`) }
+  }
+
+  /**
+   * A run's stage instances go whenever it stops driving (stage-instances.mjs): at every
+   * end, and at a pause too. An idle instance holds gigabytes of its staging host and one
+   * of its few instance slots for a wait of unknown length, while a new one costs minutes:
+   * the run's next drive after a resume creates it again from the revision it then checks.
+   * The destroy is written to the run's record (`stageInstances[].destroyed`).
+   */
+  async function destroyStageInstances (run, issuePath) {
+    if (!run?.runId) return
+    try {
+      const destroyed = await destroyRunInstances(run.runId, { reason: run.status === 'paused' ? 'run-paused' : `run-${run.status ?? 'ended'}` })
+      if (!destroyed.length) return
+      for (const d of destroyed) {
+        const entry = (run.stageInstances ?? []).findLast((i) => i.name === d.name && !i.destroyed?.passed)
+        if (entry) entry.destroyed = { reason: d.reason, at: d.at, durationMs: d.durationMs, passed: d.passed, ...(d.error ? { error: d.error } : {}) }
+        if (!d.passed) console.warn(`stage instance ${d.name} of run ${run.runId} could not be destroyed on ${d.host}; it keeps its slot until a later attempt removes it: ${d.error}`)
+      }
+      await store.writeRun(issuePath, run.runId, run)
+    } catch (error) { console.warn(`stage instances of run ${run.runId} could not be destroyed: ${error.message}`) }
   }
 
   async function settleWorkspace (record) {
@@ -1523,6 +1546,8 @@ export function createSupervisor ({
         // Its record may be the only durable copy of an unproved cleanup (the barrier file refused it).
         if ((await unrecordedCleanup(path.dirname(issue.path), run)).length) throw err(409, unrecordedRefusal(run, 'deleting the run'), { code: 'CLEANUP_UNRECORDED' })
         await removeRunWorkspace(run, await resolveProjectPath(project, { projectsDir }).catch(() => null))
+        // Its end destroyed its stage instances; one that could not be removed then is tried once more.
+        await destroyRunInstances(runId, { reason: 'run-deleted' }).catch(() => [])
         let reservations = []
         try { reservations = JSON.parse(await fs.readFile(path.join(issue.path, '.step-reservations.json'), 'utf8')) } catch (e) { if (e.code !== 'ENOENT') throw e }
         const folders = new Set((run.steps ?? []).map((s) => `${s.number}-${s.slug}`))

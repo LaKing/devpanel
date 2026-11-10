@@ -36,6 +36,7 @@ import { affectedModules, affectedModulesNotice, baseFiles, changedModules, coun
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
+import { instanceName } from './instance-drive.mjs'
 import { changedHooks, combinedSets, composeTree, parseReading, subscribersOf } from './module-hooks.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { autoReconcileRefusal } from './auto-reconcile.mjs'
@@ -57,7 +58,7 @@ export function harnessUnavailable (harnesses, id) {
 
 /** One check attempt as kept on the check that replaced or outlived it (check-log.mjs reads its logs). */
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
-  ...(c.driveSlot ? { driveSlot: c.driveSlot } : {}),
+  ...(c.driveSlot ? { driveSlot: c.driveSlot } : {}), ...(c.stageInstance ? { stageInstance: c.stageInstance } : {}),
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log, ...(x.fromSmoke ? { fromSmoke: x.fromSmoke } : {}) })),
   ...(c.continuedFrom ? { continuedFrom: c.continuedFrom } : {}), ...(c.continuation ? { continuation: c.continuation } : {}) })
@@ -1970,7 +1971,34 @@ export class Engine {
     }
     // What failed in the run's previous modules drive runs first, so its answer comes early.
     const failedFirst = (this.run.checkHistory ?? []).filter((h) => h.tier === 'modules' && Array.isArray(h.modules?.failedFilters)).at(-1)?.modules.failedFilters ?? []
-    return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries), failedFirst }), affected }
+    return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries), failedFirst, instanceName: instanceName(this.runId) }), affected }
+  }
+
+  /**
+   * What a drive did with a stage instance (checks.mjs `result.stageInstance`), kept on
+   * `run.stageInstances`: one entry per instance created, with its create, start and ready
+   * times, how many drives it served and how it ended. The run's end adds the destroy
+   * (the supervisor, stage-instances.mjs), so the record names every instance the run
+   * ever had on a staging host.
+   */
+  noteStageInstance (check) {
+    for (const drive of [...(check?.attempts ?? []), check]) {
+      const used = drive?.stageInstance
+      if (!used) continue
+      const list = (this.run.stageInstances ??= [])
+      let entry = list.findLast((i) => i.name === used.name && !i.destroyed)
+      if (used.fresh && used.state !== 'not-created' && used.created !== false) {
+        // The stage creates nothing over an existing root: an earlier instance of this name that no
+        // record saw destroyed (its owning process died) was removed before this one was made.
+        if (entry) entry.destroyed = { reason: 'owner-gone', at: drive.at ?? this.clock.iso(), passed: true }
+        entry = { name: used.name, root: used.root, host: used.host, slot: used.slot, createdAt: drive.at ?? this.clock.iso(), dir: drive.dir ?? null,
+          ...(used.slotWaitMs ? { slotWaitMs: used.slotWaitMs } : {}), createMs: used.createMs ?? null, startMs: used.startMs ?? null, ...(used.startWaitMs ? { startWaitMs: used.startWaitMs } : {}), readyMs: used.readyMs ?? null, drives: 0 }
+        list.push(entry)
+      }
+      if (!entry) continue
+      entry.drives++
+      if (used.destroyed) entry.destroyed = used.destroyed
+    }
   }
 
   /**
@@ -2079,6 +2107,7 @@ export class Engine {
       const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })
       // Tagged before any caller gates it (maybeRunChecks, reconcile): gatingResult reads the tier.
       Object.assign(result, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
+      this.noteStageInstance(result)
       await this.subscriberChecks(result, { revision: current, common })
       return result
     }
@@ -2295,6 +2324,7 @@ export class Engine {
     } catch (error) {
       result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
     }
+    this.noteStageInstance(result)
     const { revision: _none, variant, ...rest } = result
     Object.assign(record, rest, { status: result.refused ? 'refused' : 'finished', result: result.refused ? null : result.result, variant: { ...frozen, ...variant } })
     await this.persist({ type: 'diagnostic-drive', n, status: record.status, result: record.result, commands: record.commands?.length ?? 0 })
@@ -2483,8 +2513,10 @@ export class Engine {
       let drive
       try {
         const prepared = await composeTree({ project, memberPath: member.path, frameworkCollections: pool.frameworkCollections, from: this.run.workspace.path, into, revision, signal: this.controller.signal })
-        const { target } = modulesDrive(configured, { affected: { modules, core: null }, files: [] })
+        // Another project's tree: an instance of its own, beside the run's (instance-drive.mjs).
+        const { target } = modulesDrive(configured, { affected: { modules, core: null }, files: [], instanceName: instanceName(this.runId, project) })
         drive = await runChecks({ ...common, target, revision, prepared })
+        this.noteStageInstance(drive)
         const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: drive })
         Object.assign(drive, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
       } catch (error) {

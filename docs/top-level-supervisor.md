@@ -133,7 +133,8 @@ Concurrency defaults to three, and may mean several issues of one project: the
 invariant is one live run per issue, including preflight and stopping. The resources
 those runs share have their own guards: deliveries and base snapshots take turns on
 each repository's delivery lock, and remote test drives wait for a slot per staging
-host (`testDrive.maxConcurrentDrives`). The panel server refuses a run beside a live
+host (`testDrive.maxConcurrentDrives`), or, where a project's modules tier runs on a
+stage instance per run, for one of the host's instances (`testDrive.maxInstances`). The panel server refuses a run beside a live
 in-place run, or a staging or deployment run beside another of its project
 (execution-contract.md "Locking"). This covers both browser and supervisor launches
 within that server; standalone engine callers are not coordinated by it.

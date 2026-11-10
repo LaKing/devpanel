@@ -14,6 +14,8 @@ import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
 import { systemClock } from '../server/runtime/clock.mjs'
 import { sshConnection } from '../server/runtime/ssh.mjs'
+import { modulesDrive } from '../server/runtime/modules-tier.mjs'
+import { destroyRunInstances, holdsInstance } from '../server/runtime/stage-instances.mjs'
 
 export const name = 'drive slots — remote drives per staging host, pinned to the host whose slot they hold'
 
@@ -440,6 +442,62 @@ export default async function (t) {
       await until('a modules drive past the dead admission', () => exists(started('xm9')))
       await go('xm9')
       t.eq('it passes too', (await xm9).result, 'passed', (await xm9).error)
+    }
+
+    t.section('a modules drive on a stage instance of its own: no drive slot and no admission, the host bounded by its instances, created, reused and destroyed over the pinned connection')
+    {
+      await reset()
+      const instanceLog = path.join(state, 'instances.log')
+      const root = await temp('ds-instances-')
+      const say = (word) => `echo ${word} {{instanceName}} >> '${instanceLog}'`
+      const lines = async () => (await fs.readFile(instanceLog, 'utf8').catch(() => '')).split(NL).filter(Boolean)
+      // The ready command is the gate: the drive holds its instance while the test looks.
+      const instanced = async (instanceName, runId, gateName, max = 2) => {
+        const tier = { kind: 'ssh', ssh: { hostRef: 'ssh-config:host-i', workdir: await temp('ds-remote-') }, modules: { collections: ['@*'],
+          lint: { id: 'lint', run: 'true {{files}}' }, load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') },
+          ready: { id: 'ready', run: `${held(gateName)[0].run}; ${say('ready')}` }, test: { id: 'selftest', run: 'true {{instance}} {{filter}}' },
+          instance: { root, max, create: { run: `${say('create')} && mkdir {{instance}}` }, start: { run: say('start') }, destroy: { run: `${say('destroy')} && rmdir {{instance}}` } } } }
+        const { target } = modulesDrive(tier, { affected: { modules: ['@c/a'], core: null }, files: [], instanceName })
+        return runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp, target, runId, runDir: await temp('ds-run-'), driveTiming: timing() })
+      }
+      const whole = runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp,
+        target: { kind: 'ssh', tier: 'modules', ssh: { hostRef: 'ssh-config:host-i', workdir: await temp('ds-remote-') }, commands: held('ib') }, runDir: await temp('ds-run-'), driveTiming: timing() })
+      await until('the base-instance drive, holding the host whole', () => exists(started('ib')))
+      const i1 = instanced('dp-one', 'run-one', 'i1')
+      await until('the instance drive beside it', () => exists(started('i1')))
+      t.ok('it started while a base-instance drive held every slot and the admission', true)
+      await go('ib', 'i1')
+      const [base, first] = await Promise.all([whole, i1])
+      t.eq('both pass', [base.result, first.result], ['passed', 'passed'], first.error)
+      t.eq('it took no slot: only the pinned connection', [first.driveSlot.instance, first.driveSlot.exclusive, first.driveSlot.host], [true, undefined, 'host-i'])
+      t.eq('the first drive creates and starts the instance, with no load or restart', await lines(), ['create dp-one', 'start dp-one', 'ready dp-one'])
+      t.eq('and records it', [first.stageInstance.name, first.stageInstance.root, first.stageInstance.fresh, first.stageInstance.state, first.stageInstance.slot, first.stageInstance.cap], ['dp-one', `${root}/dp-one`, true, 'live', 0, 2])
+      t.ok('with the time each step took', [first.stageInstance.createMs, first.stageInstance.startMs, first.stageInstance.readyMs].every((ms) => Number.isInteger(ms)), JSON.stringify(first.stageInstance))
+      t.eq('this process holds it', holdsInstance('dp-one'), true)
+
+      await go('i2')
+      const again = await instanced('dp-one', 'run-one', 'i2')
+      t.eq('the run\'s next drive loads into it', [again.result, again.stageInstance.fresh, again.stageInstance.state], ['passed', false, 'live'], again.error)
+      t.eq('load, restart, ready', (await lines()).slice(3), ['load dp-one', 'restart dp-one', 'ready dp-one'])
+
+      // A host that keeps one instance: another run waits until the first one's is destroyed.
+      const other = instanced('dp-two', 'run-two', 'i3', 1)
+      await settle()
+      t.eq('a second instance over the cap is not created', (await lines()).filter((l) => l.endsWith('dp-two')), [])
+      const before = (await log()).length
+      const destroyed = await destroyRunInstances('run-one', { reason: 'run-completed', slotsDir })
+      t.eq('the run\'s end destroys its instance', destroyed.map((d) => [d.name, d.reason, d.passed]), [['dp-one', 'run-completed', true]], destroyed[0]?.error)
+      t.eq('on the host it was created on', (await log()).slice(before, before + 1).map((l) => l.split('|')[0]), ['host-i'])
+      t.eq('and holds it no longer', [holdsInstance('dp-one'), await exists(path.join(root, 'dp-one'))], [false, false])
+      await until('the waiting run\'s drive', () => exists(started('i3')))
+      await go('i3')
+      const second = await other
+      t.eq('it passes on an instance of its own', [second.result, second.stageInstance.name, second.stageInstance.fresh, second.stageInstance.cap], ['passed', 'dp-two', true, 1], second.error)
+      t.ok('its wait for the slot is on the record', second.stageInstance.slotWaitMs > 0, JSON.stringify(second.stageInstance))
+      t.eq('in order: the destroy, then the next create', (await lines()).slice(6), ['destroy dp-one', 'create dp-two', 'start dp-two', 'ready dp-two'])
+      t.eq('a run with no instance has nothing to destroy', await destroyRunInstances('run-none', { reason: 'run-completed', slotsDir }), [])
+      await destroyRunInstances('run-two', { reason: 'run-completed', slotsDir })
+      t.eq('nothing is left on the host', await fs.readdir(root), [])
     }
 
     t.section('local checks are not capped')

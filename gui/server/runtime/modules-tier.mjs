@@ -3,6 +3,7 @@ import path from 'node:path'
 import fs from 'node:fs/promises'
 import { isSelftestReport, readReport, selftestReport, selftestStates } from './baseline-failures.mjs'
 import { shellQuote } from './ssh.mjs'
+import { withInstance } from './instance-drive.mjs'
 
 /*
  * The modules tier (docs/project-infrastructure.md "The modules tier",
@@ -115,8 +116,12 @@ export const takesAllFilters = (command) => typeof command?.run === 'string' && 
  * running (checks.mjs runCommandSet) and the author hears of every failing
  * module in one round. `failedFirst` (filters that failed in the run's previous
  * drive, failedFilters) moves those to the front, order otherwise kept.
+ *
+ * A tier that declares `instance` (instance-drive.mjs) is bound to `instanceName`,
+ * the caller's instance for this tree: its commands name that instance, and the
+ * check runner creates it on the first drive in place of load and restart.
  */
-export function modulesDrive (target, { affected, files = [], failedFirst = [] }) {
+export function modulesDrive (target, { affected, files = [], failedFirst = [], instanceName = null }) {
   const m = target.modules
   const fill = (command, placeholder, values) => ({ ...command, run: command.run.replace(`{{${placeholder}}}`, () => values.map(shellQuote).join(' ')) })
   const commands = []
@@ -152,8 +157,9 @@ export function modulesDrive (target, { affected, files = [], failedFirst = [] }
   if (m.browser) expand('browser', m.browser, filters.filter((f) => f.module))
   const ran = filters.filter((f) => first.has(f.filter)).map((f) => f.filter)
   const { tiers, compareBaseline, baselineCache, ...rest } = target
+  const driven = { ...rest, tier: 'modules', commands, ...(m.finallyCommands ? { finallyCommands: m.finallyCommands } : {}) }
   return {
-    target: { ...rest, tier: 'modules', commands, ...(m.finallyCommands ? { finallyCommands: m.finallyCommands } : {}) },
+    target: m.instance ? withInstance(driven, m, instanceName) : driven,
     plan: {
       lint: files.length ? { files } : { files: [], skipped: 'no-changed-files' },
       tests,
@@ -192,7 +198,8 @@ export function affectedModulesNotice (revision) {
  * command is one of the drive's test or browser commands (modulesDrive's
  * `<id>-<n>`) and exited on its own. The same bytes on the same instance answer
  * the same, so the engine returns to the author without a second drive, which
- * would hold the staging host whole again. A failed lint, load, restart or ready,
+ * would only cost the host another drive. A failed lint, load, restart or ready
+ * (or the creation and start of a stage instance),
  * a timeout, a signal, a launch failure or ssh's own exit 255 (exitedOnItsOwn)
  * is not the tests' answer and keeps the retry (`retryFailed`).
  */

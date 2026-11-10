@@ -1,5 +1,6 @@
 import { ignoredWords } from './selftest-history.mjs'
 import { failedModuleTests } from './baseline-failures.mjs'
+import { instanceWords } from './instance-drive.mjs'
 
 /** Model-facing evidence summary. Full manifests/logs stay in the retained check artifact. */
 export function checkSummary (check, fullEvidence = null) {
@@ -11,13 +12,15 @@ export function checkSummary (check, fullEvidence = null) {
     // A smoke result answers whether the revision boots; only the full drive counts for closure.
     ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
       : check.tier === 'targeted' ? 'Targeted tier: only the tests named in `targeted.tests` and the commands declared to run with them, not the whole drive. A failure returns the revision to the author; a pass shows those tests only and does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
-        : check.tier === 'modules' ? 'Modules tier: lint, the candidate loaded into the stage instance, and the selftests of the affected modules and core directories. Every failure blocks (no base comparison); this is the result closure counts.'
+        : check.tier === 'modules' ? `Modules tier: lint, the candidate loaded into ${check.stageInstance ? 'the run\'s own stage instance (created from the candidate on the run\'s first drive)' : 'the stage instance'}, and the selftests of the affected modules and core directories. Every failure blocks (no base comparison); this is the result closure counts.`
           : 'Full drive: the result closure counts.' } : {}),
     ...(check.targeted ? { targeted: check.targeted } : {}),
     ...(check.targetedDeclined ? { targetedDeclined: check.targetedDeclined } : {}),
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
     // durationMs includes this: how long the drive waited for a slot on its staging host (drive-slots.mjs).
     ...(check.driveSlot?.waitMs ? { driveSlot: check.driveSlot } : {}),
+    // The run's own stage instance, when the tier declares one: which, and what this drive did with it (instance-drive.mjs).
+    ...(check.stageInstance ? { stageInstance: check.stageInstance, stageInstanceNote: instanceWords(check) } : {}),
     // Not a drive of this revision: the approved revision's result, carried over inert drift (engine.reconcileDelivery).
     ...(check.carriedFrom ? { carriedFrom: check.carriedFrom, carriedBecause: check.carriedBecause ?? null } : {}),
     // Run on the smoke's instance rather than from scratch: still the full drive closure counts.

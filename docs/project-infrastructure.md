@@ -238,7 +238,9 @@ recorded revision beside its reviews. One drive does, in this order:
    and recorded so, when there are none;
 2. **load**, **restart**, **ready**: the candidate loaded into the project's stage
    instance by the declared load command (it runs in the drive's archived candidate
-   directory), the instance restarted, and readiness awaited;
+   directory), the instance restarted, and readiness awaited. With a stage instance
+   per run ("A stage instance per run" below) the run's first drive creates and
+   starts its own instance here instead;
 3. **test**: the framework's `selftest` CLI once per affected module, with that module as
    its filter, then once per core directory; and **browser** once per affected module
    when the project declares how. A test or browser command that fails on its own exit
@@ -313,9 +315,11 @@ tests that run are only those of modules the revision touched or the triage name
 inherited failure is the author's to see, not to pass over. The baseline machinery
 (`compareBaseline`, `baselineCache`, unstable selftests) stays with the full tier.
 
-**One candidate per host.** The candidate is loaded into the running instance, which stays
-running with the last candidate. A modules drive therefore holds its staging host whole
-("How many drives a host runs"). A project with `infrastructure` but no `testDrive.modules`
+**One candidate per host, in base-instance mode.** Without `modules.instance` the tier's
+commands name one fixed instance: the candidate is loaded into it and it stays running with
+the last candidate. A modules drive therefore holds its staging host whole ("How many drives
+a host runs"). With `modules.instance` each run has an instance of its own and drives of
+different runs overlap ("A stage instance per run"). A project with `infrastructure` but no `testDrive.modules`
 gets each revision's check recorded `unavailable`, saying why, and no drive; under a
 required check closure blocks until the project declares one (`npm run config:check` warns).
 The tier carries no `tiers`, `compareBaseline`, `baselineCache` or `timing: approved`;
@@ -323,6 +327,92 @@ every command is required and none is a service. The test slot or a finalizer mu
 `report: selftest`: a passing drive whose report names a failed test, cannot be read, or was
 not shown at all gates failed. Test and browser commands are numbered `<id>-<n>`, so no
 declared id may take that form.
+
+### A stage instance per run
+
+A tier that declares `modules.instance` runs on an instance of the run's own instead of
+one fixed instance, so the installed stage instance stays with the people who use it and
+runs do not queue for it. The stage host's own tooling makes the instances; the project
+file says how to call it, and the engine decides when.
+
+```yaml
+testDrive:
+  modules:
+    lint:    { id: lint, run: '<script> {{instance}} {{files}}' }
+    load:    { id: load, run: '<script> {{instance}}' }
+    restart: { id: restart, run: '<script> {{instance}}' }
+    ready:   { id: ready, run: '<tool> ready {{instanceName}} --wait 300' }
+    test:    { id: module-selftest, run: '<script> {{instance}} {{filters}}', report: selftest }
+    instance:
+      root: /var/lib/stage-instances           # {{instance}} is <root>/<name>
+      max: 4                                # the stage's own cap, when below the host setting
+      create:  { run: '<tool> create {{instanceName}} "$PWD"', unavailableExitCodes: [3], unavailableReason: '...' }
+      start:   { run: '<tool> start {{instanceName}}', busyExitCodes: [4], busyRetrySeconds: 30 }
+      destroy: { run: '<tool> destroy {{instanceName}}' }
+      gc:      { run: '<tool> gc' }           # optional
+```
+
+**The name.** `{{instanceName}}` is derived from the run id alone: `dp-<run id>` in lower
+case when that is 1 to 40 characters of `a-z`, `0-9` and `-`, else `dp-r-<hash>`; a hook
+subscriber's drive of another project gets `dp-s-<hash>` of the run and that project. The
+stage's own listing therefore shows which run an instance belongs to, and a run always
+finds the instance an earlier process of it left. `{{instance}}` is `<root>/<name>`. Both
+are plain words, so they may stand in the lint and test templates; every command of the
+tier must name the instance, and without `instance` neither placeholder is accepted.
+
+**Lifecycle.**
+
+| When | What the engine runs |
+|---|---|
+| the run's first modules drive | `create` (in the drive's candidate directory), lint, `start`, `ready`, the tests. No load and no restart: the instance is made from the candidate |
+| each later drive of the run (a new revision, a retry, a diagnostic drive, a reconciled candidate) | lint, `load`, `restart`, `ready`, the tests, as in base-instance mode, on the same instance |
+| a drive that leaves the instance in doubt (a failed, cut or skipped create, start, load, restart or ready) | `destroy` at once; the next drive, a retry included, is a first drive again |
+| the run ends (completed, blocked, failed, cancelled, service shutdown) or is deleted | `destroy` |
+| the run pauses | `destroy`; the first drive after the resume creates a new one |
+| the panel starts | `destroy` for every instance whose owning process is proved dead, then `gc` once per staging host |
+
+A paused run gives its instance back because an idle instance holds gigabytes of the host
+and one of its few slots for a wait nobody can bound, while a new one costs a few minutes
+and is made from the revision the run then checks. `destroy` is run by the engine outside
+any drive, only while the instance's root exists, with a bound of its own
+(`timeoutSeconds`, default 300). The candidate directory of a drive is removed after the
+drive as always; the instance holds its own copy.
+
+**Exits that are not failures.**
+
+- `create.unavailableExitCodes` (the stage tooling's "this candidate needs a dependency
+  install"): the check is `unavailable`, with `unavailableReason` and what the command
+  printed, on `result.error`. Nothing is tested on the base instance or anywhere else in
+  its place. As for any `unavailable` result there is no retry and no author round; under
+  `required` closure is unmet, and such a change is verified by the project's full tier.
+- `start.busyExitCodes` (the stage runs its cap of instances, people's included): the
+  command is asked again every `busyRetrySeconds` (20) until it answers otherwise. It is a
+  wait, recorded on the command (`attempts`, `busyWaitMs`) and, like a wait for a slot,
+  not charged to the wall clock while no seat turn runs.
+
+**Who may destroy what.** The panel keeps one slot per instance beside the drive slots
+(`instance-<n>.lock` and `.json` under `issues/.drive-slots/<host>/`). The lock carries the
+owning process's identity (`runtime/lock.mjs`) and is held for as long as the instance
+exists. An instance whose lock a live process holds is never destroyed by anyone else; one
+whose owner is proved dead is destroyed by whoever takes the lock next (a drive looking for
+a slot, a run's end, the sweep at the panel's start); an owner that cannot be proved dead
+keeps its instance. A run that resumes in a new process finds its own name on record,
+destroys that instance and creates a new one: what an instance holds after its owner died
+is not known. An instance whose destroy failed keeps its record and counts against the cap
+until a later attempt removes it.
+
+**What a drive records.** `result.stageInstance`: `name`, `root`, `host`, `slot`, `cap`,
+`fresh`, `slotWaitMs`, `createMs`, `startMs`, `startWaitMs`, `readyMs` (first drive) or
+`loadMs`, `restartMs`, `readyMs` (later), `state` (`live`, `destroyed`, `not-created`) and
+`destroyed {reason, durationMs, passed}`. The run keeps `stageInstances`: one entry per
+instance it ever had, with those times, the number of drives it served and how it was
+destroyed. The check summary and the run explanation say it in a sentence.
+
+**What it does not change.** The tier still has no base drive, no baseline comparison and
+no selftest history, so no history key names an instance. A dependency change in a *later*
+revision is loaded without an install, as in base-instance mode: only `create` checks it.
+Under structured confinement (`kind` on the commands) `instance` is refused, because
+creating an instance reads the candidate and manages units.
 
 ### Module pool and hook reader
 
@@ -454,7 +544,15 @@ drive counts: candidate and base, smoke and full, a retry, a diagnostic drive. A
 from the cache is not a drive, a kept smoke instance holds no slot while it waits for its
 full drive, and local checks are not capped.
 
-A modules-tier drive loads its candidate into the host's stage instance, so it holds the
+A modules-tier drive on a stage instance of its run's own ("A stage instance per run")
+takes no drive slot and no admission: it boots nothing per drive and loads into nothing
+shared. What bounds the host then is how many instances exist, `testDrive.maxInstances` in
+the host settings (default 4, counted across projects, lowered by a project's
+`modules.instance.max`; keep it at or below the stage's own cap). A run over it waits for an
+instance to be destroyed, with the same record and wall-clock rule as a slot wait. Such
+drives do not queue behind a base-instance drive either, so use one mode per staging host.
+
+A modules-tier drive in base-instance mode loads its candidate into the host's stage instance, so it holds the
 host whole: it takes the host's admission lock (`exclusive.lock` beside the slots), then
 every slot, taking none while any is held, and keeps them all until it ends. Every other
 drive takes its one slot only while holding the admission lock for that moment, so once a

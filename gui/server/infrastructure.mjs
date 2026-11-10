@@ -1,5 +1,6 @@
 import { isSelftestReport } from './runtime/baseline-failures.mjs'
 import { reservedEnvironmentErrors } from './config/release-plan.mjs'
+import { CREATE_ID, START_ID, namesInstance } from './runtime/instance-drive.mjs'
 
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 
@@ -83,15 +84,17 @@ const NOT_A_TEST_COMMAND = new Set([...SHELL_WORDS, ...RUNNERS])
  * a called program does with its arguments cannot be seen from here
  * (docs/project-infrastructure.md "The targeted tier").
  */
-function templateProblem (run, placeholder = 'tests') {
+function templateProblem (run, placeholder = 'tests', { instance = false } = {}) {
   const slot = `{{${placeholder}}}`
+  // The instance placeholders stand for a root and a name the engine builds from plain characters only.
+  const plain = (word) => TEMPLATE_WORD.test(word) || (instance && ['{{instance}}', '{{instanceName}}'].includes(word))
   const count = run.split(slot).length - 1
   if (count !== 1) return `must hold ${slot} exactly once, found ${count}`
   const [command, ...words] = run.split(' ')
   if (!TEMPLATE_COMMAND.test(command)) return `must start with a literally named command, not ${JSON.stringify(command)}: anything more complex belongs in a script`
   if (NOT_A_TEST_COMMAND.has(command.slice(command.lastIndexOf('/') + 1))) return `must name a program that takes the tests as arguments; ${command} is a shell word or runs its arguments`
   for (const word of words) {
-    if (word !== slot && !TEMPLATE_WORD.test(word)) return `must be plain words separated by single spaces, with ${slot} as a word of its own, not ${JSON.stringify(word)}: anything more complex belongs in a script`
+    if (word !== slot && !plain(word)) return `must be plain words separated by single spaces, with ${slot} as a word of its own, not ${JSON.stringify(word)}: anything more complex belongs in a script`
   }
   return null
 }
@@ -163,14 +166,35 @@ export function modulesErrors (target) {
     if (placeholder[c.slot]) {
       // test and browser take one filter per command, or every filter in one command ({{filters}}); never both.
       const multi = placeholder[c.slot] === 'filter' && typeof c.run === 'string' && c.run.includes('{{filters}}')
-      const problem = templateProblem(c.run, multi ? 'filters' : placeholder[c.slot])
+      const problem = templateProblem(c.run, multi ? 'filters' : placeholder[c.slot], { instance: Boolean(modules.instance) })
       if (problem) errors.push(`modules.${c.slot}.run ${problem}`)
     } else if (/\{\{(files|filters?|tests)\}\}/.test(c.run)) errors.push(`modules.${c.slot}.run: only lint takes {{files}} and only test and browser take {{filter}} or {{filters}}`)
   }
+  errors.push(...instanceErrors(modules, all))
   if (target.tiers) errors.push('modules and tiers do not go on one target: the modules tier is the per-revision check, tiers are the full verification')
   if (target.compareBaseline || target.baselineCache) errors.push('the modules tier has no base drive: compareBaseline and baselineCache do not apply')
   if (target.timing === 'approved') errors.push('the modules tier runs on every revision beside the reviews; timing: approved contradicts it')
   errors.push(...confinedCommandErrors({ commands: slots.map(({ slot, ...c }) => c), finallyCommands: modules.finallyCommands, confinement: target.confinement }).filter((e) => !e.startsWith('testDrive.confinement is set')))
+  return errors
+}
+
+/**
+ * A modules tier on a stage instance of its own (`modules.instance`, instance-drive.mjs):
+ * create, start and destroy must name the instance they act on, the tier's own commands
+ * name it too (one that named a fixed instance would test something else), and the tier is
+ * unstructured, since creating an instance reads the candidate and manages units, which
+ * neither command kind allows. Without `instance` no command may hold the placeholders.
+ */
+function instanceErrors (modules, all) {
+  const instance = modules.instance
+  if (!instance) return all.filter((c) => namesInstance(c.run)).map((c) => `${c.slot ? `modules.${c.slot}` : c.id}: {{instance}} and {{instanceName}} need modules.instance; without it the tier runs on the one fixed instance its commands name`)
+  const errors = []
+  if (instance.root.split('/').includes('..')) errors.push('modules.instance.root must not hold parent traversal')
+  for (const step of ['create', 'start', 'destroy']) if (!namesInstance(instance[step].run)) errors.push(`modules.instance.${step}.run must name the instance: {{instanceName}} or {{instance}}`)
+  if (instance.gc && namesInstance(instance.gc.run)) errors.push('modules.instance.gc.run removes what no run holds on the stage host; it names no instance')
+  for (const c of all) if ([CREATE_ID, START_ID].includes(c.id)) errors.push(`modules: ${c.id} is the id of the engine's own instance command; rename it`)
+  for (const slot of ['load', 'restart', 'ready', 'test']) if (!namesInstance(modules[slot].run)) errors.push(`modules.${slot}.run must name the instance ({{instance}} or {{instanceName}}): with modules.instance every drive runs on the run's own instance`)
+  if (all.some((c) => c.kind)) errors.push('modules.instance needs an unstructured tier (no command kinds): creating an instance reads the candidate and manages units')
   return errors
 }
 
