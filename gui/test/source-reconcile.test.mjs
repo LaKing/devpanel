@@ -89,6 +89,9 @@ const types = (events) => events.map((e) => e.type)
 const finishes = (events, runId = null) => events.filter((e) => e.type === 'run-finished' && (!runId || e.runId === runId)).length
 const shows = (run, text) => JSON.stringify(explainRun(run)).includes(text)
 const DO_NOT_LAND = 'automatic reconcile running; do not land by hand'
+// The supervisor reads a run's issue through getRunHolder where there is one (an issue or a run home), so a
+// fault injected into the issue read has to be on both: wrapping getIssue alone no longer reaches the end path.
+const readsThrough = (issues, getIssue) => ({ ...issues, getIssue, getRunHolder: getIssue })
 
 export default async function (t) {
   const temps = []
@@ -354,10 +357,10 @@ export default async function (t) {
         ['many periods, reconcile does not apply', CODE_CONFLICT, 10, 'blocked']
       ]) {
         let failing = false
-        const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+        const wrap = (issues) => readsThrough(issues, async (...args) => {
           if (failing) throw new Error('disk fault')
           return issues.getIssue(...args)
-        } })
+        })
         const s = await supervisedRun(scenario, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') failing = true } })
         const { supervisor, events } = s.open()
         await supervisor.finalize(s.ids)
@@ -376,10 +379,10 @@ export default async function (t) {
       }
       // A record that is gone cannot hold anything: it is announced and not retried.
       let gone = false
-      const wrap = (issues) => ({ ...issues, getIssue: async (...args) => {
+      const wrap = (issues) => readsThrough(issues, async (...args) => {
         if (gone) throw Object.assign(new Error('no such issue'), { status: 404 })
         return issues.getIssue(...args)
-      } })
+      })
       const s = await supervisedRun(CHANGELOG_ONLY, { wrap, onEvent: (e) => { if (e.type === 'finished' && e.reason === 'finalize') gone = true } })
       const { supervisor, events } = s.open()
       await supervisor.finalize(s.ids)

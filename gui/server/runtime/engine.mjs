@@ -39,6 +39,7 @@ import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './m
 import { changedHooks, combinedSets, composeTree, parseReading, subscribersOf } from './module-hooks.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { autoReconcileRefusal } from './auto-reconcile.mjs'
+import { LEFT_TO_RECONCILE, MAX_DELIVERY_RETURNS, deliveryReturnRefusal, rebaseOntoSource, recordedConflicts, reconciliationDiff, returnAnswer, returnBrief } from './delivery-return.mjs'
 import { infrastructureBrief } from '../infrastructure.mjs'
 import { classifyFailure, backoffMs } from './failure.mjs'
 
@@ -2092,7 +2093,9 @@ export class Engine {
     this.run.baselineChecks ??= []
     const held = this.run.baselineChecks.filter((b) => b.targetKey === targetKey && b.baseCommit === sourceRevision && b.result !== 'unavailable' && !b.unfinished)
     // A reconciled candidate's base (B′) keeps its own directory beside the run's.
-    const dirName = `base-${targetKey.slice(0, 12)}${baseCommit === this.run.workspace.baseCommit ? '' : `-${baseCommit.slice(0, 12)}`}`
+    // So does the base a delivery return moved the run onto: the first base's drive stays where its record says.
+    const firstBase = this.run.deliveryReturns?.[0]?.from.baseCommit ?? this.run.workspace.baseCommit
+    const dirName = `base-${targetKey.slice(0, 12)}${baseCommit === firstBase ? '' : `-${baseCommit.slice(0, 12)}`}`
     // Across runs: the same drive of the same base commit, staging snapshot
     // and environment, from issues/<project>/.baselines (baseline-cache.mjs).
     // The identity is read for every check, because a baseline this run
@@ -2503,7 +2506,8 @@ export class Engine {
     })
     const step = this.run.steps.find((s) => s.number === number)
     if (step) step.revision = fp.fingerprint
-    this.run.revisions.push({ fingerprint: fp.fingerprint, byStep: number, at: this.clock.iso(), rule: fp.rule, ...this.revisionModules(fp) })
+    // After a delivery return the run's base is no longer the one it started on: the revision says which it is over.
+    this.run.revisions.push({ fingerprint: fp.fingerprint, byStep: number, at: this.clock.iso(), rule: fp.rule, ...(this.run.deliveryReturns?.length ? { baseCommit: this.run.workspace.baseCommit } : {}), ...this.revisionModules(fp) })
     const record = this.run.revisions.at(-1)
     // The pool's hook reading widens the affected set (module-hooks.mjs); then what this
     // revision needs and the run does not hold yet is pending, and the drive loop takes it
@@ -2644,6 +2648,15 @@ export class Engine {
     if (guidance) append('intent', `## Intent: ${this.snapshot.intent.title}${NL}${this.snapshot.intent.description}${NL}${NL}${guidance.trim()}`)
     const carried = carryForwardBrief(this.run.workspace?.seed)
     if (carried) append('carried-forward', carried)
+    // After a delivery return every seat is told what the round is: a conflict
+    // reconciliation on a moved base, not new work (delivery-return.mjs).
+    const returned = this.run.deliveryReturns?.at(-1)
+    if (returned) {
+      const kind = step.recordsRevision ? 'author' : step.output === 'reviewResult' ? 'review' : 'coordinator'
+      const resolved = this.run.steps.some((s) => s.revision && Number(s.number) > Number(returned.step))
+      append('delivery-return', returnBrief(returned, { kind, resolved,
+        diff: kind === 'review' && resolved ? await reconciliationDiff({ workspace: this.run.workspace, mergeCommit: returned.mergeCommit }) : null }))
+    }
 
     // The contract's definition, not merely its name. A coordinator-authored
     // prompt cannot know what shape the engine requires; "matching the
@@ -4748,6 +4761,116 @@ export class Engine {
     await this.persist({ type: 'worker-returned', ...entry })
   }
 
+  /** The author step that produced the current candidate and its phase: where a delivery return goes. */
+  deliveryReturnTarget () {
+    const byStep = this.run.steps.find((s) => s.number === this.run.revisions.at(-1)?.byStep)
+    const writes = (step) => step?.id === byStep?.stepId && step.recordsRevision === true
+    const phase = byStep ? this.snapshot.phases.find((p) => p.id === byStep.phase && (p.loop ? p.loop.steps.some(writes) : writes(p.step))) : null
+    return phase ? { phase, byStep } : null
+  }
+
+  /**
+   * The automatic return of a delivery the source refused for a text conflict
+   * (delivery-return.mjs): the run's base moves to the source as it is, the
+   * worktree becomes the approved change on it with the conflicts as markers,
+   * and one engine decision step (`<phase>:return`, replayed like any return)
+   * gives the author its round. The move is journaled first
+   * (`run.pendingDeliveryReturn`) and built only from what was kept — the
+   * approved patch, the old base and its baseline — so a process that dies in
+   * it does it again (resumeDeliveryReturn). `{ returned }`, `{ refusal }` with
+   * nothing changed, or `{ interrupted }` with the run blocked.
+   */
+  async returnFromDelivery ({ phase, byStep, policy, approved = null, resume = null }) {
+    const runDir = store.runDir(this.issuePath, this.runId)
+    const ws = this.run.workspace
+    const n = (this.run.deliveryReturns?.length ?? 0) + 1
+    const from = resume?.from ?? { revision: approved.revision, artifactRef: approved.artifactRef, baseCommit: ws.baseCommit, ...(ws.repository ? { sourceBase: ws.sourceBase ?? ws.baseCommit } : {}) }
+    const kept = path.join(runDir, 'delivery-return', String(n))
+    const keptMap = async (name) => new Map(Object.entries(JSON.parse(await fs.readFile(path.join(kept, name), 'utf8'))))
+    let baseline = this.baseline ?? new Map()
+    if (resume) {
+      baseline = await keptMap('previous-baseline.json')
+      baseline.modes = await keptMap('previous-baseline-modes.json')
+    } else {
+      await fs.mkdir(kept, { recursive: true })
+      await writeJson(path.join(kept, 'previous-baseline.json'), Object.fromEntries(baseline))
+      await writeJson(path.join(kept, 'previous-baseline-modes.json'), Object.fromEntries(baseline.modes ?? []))
+    }
+    const rebase = await rebaseOntoSource({ workspace: { ...ws, baseCommit: from.baseCommit, ...(ws.repository ? { sourceBase: from.sourceBase } : {}) }, baseline, revision: from.revision,
+      patchFile: path.join(runDir, from.artifactRef), policy: policy ?? {}, runDir, runId: this.runId, n, clock: this.clock, extraPaths: resume?.paths ?? [] })
+    if (rebase.state !== 'rebased') return { refusal: rebase.reason }
+    try {
+      const at = this.clock.iso()
+      this.run.pendingDeliveryReturn = { n, state: 'writing', at, phase: phase.id, byStep: byStep.number, from, sourceBase: rebase.sourceBase, paths: rebase.paths }
+      await this.persist({ type: 'delivery-return-started', n, from: from.revision, sourceBase: rebase.sourceBase })
+      await rebase.write()
+      await this.hook('afterDeliveryRebase')
+      await store.writeBaseline(this.issuePath, this.runId, rebase.baseline)
+      this.baseline = rebase.baseline
+      this.run.workspace = { ...ws, baseCommit: rebase.sourceBase, ...(ws.repository ? { sourceBase: rebase.publicationBase ?? rebase.sourceBase } : {}) }
+      // The engine wrote the worktree and moved its HEAD: that state is the next turn's integrity baseline.
+      if (this.run.integrity) {
+        const before = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
+        const checkpoint = `delivery-return-${n}`
+        await writeIntegrity(this.integrityDir(), checkpoint, await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: before.trackedPaths }))
+        this.run.integrity = { ...this.run.integrity, checkpoint }
+      }
+      // The modules tier compares against the base's checksums: the base is another now.
+      if (this.run.modules?.base) delete this.run.modules.base
+      const entry = { n, at, phase: phase.id, from, sourceBase: rebase.sourceBase, mergeCommit: rebase.mergeCommit, conflicts: recordedConflicts(rebase.conflicts), appended: rebase.appended,
+        refused: this.run.delivery?.error ?? null, ...(resume ? { resumed: true } : {}) }
+      const answer = returnAnswer(entry)
+      const decision = { pauseId: null, key: returnKey(phase), question: `Return "${phase.title ?? phase.id}" to the author: delivery conflicted with the source in ${entry.conflicts.map((c) => c.path).join(', ')}.`, options: null, answer,
+        actor: 'engine', automatic: true, deliveryReturn: n, askedBy: { phase: phase.id, stepId: phase.step?.id ?? null, step: byStep.number }, askedAt: at, at }
+      const invocationId = `decision-${uuid()}`
+      const response = `# Engine: return a delivery conflict to the author${NL}${NL}${answer}${NL}${NL}Recorded by the engine at ${at}.${NL}`
+      const created = await this.stepStore.create({ name: 'return', response, invocationId })
+      this.run.steps.push({
+        number: created.number, slug: created.slug, basedOnRevision: null, stepId: 'decision', role: 'operator', phase: phase.id, round: 0, attempt: 1,
+        invocationId, startedAt: at, endedAt: at, durationMs: null, durationUnknown: null, revision: null, outputRef: null, usage: null, response, decision
+      })
+      // The confirmation named the approved revision; the reconciled one is confirmed again.
+      this.run.supersededSteps = [...new Set([...(this.run.supersededSteps ?? []), ...this.run.steps.filter((s) => this.outputs[s.number]?.contract === 'closureConfirmation').map((s) => s.number)])]
+      this.run.deliveryReturns = [...(this.run.deliveryReturns ?? []), { ...entry, step: created.number }]
+      // Nothing taken on the approved revision is carried: not even where the reconciled content were to hash the same.
+      this.run.approvals = []
+      this.run.checkResults = []
+      delete this.run.pendingDeliveryReturn
+      this.run.delivery = null
+      this.run.blockedReason = null
+      this.run.closure = null
+      await this.persist({ type: 'delivery-returned', n, step: created.number, phase: phase.id, from: from.revision, sourceBase: rebase.sourceBase, conflicts: entry.conflicts.map((c) => c.path) })
+      return { returned: true }
+    } catch (error) {
+      if (error.simulatedCrash) throw error
+      await this.blockDeliveryReturn(error.message)
+      return { interrupted: true }
+    } finally {
+      await rebase.release()
+    }
+  }
+
+  /** A delivery return that cannot be finished: the worktree is neither the approved revision nor its merge, and a person decides. */
+  async blockDeliveryReturn (error) {
+    this.run.pendingDeliveryReturn = { ...this.run.pendingDeliveryReturn, state: 'interrupted', error }
+    this.run.status = 'blocked'
+    this.run.blockedReason = 'delivery-return-interrupted'
+    this.run.outcome = 'unresolved'
+    await this.persist({ type: 'delivery-return-interrupted', n: this.run.pendingDeliveryReturn.n, error })
+  }
+
+  /** Closure reached with a journaled delivery return: finish it from what it kept, or leave the run blocked saying why. */
+  async resumeDeliveryReturn ({ mayReturn }) {
+    const pending = this.run.pendingDeliveryReturn
+    const phase = this.snapshot.phases.find((p) => p.id === pending.phase)
+    const byStep = this.run.steps.find((s) => s.number === pending.byStep)
+    if (pending.state !== 'writing' || !mayReturn || !phase || !byStep) return this.blockDeliveryReturn(pending.error ?? 'the move of the worktree onto the current source was interrupted')
+    const policy = await Promise.resolve(this.reconcilePolicy?.()).catch(() => null)
+    const back = await this.returnFromDelivery({ phase, byStep, policy, resume: pending })
+    if (back.returned) return 'returned'
+    if (back.refusal) await this.blockDeliveryReturn(`interrupted, and it cannot be done again: ${back.refusal}`)
+  }
+
   /** The coordinator's closure confirmation in force: `[step, output]`, or empty. */
   activeConfirmation () {
     return Object.entries(this.outputs).filter(([number]) => !(this.run.supersededSteps ?? []).includes(number) && (!this.snapshot.tactic || Number(number) > (this.run.windowResetAfter ?? -1)))
@@ -4780,6 +4903,9 @@ export class Engine {
   async closeOn (candidate, { mayReturn = false } = {}) {
     await this.assertJournal()
     if (this.run.integrity?.status === 'quarantined' || this.run.integrity?.status === 'abandoned' || this.run.recovery?.required) return
+    // A delivery return the process died in: the worktree may be half moved, so
+    // nothing below can read it. The move is done again from what was kept.
+    if (this.run.pendingDeliveryReturn) return this.resumeDeliveryReturn({ mayReturn })
     if (this.run.integrity && !this.run.revisions.length) {
       const role = this.run.integrity.latest?.role ?? Object.keys(this.run.participants)[0]
       if (!await this.beginIntegrity(role, { invocationId: `closure-${uuid()}` })) return
@@ -4924,6 +5050,7 @@ export class Engine {
     let blockedReason = null
     let notReturned = null
     let workerNotReturned = null
+    let deliveryNotReturned = null
 
     // Written whole, because a crash during delivery must leave a true record.
     const reportOnly = this.snapshot.completion.requires.includes('reportDispositionRecorded')
@@ -4943,6 +5070,8 @@ export class Engine {
         ...(notReturned ? { notReturned } : {}),
         // Why a single seat's failed check or unfinished task got no further turn.
         ...(workerNotReturned ? { workerNotReturned } : {}),
+        // Why a delivery refused by the source did not go back to the author (returnFromDelivery).
+        ...(deliveryNotReturned ? { deliveryNotReturned } : {}),
         // The checks as closure counted them, with the inherited-failure comparison.
         ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
           // The modules tier has no comparison to explain its gate: the gate's own words.
@@ -5086,6 +5215,21 @@ export class Engine {
 
     // Read before the status changes, so nothing waits between the block and its marker below.
     const reconcilePolicy = blockedReason === 'source-delivery-blocked' ? await Promise.resolve(this.reconcilePolicy?.()).catch(() => null) : null
+
+    // A text conflict with the source is the author's to reconcile, in this run
+    // (execution-contract.md "The engine returns a delivery conflict to the author").
+    if (blockedReason === 'source-delivery-blocked') {
+      const refusal = deliveryReturnRefusal({ run: this.run, application: this.run.delivery?.application, policy: reconcilePolicy, reconciled: Boolean(candidate) })
+      const target = refusal ? null : this.deliveryReturnTarget()
+      if (refusal) deliveryNotReturned = refusal === LEFT_TO_RECONCILE ? null : refusal
+      else if (!target) deliveryNotReturned = 'no author step of this run produced the candidate'
+      else if (mayReturn) {
+        const back = await this.returnFromDelivery({ ...target, policy: reconcilePolicy, approved: { revision: current, artifactRef: this.run.delivery.artifactRef } })
+        if (back.returned) return 'returned'
+        if (back.interrupted) return
+        deliveryNotReturned = back.refusal
+      } else deliveryNotReturned = 'this closure ran outside the drive loop (finalize), which gives no author round'
+    }
 
     if (conditions.deliveryCompleted) {
       this.run.status = 'completed'

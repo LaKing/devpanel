@@ -302,6 +302,15 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   Continue; later audits give each a `priorFindings` disposition. At most 2 per run (`run.closureReturns`); otherwise,
   or for an operator matter, it blocks as before with `closure.notReturned`. The confirm step has `access: checks`
   (read-only `checks/` + `evidence/` inside a proved fence) and always gets the check's gating and baseline comparison.
+- A delivery conflict goes back to the author (`engine.returnFromDelivery`, `runtime/delivery-return.mjs`): an `apply-to-source`
+  delivery refused for text conflicts only moves the run's base to the source as it is (B′, as reconcile builds it;
+  `workspace.baseCommit`, `baseline.json`, HEAD and index, integrity checkpoint), makes the worktree the approved change on it
+  with the conflicts as markers, and records an `automatic` decision step `<phase>:return` (`decision.deliveryReturn`) quoting
+  them, replayed like any return (review loop or single seat). The reconciled revision is checked, reviewed (the auditor gets
+  the diff since the engine's merge), confirmed and delivered with nothing carried. At most 2 per run (`run.deliveryReturns`);
+  the move is journaled (`run.pendingDeliveryReturn`) and redone after a crash, else `delivery-return-interrupted`. A non-text
+  conflict, a materialized path, any other refusal, an unreadable reconcile policy or the bound block as before with
+  `closure.deliveryNotReturned`; conflicts only on declared append paths stay the automatic reconcile's.
 - Checks-only stops: an approved revision whose check failed and that the author answers unchanged ends the loop as
   `checks-failed-unchanged`; that, or `rounds-exhausted` with every auditor approving the latest revision and its check
   not passing (`checksOnlyBlock`, run-control.mjs), offers `refresh-checks` to rerun the checks on the candidate.

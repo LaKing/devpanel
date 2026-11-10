@@ -135,9 +135,11 @@ async function delta (scratch, before, after, modes) {
  * destination. Returns `{ state: 'merged', candidate, … }` with the merged
  * candidate in a temporary worktree (call `release()` when done), or a refusal
  * `{ state, error, conflicts, changedDelta }` that has written nothing but
- * objects and the B′ ref into the run's Git directory.
+ * objects and the B′ ref into the run's Git directory. With `keepConflicts` a
+ * `conflicts` refusal also carries the conflicted tree (`candidate`, `drift`,
+ * `release()`), for a delivery return.
  */
-export async function mergeOntoSource ({ workspace, baseline, revision, patchFile, policy = {}, ref, runDir, clock }) {
+export async function mergeOntoSource ({ workspace, baseline, revision, patchFile, policy = {}, ref, runDir, clock, keepConflicts = false }) {
   const gitDir = workspace.gitDir ?? null
   const repo = (args, options) => git([...repositoryGitArgs(workspace.path, gitDir), ...args], options)
   const inTree = (dir, args, options) => git(['-C', dir, ...HARDENED, ...args], options)
@@ -243,7 +245,14 @@ export async function mergeOntoSource ({ workspace, baseline, revision, patchFil
       await must(inTree(mergedDir, ['add', '--', p]))
       result.appended.push(p)
     }
-    if (conflicts.length) return refuse('conflicts', `The merge conflicts outside the declared append paths: ${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? ', …' : ''}.`, { conflicts })
+    if (conflicts.length) {
+      const refusal = refuse('conflicts', `The merge conflicts outside the declared append paths: ${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? ', …' : ''}.`, { conflicts })
+      if (!keepConflicts) return refusal
+      // A delivery return (delivery-return.mjs) takes the conflicted tree as it stands: B′ plus the
+      // approved patch, the conflicting hunks left as markers for the author. The caller releases it.
+      keep = true
+      return { ...refusal, drift: drift.map((e) => e.path), candidate: { path: mergedDir, baseCommit: result.sourceBase, baseline: next }, release }
+    }
 
     // 6. Outside the append paths the merged change must be the reviewed one.
     const merged = await fingerprint(mergedDir, { baseCommit: result.sourceBase, baseline: next, clock })

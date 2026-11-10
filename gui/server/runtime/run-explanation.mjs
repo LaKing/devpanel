@@ -289,6 +289,15 @@ function workerNotReturnedWords (run) {
   return `${before}${reason === 'bound-reached' ? 'It was not returned again: the engine returns a single seat\'s work at most twice.' : `It was not returned to the agent: ${reason}.`}`
 }
 
+/** How often a delivery conflict went back to the author, and why this one did not (engine.returnFromDelivery). */
+function deliveryNotReturnedWords (run) {
+  const had = run.deliveryReturns?.length ?? 0
+  const reason = run.closure?.deliveryNotReturned
+  const before = had ? ` The engine had returned a delivery conflict to the author ${had === 1 ? 'once' : `${had} times`} in this run.` : ''
+  if (!reason) return before
+  return `${before} ${reason === 'bound-reached' ? 'It was not returned again: the engine returns a delivery conflict at most twice.' : `It was not returned to the author: ${String(reason).replace(/\.$/, '')}.`}`
+}
+
 /** Why closure did not happen, from the first condition that failed. */
 function closureUnmet (run, confirmation) {
   const c = run.closure?.conditions ?? {}
@@ -564,8 +573,13 @@ function standingOf (run, { outputs, active, ownership }) {
     case 'running': {
       const working = active.map((a) => ROLE(a.role))
       const doing = working.length ? `${Cap(working.join(' and '))} ${working.length === 1 ? 'is' : 'are'} working.` : 'Between turns.'
-      // After an automatic return the run is working on what closure found.
+      // After a delivery return the author is reconciling a conflict with the project; the later of the two returns is what the run is doing.
+      const conflict = (run.deliveryReturns ?? []).at(-1)
       const back = (run.closureReturns ?? []).at(-1)
+      if (conflict && !(back && Number(back.step) > Number(conflict.step))) {
+        return { tone: 'progress', headline: 'Running: reconciling a conflict with the project',
+          detail: `The approved version conflicted with changes made in the project meanwhile (${conflict.conflicts.map((c) => c.path).join(', ')}), so the engine moved the work onto the current project and gave the author another round to reconcile those lines (return ${run.deliveryReturns.length} of 2). The result is checked and reviewed again. ${doing}` }
+      }
       if (back) {
         return { tone: 'progress', headline: 'Running: returned to the author after closure',
           detail: `The coordinator found ${back.criteria.map((c) => `${c.id} (${c.unmet})`).join(', ')} not yet met on an approved, checked version, so the engine gave the author another round (return ${run.closureReturns.length} of 2). ${doing}` }
@@ -805,7 +819,13 @@ function blocked (run, outputs, kept) {
     const notRun = run.autoReconcile?.state === 'not-run' ? ` The automatic reconcile did not run: ${String(run.autoReconcile.reason).replace(/\.$/, '')}.` : ''
     const next = !reconcileUnavailable(run) ? `Reconcile delivery (the Reconcile with source button) merges it onto the project and rechecks it, unless only declared inert paths drifted; otherwise: ${d.next.charAt(0).toLowerCase()}${d.next.slice(1)}` : d.next
     const conflicts = reason === 'source-delivery-blocked' ? mergeSummary(run.delivery).conflicts : null
-    return { ...base, headline: d.headline, detail: (d.detail ?? '') + (conflicts ? ` ${conflicts}` : '') + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
+    const returned = reason === 'source-delivery-blocked' ? deliveryNotReturnedWords(run) : ''
+    return { ...base, headline: d.headline, detail: (d.detail ?? '') + (conflicts ? ` ${conflicts}` : '') + returned + refused + notRun || null, cause: firstLine(run.delivery?.error, 400) || null, next }
+  }
+  if (reason === 'delivery-return-interrupted') {
+    return { ...base, tone: 'error', headline: 'Stopped while moving the work onto the current project',
+      detail: 'The approved version conflicted with the project, and the engine was carrying it onto the current project for the author to reconcile when that step failed. The work folder may hold part of that merge; the approved patch is kept untouched.',
+      cause: firstLine(run.pendingDeliveryReturn?.error, 400) || null, next: 'Apply the approved patch by hand, or start a new run: it starts from that patch.' }
   }
   if (reason === 'release-staging-not-passed') {
     return { ...base, headline: 'Stopped: staging did not pass, so production was not touched', detail: 'The staging release or one of its assessments did not pass; staging was recovered under its configured policy.', next: 'Read the staging assessments and release commands in the technical details.' }

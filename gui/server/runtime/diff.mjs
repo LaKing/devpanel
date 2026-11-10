@@ -26,9 +26,9 @@ const withoutFenceStubs = async (dir, paths, stubs) => {
   return paths.filter((rel) => !fence.has(rel))
 }
 
-const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, timeout = 0 } = {}) => {
+const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, timeout = 0, index = null } = {}) => {
   try {
-    return (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], { env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0' }), maxBuffer, timeout })).stdout
+    return (await exec('git', [...worktreeGitArgs(dir, gitDir), ...args], { env: engineGitEnv({ GIT_OPTIONAL_LOCKS: '0', ...(index ? { GIT_INDEX_FILE: index } : {}) }), maxBuffer, timeout })).stdout
   } catch (error) {
     // `git diff --no-index` exits 1 when files differ; that is the normal case.
     if (typeof error.code === 'number' && error.code === 1 && typeof error.stdout === 'string') return error.stdout
@@ -37,20 +37,24 @@ const git = async (dir, args, { maxBuffer = 64 * 1024 * 1024, gitDir = null, tim
 }
 
 /**
+ * `index` names an index file to read instead of the worktree's own: "tracked"
+ * is then what that index holds (the diff against a commit that is not the
+ * worktree's base, delivery-return.mjs).
+ *
  * @returns {{ text: string, files: number, truncated: boolean, bytes: number }}
  */
-export async function candidateDiff (workspacePath, { baseCommit = null, maxBytes = DEFAULT_DIFF_LIMIT, gitDir = null, fenceStubs = [] } = {}) {
+export async function candidateDiff (workspacePath, { baseCommit = null, maxBytes = DEFAULT_DIFF_LIMIT, gitDir = null, fenceStubs = [], index = null } = {}) {
   if (!workspacePath) return { text: '', files: 0, truncated: false, bytes: 0 }
   const base = baseCommit ?? 'HEAD'
   const parts = []
   let files = 0
   // Tracked changes, staged or not, against the base the worktree was cut from.
-  const tracked = await git(workspacePath, ['diff', '--no-color', '--no-ext-diff', '--no-renames', base, '--'], { gitDir })
+  const tracked = await git(workspacePath, ['diff', '--no-color', '--no-ext-diff', '--no-renames', base, '--'], { gitDir, index })
   if (tracked.trim()) { parts.push(tracked); files += (tracked.match(/^diff --git /gm) ?? []).length }
   // Untracked files are part of the candidate too; render each as a new file.
   // The scope is the fingerprint's, not .gitignore's: a file the writer adds
   // AND ignores is still delivered, so the reviewer sees it, marked (audit I10).
-  const list = async (extra) => (await git(workspacePath, ['ls-files', '--others', '-z', ...extra], { gitDir })).split('\0').filter(Boolean)
+  const list = async (extra) => (await git(workspacePath, ['ls-files', '--others', '-z', ...extra], { gitDir, index })).split('\0').filter(Boolean)
   const untracked = (await withoutFenceStubs(workspacePath, await list(FINGERPRINT_EXCLUDES.map((e) => `--exclude=${e}`)), fenceStubs)).sort()
   const notIgnored = new Set(await list(['--exclude-standard']))
   for (const file of untracked) {

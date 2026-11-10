@@ -159,7 +159,8 @@ const nextAction = computed(() => {
     'delivery-unverifiable': 'A patch was written, but rebuilding the candidate from it did not reproduce the approved revision. The worktree is kept; the patch is not a faithful copy. Fix the cause, then press Finalize run to evaluate closure again from the retained worktree.',
     'delivery-failed': 'The delivery action itself failed. The worktree is kept. Fix the cause, then press Finalize run.',
     'source-delivery-blocked': 'Source delivery did not verify. The patch and worktree are retained. If source drifted, use Reconcile with source when it is offered; otherwise apply manually or rerun against the current checkout. Finalize can recognize an exact manual application; it never overrides drift.',
-    'source-delivery-interrupted': 'Source delivery was interrupted. Finalize checks the destination: approved revision means done, base means not applied, anything else requires recovery. The patch and worktree are retained.'
+    'source-delivery-interrupted': 'Source delivery was interrupted. Finalize checks the destination: approved revision means done, base means not applied, anything else requires recovery. The patch and worktree are retained.',
+    'delivery-return-interrupted': 'The approved patch conflicted with the source, and moving the worktree onto the current source for the author failed part-way. The worktree may hold part of that merge; the approved patch is retained untouched. Apply it manually, or start a new run: it starts from that patch.'
   }[run.value.blockedReason] ?? 'This run stopped and needs a human.'
 })
 

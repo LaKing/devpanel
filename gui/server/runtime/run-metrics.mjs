@@ -411,10 +411,11 @@ export function runMetrics (run, { outputs = null, now = Date.now() } = {}) {
     rounds: roundsAndRestarts(run),
     findings: findingStats(run, outputs),
     closureReturns: (run.closureReturns ?? []).length,
+    deliveryReturns: (run.deliveryReturns ?? []).length,
     regressionsAfterApproval: regressions.count,
     regressionsBasis: regressions.basis,
     ...(targeted ? { targeted } : {}),
-    means: 'measurements read off the run record, not stored by the engine; compare runs of the same configHash before changing seats, models or strategy; closureReturns counts the engine\'s automatic returns to the author after an unmet closure confirmation; regressionsAfterApproval counts checks that failed (inherited failures included) or whose baseline comparison named new failures, on a revision already approved when they started, and regressionsBasis "inferred" or "mixed" says part of the count comes from an older record that keeps only the current revision\'s checks'
+    means: 'measurements read off the run record, not stored by the engine; compare runs of the same configHash before changing seats, models or strategy; closureReturns counts the engine\'s automatic returns to the author after an unmet closure confirmation, deliveryReturns those after a delivery that conflicted with the source; regressionsAfterApproval counts checks that failed (inherited failures included) or whose baseline comparison named new failures, on a revision already approved when they started, and regressionsBasis "inferred" or "mixed" says part of the count comes from an older record that keeps only the current revision\'s checks'
   }
 }
 
@@ -438,7 +439,7 @@ export function seatMetrics (run, role) {
 export function emptyMetricsTotals () {
   return {
     measured: 0, agentMs: 0, seatMs: 0, operatorWaitMs: 0, suspendedMs: 0, checksMs: 0, waitingForChecksMs: 0, driveSlotWaitMs: 0, inconsistent: 0,
-    cycleRestarts: 0, inferredRestarts: 0, ignoredRestartRequests: 0, closureReturns: 0, regressionsAfterApproval: 0,
+    cycleRestarts: 0, inferredRestarts: 0, ignoredRestartRequests: 0, closureReturns: 0, deliveryReturns: 0, regressionsAfterApproval: 0,
     targetedDrives: 0, targetedConfirmedByFull: 0, targetedMissedByFull: 0,
     planReviewRoundExecutions: { total: 0, counted: 0 },
     seat: null
@@ -461,6 +462,7 @@ export function absorbMetrics (into, run, { role = null } = {}) {
   if (m.rounds.restartsInferred > 0) into.inferredRestarts++
   into.ignoredRestartRequests += m.rounds.ignoredRestartRequests
   into.closureReturns += m.closureReturns
+  into.deliveryReturns += m.deliveryReturns ?? 0
   into.regressionsAfterApproval += m.regressionsAfterApproval
   into.targetedDrives += m.targeted?.drives ?? 0
   into.targetedConfirmedByFull += m.targeted?.confirmedByFull ?? 0

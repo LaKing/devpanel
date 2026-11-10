@@ -2662,6 +2662,73 @@ scratch is its working directory. With the fence off, unproved
 Either way the prompt quotes the latest check's `gating` and
 `baselineComparison`, selftest failures included.
 
+### The engine returns a delivery conflict to the author
+
+Source delivery merges drift on the approved patch's own paths three-way and
+refuses only a real conflict ("Reconciling a delivery with drifted source"). A
+run that ended there had met every other closure condition, and a person merged
+the patch by hand. When the refusal is a text conflict the engine now returns the
+run to its author instead, in the same run (`engine.returnFromDelivery`,
+`runtime/delivery-return.mjs`):
+
+1. **The base moves.** The destination as delivery reads it becomes a commit over
+   the run's snapshot (B′, built as for reconcile, kept under
+   `refs/devpanel/delivery-return/<run>-<n>`), and the approved patch is applied
+   three-way onto it. The live worktree is made that tree: everything that merged
+   is applied, each conflicting hunk is left as conflict markers. The merged tree
+   is kept as a commit too (`…-<n>-merged`). `run.workspace.baseCommit` becomes B′
+   (for a private repository `workspace.sourceBase` becomes its translation base),
+   the run's `baseline.json` becomes B′'s (the previous one is kept in
+   `runs/<id>/delivery-return/<n>/`), the HEAD and index the worktree is read
+   through name B′ (the seat's own Git directory gets them as files; the host still
+   never runs it), and the integrity checkpoint is taken after the engine's own
+   writes, so they are not a seat's.
+2. **One decision step.** Key `<phase>:return`, actor `engine`, `automatic: true`,
+   `decision.deliveryReturn: <n>`; its text quotes each conflicting path with the
+   marker lines in the worktree file and both sides. Replay reads it like any
+   return: a review loop gets one more round (brief, author, reviews) and the
+   confirmation is asked again (the earlier ones are superseded); a single seat
+   (Prompt) gets one more round of its step.
+3. **Every later turn is told what the round is.** The author's prompt quotes the
+   conflicts and says: reconcile these, keep the approved behaviour and the
+   source's change, remove every marker, change nothing else. A reviewer is told
+   it reviews a conflict reconciliation and is given, beside the revision's diff
+   against B′, the diff between the engine's merge and the revision: the
+   reconciliation alone. The coordinator is told not to reopen what was approved.
+4. **Nothing is carried.** What the author produces is an ordinary revision over
+   B′ (`revisions[].baseCommit`): its checks are driven (the base drive of B′ keeps
+   its own directory), every occupied auditor reviews it, the coordinator confirms
+   it, and delivery applies it. The approvals and check results of the approved
+   revision are dropped at the return, also where the reconciled content were to
+   hash the same. Budgets and the wall clock count as for any round.
+
+The move is a recorded fact, never derived by replay: the run record names the new
+base and `run.deliveryReturns[]` keeps `{n, step, phase, from: {revision,
+artifactRef, baseCommit}, sourceBase, mergeCommit, conflicts, appended}`. It is
+journaled before the first write (`run.pendingDeliveryReturn`, state `writing`)
+and built only from what was kept — the approved patch, the old base, the old
+baseline — so a process that dies inside it does it again when closure is next
+reached (`resumed: true`); if that cannot be done the run blocks
+`delivery-return-interrupted`, the approved patch untouched. A crash after the
+decision step replays to the author's round like any other.
+
+Returned: `apply-to-source` deliveries refused `source-drift` whose conflicts are
+all `text`, of a run in a worktree, whose candidate an author step of the run
+produced. At most two per run (`MAX_DELIVERY_RETURNS`). Not returned, and blocked
+`source-delivery-blocked` exactly as before with the reason in
+`run.closure.deliveryNotReturned` and in the run explanation: a binary file, a
+symlink, a mode change, an addition or deletion on one side, a path under a
+materialized link, any other refusal (`selection-rules-changed`, an unverifiable
+delivery), a reconciled candidate, a third conflict (`bound-reached`), a merge that
+no longer conflicts when the engine makes it, an engine that cannot read the
+project's reconcile policy (one no supervisor drives), and Finalize (it runs outside
+the drive loop). A conflict only on paths the project declares `append`/`prepend`
+is left to the automatic reconcile, which resolves it by rule without an author;
+where such a path conflicts beside others, the return merges it by the rule and
+the author gets the rest. A run that was returned and then ended some other way is
+followed by a run that starts from the originally approved patch
+(`carry-forward.mjs`). Run metrics count returns as `deliveryReturns`.
+
 ### Refreshing closure evidence
 
 `POST .../runs/:runId/refresh-checks` and the supervisor's `refresh_checks_run`

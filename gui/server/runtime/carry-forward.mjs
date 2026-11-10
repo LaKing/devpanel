@@ -50,6 +50,11 @@ export async function undeliveredApproval (issuePath, runId) {
   const { id, prior } = latest
   const c = prior.closure?.conditions
   const approved = c?.sameRevisionApproval && c.checksSatisfied && c.noOutstandingBlockingFindings && c.deliveryCompleted === false
+  // A delivery return took the approved revision back to the author and the run
+  // then ended some other way (delivery-return.mjs): its closure no longer says
+  // approved, but the patch every reviewer approved is still that return's.
+  const returned = approved || prior.outcome === 'resolved' ? null : prior.deliveryReturns?.[0]?.from ?? prior.pendingDeliveryReturn?.from
+  if (returned?.artifactRef) return { runId: id, revision: returned.revision, patch: path.join(runDir(issuePath, id), returned.artifactRef), reason: 'its reconciliation after a delivery conflict did not finish' }
   const d = prior.delivery
   if (!approved || !d?.artifactRef || d.reconstruction?.verified !== true || d.reconstruction.fingerprint !== prior.closure.revision) return null
   return { runId: id, revision: prior.closure.revision, patch: path.join(runDir(issuePath, id), d.artifactRef), reason: d.application?.state ?? d.error ?? null }
