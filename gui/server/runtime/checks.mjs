@@ -11,6 +11,7 @@ import { holdDriveSlot } from './drive-slots.mjs'
 import { fingerprint, treeIdentity } from './fingerprint.mjs'
 import { runProcess } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
+import { exitedOnItsOwn } from './modules-tier.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
 import { discardReconstruction, reconstructInto, worktreeDiffDelivery } from './launch.mjs'
 import { applyFence, PANEL_ROOT } from '../../../harness/fence.mjs'
@@ -247,7 +248,9 @@ async function nextIndex (checksDir) {
  * After a required command failed, a later command runs only when it declares
  * `needs` (an empty list: independent) and every need — plus the service it
  * joins — ran and passed. Without `needs` it is skipped, as before; every skip
- * is recorded in `result.skipped` with its reason. A service that did not meet its
+ * is recorded in `result.skipped` with its reason. A failed command marked
+ * `ownFailureContinues` that exited on its own does not count as that failure
+ * (runCommandSet): what follows it runs. A service that did not meet its
  * started marker takes down what declares it (`needs`, `join`) even when the
  * service itself is optional: those commands would only fail on what it never wrote.
  */
@@ -272,8 +275,12 @@ async function runCommandSet ({ commands, result, signal, run }) {
       if (command.required !== false) failed = true
       continue
     }
-    result.commands.push(await run(command))
-    if (!result.commands.at(-1).passed && command.required !== false) failed = true
+    const record = await run(command)
+    result.commands.push(record)
+    // A test of an instance that is up (`ownFailureContinues`, modules-tier.mjs) that exits non-zero
+    // on its own answers for itself alone: the remaining tests still run, and judge() reads them all.
+    // A timeout, a signal or ssh's own exit leaves the instance in doubt and stops the rest as ever.
+    if (!record.passed && command.required !== false && !(command.ownFailureContinues === true && exitedOnItsOwn(record))) failed = true
   }
 }
 

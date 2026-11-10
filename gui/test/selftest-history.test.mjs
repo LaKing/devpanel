@@ -555,7 +555,10 @@ export default async function (t) {
       if (stepId.startsWith('brief')) return fence({ targetRole: 'worker', prompt: 'Do the work.', windowDecision: 'keep' })
       if (stepId === 'implement') {
         await fs.writeFile(path.join(engine.run.workspace.path, 'server.mjs'), serverLines({ 9: 'line 9 fixed' }))
-        await fs.writeFile(path.join(f.projectPath, 'server.mjs'), serverLines({ 1: 'line 1 OTHER' }))
+        // Drift delivery never merges on its own (a mode change on a path the patch edits always conflicts,
+        // execution-contract.md "Merging with manual edits"), and that is no text conflict the engine would
+        // return to the author: the run blocks, and only a reconcile carries the patch onto it.
+        await fs.chmod(path.join(f.projectPath, 'server.mjs'), 0o755)
         return fence({ summary: 'Implemented', basedOnRevision: revisionIn(prompt) })
       }
       if (stepId.startsWith('audit-')) {
@@ -569,7 +572,7 @@ export default async function (t) {
     await fs.writeFile(path.join(f.projectPath, 'server.mjs'), serverLines())
     await exec('git', ['-C', f.projectPath, 'add', '-A'])
     await exec('git', ['-C', f.projectPath, 'commit', '-qm', 'source'])
-    const collect = `t='{"test":"core/a"}'; if ${failing ? 'grep -q fixed server.mjs && grep -q OTHER server.mjs' : 'false'}; then t="$t"',{"test":"${failing}","error":"x"}'; fi; echo "== runtime/selftest.report"; printf '{"tests":[%s]}\n' "$t"`
+    const collect = `t='{"test":"core/a"}'; if ${failing ? 'grep -q fixed server.mjs && test -x server.mjs' : 'false'}; then t="$t"',{"test":"${failing}","error":"x"}'; fi; echo "== runtime/selftest.report"; printf '{"tests":[%s]}\n' "$t"`
     await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
       `\nchecks:\n  requirement: required\n  concurrent: false\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n      - id: collect\n        report: selftest\n        run: ${JSON.stringify(collect)}\n`)
     const dir = historyDir(f.issuePath)

@@ -32,7 +32,7 @@ import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
-import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
+import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
@@ -1942,7 +1942,7 @@ export class Engine {
       ...(result.baselineComparison?.selftest?.unstable?.length ? { unstableIgnored: result.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}),
       ...(result.continuedFrom ? { continuedFrom: result.continuedFrom.dir } : {}), ...(result.continuation ? { continuation: result.continuation.reason } : {}),
       ...(result.targeted ? { targeted: result.targeted } : {}), ...(result.targetedDeclined ? { targetedDeclined: result.targetedDeclined } : {}),
-      ...(result.modules ? { modules: { tests: result.modules.tests.length, unlisted: result.modules.affected?.unlisted ?? [] } } : {}),
+      ...(result.modules ? { modules: { tests: result.modules.tests.length, unlisted: result.modules.affected?.unlisted ?? [], failedFilters: failedFilters(result) } } : {}),
       // Survives a new revision, so the next one's targeted decision can read what failed.
       ...(configured.tiers?.targeted && namedFailuresOf(result).length ? { namedFailures: namedFailuresOf(result) } : {}) })
     await this.persist({ type: 'checks', revision: current, ...tierOf, ...namedTests, result: result.result, commands: result.commands?.length ?? 0,
@@ -1968,7 +1968,9 @@ export class Engine {
       if (recorded?.affectedModules && 'viaHooks' in recorded.affectedModules) affected.viaHooks = recorded.affectedModules.viaHooks
       if (recorded) Object.assign(recorded, computed)
     }
-    return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries) }), affected }
+    // What failed in the run's previous modules drive runs first, so its answer comes early.
+    const failedFirst = (this.run.checkHistory ?? []).filter((h) => h.tier === 'modules' && Array.isArray(h.modules?.failedFilters)).at(-1)?.modules.failedFilters ?? []
+    return { ...modulesDrive(configured, { affected, files: lintFiles(fp.entries), failedFirst }), affected }
   }
 
   /**

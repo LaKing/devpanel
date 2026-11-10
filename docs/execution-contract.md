@@ -476,6 +476,34 @@ modules' browser runs when declared, then the finalizers.
   recorded once on `run.modules.base`. Every auditor prompt names the changed and
   tested modules and, when there are any, the unlisted ones; nothing about them
   refuses.
+- **One failing module does not hide the others.** Once the instance is up (lint,
+  load, restart and ready passed), a test or browser command that exits non-zero
+  on its own (`exitedOnItsOwn`, modules-tier.mjs: an exit status of 1–123, no
+  timeout, no signal) does not stop the test and browser commands after it
+  (`ownFailureContinues`, checks.mjs `runCommandSet`); the drive's result and gate
+  are computed from all of them. Anything else stops the rest as in any drive and
+  records them in `skipped`: a failed lint, load, restart or ready, a timeout, a
+  signal, a command that could not be launched (124–127, 128+n), ssh's own 255,
+  or a command reporting the drive unavailable, because the instance's state is
+  then in doubt. Every seat's `checks.latest.modules` lists `failed` (every failing
+  module or core directory of the drive, with its command and exit), `notRun`
+  (outcome unknown, never a pass) and `selftestFailures`, and the gate's reason and
+  the run explanation name the same modules (`failedModuleTests`,
+  baseline-failures.mjs). The selftest report of a test command that itself failed
+  is read for its failed tests' names; it gates nothing the exit did not.
+- **One command for every filter.** A test or browser template holding
+  `{{filters}}` instead of `{{filter}}` is expanded to one command (`<id>-1`) that
+  receives every filter, each shell-quoted as an argument of its own; its plan
+  entry carries `filters`, `modules` and `core`, and its timeout is `timeoutSeconds`
+  plus `timeoutSecondsPerFilter` for each filter when the template declares that. Its exit does not say which
+  module failed: `failed` then names the modules read off the failed tests (the
+  `module` a tester states beside a test, else the test name's first segment
+  against the module's directory name; `by: test-names`), or one `undetermined`
+  entry listing every filter.
+- **What failed runs first.** A drive orders its filters so that those whose
+  command failed in the run's previous modules drive come first
+  (`checkHistory[].modules.failedFilters`; recorded on the check as
+  `modules.failedFirst`), modules and core alike, the order otherwise unchanged.
 - **No base, every failure blocks.** The tier runs no base drive, reads no
   baseline cache, makes no baseline comparison and records no selftest history,
   because its instance is the shared stage loaded with this candidate and its
@@ -488,16 +516,17 @@ modules' browser runs when declared, then the finalizers.
 - **A failed test is not driven twice.** A second drive holds the staging host
   whole again, and the same bytes on the same instance fail the same test. When
   every failed required command of the drive is one of its test or browser
-  commands and exited on its own (`failedInTests`, modules-tier.mjs), the result
+  commands and exited on its own (`failedInTests`, modules-tier.mjs; the same
+  `exitedOnItsOwn` that lets the other tests run), the result
   stands at once: `retrySkipped {reason: tests-failed, commands}` on the check, a
   `checks-retry-skipped` event, and the author hears of it in the next round. A
-  failed lint, load, restart or ready, a timeout, a signal or ssh's own exit 255
-  is not the tests' answer: those keep the retry (`retryFailed`, default 1) as
+  failed lint, load, restart or ready, a timeout, a signal, a launch failure or
+  ssh's own exit 255 is not the tests' answer: those keep the retry (`retryFailed`, default 1) as
   for any check. A project's `retryFailed` therefore bounds the infrastructural
   reruns of this tier only.
 - **Closure** counts a modules record where the full drive would count
   (`countsForClosure`); the check record carries `modules` (`affected`, `lint`,
-  the command → module map `tests`, `unusualFilters`, `selftestFailures`).
+  the command → module map `tests`, `failedFirst`, `unusualFilters`, `selftestFailures`).
 - **Undeclared.** A project with `infrastructure` but no `testDrive.modules` gets
   each revision's check recorded `unavailable` (`undeclared: true`) with the reason,
   and nothing is driven; under `requirement: required` closure is unmet.
@@ -1014,6 +1043,17 @@ sandbox. Neither runtime can fence Bash by path; the adapters report that gap
 in their diagnostics rather than claim more than they enforce, and the
 recorded policy is what an auditor checks a transcript against. Check
 commands themselves run only in the rebuilt candidate.
+
+**Declared commands have no network, in every seat.** A declared tooling
+command is given to a seat only through the offline wrapper
+(`/run/devpanel/tooling/offline`, harness/README.md), which decides in this
+order and runs the command only once one holds: a fresh network namespace; the
+runtime's own socket denial, proved for the wrapper's process (Codex's sandbox);
+a seccomp filter the wrapper installs on itself that refuses every `socket()`
+call, proved the same way (a Claude seat's Bash sandbox, where a command can
+make no namespace and IP sockets still open). The last two say `isolation
+inherited` and refuse loopback too. When none holds the wrapper exits 125
+without running the command, and the seat records it as not run.
 
 **A Node child's output that could not be read.** Under some sandboxes a Node
 program that reads a Node child through `execFile` gets exit 0 and no output,

@@ -13,6 +13,19 @@
 # that lets sockets be created (refusing only bind or listen, say) is not
 # accepted. Loopback is refused too, so a command that listens on it fails here.
 #
+# When neither holds (a Claude seat's Bash sandbox: its seccomp filter keeps a
+# command from making namespaces, so bwrap gets EPERM, while IP sockets can
+# still be created there and reach the sandbox's proxy on loopback), the
+# wrapper imposes the denial itself: a fixed-path Python installs a seccomp
+# filter on this process (no privilege needed; inherited by everything it
+# executes, never removable) under which socket() is refused with EPERM for
+# every family, io_uring_setup with ENOSYS (it can create sockets too) and every
+# syscall of a foreign ABI (i386's socketcall, x32) with EPERM; socketpair, and
+# with it pipes to children, still works. It then runs this wrapper once more,
+# and that second pass decides exactly as above: the command runs only when the
+# verifier proves the denial. A machine whose syscall numbers are not listed
+# below, a refused prctl, or a missing Python leaves exit 125.
+#
 # Nothing the seat's environment controls takes part in the decision: the
 # dynamic loader's variables (LD_*) are dropped before anything is executed, so
 # no preload reaches bwrap, the verifier or the command; bwrap and the verifier
@@ -29,11 +42,12 @@
 # an intact answer says nothing. The command then runs the same either way, with
 # its own exit code. The exit 125 path never gets here.
 #
-# Exit 64: usage. Exit 125: network isolation could not start in this seat and
-# no denial was proved, so the command was NOT run. There is no fallback to
+# Exit 64: usage. Exit 125: network isolation could not start in this seat, no
+# denial was proved and none could be imposed, so the command was NOT run. There is no fallback to
 # running it with network.
 BWRAP=/usr/bin/bwrap
 VERIFIER=/usr/bin/python3
+IMPOSER=/usr/bin/python3
 NODE=/usr/bin/node
 NL='
 '
@@ -49,6 +63,10 @@ $(export -p)
 EOF
 }
 drop 'LD_*'
+# Set only by this wrapper's own second pass (IMPOSE below). A seat that sets it
+# gains nothing: it only skips the attempt to impose, and the proof still decides.
+imposed=${DEVPANEL_OFFLINE_IMPOSED:-}
+unset DEVPANEL_OFFLINE_IMPOSED
 if [ "$#" -eq 0 ]; then echo 'devpanel-offline: usage: offline <program> [args...]' >&2; exit 64; fi
 if [ "$1" = "--" ]; then echo 'devpanel-offline: no "--" separator; pass the program directly' >&2; exit 64; fi
 nonce=
@@ -96,11 +114,54 @@ print("proved " + sys.argv[1])
 why=$(drop '*'; exec "$VERIFIER" -I -S -c "$NO_IP" "$nonce" 2>&1)
 status=$?
 if [ "$status" -eq 0 ] && [ -n "$nonce" ] && [ "${why##*"$NL"}" = "proved $nonce" ]; then
-  echo 'devpanel-offline: isolation inherited: no network namespace here, but this runtime refuses IP sockets (proved: seccomp filter, EPERM creating TCP and UDP sockets, IPv4 and IPv6); loopback is refused too' >&2
+  if [ -n "$imposed" ]; then
+    echo 'devpanel-offline: isolation inherited: no network namespace can start here, so this wrapper installed a seccomp filter of its own that refuses every socket (proved: seccomp filter, EPERM creating TCP and UDP sockets, IPv4 and IPv6); loopback is refused too' >&2
+  else
+    echo 'devpanel-offline: isolation inherited: no network namespace here, but this runtime refuses IP sockets (proved: seccomp filter, EPERM creating TCP and UDP sockets, IPv4 and IPv6); loopback is refused too' >&2
+  fi
   check_child_output
   exec "$@"
 fi
-echo "devpanel-offline: network isolation could not start in this seat: ${err:-bwrap unavailable}" >&2
-echo "devpanel-offline: and the runtime's own network denial is not proved: ${why:-verifier unavailable}" >&2
-echo 'devpanel-offline: the command was NOT run (no network fallback)' >&2
-exit 125
+unavailable () {
+  echo "devpanel-offline: network isolation could not start in this seat: ${err:-bwrap unavailable}" >&2
+  echo "devpanel-offline: and the runtime's own network denial is not proved: ${why:-verifier unavailable}" >&2
+  [ -n "$1" ] && echo "devpanel-offline: and the wrapper could not impose one: $1" >&2
+  echo 'devpanel-offline: the command was NOT run (no network fallback)' >&2
+  exit 125
+}
+[ -n "$imposed" ] && unavailable 'the socket filter it installed did not pass the proof'
+[ -x "$IMPOSER" ] || unavailable "no $IMPOSER"
+# struct sock_filter is (u16 code, u8 jt, u8 jf, u32 k); seccomp_data holds nr at 0, arch at 4.
+# On any failure it says the same lines as `unavailable` and exits 125 itself: this shell is gone by then.
+IMPOSE='
+import ctypes, errno, os, platform, socket, struct, sys
+err, why, script = sys.argv[1:4]
+def unavailable(reason):
+    for line in ("network isolation could not start in this seat: " + err, "and the runtime\x27s own network denial is not proved: " + why,
+                 "and the wrapper could not impose one: " + reason, "the command was NOT run (no network fallback)"):
+        print("devpanel-offline: " + line, file=sys.stderr)
+    sys.exit(125)
+ARCH = {"x86_64": (0xC000003E, 41), "aarch64": (0xC00000B7, 198)}.get(platform.machine())
+if not ARCH: unavailable("no socket filter is defined for " + platform.machine())
+audit, nr_socket = ARCH
+EPERM, ENOSYS, ALLOW = 0x00050000 | errno.EPERM, 0x00050000 | errno.ENOSYS, 0x7FFF0000
+LD, JEQ, JGE, RET = 0x20, 0x15, 0x35, 0x06
+prog = b"".join(struct.pack("HBBI", *i) for i in (
+    (LD, 0, 0, 4), (JEQ, 1, 0, audit), (RET, 0, 0, EPERM),
+    (LD, 0, 0, 0), (JGE, 0, 1, 0x40000000), (RET, 0, 0, EPERM),
+    (JEQ, 0, 1, nr_socket), (RET, 0, 0, EPERM),
+    (JEQ, 0, 1, 425), (RET, 0, 0, ENOSYS),
+    (RET, 0, 0, ALLOW)))
+class Fprog(ctypes.Structure): _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+buf = ctypes.create_string_buffer(prog, len(prog))
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(38, 1, 0, 0, 0) or libc.prctl(22, 2, ctypes.byref(Fprog(len(prog) // 8, ctypes.addressof(buf))), 0, 0):
+    unavailable("prctl refused the filter (" + os.strerror(ctypes.get_errno()) + ")")
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+    unavailable("the filter it installed does not refuse sockets")
+except PermissionError: pass
+try: os.execve("/bin/sh", ["/bin/sh", script] + sys.argv[4:], dict(os.environ, DEVPANEL_OFFLINE_IMPOSED="1"))
+except OSError as e: unavailable("its second pass could not start (" + str(e) + ")")
+'
+exec "$IMPOSER" -I -S -c "$IMPOSE" "${err:-bwrap unavailable}" "${why:-verifier unavailable}" "$0" "$@"

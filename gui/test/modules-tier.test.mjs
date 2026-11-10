@@ -9,9 +9,10 @@ import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents, runDir } from '../server/runtime/store.mjs'
 import { modulesErrors, modulesTarget } from '../server/infrastructure.mjs'
-import { gateReason, gatingResult, inconclusiveBase } from '../server/runtime/baseline-failures.mjs'
+import { failedModuleTests, failedModulesWords, gateReason, gatingResult, inconclusiveBase } from '../server/runtime/baseline-failures.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
-import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, failedInTests, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
+import { checkSummary } from '../server/runtime/check-summary.mjs'
+import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, exitedOnItsOwn, failedFilters, failedInTests, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
 import { fingerprint, workspaceProjection } from '../server/runtime/fingerprint.mjs'
 
 export const name = 'modules tier — module mapping, the union with the triage list, unlisted, checksums and changed modules, the drive\'s order, its recording, no base drive, and the coding playbooks\' default'
@@ -37,11 +38,12 @@ const declared = (extra = {}) => ({
  * module file and a core file each round; `onAudit` sees each auditor prompt.
  */
 async function scenario ({ target, sizing = null, onAudit = null, extra = null }) {
-  const state = { engine: null, prompts: [] }
+  const state = { engine: null, prompts: [], authorPrompts: [] }
   const script = async (turn) => {
     const { stepId, role, round, prompt } = turn
     if (stepId.startsWith('brief')) return fence({ targetRole: 'worker', prompt: 'Do the work.', windowDecision: 'keep' })
     if (stepId === 'implement') {
+      state.authorPrompts.push({ round, prompt })
       const ws = state.engine.run.workspace.path
       await fs.mkdir(path.join(ws, '@c/a'), { recursive: true })
       await fs.mkdir(path.join(ws, 'lib'), { recursive: true })
@@ -76,7 +78,7 @@ async function scenario ({ target, sizing = null, onAudit = null, extra = null }
   })
   await engine.drive()
   const { events } = await readEvents(f.issuePath, engine.runId)
-  return { engine, events, f, prompts: state.prompts }
+  return { engine, events, f, prompts: state.prompts, authorPrompts: state.authorPrompts }
 }
 
 export default async function (t) {
@@ -317,7 +319,7 @@ export default async function (t) {
         test: { id: 'module-selftest', run: `${later} {{filter}}` }, finallyCommands: [collect] } } })
       t.eq('the run completes on the second revision', [tests.engine.run.status, tests.engine.run.revisions.length], ['completed', 2], tests.engine.run.blockedReason)
       t.eq('no rerun of the failed tests', tests.events.filter((e) => e.type === 'checks-retry').length, 0)
-      t.eq('the skip is an event naming the test command', tests.events.filter((e) => e.type === 'checks-retry-skipped').map((e) => [e.reason, e.commands.map((c) => c.command)]), [['tests-failed', ['module-selftest-1']]])
+      t.eq('the skip is an event naming the test command', tests.events.filter((e) => e.type === 'checks-retry-skipped').map((e) => [e.reason, e.commands.map((c) => c.command)]), [['tests-failed', ['module-selftest-1', 'module-selftest-2', 'module-selftest-3']]])
       t.eq('one drive per revision on the record', tests.engine.run.checkHistory.map((h) => [h.result, h.runs.length]), [['failed', 1], ['passed', 1]])
       await releaseWorkspace(tests.engine)
 
@@ -328,6 +330,90 @@ export default async function (t) {
       t.eq('the failed ready was retried once', infra.events.filter((e) => e.type === 'checks-retry').length, 1)
       t.eq('and the pass is recorded flaky, two drives', [infra.engine.run.checkResults.at(-1).flaky, infra.engine.run.checkHistory.at(-1).runs.length], [true, 2])
       await releaseWorkspace(infra.engine)
+    }
+
+    t.section('a test that fails on its own exit does not hide the others: every module of the drive runs, all failures are told together, and what failed runs first next time')
+    {
+      const dir = await temp('devpanel-modules-all-')
+      const collect = { id: 'collect', run: 'echo "== runtime/selftest.report"; echo \'{"tests":[{"test":"@c/a: works"}]}\'', report: 'selftest' }
+      const ok = path.join(dir, 'ok')
+      await fs.writeFile(ok, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      const base = { collections: ['@*'], lint: { id: 'lint', run: `${ok} {{files}}` }, load: { id: 'load', run: 'true' }, restart: { id: 'restart', run: 'true' }, ready: { id: 'ready', run: 'true' } }
+      const flat = (prompt) => prompt.replace(/\s+/g, '')
+      // The root filter passes; the module and lib fail on the first revision's bytes (exit 1) and pass on the second's.
+      const tester = path.join(dir, 'tester')
+      await fs.writeFile(tester, '#!/bin/sh\n[ "$1" = . ] && exit 0\ntest -f round-1.txt\n', { mode: 0o755 })
+      const all = await scenario({ target: { kind: 'local', modules: { ...base, test: { id: 'module-selftest', run: `${tester} {{filter}}` }, finallyCommands: [collect] } } })
+      t.eq('the run completes on the second revision', [all.engine.run.status, all.engine.run.revisions.length], ['completed', 2], all.engine.run.blockedReason)
+      t.eq('the first drive failed in both failing filters, in one drive', all.events.filter((e) => e.type === 'checks-retry-skipped').map((e) => e.commands.map((c) => c.command)), [['module-selftest-1', 'module-selftest-3']])
+      t.eq('the history keeps what failed', all.engine.run.checkHistory.map((h) => [h.result, h.modules.failedFilters]), [['failed', ['@c/a', 'lib']], ['passed', []]])
+      const second = flat(all.authorPrompts.find((p) => p.round === 1)?.prompt ?? '')
+      t.ok('the author is told every failed module of the drive', second.includes('"module":"@c/a"') && second.includes('"core":"lib"') && second.includes('"notRun":[]'), second.slice(second.indexOf('"failed"'), second.indexOf('"failed"') + 400))
+      const last = all.engine.run.checkResults.at(-1)
+      t.eq('the next drive runs what failed first', [last.modules.tests.map((x) => x.filter), last.modules.failedFirst], [['@c/a', 'lib', '.'], ['@c/a', 'lib']])
+      await releaseWorkspace(all.engine)
+
+      // An exit that is not the test's own (here a shell's word for SIGKILL) leaves the instance in doubt: the rest do not run.
+      const killed = path.join(dir, 'killed')
+      await fs.writeFile(killed, '#!/bin/sh\ntest -f round-1.txt || exit 137\n', { mode: 0o755 })
+      const stop = await scenario({ target: { kind: 'local', modules: { ...base, test: { id: 'module-selftest', run: `${killed} {{filter}}` }, finallyCommands: [collect] } } })
+      t.eq('completed on the second revision', [stop.engine.run.status, stop.engine.run.revisions.length], ['completed', 2], stop.engine.run.blockedReason)
+      t.eq('that failure keeps the retry', [stop.events.filter((e) => e.type === 'checks-retry').length, stop.events.filter((e) => e.type === 'checks-retry-skipped').length], [1, 0])
+      const told = flat(stop.authorPrompts.find((p) => p.round === 1)?.prompt ?? '')
+      t.ok('and the author is told which modules never ran', /"notRun":\[\{"core":"\.","slot":"test","command":"module-selftest-2"\},\{"core":"lib","slot":"test","command":"module-selftest-3"\}\]/.test(told), told.slice(told.indexOf('"notRun"'), told.indexOf('"notRun"') + 300))
+      await releaseWorkspace(stop.engine)
+
+      t.eq('exit 1 is the test\'s own', exitedOnItsOwn({ exitCode: 1, signal: null, timedOut: false }), true)
+      t.eq('124 to 255 are not', [124, 125, 126, 127, 137, 255].map((exitCode) => exitedOnItsOwn({ exitCode, signal: null, timedOut: false })), [false, false, false, false, false, false])
+      t.eq('nor a command that reported the drive unavailable', exitedOnItsOwn({ exitCode: 1, unavailable: 'no snapshot' }), false)
+    }
+
+    t.section('{{filters}}: one test command receives every affected module and core directory, each as an argument of its own')
+    {
+      const affected = { modules: ['@c/a', '@c/b'], core: { paths: 2, dirs: ['.', 'lib'] } }
+      const target = { kind: 'ssh', tier: 'modules', modules: declared({ test: { id: 'module-selftest', run: 'selftest-it stage {{filters}}', report: 'selftest' }, browser: { id: 'browser', run: 'browse-it {{filters}}' } }) }
+      const { target: drive, plan } = modulesDrive(target, { affected, files: [], failedFirst: ['lib', '@c/b', 'gone'] })
+      t.eq('one test and one browser command', drive.commands.map((c) => c.id), ['load', 'restart', 'ready', 'module-selftest-1', 'browser-1'])
+      t.eq('every filter quoted on its own, what failed before first', drive.commands.slice(3).map((c) => c.run), ["selftest-it stage '@c/b' 'lib' '@c/a' '.'", "browse-it '@c/b' '@c/a'"])
+      t.eq('the plan names what the command covers', plan.tests[0], { id: 'module-selftest-1', slot: 'test', filters: ['@c/b', 'lib', '@c/a', '.'], modules: ['@c/b', '@c/a'], core: ['lib', '.'] })
+      t.eq('and what ran first', plan.failedFirst, ['@c/b', 'lib'])
+      t.eq('nothing affected, no command', modulesDrive(target, { affected: { modules: [], core: null }, files: [] }).target.commands.map((c) => c.id), ['load', 'restart', 'ready'])
+      const one = modulesDrive({ ...target, modules: declared() }, { affected, files: [] })
+      t.eq('{{filter}} still expands per filter, each continuing past a failed sibling', one.target.commands.slice(3).map((c) => [c.id, c.ownFailureContinues]), [1, 2, 3, 4].map((n) => [`module-selftest-${n}`, true]))
+      t.eq('the declaration is valid', modulesErrors({ ...target, tier: undefined }), [])
+      const scaled = (test) => modulesDrive({ ...target, modules: declared({ test }) }, { affected, files: [] }).target.commands[3]
+      t.eq('a per-filter share scales the one command\'s timeout', [scaled({ id: 'module-selftest', run: 's {{filters}}', timeoutSeconds: 600, timeoutSecondsPerFilter: 300 }).timeoutSeconds, scaled({ id: 'module-selftest', run: 's {{filters}}', timeoutSecondsPerFilter: 100 }).timeoutSeconds, 'timeoutSecondsPerFilter' in scaled({ id: 'module-selftest', run: 's {{filters}}', timeoutSecondsPerFilter: 100 })], [1800, 1300, false])
+      t.ok('which only the {{filters}} form takes', modulesErrors({ kind: 'ssh', modules: declared({ test: { id: 'module-selftest', run: 'selftest-it {{filter}}', report: 'selftest', timeoutSecondsPerFilter: 60 } }) }).some((e) => /timeoutSecondsPerFilter applies only/.test(e)))
+      t.eq('the framework\'s script line is accepted', modulesErrors({ kind: 'ssh', modules: declared({ test: { id: 'module-selftest', run: '@boilerplate/tooling/stage-module-selftest.sh /opt/stage.example.invalid APP {{filters}}', report: 'selftest', timeoutSeconds: 600, timeoutSecondsPerFilter: 600 } }) }), [])
+      t.ok('but not behind an interpreter word', modulesErrors({ kind: 'ssh', modules: declared({ test: { id: 'module-selftest', run: 'bash @boilerplate/tooling/stage-module-selftest.sh /opt/stage.example.invalid APP {{filters}}', report: 'selftest' } }) }).some((e) => /modules.test.run must name a program/.test(e)))
+      t.ok('{{filters}} must be a word of its own', modulesErrors({ kind: 'ssh', modules: declared({ test: { id: 'module-selftest', run: 'selftest-it x{{filters}}', report: 'selftest' } }) }).some((e) => /modules.test.run/.test(e)))
+      t.ok('not both forms in one template', modulesErrors({ kind: 'ssh', modules: declared({ test: { id: 'module-selftest', run: 'selftest-it {{filter}} {{filters}}', report: 'selftest' } }) }).some((e) => /modules.test.run/.test(e)))
+      t.ok('only test and browser take it', modulesErrors({ kind: 'ssh', modules: declared({ load: { id: 'load', run: 'load-it {{filters}}' } }) }).some((e) => /only test and browser take/.test(e)))
+
+      const cmd = (id, exitCode) => ({ id, required: true, passed: exitCode === 0, exitCode, signal: null, timedOut: false })
+      const check = { tier: 'modules', result: 'failed', commands: [cmd('ready', 0), cmd('module-selftest-1', 1)], modules: { tests: plan.tests, selftestFailures: [{ command: 'module-selftest-1', test: 'a/saves' }, { command: 'module-selftest-1', test: 'x/y', module: '@c/b' }] } }
+      t.eq('its failed modules are read off the failed tests', failedModuleTests(check).failed.map((f) => [f.module, f.by]), [['@c/b', 'test-names'], ['@c/a', 'test-names']])
+      t.eq('and every filter is named when no test says which', failedModuleTests({ ...check, modules: { tests: plan.tests, selftestFailures: [] } }).failed.map((f) => [f.filters, f.undetermined]), [[['@c/b', 'lib', '@c/a', '.'], true]])
+      t.eq('all of them run first in the next drive', failedFilters(check), ['@c/b', 'lib', '@c/a', '.'])
+      t.ok('the gate names the modules', /failed modules of this drive: @c\/b \(module-selftest-1, exit 1, read off the failed tests' names\), @c\/a/.test(gateReason(check, {})), gateReason(check, {}))
+      t.eq('the browser command that never ran is said so', failedModulesWords(check).includes('not run, outcome unknown: one of @c/b, @c/a (browser-1)'), true, failedModulesWords(check))
+      const summary = checkSummary(check).modules
+      t.eq('the seats get the same reading', [summary.tested, summary.failed.length, summary.notRun.length, /EVERY failing module/.test(summary.note)], [['@c/b', 'lib', '@c/a', '.'], 2, 1, true])
+
+      // The whole path: one command, a report behind a failing exit, the module read from the report.
+      const dir = await temp('devpanel-modules-filters-')
+      const tester = path.join(dir, 'tester')
+      await fs.writeFile(tester, `#!/bin/sh\nprintf '%s\\n' "$@" > '${dir}/args'\necho '== runtime/selftest.report'\nif [ -f round-1.txt ]; then echo '{"tests":[{"test":"a/saves"}]}'; exit 0; fi\necho '{"tests":[{"test":"a/saves","error":"boom"},{"test":"lib/ok"}]}'\nexit 1\n`, { mode: 0o755 })
+      const okLint = path.join(dir, 'ok')
+      await fs.writeFile(okLint, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      const run = await scenario({ target: { kind: 'local', modules: { collections: ['@*'], lint: { id: 'lint', run: `${okLint} {{files}}` }, load: { id: 'load', run: 'true' }, restart: { id: 'restart', run: 'true' }, ready: { id: 'ready', run: 'true' },
+        test: { id: 'module-selftest', run: `${tester} {{filters}}`, report: 'selftest' } } } })
+      t.eq('completed on the second revision', [run.engine.run.status, run.engine.run.revisions.length], ['completed', 2], run.engine.run.blockedReason)
+      t.eq('the one command got every filter as its own argument', (await fs.readFile(path.join(dir, 'args'), 'utf8')).trim().split('\n'), ['@c/a', '.', 'lib'])
+      t.eq('one test command per drive', run.engine.run.checkResults.at(-1).commands.map((c) => c.id), ['lint', 'load', 'restart', 'ready', 'module-selftest-1'])
+      const told = (run.authorPrompts.find((p) => p.round === 1)?.prompt ?? '').replace(/\s+/g, '')
+      t.ok('the author is told the failed module and test, read from the failed command\'s report', told.includes('"module":"@c/a"') && told.includes('"test":"a/saves"') && told.includes('"by":"test-names"'), told.slice(told.indexOf('"failed"'), told.indexOf('"failed"') + 400))
+      await releaseWorkspace(run.engine)
     }
 
     t.section('every command passed but a selftest report could not be read: inconclusive, no author round, said in words')

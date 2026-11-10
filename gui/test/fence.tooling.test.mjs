@@ -125,7 +125,7 @@ export default async function (t) {
       t.ok('a seat without a shell is told so instead', toolingBrief({ tooling, worktree: '/w', shell: false }).includes('no shell in this turn'))
       t.eq('nothing declared, no brief', toolingBrief({ tooling: {}, worktree: '/w' }), null)
       // The fenced brief, byte for byte: base 098f95c's (P2-1) plus what a child-output line means for a verdict.
-      const GOLDEN = "Project tooling (projects/<id>.yaml workspace.tooling).\nMounted read-only in the worktree: gui/node_modules (from /projects/p/gui/node_modules). Never install anything: these are read-only, and the commands below have no network.\nDeclared commands, each to be run exactly in the form shown (fill in <placeholders>):\n- unit: unit suites\n  cd '/w/gui' && /run/devpanel/tooling/offline sh -c 'node test/run.mjs <suite>'\n- fmt (provisional)\n  cd '/w' && /run/devpanel/tooling/offline sh -c 'prettier --check <files>'\nA listed command is not \"could not run\" unless you quote the command line you ran and its output. Exit 125 with \"devpanel-offline: network isolation could not start in this seat\" means isolation is unavailable here and the command was NOT run: record it as not run, quoting the command line and that output, and do not run it any other way (not without the wrapper, not with network). \"devpanel-offline: isolation inherited\" means the command ran under your runtime's own proved network denial, which refuses loopback too: a failure to listen on or reach 127.0.0.1 is that, not a defect of the candidate. With \"devpanel-offline: child output unobservable\" on a command's stderr, a result that depends on a Node child's output, such as exit 0 with nothing printed or a test failing on empty child output like \"Unexpected end of JSON input\", is not evidence: not \"the command printed nothing\", not a pass, and not by itself a defect of the candidate. Record it as not observed under verification.notRun, quoting the line, and judge from other evidence such as a check drive. \"devpanel-offline: child output unchecked\" means it is not known whether such output can be read here. Through the wrapper with neither line, empty output with exit 0 means the command printed nothing."
+      const GOLDEN = "Project tooling (projects/<id>.yaml workspace.tooling).\nMounted read-only in the worktree: gui/node_modules (from /projects/p/gui/node_modules). Never install anything: these are read-only, and the commands below have no network.\nDeclared commands, each to be run exactly in the form shown (fill in <placeholders>):\n- unit: unit suites\n  cd '/w/gui' && /run/devpanel/tooling/offline sh -c 'node test/run.mjs <suite>'\n- fmt (provisional)\n  cd '/w' && /run/devpanel/tooling/offline sh -c 'prettier --check <files>'\nA listed command is not \"could not run\" unless you quote the command line you ran and its output. Exit 125 with \"devpanel-offline: network isolation could not start in this seat\" means isolation is unavailable here and the command was NOT run: record it as not run, quoting the command line and that output, and do not run it any other way (not without the wrapper, not with network). \"devpanel-offline: isolation inherited\" means the command ran under a proved socket denial instead of a network namespace (your runtime's own, or a filter the wrapper installed), which refuses loopback too: a failure to listen on or reach 127.0.0.1 is that, not a defect of the candidate. With \"devpanel-offline: child output unobservable\" on a command's stderr, a result that depends on a Node child's output, such as exit 0 with nothing printed or a test failing on empty child output like \"Unexpected end of JSON input\", is not evidence: not \"the command printed nothing\", not a pass, and not by itself a defect of the candidate. Record it as not observed under verification.notRun, quoting the line, and judge from other evidence such as a check drive. \"devpanel-offline: child output unchecked\" means it is not known whether such output can be read here. Through the wrapper with neither line, empty output with exit 0 means the command printed nothing."
       const GOLDEN_NO_SHELL = "Project tooling (projects/<id>.yaml workspace.tooling).\nMounted read-only in the worktree: gui/node_modules (from /projects/p/gui/node_modules). Never install anything: these are read-only, and the commands below have no network.\nDeclared commands, each to be run exactly in the form shown (fill in <placeholders>):\n- unit: unit suites\n  cd '/w/gui' && /run/devpanel/tooling/offline sh -c 'node test/run.mjs <suite>'\n- fmt (provisional)\n  cd '/w' && /run/devpanel/tooling/offline sh -c 'prettier --check <files>'\nYour runtime has no shell in this turn, so you cannot run these: record each one you would need under not run, saying so."
       t.eq('inside the fence the brief is byte for byte the expected text', toolingBrief({ tooling, worktree: '/w' }), GOLDEN)
       t.eq('and for a seat without a shell', toolingBrief({ tooling, worktree: '/w', shell: false }), GOLDEN_NO_SHELL)
@@ -171,7 +171,7 @@ export default async function (t) {
 
       // Real seccomp filters, installed by bubblewrap around the wrapper: the
       // runtime's denial as Codex installs it, and filters that must not pass.
-      const SYS = { x64: { arch: 0xc000003e, socket: 41, bind: 49, getsockopt: 55, getsockname: 51 }, arm64: { arch: 0xc00000b7, socket: 198, bind: 200, getsockopt: 209, getsockname: 204 } }[process.arch]
+      const SYS = { x64: { arch: 0xc000003e, socket: 41, bind: 49, getsockopt: 55, getsockname: 51, prctl: 157 }, arm64: { arch: 0xc00000b7, socket: 198, bind: 200, getsockopt: 209, getsockname: 204, prctl: 167 } }[process.arch]
       const ins = (code, jt, jf, k) => { const b = Buffer.alloc(8); b.writeUInt16LE(code, 0); b[2] = jt; b[3] = jf; b.writeUInt32LE(k >>> 0, 4); return b }
       /** A classic-BPF seccomp program: each rule refuses one syscall with EPERM, optionally only for (or except for) one first argument. */
       const filter = async (name, rules) => {
@@ -195,19 +195,42 @@ export default async function (t) {
         const netlinkOnly = await filter('netlink-only', [{ nr: SYS.socket, arg0: AF_NETLINK }])
         const bindOnly = await filter('bind-only', [{ nr: SYS.socket, arg0: AF_NETLINK }, { nr: SYS.bind }])
 
-        const unavailable = await underFilter(netlinkOnly, rendered)
-        t.eq('a namespace that cannot start and IP sockets that open: exit 125', unavailable.code, 125, unavailable.stderr)
-        t.ok('with the isolation-unavailable message and bwrap\'s own words', unavailable.stderr.includes(ISOLATION_UNAVAILABLE) && unavailable.stderr.includes('NETLINK') && /NOT run/.test(unavailable.stderr), unavailable.stderr)
-        t.ok('and why the runtime\'s denial was not accepted', unavailable.stderr.includes('not proved: IP sockets are not refused (TCP/IPv4 created'), unavailable.stderr)
-        t.eq('and the command never ran (no network fallback)', await exists(marker), false)
+        // Where no namespace can start and the runtime refuses nothing (a Claude seat's Bash sandbox), the
+        // wrapper installs its own socket filter and the same proof decides: the command runs without network.
+        const IMPOSED = /this wrapper installed a seccomp filter of its own that refuses every socket/
+        const creates = (family) => `cd ${quoteSh(root)} && /bin/sh ${WRAPPER} /usr/bin/python3 -c 'import socket; socket.socket(socket.${family}); print("SOCKET-CREATED")'`
+        const imposedRun = await underFilter(netlinkOnly, rendered)
+        t.eq('a namespace that cannot start and IP sockets that open: the wrapper imposes the denial and the command runs', [imposedRun.code, await exists(marker)], [0, true], imposedRun.stderr)
+        t.ok('saying so, loopback included, and never "unavailable"', imposedRun.stderr.includes(ISOLATION_INHERITED) && IMPOSED.test(imposedRun.stderr) && /loopback is refused too/.test(imposedRun.stderr) && !imposedRun.stderr.includes(ISOLATION_UNAVAILABLE), imposedRun.stderr)
+        await fs.rm(marker, { force: true })
+        for (const family of ['AF_INET', 'AF_INET6', 'AF_UNIX', 'AF_NETLINK']) {
+          const made = await underFilter(netlinkOnly, creates(family))
+          t.ok(`the command it runs cannot create an ${family} socket`, made.code !== 0 && !made.stdout.includes('SOCKET-CREATED') && /Operation not permitted/.test(made.stderr), `${made.code} ${made.stdout} ${made.stderr}`)
+        }
+        const piped = await underFilter(netlinkOnly, `cd ${quoteSh(root)} && /bin/sh ${WRAPPER} /bin/sh -c 'echo through-a-pipe | /bin/cat; exit 7'`)
+        t.eq('pipes to children still work there, and the exit code is the command\'s own', [piped.code, piped.stdout], [7, 'through-a-pipe\n'], piped.stderr)
 
         const bindDenied = await underFilter(bindOnly, rendered)
-        t.eq('a filter that refuses bind but lets IP sockets be created and connect: exit 125, not run (auditor-1-002)', [bindDenied.code, await exists(marker)], [125, false], bindDenied.stderr)
-        t.ok('naming the sockets that were created', bindDenied.stderr.includes('IP sockets are not refused (TCP/IPv4 created, UDP/IPv4 created'), bindDenied.stderr)
+        t.eq('a filter that refuses bind but lets IP sockets be created is not accepted as it stands (auditor-1-002): the wrapper\'s own filter is what the command runs under', [bindDenied.code, await exists(marker), IMPOSED.test(bindDenied.stderr)], [0, true, true], bindDenied.stderr)
+        await fs.rm(marker, { force: true })
 
         const bypass = await underFilter(netlinkOnly, rendered, hostile)
-        t.eq('the auditor\'s bypass (preload exiting 0, stub interpreters on PATH) under a network-permitting filter: exit 125, not run (auditor-1-001)', [bypass.code, await exists(marker)], [125, false], bypass.stderr)
-        t.eq('and none of them ran', await fs.readFile(touched, 'utf8').catch(() => ''), '')
+        t.eq('the auditor\'s bypass (preload exiting 0, stub interpreters on PATH) under a network-permitting filter: the command runs only under the imposed filter (auditor-1-001)', [bypass.code, await exists(marker), IMPOSED.test(bypass.stderr)], [0, true, true], bypass.stderr)
+        t.eq('and none of the stubs ran', await fs.readFile(touched, 'utf8').catch(() => ''), '')
+        await fs.rm(marker, { force: true })
+        const hostileSocket = await underFilter(netlinkOnly, creates('AF_INET'), hostile)
+        t.ok('in that environment too the command cannot create an IP socket', hostileSocket.code !== 0 && !hostileSocket.stdout.includes('SOCKET-CREATED'), `${hostileSocket.code} ${hostileSocket.stdout} ${hostileSocket.stderr}`)
+        const seatSet = await underFilter(netlinkOnly, rendered, { PATH: '/usr/bin:/bin', DEVPANEL_OFFLINE_IMPOSED: '1' })
+        t.eq('a seat that sets the second-pass marker itself gains nothing: exit 125, not run', [seatSet.code, await exists(marker)], [125, false], seatSet.stderr)
+
+        // Where the filter cannot be installed either, it stays what it was: exit 125, nothing run.
+        const noPrctl = await filter('no-prctl', [{ nr: SYS.socket, arg0: AF_NETLINK }, { nr: SYS.prctl }])
+        const unavailable = await underFilter(noPrctl, rendered)
+        t.eq('a namespace that cannot start, IP sockets that open and a filter that cannot be installed: exit 125', unavailable.code, 125, unavailable.stderr)
+        t.ok('with the isolation-unavailable message', unavailable.stderr.includes(ISOLATION_UNAVAILABLE) && /NOT run/.test(unavailable.stderr), unavailable.stderr)
+        t.ok('why the runtime\'s denial was not accepted', unavailable.stderr.includes('not proved: IP sockets are not refused (TCP/IPv4 created'), unavailable.stderr)
+        t.ok('and why none could be imposed', /could not impose one: prctl refused the filter/.test(unavailable.stderr), unavailable.stderr)
+        t.eq('and the command never ran (no network fallback)', await exists(marker), false)
 
         // The auditor's loader bypasses: a preload whose constructor, in anything
         // but the shell, forges `proved <last argument>` and exits 0, or exits 1
@@ -236,10 +259,12 @@ export default async function (t) {
           t.ok('control: the preload library does run in a program it reaches', control.code === 0 && (await fs.readFile(touched, 'utf8').catch(() => '')).includes('preload in /usr/bin/true'), control.stderr)
           await fs.rm(touched, { force: true })
           const forged = await underFilter(netlinkOnly, preloaded(forging))
-          t.eq('an LD_PRELOAD constructor that forges "proved <nonce>" in env/python3: exit 125, not run (auditor-1-001)', [forged.code, await exists(marker)], [125, false], forged.stderr)
+          t.eq('an LD_PRELOAD constructor that forges "proved <nonce>" in env/python3 forges nothing: the command runs only under the imposed filter (auditor-1-001)', [forged.code, await exists(marker), IMPOSED.test(forged.stderr)], [0, true, true], forged.stderr)
+          await fs.rm(marker, { force: true })
           t.eq('because no program the wrapper executes gets the preload', await fs.readFile(touched, 'utf8').catch(() => ''), '')
           const exitOne = await underFilter(netlinkOnly, preloaded(failing), hostile)
-          t.eq('a preloaded verifier exiting 1 with PATH-stubbed cat and tail: exit 125, not run (auditor-1-001)', [exitOne.code, await exists(marker)], [125, false], exitOne.stderr)
+          t.eq('a preload exiting 1 with PATH-stubbed cat and tail changes nothing either (auditor-1-001)', [exitOne.code, await exists(marker), IMPOSED.test(exitOne.stderr)], [0, true, true], exitOne.stderr)
+          await fs.rm(marker, { force: true })
           t.eq('and neither the preload nor the stubs ran', await fs.readFile(touched, 'utf8').catch(() => ''), '')
           const genuine = await underFilter(codexLike, preloaded(forging), hostile)
           t.eq('under Codex\'s denial the same preload changes nothing: the genuine verifier proves it, the command runs', [genuine.code, await exists(marker), await fs.readFile(touched, 'utf8').catch(() => '')], [0, true, ''], genuine.stderr)
@@ -311,13 +336,13 @@ export default async function (t) {
       const disproves = await fake('verifier-disproves', 'echo "IP sockets are not refused"; exit 1')
       const nodeRan = path.join(fakes, 'node-ran')
       const nodeSays = (name, line) => fake(name, `: > ${nodeRan}\n${line}`)
-      const wrapped = async (name, { bwrap = bwrapStarts, verifier = disproves, node }, argv) => {
+      const wrapped = async (name, { bwrap = bwrapStarts, verifier = disproves, node, imposer = path.join(fakes, 'no-imposer') }, argv) => {
         const copy = path.join(fakes, `offline-${name}`)
-        await fs.writeFile(copy, wrapperText.replace('BWRAP=/usr/bin/bwrap', `BWRAP=${bwrap}`).replace('VERIFIER=/usr/bin/python3', `VERIFIER=${verifier}`).replace('NODE=/usr/bin/node', `NODE=${node}`))
+        await fs.writeFile(copy, wrapperText.replace('BWRAP=/usr/bin/bwrap', `BWRAP=${bwrap}`).replace('VERIFIER=/usr/bin/python3', `VERIFIER=${verifier}`).replace('IMPOSER=/usr/bin/python3', `IMPOSER=${imposer}`).replace('NODE=/usr/bin/node', `NODE=${node}`))
         await fs.rm(nodeRan, { force: true })
         return runProcess({ command: '/bin/sh', args: [copy, ...argv], env: { PATH: '/usr/bin:/bin' }, stdin: '' })
       }
-      t.ok('the wrapper\'s fixed paths are what these replace', ['BWRAP=/usr/bin/bwrap', 'VERIFIER=/usr/bin/python3', 'NODE=/usr/bin/node'].every((line) => wrapperText.split('\n').includes(line)))
+      t.ok('the wrapper\'s fixed paths are what these replace', ['BWRAP=/usr/bin/bwrap', 'VERIFIER=/usr/bin/python3', 'IMPOSER=/usr/bin/python3', 'NODE=/usr/bin/node'].every((line) => wrapperText.split('\n').includes(line)))
 
       const observed = await nodeSays('node-observed', 'echo "observed $3"')
       const discarded = await nodeSays('node-discarded', 'echo "discarded $3"')
@@ -341,7 +366,7 @@ export default async function (t) {
 
       const notRun = path.join(fakes, 'not-run')
       const refused = await wrapped('e', { bwrap: bwrapRefuses, node: discarded }, ['/bin/sh', '-c', `: > ${notRun}`])
-      t.eq('neither isolation: exit 125, not run, as before (AC6)', [refused.code, await exists(notRun), refused.stderr.includes(ISOLATION_UNAVAILABLE), /NOT run/.test(refused.stderr)], [125, false, true, true], refused.stderr)
+      t.eq('neither isolation and nothing to impose one with: exit 125, not run, as before (AC6)', [refused.code, await exists(notRun), refused.stderr.includes(ISOLATION_UNAVAILABLE), /NOT run/.test(refused.stderr), /could not impose one: no /.test(refused.stderr)], [125, false, true, true, true], refused.stderr)
       t.eq('and nothing is measured or said about child output', [await exists(nodeRan), refused.stderr.includes('child output')], [false, false], refused.stderr)
     }
 

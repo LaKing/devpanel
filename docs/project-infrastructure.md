@@ -241,7 +241,10 @@ recorded revision beside its reviews. One drive does, in this order:
    directory), the instance restarted, and readiness awaited;
 3. **test**: the framework's `selftest` CLI once per affected module, with that module as
    its filter, then once per core directory; and **browser** once per affected module
-   when the project declares how;
+   when the project declares how. A test or browser command that fails on its own exit
+   does not stop the ones after it, so one drive reports every failing module; a
+   timeout, a signal or an unreachable host stops the rest. Filters whose command
+   failed in the run's previous drive run first;
 4. the **finallyCommands** (log and selftest report collection). Result, per-command logs
    and the selftest report are recorded as for any drive, with `tier: modules`.
 
@@ -258,6 +261,26 @@ testDrive:
     browser: { id: module-browser, run: '... {{filter}}' }   # optional
     finallyCommands: [ ... ]
 ```
+
+**One command for all filters.** A `test` (or `browser`) template that holds
+`{{filters}}` in place of `{{filter}}` runs once per drive (id `<id>-1`) and receives
+every filter as an argument of its own, each shell-quoted: modules first, then core
+directories, with what failed in the previous drive leading. Use it when the project's
+script can test several filters in one pass over the instance:
+
+```yaml
+    test: { id: module-selftest, run: '<script> <fixed words> {{filters}}', report: selftest, timeoutSeconds: 600, timeoutSecondsPerFilter: 600 }
+```
+
+The template rules are those of `{{filter}}` (a literally named program, plain words,
+the placeholder a word of its own, exactly once; never both placeholders). The
+command's `timeoutSeconds` then covers all filters; `timeoutSecondsPerFilter: <n>` beside
+it adds n seconds per filter the command receives, so the bound grows with the number
+of affected modules (900 + n per filter when `timeoutSeconds` is left out). Its exit cannot say which module failed, so
+the engine reads the failed modules off the selftest report the command prints (a
+`module` beside a failed test, else the first segment of the test's name), which is
+one more reason to declare `report: selftest` on it. A drive with nothing affected
+runs no test command in either form.
 
 `examples/host-config/projects/example-project.yaml` shows a whole declaration and how
 its commands are composed from `quick-deploy.sh`, the starter and the `selftest` CLI where
@@ -820,8 +843,12 @@ What happens with them:
   seccomp filter, and `EPERM` creating TCP and UDP sockets, IPv4 and IPv6,
   checked by a fixed-path verifier with an empty environment), saying
   `isolation inherited`; loopback is refused there too, so a command that
-  listens on it fails in a Codex seat. Exit 125 from the wrapper means neither
-  isolation could be had in that seat: the command was not run, and the seat
+  listens on it fails in a Codex seat. Where the runtime neither allows the
+  namespace nor refuses sockets (a Claude seat's Bash sandbox keeps commands
+  from making namespaces), the wrapper installs a seccomp filter of its own
+  that refuses every `socket()` call, proves it the same way and says
+  `isolation inherited` too; loopback is refused there as well. Exit 125 from
+  the wrapper means no isolation could be had in that seat: the command was not run, and the seat
   records it as not run with the line and output quoted. A command that does
   run may carry `child output unobservable` on stderr: a Node child's output could
   not be read in that seat (docs/execution-contract.md "Tooling policy"). No

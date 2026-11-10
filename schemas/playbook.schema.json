@@ -397,6 +397,11 @@
                 "minimum": 1,
                 "default": 900
               },
+              "timeoutSecondsPerFilter": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Only on a modules tier test or browser template holding `{{filters}}`: seconds added to `timeoutSeconds` for each filter the one command receives, so its bound grows with the number of affected modules."
+              },
               "kind": {
                 "enum": [
                   "candidate",
@@ -660,11 +665,11 @@
             },
             "test": {
               "$ref": "#/$defs/checkTarget/properties/commands/items",
-              "description": "The framework's selftest CLI for one filter: `command word... {{filter}} word...`; run once per affected module (filter `<collection>/<module>`) and per core directory, the filter shell-quoted as one argument. Ids are `<id>-<n>`."
+              "description": "The framework's selftest CLI for one filter: `command word... {{filter}} word...`; run once per affected module (filter `<collection>/<module>`) and per core directory, the filter shell-quoted as one argument. Ids are `<id>-<n>`. With `{{filters}}` in place of `{{filter}}` it runs ONCE (`<id>-1`) and receives every filter, each shell-quoted as an argument of its own, modules first (those that failed in the run's previous drive leading), then core directories."
             },
             "browser": {
               "$ref": "#/$defs/checkTarget/properties/commands/items",
-              "description": "Optional: the browser scenarios of one module, `{{filter}}` as for test; run once per affected module."
+              "description": "Optional: the browser scenarios of one module, `{{filter}}` as for test; run once per affected module. `{{filters}}` runs it once with every affected module."
             },
             "finallyCommands": {
               "$ref": "#/$defs/checkTarget/properties/commands",

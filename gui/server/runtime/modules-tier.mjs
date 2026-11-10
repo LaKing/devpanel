@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import path from 'node:path'
-import { isSelftestReport, readReport, selftestStates } from './baseline-failures.mjs'
+import fs from 'node:fs/promises'
+import { isSelftestReport, readReport, selftestReport, selftestStates } from './baseline-failures.mjs'
 import { shellQuote } from './ssh.mjs'
 
 /*
@@ -88,14 +89,34 @@ export const lintFiles = (entries) => (entries ?? []).filter((e) => ['added', 'm
 const unusual = (filter) => filter.startsWith('-') || /[\u0000-\u001f\u007f-\u009f]/.test(filter) || filter.length > 200
 
 /**
+ * Whether a failed command ended by its own exit: no timeout, no signal, no
+ * report that the drive cannot be made, and an exit status a program chooses
+ * (1–123). 124 is the remote timeout, 125–127 a command that could not be
+ * launched, 128+n a shell's word for a signal, 255 ssh's own. Only a chosen
+ * exit is a test's answer; anything else leaves the instance's state in doubt.
+ */
+export const exitedOnItsOwn = (c) => !c.timedOut && !c.signal && !c.unavailable && Number.isInteger(c.exitCode) && c.exitCode >= 1 && c.exitCode < 124
+
+/** Whether a test or browser template takes every filter in one command (`{{filters}}`) instead of one per command. */
+export const takesAllFilters = (command) => typeof command?.run === 'string' && command.run.includes('{{filters}}')
+
+/**
  * One drive of the tier for a revision: lint (left out with no files), load,
  * restart, ready, a test per affected module then per core directory (the root
  * gets `rootFilter`, default '.'), a browser run per affected module when the
- * project declares one, then the finalizers. Each file and filter is
- * shell-quoted into its template's own word, so whatever bytes a path holds it
- * arrives as one argument and runs nothing; no filter is ever refused.
+ * project declares one, then the finalizers. A template holding `{{filters}}`
+ * gets ONE command with every filter as an argument of its own (`<id>-1`).
+ * Each file and filter is shell-quoted into its template's own word, so whatever
+ * bytes a path holds it arrives as one argument and runs nothing; no filter is
+ * ever refused.
+ *
+ * Test and browser commands carry `ownFailureContinues`: the instance is up by
+ * then, so one that exits non-zero on its own does not keep the others from
+ * running (checks.mjs runCommandSet) and the author hears of every failing
+ * module in one round. `failedFirst` (filters that failed in the run's previous
+ * drive, failedFilters) moves those to the front, order otherwise kept.
  */
-export function modulesDrive (target, { affected, files = [] }) {
+export function modulesDrive (target, { affected, files = [], failedFirst = [] }) {
   const m = target.modules
   const fill = (command, placeholder, values) => ({ ...command, run: command.run.replace(`{{${placeholder}}}`, () => values.map(shellQuote).join(' ')) })
   const commands = []
@@ -103,32 +124,54 @@ export function modulesDrive (target, { affected, files = [] }) {
   commands.push(m.load, m.restart, m.ready)
   // Hook subscribers in this tree (affectedModules.viaHooks, module-hooks.mjs) are tested here too, once each.
   const modules = [...new Set([...(affected?.modules ?? []), ...(affected?.viaHooks ?? []).filter((v) => v.inTree).map((v) => v.module)])].sort()
-  const filters = [
+  const declared = [
     ...modules.map((module) => ({ module, filter: module })),
     ...(affected?.core?.dirs ?? []).map((dir) => ({ core: dir, filter: dir === '.' ? (m.rootFilter ?? '.') : dir }))
   ]
+  const first = new Set(failedFirst ?? [])
+  const filters = [...declared.filter((f) => first.has(f.filter)), ...declared.filter((f) => !first.has(f.filter))]
   const tests = []
-  filters.forEach((f, i) => {
-    const id = `${m.test.id}-${i + 1}`
-    commands.push(fill({ ...m.test, id }, 'filter', [f.filter]))
-    tests.push({ id, slot: 'test', ...f })
-  })
-  if (m.browser) {
-    filters.filter((f) => f.module).forEach((f, i) => {
-      const id = `${m.browser.id}-${i + 1}`
-      commands.push(fill({ ...m.browser, id }, 'filter', [f.filter]))
-      tests.push({ id, slot: 'browser', ...f })
+  const expand = (slot, template, list) => {
+    if (!list.length) return
+    if (takesAllFilters(template)) {
+      const id = `${template.id}-1`
+      // One command for N filters: its bound is the declared one plus the declared share of each filter.
+      const { timeoutSecondsPerFilter: each, ...one } = template
+      const bound = each ? { timeoutSeconds: (one.timeoutSeconds ?? 900) + each * list.length } : {}
+      commands.push({ ...fill({ ...one, id }, 'filters', list.map((f) => f.filter)), ...bound, ownFailureContinues: true })
+      tests.push({ id, slot, filters: list.map((f) => f.filter), modules: list.filter((f) => f.module).map((f) => f.module), core: list.filter((f) => f.core).map((f) => f.core) })
+      return
+    }
+    list.forEach((f, i) => {
+      const id = `${template.id}-${i + 1}`
+      commands.push({ ...fill({ ...template, id }, 'filter', [f.filter]), ownFailureContinues: true })
+      tests.push({ id, slot, ...f })
     })
   }
+  expand('test', m.test, filters)
+  if (m.browser) expand('browser', m.browser, filters.filter((f) => f.module))
+  const ran = filters.filter((f) => first.has(f.filter)).map((f) => f.filter)
   const { tiers, compareBaseline, baselineCache, ...rest } = target
   return {
     target: { ...rest, tier: 'modules', commands, ...(m.finallyCommands ? { finallyCommands: m.finallyCommands } : {}) },
     plan: {
       lint: files.length ? { files } : { files: [], skipped: 'no-changed-files' },
       tests,
+      ...(ran.length ? { failedFirst: ran } : {}),
       unusualFilters: [...new Set(filters.map((f) => f.filter).filter(unusual))]
     }
   }
+}
+
+/**
+ * The filters whose test or browser command failed in a modules drive: what the
+ * run's next drive runs first (kept on the check history, which outlives the
+ * revision). A command that took several filters names all of them, since its
+ * exit does not say which failed.
+ */
+export function failedFilters (check) {
+  const failed = new Set((check?.commands ?? []).filter((c) => !c.passed).map((c) => c.id))
+  return [...new Set((check?.modules?.tests ?? []).filter((t) => failed.has(t.id)).flatMap((t) => t.filters ?? [t.filter]))]
 }
 
 /** What an auditor is told of the revision under review: unlisted modules are told, never refused. */
@@ -150,14 +193,14 @@ export function affectedModulesNotice (revision) {
  * `<id>-<n>`) and exited on its own. The same bytes on the same instance answer
  * the same, so the engine returns to the author without a second drive, which
  * would hold the staging host whole again. A failed lint, load, restart or ready,
- * a timeout, a signal or ssh's own exit 255 is not the tests' answer and keeps
- * the retry (`retryFailed`).
+ * a timeout, a signal, a launch failure or ssh's own exit 255 (exitedOnItsOwn)
+ * is not the tests' answer and keeps the retry (`retryFailed`).
  */
 export function failedInTests (target, check) {
   const prefixes = [target?.modules?.test?.id, target?.modules?.browser?.id].filter(Boolean)
   const isTest = (id) => prefixes.some((p) => typeof id === 'string' && id.startsWith(`${p}-`) && /^\d+$/.test(id.slice(p.length + 1)))
   const failed = (check?.commands ?? []).filter((c) => c.required !== false && !c.passed)
-  return check?.result === 'failed' && failed.length > 0 && failed.every((c) => isTest(c.id) && !c.timedOut && !c.signal && Number.isInteger(c.exitCode) && c.exitCode !== 255)
+  return check?.result === 'failed' && failed.length > 0 && failed.every((c) => isTest(c.id) && exitedOnItsOwn(c))
 }
 
 /** Check records that count for closure: the full drive, or the modules tier where it is the target. */
@@ -166,9 +209,16 @@ export const countsForClosure = (c) => ['full', 'modules'].includes(c?.tier ?? '
 /** Whether a check target is the modules tier (declared or not). */
 export const isModulesTarget = (target) => target?.tier === 'modules' || Boolean(target?.modules)
 
+/** A report's failed tests, each with the module the tester states beside it, if any. */
+function failedOf (command, report) {
+  const { state, modules } = selftestStates(report)
+  return [...state].filter(([, s]) => s === 'FAIL').map(([test]) => ({ command, test, ...(modules.has(test) ? { module: modules.get(test) } : {}) }))
+}
+
 /**
  * The failed tests a modules drive's selftest reports name, and the reports that
- * could not be read: either blocks the revision (no base to inherit from).
+ * could not be read: either blocks the revision (no base to inherit from). The
+ * report of a test command that itself failed is read for its names too.
  */
 export async function modulesSelftestFailures ({ runDir, target, check }) {
   const failures = []
@@ -177,10 +227,21 @@ export async function modulesSelftestFailures ({ runDir, target, check }) {
   let read = 0
   for (const { id } of declared) {
     const got = await readReport(runDir, check, id)
-    if (got.notRun || got.failed) continue
+    if (got.notRun) continue
+    if (got.failed) {
+      // A test that exited non-zero on its own still printed its report: the names tell the author
+      // which tests failed (and, for a command of several filters, in which module). Best effort:
+      // the command's failure already gates, so a report that cannot be read here adds nothing.
+      const record = check.commands.find((c) => c.id === id)
+      if (!exitedOnItsOwn(record)) continue
+      const stdout = await fs.readFile(path.join(runDir, check.dir ?? '', `${id}.stdout`), 'utf8').catch(() => null)
+      const report = stdout === null ? null : selftestReport(stdout).report
+      if (report) failures.push(...failedOf(id, report))
+      continue
+    }
     if (!got.report) { unreadable.push({ command: id, error: got.error }); continue }
     read++
-    for (const [test, state] of selftestStates(got.report).state) if (state === 'FAIL') failures.push({ command: id, test })
+    failures.push(...failedOf(id, got.report))
   }
   // A passing drive must have shown a report: one that ran none, or only failed or skipped
   // collectors, proved no test (the declaration requires a collector, modulesErrors).

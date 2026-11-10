@@ -74,6 +74,8 @@ infrastructure:
       # The selftest CLI of the running instance, once per affected module
       # (filter <collection>/<module>) and per core directory (filter = the directory).
       test: { id: module-selftest, run: '/opt/staging.example.invalid/runtime/processes/cli/project.main selftest {{filter}}', timeoutSeconds: 900 }
+      # A script that tests several filters in one pass takes them all in ONE command instead:
+      # test: { id: module-selftest, run: '/opt/staging.example.invalid/tooling/selftest-many.sh {{filters}}', report: selftest, timeoutSeconds: 1800 }
       # Browser scenarios of a module, when the project has a runner for them:
       # browser: { id: module-browser, run: '/opt/staging.example.invalid/runtime/processes/cli/project.main browser {{filter}}', timeoutSeconds: 900 }
       # The selftest report and the log tail, recorded as for any drive.

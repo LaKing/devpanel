@@ -16,7 +16,11 @@ import path from 'node:path'
 
 export const OFFLINE = '/run/devpanel/tooling/offline'
 export const ISOLATION_UNAVAILABLE = 'devpanel-offline: network isolation could not start in this seat'
-/** The wrapper ran the command under the runtime's own, proved network denial (Codex's sandbox), not a namespace of its own. */
+/**
+ * The wrapper ran the command under a proved socket denial, not a namespace of its own: the runtime's
+ * (Codex's sandbox), or a seccomp filter the wrapper installed itself where no namespace can start and the
+ * runtime refuses nothing (a Claude seat's Bash sandbox keeps commands from making namespaces).
+ */
 export const ISOLATION_INHERITED = 'devpanel-offline: isolation inherited'
 /** The wrapper's measurement: a Node child's output came back empty here, or the measurement itself failed. Reported, never decided on. */
 export const CHILD_OUTPUT_UNOBSERVABLE = 'devpanel-offline: child output unobservable'
@@ -78,7 +82,7 @@ export function toolingBrief ({ tooling, worktree, shell = true, confinement = n
     lines.push('Declared commands, each to be run exactly in the form shown (fill in <placeholders>):')
     for (const c of commands) lines.push(`- ${c.id}${c.provisional ? ' (provisional)' : ''}${c.description ? `: ${c.description}` : ''}${'\n'}  ${renderToolingCommand(c, worktree)}`)
     lines.push(shell
-      ? `A listed command is not "could not run" unless you quote the command line you ran and its output. Exit 125 with "${ISOLATION_UNAVAILABLE}" means isolation is unavailable here and the command was NOT run: record it as not run, quoting the command line and that output, and do not run it any other way (not without the wrapper, not with network). "${ISOLATION_INHERITED}" means the command ran under your runtime's own proved network denial, which refuses loopback too: a failure to listen on or reach 127.0.0.1 is that, not a defect of the candidate. ${CHILD_OUTPUT_MEANING}`
+      ? `A listed command is not "could not run" unless you quote the command line you ran and its output. Exit 125 with "${ISOLATION_UNAVAILABLE}" means isolation is unavailable here and the command was NOT run: record it as not run, quoting the command line and that output, and do not run it any other way (not without the wrapper, not with network). "${ISOLATION_INHERITED}" means the command ran under a proved socket denial instead of a network namespace (your runtime's own, or a filter the wrapper installed), which refuses loopback too: a failure to listen on or reach 127.0.0.1 is that, not a defect of the candidate. ${CHILD_OUTPUT_MEANING}`
       : NO_SHELL)
   }
   return lines.join('\n')

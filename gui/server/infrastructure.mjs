@@ -127,7 +127,9 @@ export const MODULE_SLOTS = ['lint', 'load', 'restart', 'ready', 'test', 'browse
 /**
  * A modules tier (`modules`, docs/project-infrastructure.md "The modules tier"):
  * the templates take their placeholder once in the targeted tier's plain-word
- * form, so every file and filter reaches its program as one argument; every slot
+ * form, so every file and filter reaches its program as one argument (test and
+ * browser take `{{filter}}`, one command per filter, or `{{filters}}`, one
+ * command with every filter as an argument of its own); every slot
  * is required and none is a service; and it carries no tiers or baseline, which
  * belong to the full verification.
  */
@@ -143,6 +145,10 @@ export function modulesErrors (target) {
     if (c.service === true) errors.push(`modules.${c.slot}: a modules command cannot be a service (the stage instance is the project's own)`)
     if (c.needs || c.join) errors.push(`modules.${c.slot}: the modules tier runs in a fixed order; needs and join do not apply`)
   }
+  for (const c of all) {
+    const multi = ['test', 'browser'].includes(c.slot) && typeof c.run === 'string' && c.run.includes('{{filters}}')
+    if (c.timeoutSecondsPerFilter !== undefined && !multi) errors.push(`${c.slot ? `modules.${c.slot}` : c.id}: timeoutSecondsPerFilter applies only to a test or browser template holding {{filters}}`)
+  }
   for (const c of modules.finallyCommands ?? []) if (c.needs) errors.push(`${c.id}: finallyCommands always run and cannot declare needs`)
   // The selftest report is the tier's evidence: a drive that collects none could pass unexamined.
   if (!all.some((c) => isSelftestReport(c.report))) errors.push('modules: no command declares report: selftest (the test slot or a finalizer), so nothing would show which tests ran or failed')
@@ -155,9 +161,11 @@ export function modulesErrors (target) {
   const placeholder = { lint: 'files', test: 'filter', browser: 'filter' }
   for (const c of slots) {
     if (placeholder[c.slot]) {
-      const problem = templateProblem(c.run, placeholder[c.slot])
+      // test and browser take one filter per command, or every filter in one command ({{filters}}); never both.
+      const multi = placeholder[c.slot] === 'filter' && typeof c.run === 'string' && c.run.includes('{{filters}}')
+      const problem = templateProblem(c.run, multi ? 'filters' : placeholder[c.slot])
       if (problem) errors.push(`modules.${c.slot}.run ${problem}`)
-    } else if (/\{\{(files|filter|tests)\}\}/.test(c.run)) errors.push(`modules.${c.slot}.run: only lint takes {{files}} and only test and browser take {{filter}}`)
+    } else if (/\{\{(files|filters?|tests)\}\}/.test(c.run)) errors.push(`modules.${c.slot}.run: only lint takes {{files}} and only test and browser take {{filter}} or {{filters}}`)
   }
   if (target.tiers) errors.push('modules and tiers do not go on one target: the modules tier is the per-revision check, tiers are the full verification')
   if (target.compareBaseline || target.baselineCache) errors.push('the modules tier has no base drive: compareBaseline and baselineCache do not apply')

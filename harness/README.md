@@ -224,8 +224,21 @@ supervisor, model oracle, performance probe) always pass `hygiene: true`.
   accepted. It then runs the command and says `devpanel-offline: isolation
   inherited` on stderr. That denial refuses loopback too, so a command that
   listens on `127.0.0.1` fails there. The proof rests on what the process can
-  do, never on the harness or the sandbox setting: a Codex seat with
-  `networkAccess` creates the sockets and is refused. Nothing the seat's
+  do, never on the harness or the sandbox setting. Where neither holds, the
+  wrapper imposes the denial itself. That is a Claude seat whose Bash sandbox is
+  on: the CLI's seccomp filter keeps a command from making namespaces (`bwrap:
+  No permissions to create a new namespace`) while IP sockets can still be
+  created there and reach the sandbox's proxy on loopback; a Codex seat with
+  `networkAccess` is the same case. Fixed-path `/usr/bin/python3 -I -S` installs
+  a seccomp filter on the wrapper's own process (`PR_SET_NO_NEW_PRIVS`, then
+  `PR_SET_SECCOMP`; no privilege needed, inherited across exec, never removable):
+  `socket()` is refused with `EPERM` for every family, `io_uring_setup` with
+  `ENOSYS`, and every syscall of a foreign ABI (i386, x32) with `EPERM`;
+  `socketpair`, and so pipes to children, still works. It then runs the wrapper
+  once more, and that second pass decides by the same proof as above, saying
+  `isolation inherited: … this wrapper installed a seccomp filter of its own`.
+  The second pass is marked by `DEVPANEL_OFFLINE_IMPOSED`; a seat that sets it
+  only skips the attempt. Syscall numbers are listed for x86_64 and aarch64. Nothing the seat's
   environment controls takes part in the decision: the dynamic loader's
   variables (`LD_*`) are dropped before anything is executed, so no preload
   reaches bwrap, the verifier or the command; `bwrap` and the verifier are fixed
@@ -235,8 +248,9 @@ supervisor, model oracle, performance probe) always pass `hygiene: true`.
   final line carrying the nonce made for that call counts, so one that stops
   early or fails proves nothing. The wrapper's own interpreter (`/bin/sh`) is
   where trust starts: a preload that subverts the shell itself is beyond what a
-  script can check. Neither isolation proved, it exits **125**, says the command was
-  NOT run with both reasons, and never falls back to running it with network. The prompt tells the seat to record exactly that, quoted. Once
+  script can check. Neither isolation proved and none imposed (another machine
+  type, a runtime that refuses `prctl`, no Python), it exits **125**, says the command was
+  NOT run with each reason, and never falls back to running it with network. The prompt tells the seat to record exactly that, quoted. Once
   isolation is decided, the wrapper also measures whether a Node child's output
   can be read here: fixed-path `/usr/bin/node`, every variable unset, a per-call
   nonce read back through `execFile`. It says `child output unobservable [<nonce>]`

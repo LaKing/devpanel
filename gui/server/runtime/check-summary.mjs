@@ -1,4 +1,5 @@
 import { ignoredWords } from './selftest-history.mjs'
+import { failedModuleTests } from './baseline-failures.mjs'
 
 /** Model-facing evidence summary. Full manifests/logs stay in the retained check artifact. */
 export function checkSummary (check, fullEvidence = null) {
@@ -10,7 +11,8 @@ export function checkSummary (check, fullEvidence = null) {
     // A smoke result answers whether the revision boots; only the full drive counts for closure.
     ...(check.tier ? { tier: check.tier, tierNote: check.tier === 'smoke' ? 'Smoke tier: boot and lint only. A failure returns the revision to the author; a pass does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
       : check.tier === 'targeted' ? 'Targeted tier: only the tests named in `targeted.tests` and the commands declared to run with them, not the whole drive. A failure returns the revision to the author; a pass shows those tests only and does not stand in for the full drive, which runs on the approved revision and is what closure counts.'
-        : 'Full drive: the result closure counts.' } : {}),
+        : check.tier === 'modules' ? 'Modules tier: lint, the candidate loaded into the stage instance, and the selftests of the affected modules and core directories. Every failure blocks (no base comparison); this is the result closure counts.'
+          : 'Full drive: the result closure counts.' } : {}),
     ...(check.targeted ? { targeted: check.targeted } : {}),
     ...(check.targetedDeclined ? { targetedDeclined: check.targetedDeclined } : {}),
     durationMs: check.durationMs, step: check.step, dir: check.dir, error: clip(check.error), fullEvidence,
@@ -35,6 +37,8 @@ export function checkSummary (check, fullEvidence = null) {
     commandCount: check.commands?.length ?? 0,
     // Commands that did not run after a required failure: their outcome is unknown.
     ...(check.skipped?.length ? { skipped: check.skipped } : {}),
+    // The modules tier: every module whose test or browser command failed in this drive, and what never ran.
+    ...(modulesSummary(check) ?? {}),
     ...(check.baselineComparison ? { baselineComparison: check.baselineComparison } : {}),
     // Failures the gate passed over on history's word: never read as nothing happened.
     ...(check.baselineComparison?.selftest?.unstable?.length ? { unstableNote: check.baselineComparison.selftest.unstable.map(ignoredWords) } : {}),
@@ -53,4 +57,25 @@ export function checkSummary (check, fullEvidence = null) {
         : 'Not driven a second time: every failed required command failed the same way on an earlier revision of this run and the base passed it (retrySkipped.commands names the way and the revision).' } : {}),
     instruction: 'Summary only. Full evidence includes the file manifest and command details; inspect it when needed. A passed smoke test is not proof of all acceptance criteria. A command\'s `results` lists every PASS/FAIL-style line of its whole output, including non-gating collectors: quote those lines as evidence instead of saying the report is unreadable.'
   }
+}
+
+/**
+ * A modules drive's failures by module. Its test commands do not stop each other
+ * (checks.mjs runCommandSet), so `failed` is every failing module of the drive,
+ * not the first; `notRun` is non-empty only when a command ended in a way that
+ * left the instance in doubt.
+ */
+function modulesSummary (check) {
+  if (check.tier !== 'modules') return null
+  const read = failedModuleTests(check)
+  if (!read) return null
+  const named = check.modules.selftestFailures ?? []
+  return { modules: {
+    tested: check.modules.tests.flatMap((t) => t.filters ?? [t.filter]).filter((f, i, all) => all.indexOf(f) === i),
+    ...(check.modules.failedFirst?.length ? { failedFirst: check.modules.failedFirst } : {}),
+    failed: read.failed, notRun: read.notRun,
+    selftestFailures: named.slice(0, 60), ...(named.length > 60 ? { selftestFailuresTotal: named.length } : {}),
+    ...(check.modules.reportUnreadable?.length ? { reportUnreadable: check.modules.reportUnreadable } : {}),
+    note: `Modules tier: a test or browser command that fails on its own exit does not stop the others, so \`failed\` lists EVERY failing module of this drive${read.failed.length ? ' — answer all of them in one revision, not only the first' : ''}. \`notRun\` holds commands that did not run because an earlier one timed out, was killed or could not be reached: their outcome is unknown, not a pass.${read.failed.some((f) => f.undetermined) ? ' An `undetermined` entry is one command that tested several filters: read `selftestFailures` and its log for which.' : ''}`
+  } }
 }

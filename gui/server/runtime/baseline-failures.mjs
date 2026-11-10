@@ -524,6 +524,48 @@ export function inconclusiveBase (check, run) {
  */
 export const unreadableReportOnly = (check) => check?.tier === 'modules' && check.result === 'passed' && !check.modules?.selftestFailures?.length && Boolean(check.modules?.reportUnreadable?.length)
 
+/**
+ * Every test and browser command of a modules drive that did not pass, as the
+ * module or core directory it tested, and those that never ran (`notRun`): what
+ * prompts and explanations list, so one round names every failing module. Null
+ * for a record without the drive's plan. A command that took several filters
+ * (`{{filters}}`) says only that one of them failed: its modules are then read
+ * off the failed tests (the `module` a tester states, else the name's first
+ * segment against the module's directory name; `by: 'test-names'`), and when
+ * no name matches a module the entry lists every filter as `undetermined`.
+ */
+export function failedModuleTests (check) {
+  const tests = check?.modules?.tests
+  if (!Array.isArray(tests)) return null
+  const byId = new Map((check.commands ?? []).map((c) => [c.id, c]))
+  // The module a tester states beside a failed test, else the test name's first segment.
+  const namedPrefixes = new Set((check.modules.selftestFailures ?? []).flatMap((f) => [f.module, String(f.test).split('/')[0]]).filter(Boolean))
+  const failed = []
+  for (const t of tests) {
+    const c = byId.get(t.id)
+    if (!c || c.passed) continue
+    const how = { slot: t.slot, command: t.id, exitCode: c.exitCode ?? null, ...(c.timedOut ? { timedOut: true } : {}), ...(c.signal ? { signal: c.signal } : {}) }
+    if (!t.filters) { failed.push({ ...(t.module ? { module: t.module } : { core: t.core }), ...how }); continue }
+    const hit = (t.modules ?? []).filter((m) => namedPrefixes.has(m) || namedPrefixes.has(m.slice(m.lastIndexOf('/') + 1)))
+    if (hit.length) for (const module of hit) failed.push({ module, ...how, by: 'test-names' })
+    else failed.push({ filters: t.filters, ...how, undetermined: true })
+  }
+  const notRun = tests.filter((t) => !byId.has(t.id)).map((t) => ({ ...(t.filters ? { filters: t.filters } : t.module ? { module: t.module } : { core: t.core }), slot: t.slot, command: t.id }))
+  return { failed, notRun }
+}
+
+/** `failedModuleTests` in words, or '' when nothing failed and everything ran. */
+export function failedModulesWords (check) {
+  const read = failedModuleTests(check)
+  if (!read || (!read.failed.length && !read.notRun.length)) return ''
+  const name = (f) => f.module ? f.module : f.core !== undefined ? `core ${f.core}` : `one of ${f.filters.join(', ')}`
+  const one = (f) => `${name(f)} (${f.command}${f.timedOut ? ', timed out' : f.signal ? `, ${f.signal}` : f.exitCode === null ? '' : `, exit ${f.exitCode}`}${f.by ? ', read off the failed tests\' names' : ''})`
+  const parts = []
+  if (read.failed.length) parts.push(`failed modules of this drive: ${read.failed.map(one).join(', ')}`)
+  if (read.notRun.length) parts.push(`not run, outcome unknown: ${read.notRun.map((f) => `${name(f)} (${f.command})`).join(', ')}`)
+  return parts.join('; ')
+}
+
 /** Whether a modules drive's reports name a failed test, or could not be read. */
 const modulesReportBlocks = (check) => Boolean(check.modules?.selftestFailures?.length || check.modules?.reportUnreadable?.length)
 
@@ -560,6 +602,8 @@ export function gateReason (check, run) {
     const parts = []
     const failed = (check.commands ?? []).filter((c) => c.required !== false && !c.passed).map((c) => c.id)
     if (check.result === 'failed') parts.push(failed.length ? `required ${failed.length === 1 ? 'command' : 'commands'} ${failed.join(', ')} failed` : check.error ?? 'the check failed')
+    const modules = failedModulesWords(check)
+    if (modules) parts.push(modules)
     if (check.modules?.selftestFailures?.length) parts.push(`the selftest report names failed tests: ${named(check.modules.selftestFailures)}`)
     if (check.modules?.reportUnreadable?.length) parts.push(`selftest report unreadable: ${check.modules.reportUnreadable.map((r) => `${r.command} (${r.error})`).join(', ')}`)
     return parts.join('; ') + ' (the modules tier has no base: every failure blocks)'
