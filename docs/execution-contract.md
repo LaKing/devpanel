@@ -593,18 +593,71 @@ stage instance per run") is driven on an instance that belongs to the run
   unknown, and the instance is destroyed before the drive's result is returned. A
   retry (`retryFailed`) therefore starts from a new instance.
 - **Create refused for a dependency change.** An exit listed in
-  `create.unavailableExitCodes` makes the check `unavailable` with the declared reason
-  and the command's own words; the candidate is tested nowhere else. No retry, no
-  author round; closure under `required` is unmet and names the reason.
-- **Stage full.** An exit listed in `start.busyExitCodes` is asked again
+  `create.unavailableExitCodes` says the candidate's dependency manifests are not the
+  stage's. Without `instance.syncDependencies`, or when the revision itself changed no
+  manifest (`changedManifests` over the fingerprint's entries: `package.json`,
+  `package-lock.json`, `npm.sh`, `dnf.sh`, `node-version` by file name, or the declared
+  `manifests`), the check is `unavailable` with the declared reason and the command's
+  own words; with the declaration it also says that the stage moved ahead of the run's
+  base, or holds another run's dependencies, and that the run is to start again from
+  the current base. The candidate is tested nowhere else. No retry, no author round;
+  closure under `required` is unmet and names the reason.
+- **Dependency sync.** When the revision did change a manifest, the check runner runs
+  `syncDependencies` in the candidate directory (`instance-sync-deps`; `{{changed}}` is
+  those paths, each one shell word; the owner is the instance name), then `create`
+  again (`runtime/dependency-sync.mjs`). The stage installs the manifests on its base
+  instance, which every instance shares: no install inside an instance, no other tier.
+  The sync's own `unavailableExitCodes` (not this candidate's change, a change that
+  needs a release, another owner's sync in force) end the check `unavailable` with the
+  stage's words; any other failure is a failed check and the author's round, with no
+  second drive when the stage itself reported the install failed
+  (`checks-retry-skipped`, `dependency-sync-failed`): a retry would stop and restart
+  the base instance again for the same answer. The
+  refused first create is not among the drive's commands; what it said is
+  `dependencySync.createSaid`. The whole sync step is told as a wait
+  (`checks-waiting`, reason `dependency-sync`) and excused from the wall clock like a
+  wait for a slot: the stage's guard waits for deployments and for commands inside
+  other instances before it installs, and one command does not let the engine tell
+  that wait from the install.
+- **A later revision's manifests.** An instance is created against one state of the
+  revision's changed manifests (`manifestsKey`, kept on its slot record). A later drive
+  whose revision has another state is not loaded into it: the instance is destroyed
+  (`dependencies-changed`, `stageInstance.replaced`) and the drive is a first drive, so
+  `create` and the sync decide. Only with `syncDependencies` declared.
+- **The sync outlives the instance.** A record per owner (`sync-<owner>.json` beside
+  the instance slots, written before the sync command runs, `runtime/sync-records.mjs`)
+  says which run installed what and how to revert it. What becomes of it is read off
+  the run (`syncDisposition`): a paused run keeps it, and so does a run a service
+  shutdown stopped while `resumeAfterShutdown` will resume it (a revert and a second
+  sync would restart the base instance twice more); a run that delivered to the source
+  (`runResult` `delivered`) has its record dropped without a revert, the stage keeping
+  the dependencies until the next release carries them; every other end (blocked,
+  failed, cancelled, completed with a patch only), and the run's deletion, runs
+  `syncDependencies.revert` where the supervisor destroys the instance, after the
+  destroy. At the panel's start a record whose lock no live or unknown owner holds is
+  judged the same way, and a run whose status is still live counts as ended only when
+  its run lock's owner is proved dead. A revert that fails keeps the record
+  (`revertFailed`) for the next attempt. `run.dependencySyncs[]` holds each sync
+  (`name`, `host`, `files`, `durationMs`, `outcome` `synced | unavailable | failed`,
+  `reason`) and `settled` once it was reverted or left for the release.
+- **Stage full, or held.** An exit listed in `start.busyExitCodes` (the stage runs its
+  cap of instances, or a deployment or a dependency sync holds it) is asked again
   (`busyRetrySeconds`), and a run that finds every instance slot of its host taken
   waits for one. Both are waits, on `run.driveSlotWaits` like a drive slot's and
   excused from the wall clock under the same rule ("What the wall clock counts").
+- **Stale.** An exit listed in `start.staleExitCodes` says the stage's dependencies
+  were replaced after the instance was created. In that drive the engine destroys the
+  instance (`instance-destroy`), creates it again from the same candidate (sync
+  included) and starts it, once (`stageInstance.recreated`); a second create that is
+  refused makes the check `unavailable`. An instance another run's sync stopped after
+  it was live is met by the next drive's load or restart, which fails: the instance is
+  in doubt, destroyed, and the retry creates one.
 - **Destroyed at every end, and at a pause.** The supervisor destroys a run's
   instances wherever it releases an ended run's module locks, and when the run pauses
   (the module locks stay, the instance does not): completed, blocked, failed,
   cancelled, a service shutdown, and again when the run is deleted. A paused run's
-  next drive after its resume is a first drive.
+  next drive after its resume is a first drive. A dependency sync is settled in the
+  same place ("The sync outlives the instance" above).
 - **Liveness is the slot's lock.** A slot's lock is held by the process that drives
   the run (`runtime/lock.mjs` identity). Nobody destroys an instance whose lock a live
   owner holds, or whose owner cannot be proved dead. A dead owner's instance is
@@ -612,7 +665,9 @@ stage instance per run") is driven on an instance that belongs to the run
   followed by the host's declared `gc`), by a drive looking for a slot, or by the same
   run coming back, which removes its earlier instance before it creates another.
 - **Record.** `checkResults[].stageInstance` (and each attempt's) names the instance
-  and the time of each lifecycle step; `run.stageInstances` holds one entry per
+  and the time of each lifecycle step, and `dependencySync {files, durationMs, outcome,
+  reason}` when create was refused under a declared sync (`outcome: not-changed` when
+  nothing was run); `run.stageInstances` holds one entry per
   instance the run ever had, with `destroyed {reason, at, durationMs, passed}`.
   The tier records no selftest history and reads no baseline, so nothing keyed by
   `treeIdentity` or `targetKey` across runs depends on an instance name.

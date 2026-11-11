@@ -13,7 +13,8 @@ import { runProcess } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
 import { exitedOnItsOwn } from './modules-tier.mjs'
 import { driveCommands, instanceTimings, instanceVerdict } from './instance-drive.mjs'
-import { destroyInstance, holdInstance, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
+import { instanceStep, manifestsKey, syncOf } from './dependency-sync.mjs'
+import { destroyInstance, holdInstance, liveManifests, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
 import { discardReconstruction, reconstructInto, worktreeDiffDelivery } from './launch.mjs'
 import { applyFence, PANEL_ROOT } from '../../../harness/fence.mjs'
@@ -133,6 +134,9 @@ export async function runChecks ({
       result.error = 'candidate could not be materialised to the revision'
       return finish()
     }
+    // What the revision itself changed against the run's base: only a manifest among these is the run's to install
+    // (dependency-sync.mjs). A base drive and a composed tree have no such reading.
+    const changedEntries = base || prepared ? [] : check.entries
     if (variant) {
       check = await applyVariant({ rebuilt, patchFile: variant.patchFile, revisionPrint: check.fingerprint, result, baseCommit, baseline, clock, signal })
       if (!check) return finish()
@@ -142,7 +146,7 @@ export async function runChecks ({
 
     // 2. Commands, in the isolated candidate, or on the target host.
     // A tier on a stage instance (instance-drive.mjs) runs between taking the instance and settling what the drive left of it.
-    const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming }
+    const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming, entries: changedEntries }
     if (target.kind === 'local') {
       await withStageInstance({ ...instanced, host: LOCAL_HOST }, (driven) => runCommandsLocally({ target: driven, cwd: rebuilt, dir, result, clock, signal, platform, runId, onDriveWait }))
     } else {
@@ -196,18 +200,27 @@ export async function runChecks ({
  * stays for the run's next drive; in doubt, it is destroyed here, so a retry of the
  * drive starts from a new one. `result.stageInstance` records all of it.
  */
-async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming }, run) {
+async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming, entries = [] }, run) {
   const instance = target.stageInstance
   if (!instance) return run(target)
-  const slot = await holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
+  const hold = () => holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
     ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir: driveTiming.slotsDir ?? null })
-  const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}) }
+  let slot = await hold()
+  // A revision whose changed dependency manifests are not the ones the instance was made with is not loaded into it.
+  const manifests = manifestsKey(instance, entries)
+  let replaced = null
+  if (!slot.fresh && manifests !== null && liveManifests(instance.name) !== manifests) {
+    replaced = await destroyInstance(instance.name, { reason: 'dependencies-changed', clock })
+    slot = await hold()
+  }
+  const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}), ...(replaced ? { replaced: { reason: replaced.reason, at: replaced.at, durationMs: replaced.durationMs, passed: replaced.passed, ...(replaced.error ? { error: replaced.error } : {}) } } : {}) }
   try {
-    await run({ ...target, commands: driveCommands(target, slot.fresh) })
+    const holder = { kind: target.kind, ssh: target.ssh ?? null, runId, runDir, dir: result.dir, slotsDir: driveTiming.slotsDir ?? null }
+    await run({ ...target, commands: driveCommands(target, slot.fresh), stageInstance: { ...instance, sync: syncOf(instance, entries), holder } })
   } finally {
     Object.assign(record, instanceTimings(target, slot.fresh, result))
     const verdict = instanceVerdict(target, slot.fresh, result)
-    if (verdict === 'live') await markLive(instance.name, { revision: result.revision ?? result.ofRevision ?? null, clock })
+    if (verdict === 'live') await markLive(instance.name, { revision: result.revision ?? result.ofRevision ?? null, manifests, clock })
     else if (verdict === 'doubt') record.destroyed = await destroyInstance(instance.name, { reason: slot.fresh ? 'did-not-come-up' : 'reload-failed', clock })
     else if (slot.fresh) await releaseInstance(instance.name)
     record.state = verdict === 'doubt' ? 'destroyed' : verdict === 'untouched' && slot.fresh ? 'not-created' : 'live'
@@ -418,7 +431,7 @@ async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, pl
   const env = { ...childEnvironment('none'), HOME: os.homedir(), ...(wrap ? { TMPDIR: '/tmp' } : {}), ...(runId ? { DEVPANEL_RUN_ID: runId } : {}) }
   const spawn = c => ({ ...(wrap ? wrap('/bin/sh', ['-c', c.run]) : { command: '/bin/sh', args: ['-c', c.run] }), env })
   try {
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => runBusy(command, () => runOne({ command, cwd, dir, clock, signal, spawn }), { clock, signal, onWait: onDriveWait, host: LOCAL_HOST, dir: result.dir }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd, dir, clock, signal, spawn }), { clock, signal, onWait: onDriveWait, host: LOCAL_HOST, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host: LOCAL_HOST }) })
   } finally {
     for (const command of target.finallyCommands ?? []) result.commands.push(await runOne({ command, cwd, dir, clock, spawn }))
   }
@@ -617,7 +630,7 @@ async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, run
     // and only does not execute what the smoke ran, so comparison and gating
     // read the records a fresh drive with these outcomes would leave: a smoke
     // command a fresh drive would have skipped reads as not run.
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? runBusy(command, () => runOne({ command, cwd: null, dir, clock, signal, spawn: remoteSpawn }), { clock, signal, onWait: onDriveWait, host, dir: result.dir }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd: null, dir, clock, signal, spawn: remoteSpawn }), { clock, signal, onWait: onDriveWait, host, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host }) })
   } finally {
     if (carried) {
       const { instance, smoke, plan } = continueFrom

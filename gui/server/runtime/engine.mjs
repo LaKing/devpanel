@@ -36,7 +36,8 @@ import { affectedModules, affectedModulesNotice, baseFiles, changedModules, coun
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
-import { instanceName } from './instance-drive.mjs'
+import { instanceName, SYNC_ID } from './instance-drive.mjs'
+import { syncFailedForGood } from './dependency-sync.mjs'
 import { changedHooks, combinedSets, composeTree, parseReading, subscribersOf } from './module-hooks.mjs'
 import { mergeOntoSource, keepCandidate, rebuildReconciled, reconcileUnavailable } from './source-reconcile.mjs'
 import { autoReconcileRefusal } from './auto-reconcile.mjs'
@@ -1985,12 +1986,15 @@ export class Engine {
     for (const drive of [...(check?.attempts ?? []), check]) {
       const used = drive?.stageInstance
       if (!used) continue
+      // A sync that ran is the run's to answer for: the supervisor reverts it when the run ends undelivered (sync-records.mjs).
+      const sync = used.dependencySync
+      if (sync && sync.outcome !== 'not-changed') (this.run.dependencySyncs ??= []).push({ name: used.name, host: used.host, at: drive.at ?? this.clock.iso(), dir: drive.dir ?? null, files: sync.files, durationMs: sync.durationMs, outcome: sync.outcome, reason: sync.reason })
       const list = (this.run.stageInstances ??= [])
       let entry = list.findLast((i) => i.name === used.name && !i.destroyed)
       if (used.fresh && used.state !== 'not-created' && used.created !== false) {
         // The stage creates nothing over an existing root: an earlier instance of this name that no
         // record saw destroyed (its owning process died) was removed before this one was made.
-        if (entry) entry.destroyed = { reason: 'owner-gone', at: drive.at ?? this.clock.iso(), passed: true }
+        if (entry) entry.destroyed = used.replaced ?? { reason: 'owner-gone', at: drive.at ?? this.clock.iso(), passed: true }
         entry = { name: used.name, root: used.root, host: used.host, slot: used.slot, createdAt: drive.at ?? this.clock.iso(), dir: drive.dir ?? null,
           ...(used.slotWaitMs ? { slotWaitMs: used.slotWaitMs } : {}), createMs: used.createMs ?? null, startMs: used.startMs ?? null, ...(used.startWaitMs ? { startWaitMs: used.startWaitMs } : {}), readyMs: used.readyMs ?? null, drives: 0 }
         list.push(entry)
@@ -2101,7 +2105,9 @@ export class Engine {
       const first = await runChecks({ ...common, revision: current, fingerprint: fp })
       // Tests that ran and failed are the answer for these bytes: no second drive (failedInTests).
       const inTests = failedInTests(target, first) && !this.controller.signal.aborted
-      const retrySkipped = inTests ? { reason: 'tests-failed', commands: first.commands.filter((c) => c.required !== false && !c.passed).map((c) => ({ command: c.id })) } : null
+      const retrySkipped = inTests ? { reason: 'tests-failed', commands: first.commands.filter((c) => c.required !== false && !c.passed).map((c) => ({ command: c.id })) }
+        // Nor after a dependency install the stage itself reported failed: a retry would restart its base instance again (dependency-sync.mjs).
+        : syncFailedForGood(first) && !this.controller.signal.aborted ? { reason: 'dependency-sync-failed', commands: [{ command: SYNC_ID }] } : null
       if (retrySkipped) await this.persist({ type: 'checks-retry-skipped', revision: current, ...retrySkipped })
       const result = retrySkipped ? { ...first, retrySkipped } : await this.retryFailedCheck(first, { common, revision: current, fingerprint: fp, target, earlier: [], base: null })
       const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })

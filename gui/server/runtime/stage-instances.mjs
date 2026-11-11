@@ -66,26 +66,34 @@ async function slotsOf (dir) {
 }
 
 /**
- * Remove an instance on its host with the declared command, only when its root is still
- * there: a slot taken for an instance that was never created has nothing to remove.
+ * One of a record's declared commands on the host it names (`record.kind`, `ssh`, `host`), outside
+ * any drive, bounded. Never throws: `{ passed, durationMs, error?, output }`.
  */
-async function destroyOnHost (record, { connection = null } = {}) {
+export async function runOnHost (record, script, { timeoutSeconds, connection = null } = {}) {
   const started = Date.now()
-  const script = `if [ -e ${shellQuote(record.root)} ]; then\n${record.destroy.run}\nfi`
   try {
-    const signal = AbortSignal.timeout((record.destroy.timeoutSeconds ?? DESTROY_TIMEOUT_SECONDS) * 1000)
+    const signal = AbortSignal.timeout(timeoutSeconds * 1000)
     let out
     if (record.kind === 'local') out = await runProcess({ command: '/bin/sh', args: ['-c', script], signal })
     else {
-      // To the host the instance was created on, whatever the reference says now.
+      // To the host the record was made for, whatever the reference says now.
       const reached = connection ?? pinConnection(await sshConnection(record.ssh), record.host)
       out = await runProcess({ command: reached.command, args: [...reached.args, `bash -c ${shellQuote(script)}`], signal })
     }
     const passed = out.code === 0 && !out.cancelled
-    return { passed, durationMs: Date.now() - started, ...(passed ? {} : { error: (out.stderr || out.stdout || `exit ${out.code}`).trim().slice(-600) }) }
+    return { passed, durationMs: Date.now() - started, output: (out.stdout ?? '').trim().slice(-600), ...(passed ? {} : { error: (out.stderr || out.stdout || `exit ${out.code}`).trim().slice(-600) }) }
   } catch (error) {
-    return { passed: false, durationMs: Date.now() - started, error: error.message }
+    return { passed: false, durationMs: Date.now() - started, output: '', error: error.message }
   }
+}
+
+/**
+ * Remove an instance on its host with the declared command, only when its root is still
+ * there: a slot taken for an instance that was never created has nothing to remove.
+ */
+async function destroyOnHost (record, { connection = null } = {}) {
+  const { output, ...outcome } = await runOnHost(record, `if [ -e ${shellQuote(record.root)} ]; then\n${record.destroy.run}\nfi`, { timeoutSeconds: record.destroy.timeoutSeconds ?? DESTROY_TIMEOUT_SECONDS, connection })
+  return outcome
 }
 
 /** Remove what a slot's record names. The caller holds the slot's lock. */
@@ -176,12 +184,15 @@ export async function holdInstance ({ instance, host, kind, ssh = null, connecti
 }
 
 /** The instance came up: its record says since when, for whoever reads the slots. */
-export async function markLive (name, { revision = null, clock = systemClock } = {}) {
+export async function markLive (name, { revision = null, manifests = null, clock = systemClock } = {}) {
   const mine = held.get(name)
   if (!mine) return
-  mine.record = { ...mine.record, liveSince: mine.record.liveSince ?? clock.iso(), revision }
+  mine.record = { ...mine.record, liveSince: mine.record.liveSince ?? clock.iso(), revision, manifests }
   await fs.writeFile(mine.file, JSON.stringify(mine.record, null, 2)).catch(() => {})
 }
+
+/** The changed-manifests state (dependency-sync.mjs manifestsKey) the held instance was last driven with; undefined when none is held. */
+export const liveManifests = (name) => held.get(name)?.record.manifests
 
 /** Give a slot back for an instance that was never created: nothing is on the host. */
 export async function releaseInstance (name) {
@@ -242,12 +253,15 @@ export async function destroyRunInstances (runId, { reason, clock = systemClock,
 export const sweepInstances = ({ clock = systemClock, slotsDir = null } = {}) => clearUnheld({ reason: 'owner-gone', clock, slotsDir })
 
 /**
- * The panel's start, in the background: the sweep above, then each staging host's own
+ * The panel's start, in the background: the sweep above, the dependency syncs of runs that
+ * ended or died meanwhile (`sweepSyncs`, sync-records.mjs, handed in by the caller), then each staging host's own
  * collector once (`modules.instance.gc`), which removes what the stage itself finds
  * abandoned. In that order, so a collector never meets an instance this panel still counts.
  */
-export async function sweepAtStart ({ infrastructures = [], clock = systemClock } = {}) {
+export async function sweepAtStart ({ infrastructures = [], clock = systemClock, sweepSyncs = null } = {}) {
   const cleared = await sweepInstances({ clock })
+  // After the instances: a revert restarts the base, which no instance of a dead owner should be riding on.
+  const reverted = sweepSyncs ? await sweepSyncs({ clock }) : []
   const collectors = new Map()
   for (const infra of infrastructures) {
     const gc = infra?.testDrive?.modules?.instance?.gc
@@ -261,5 +275,5 @@ export async function sweepAtStart ({ infrastructures = [], clock = systemClock 
       collected.push({ host: ssh.hostRef, passed: out.code === 0 && !out.cancelled, output: (out.stdout + out.stderr).trim().slice(-600) })
     } catch (error) { collected.push({ host: ssh.hostRef, passed: false, output: error.message }) }
   }
-  return { cleared, collected }
+  return { cleared, reverted, collected }
 }

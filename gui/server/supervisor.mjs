@@ -47,6 +47,7 @@ import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
 import { forgetRunDrives } from './runtime/selftest-history.mjs'
 import { destroyRunInstances } from './runtime/stage-instances.mjs'
+import { settleRunSyncs, syncDisposition } from './runtime/sync-records.mjs'
 import { routeAutoStart } from './auto-start.mjs'
 import { poolOf, poolRecord } from './runtime/module-pool.mjs'
 import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules } from './runtime/module-locks.mjs'
@@ -1264,12 +1265,27 @@ export function createSupervisor ({
    * of its few instance slots for a wait of unknown length, while a new one costs minutes:
    * the run's next drive after a resume creates it again from the revision it then checks.
    * The destroy is written to the run's record (`stageInstances[].destroyed`).
+   *
+   * Dependencies the run had installed on the stage (sync-records.mjs) are another matter:
+   * a paused run, and one a shutdown stopped that the next start resumes, keeps them, since
+   * a revert and a second sync would restart the stage's base instance twice more. Every
+   * other end without a delivery to the source reverts them here, after the instance is
+   * gone; a delivered run leaves them for the next release (`dependencySyncs[].settled`).
    */
   async function destroyStageInstances (run, issuePath) {
     if (!run?.runId) return
     try {
-      const destroyed = await destroyRunInstances(run.runId, { reason: run.status === 'paused' ? 'run-paused' : `run-${run.status ?? 'ended'}` })
-      if (!destroyed.length) return
+      const reason = run.status === 'paused' ? 'run-paused' : `run-${run.status ?? 'ended'}`
+      const destroyed = await destroyRunInstances(run.runId, { reason })
+      const how = syncDisposition(run)
+      const settled = ['revert', 'drop'].includes(how) ? await settleRunSyncs(run.runId, { how, reason }) : []
+      for (const s of settled) {
+        const entry = (run.dependencySyncs ?? []).findLast((d) => d.name === s.owner && d.outcome === 'synced' && !d.settled?.passed)
+        const { owner, host, runId, files, ...rest } = s
+        if (entry) entry.settled = rest
+        if (s.passed === false) console.warn(`the dependencies run ${run.runId} installed on ${s.host} could not be reverted; the record stays and the run's deletion or the next panel start tries again: ${s.error}`)
+      }
+      if (!destroyed.length && !settled.length) return
       for (const d of destroyed) {
         const entry = (run.stageInstances ?? []).findLast((i) => i.name === d.name && !i.destroyed?.passed)
         if (entry) entry.destroyed = { reason: d.reason, at: d.at, durationMs: d.durationMs, passed: d.passed, ...(d.error ? { error: d.error } : {}) }
@@ -1548,6 +1564,8 @@ export function createSupervisor ({
         await removeRunWorkspace(run, await resolveProjectPath(project, { projectsDir }).catch(() => null))
         // Its end destroyed its stage instances; one that could not be removed then is tried once more.
         await destroyRunInstances(runId, { reason: 'run-deleted' }).catch(() => [])
+        // So is a dependency sync its end could not revert; a delivered run's record went at its end.
+        if (syncDisposition(run) === 'revert') await settleRunSyncs(runId, { how: 'revert', reason: 'run-deleted' }).catch(() => [])
         let reservations = []
         try { reservations = JSON.parse(await fs.readFile(path.join(issue.path, '.step-reservations.json'), 'utf8')) } catch (e) { if (e.code !== 'ENOENT') throw e }
         const folders = new Set((run.steps ?? []).map((s) => `${s.number}-${s.slug}`))

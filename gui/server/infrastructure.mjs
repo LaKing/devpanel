@@ -1,6 +1,6 @@
 import { isSelftestReport } from './runtime/baseline-failures.mjs'
 import { reservedEnvironmentErrors } from './config/release-plan.mjs'
-import { CREATE_ID, START_ID, namesInstance } from './runtime/instance-drive.mjs'
+import { CREATE_ID, DESTROY_ID, START_ID, SYNC_ID, namesInstance, takesChanged } from './runtime/instance-drive.mjs'
 
 const quote = value => `'${String(value).replaceAll("'", "'\\''")}'`
 
@@ -192,7 +192,15 @@ function instanceErrors (modules, all) {
   if (instance.root.split('/').includes('..')) errors.push('modules.instance.root must not hold parent traversal')
   for (const step of ['create', 'start', 'destroy']) if (!namesInstance(instance[step].run)) errors.push(`modules.instance.${step}.run must name the instance: {{instanceName}} or {{instance}}`)
   if (instance.gc && namesInstance(instance.gc.run)) errors.push('modules.instance.gc.run removes what no run holds on the stage host; it names no instance')
-  for (const c of all) if ([CREATE_ID, START_ID].includes(c.id)) errors.push(`modules: ${c.id} is the id of the engine's own instance command; rename it`)
+  const sync = instance.syncDependencies
+  if (sync) {
+    if (!namesInstance(sync.run) || !takesChanged(sync.run)) errors.push('modules.instance.syncDependencies.run must name the owner ({{instanceName}}) and hold {{changed}} exactly once, as a word of its own: the revision\'s changed manifest paths')
+    if (!namesInstance(sync.revert.run)) errors.push('modules.instance.syncDependencies.revert.run must name the owner: {{instanceName}}')
+    if (!instance.create.unavailableExitCodes?.length) errors.push('modules.instance.syncDependencies needs create.unavailableExitCodes: the sync runs when create answers one of them')
+    if (sync.busyExitCodes?.some((code) => sync.unavailableExitCodes?.includes(code))) errors.push('modules.instance.syncDependencies: an exit status is either a wait (busyExitCodes) or a refusal (unavailableExitCodes), not both')
+  }
+  if (instance.start.staleExitCodes?.some((code) => instance.start.busyExitCodes?.includes(code))) errors.push('modules.instance.start: an exit status is either a wait (busyExitCodes) or a stale instance (staleExitCodes), not both')
+  for (const c of all) if ([CREATE_ID, START_ID, SYNC_ID, DESTROY_ID].includes(c.id)) errors.push(`modules: ${c.id} is the id of the engine's own instance command; rename it`)
   for (const slot of ['load', 'restart', 'ready', 'test']) if (!namesInstance(modules[slot].run)) errors.push(`modules.${slot}.run must name the instance ({{instance}} or {{instanceName}}): with modules.instance every drive runs on the run's own instance`)
   if (all.some((c) => c.kind)) errors.push('modules.instance needs an unstructured tier (no command kinds): creating an instance reads the candidate and manages units')
   return errors

@@ -17,6 +17,8 @@ import crypto from 'node:crypto'
 export const INSTANCE_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/
 export const CREATE_ID = 'instance-create'
 export const START_ID = 'instance-start'
+export const SYNC_ID = 'instance-sync-deps'
+export const DESTROY_ID = 'instance-destroy'
 
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex')
 
@@ -34,6 +36,9 @@ export function instanceName (runId, scope = null) {
 }
 
 const PLACEHOLDER = /\{\{instance(Name)?\}\}/
+// The revision's changed dependency manifests in a syncDependencies command: a word of its own.
+export const CHANGED = '{{changed}}'
+export const takesChanged = (run) => typeof run === 'string' && run.split(CHANGED).length === 2 && /(^|\s)\{\{changed\}\}(\s|$)/.test(run)
 
 /** Whether a command text names the instance. */
 export const namesInstance = (run) => typeof run === 'string' && PLACEHOLDER.test(run)
@@ -60,6 +65,8 @@ export function withInstance (target, modules, name) {
       create: { ...fill(declared.create, at), id: CREATE_ID },
       start: { ...fill(declared.start, at), id: START_ID },
       destroy: fill(declared.destroy, at),
+      // dependency-sync.mjs: the template keeps `{{changed}}` until a drive knows the revision's manifests.
+      ...(declared.syncDependencies ? { syncDependencies: (({ revert, ...sync }) => ({ ...fill(sync, at), id: SYNC_ID, revert: fill(revert, at) }))(declared.syncDependencies) } : {}),
       ids: { lint: modules.lint.id, load: modules.load.id, restart: modules.restart.id, ready: modules.ready.id }
     }
   }
@@ -116,11 +123,18 @@ export function instanceWords (check) {
   const used = check?.stageInstance
   if (!used) return ''
   const waited = (used.slotWaitMs ?? 0) + (used.startWaitMs ?? 0)
+  const sync = used.dependencySync
+  const synced = !sync ? ''
+    : sync.outcome === 'synced' ? ` Before that the revision's changed dependency manifests (${sync.files.join(', ')}) were installed on the whole stage of ${used.host} (${seconds(sync.durationMs)}); they are reverted there when the run ends without delivering.`
+      : sync.outcome === 'not-changed' ? ` ${sync.reason}`
+        : ` Installing the revision's changed dependency manifests (${sync.files.join(', ')}) on the stage of ${used.host} ${sync.outcome === 'unavailable' ? 'was refused' : 'failed'} (${seconds(sync.durationMs)}): ${sync.reason}`
+  const stale = used.recreated ? ` The instance had gone stale between its creation and its start (${used.recreated.said}), so it was destroyed and created again in this drive.` : ''
   const how = used.state === 'not-created' ? `The drive ended before stage instance ${used.name} was created on ${used.host}.`
     : used.fresh && used.created === false ? `Stage instance ${used.name} could not be created on ${used.host} from this candidate (create ${seconds(used.createMs)}); nothing was started or tested.`
     : used.fresh ? `This drive created stage instance ${used.name} on ${used.host} for the run (create ${seconds(used.createMs)}, start ${seconds(used.startMs)}, ready ${seconds(used.readyMs)}${waited ? `, after waiting ${seconds(waited)} for room on the host` : ''}).`
       : `This drive loaded the candidate into the run's stage instance ${used.name} on ${used.host} (load ${seconds(used.loadMs)}, restart ${seconds(used.restartMs)}, ready ${seconds(used.readyMs)}).`
   const gone = !used.destroyed || used.created === false ? ''
     : ` The instance ${used.fresh ? 'did not come up' : 'did not come back after the load'}, so it was ${used.destroyed.passed ? 'destroyed' : `to be destroyed, which failed (${used.destroyed.error}); it keeps its slot until that succeeds`}: the next drive creates a new one.`
-  return how + gone
+  const replaced = used.replaced ? ` The run's earlier instance was destroyed first: this revision's dependency manifests are not the ones it was created with.` : ''
+  return replaced + how + stale + synced + gone
 }
