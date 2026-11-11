@@ -19,6 +19,8 @@ autoClose:
   justification: Completing triage records a disposition; the issue stays open for implementation.
 budgets:
   maxSteps: 6        # brief + two concurrent investigators leaves room for repair turns
+  # Two tool-using seats read the snapshot at once and Anthropic totals include cache reads: a plain triage
+  # measured 722 000 tokens (2026-11-11), so the limit only guards against a runaway.
   wallClockMinutes: 5
-  maxTokens: 120000
+  maxTokens: 2000000
   maxCostUsd: 1

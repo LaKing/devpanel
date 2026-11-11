@@ -35,7 +35,7 @@ checks:
 budgets:
   maxSteps: 6
   wallClockMinutes: 10
-  maxTokens: 200000
+  maxTokens: 2000000
   maxCostUsd: 1
   onExhausted: unresolved
 phases:
