@@ -2966,7 +2966,12 @@ pending invocation from the adapter ledgers (adopt completed, retry not-started)
 retries an *uncertain* one with a fresh session only when the integrity
 comparison proves the workspace untouched, and otherwise stays blocked naming what
 is uncertain. On success it resumes as `resume` does, the time nobody owned the
-run counted as suspended (`ownerRecoveries`). A quarantined run instead offers
+run counted as suspended (`ownerRecoveries`). A wait for another run's modules
+that the lost owner never ended is put on `run.moduleLockWaits` up to the time it
+was last seen (`ownerLost: true`), so it is excused like any other. When the
+limits refuse the continuation (`WALL_CLOCK_EXHAUSTED`: `recover` takes `budgets`
+too) the run stands `blocked` / `owner-lost`, and `resume` with a raised limit
+continues it from the time the owner was lost. A quarantined run instead offers
 `resolve-integrity` (`GET/POST …/runs/:runId/integrity`): inspect the changes,
 then `accept-partial`, `restored` or `abandon`, pinned to the inspected state hash.
 

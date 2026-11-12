@@ -1558,6 +1558,13 @@ export class Engine {
     await noteLostTags(this.run, { platform: this.platform, projectDir: path.dirname(this.issuePath), at: this.clock.iso() })
     const lostAt = this.run.recovery.lastActivityAt ?? null
     const detectedAt = this.run.recovery.detectedAt ?? null
+    // A wait for another run's modules is put on the record only when it ends, and the lost
+    // owner never ended this one: without it the whole wait would count as wall clock.
+    const waited = this.run.moduleLocks?.waiting
+    const waitedTo = lostAt ?? detectedAt
+    if (waited?.since && waitedTo && Date.parse(waitedTo) > Date.parse(waited.since) && !(this.run.moduleLockWaits ?? []).some((w) => w.from === waited.since)) {
+      ;(this.run.moduleLockWaits ??= []).push({ from: waited.since, to: waitedTo, modules: waited.modules ?? [], ownerLost: true })
+    }
     await this.recover({ retryUncertain: true })
     const unresolved = Object.entries(this.run.participants).filter(([, p]) => p.pendingInvocation || p.state === 'recovery-required').map(([role]) => role)
     if (this.run.integrity?.status !== 'clear' || unresolved.length) {
@@ -3255,7 +3262,10 @@ export class Engine {
       limits[key] = value
     }
     const events = (await store.readEvents(this.issuePath, this.runId)).events
-    const stopped = stoppedAt ?? this.run.pause?.at ?? this.run.endedAt ?? events.filter(e => ['budget-exhausted', 'failed', 'cancelled', 'finished'].includes(e.type)).at(-1)?.at
+    // A recovery of a lost owner that these limits refused left the run `owner-lost` with no pause or end:
+    // it stopped when its owner was last seen, and a Resume raising the limit must be able to say so.
+    const lostOwnerAt = this.run.blockedReason === 'owner-lost' ? this.run.ownerRecoveries?.at(-1)?.lostAt ?? this.run.ownerRecoveries?.at(-1)?.detectedAt : null
+    const stopped = stoppedAt ?? this.run.pause?.at ?? this.run.endedAt ?? lostOwnerAt ?? events.filter(e => ['budget-exhausted', 'failed', 'cancelled', 'finished'].includes(e.type)).at(-1)?.at
     if (!stopped || !Number.isFinite(Date.parse(stopped))) throw Object.assign(new Error('No reliable stop time is recorded for this run.'), { status: 409 })
     const suspendedMs = Math.max(0, this.clock.now() - Date.parse(stopped))
     const standing = limits.wallClockMinutes ? wallClockStanding(this.run, this.outputs, this.clock.now(), { limitMinutes: limits.wallClockMinutes, stoppedAt: Date.parse(stopped) }) : null

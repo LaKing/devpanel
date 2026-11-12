@@ -70,6 +70,34 @@ export default async function (t) {
     await releaseWorkspace(engine)
   }
 
+  t.section('owner lost while waiting for another run\'s modules: the wait is excused, and a refused recovery leaves Resume')
+  {
+    const f = await engineFixture()
+    const runId = await lostOwner(f, 'afterPersistBeforeAdvance', (e) => e.run.steps.length === 3)
+    const run = await store.readRun(f.issuePath, runId)
+    const lostAt = run.recovery.lastActivityAt
+    const since = new Date(Date.parse(lostAt) - 3 * 3600_000).toISOString()
+    // Started five hours before the loss, three of them spent waiting, under a two-hour limit.
+    run.startedAt = new Date(Date.parse(lostAt) - 5 * 3600_000).toISOString()
+    run.budgets.limits.wallClockMinutes = 120
+    run.moduleLocks = { pool: 'devpanel-project', project: 'devpanel-project', issueId: f.issue.id, held: [], waiting: { modules: ['m'], holders: [], since } }
+    await store.writeRun(f.issuePath, runId, run)
+    const engine = await reopen(f, runId)
+    const refused = await engine.recoverOwnerLoss().catch((e) => e)
+    t.eq('five hours under a two-hour limit refuses, the excused wait notwithstanding', refused?.code, 'WALL_CLOCK_EXHAUSTED')
+    t.eq('the wait the lost owner never ended is on the record', engine.run.moduleLockWaits?.map((w) => [w.from, w.to, w.ownerLost]), [[since, lostAt, true]])
+    t.eq('the refused run stands owner-lost', [engine.run.status, engine.run.blockedReason], ['blocked', 'owner-lost'])
+    const again = await engine.recoverOwnerLoss().catch((e) => e)
+    t.ok('recover no longer applies', again instanceof Error)
+    t.eq('and the wait is recorded once', engine.run.moduleLockWaits.length, 1)
+    // Two hours counted (five less the three waiting): a limit of 180 leaves an hour.
+    const entry = await engine.resumeExecution({ budgets: { wallClockMinutes: 180 }, actor: 'alice', origin: 'test' })
+    t.eq('Resume with a raised limit continues it from the time the owner was lost', entry.limits.wallClockMinutes, 180)
+    const done = await engine.drive()
+    t.eq('and it completes', done.outcome, 'resolved')
+    await releaseWorkspace(engine)
+  }
+
   t.section('a run that is merely blocked is not offered recovery')
   {
     t.eq('recovery-required without owner loss offers only abandon', supportedActions({ status: 'blocked', blockedReason: 'recovery-required', recovery: { required: true, reason: 'writer: invocation x is uncertain' }, integrity: { status: 'clear' }, workspace: { path: '/x', state: 'retained' }, participants: {} }), ['abandon'])
