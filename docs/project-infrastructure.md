@@ -401,6 +401,26 @@ drive as always; the instance holds its own copy.
 - `start.staleExitCodes` (the stage's dependencies were replaced after the instance was
   created): the engine destroys the instance, creates it again from the same candidate and
   starts that, once per drive; nothing fails and no retry is spent.
+- `create.reportsUnavailable` and `syncDependencies.reportsUnavailable`: the command may
+  say that the drive cannot be made, with a line `devpanel-unavailable: <reason>` and a
+  non-zero exit, as a test drive command does ("One application snapshot per run"). The
+  check is `unavailable` with that reason. Such an exit is never one of
+  `unavailableExitCodes`, so no sync follows it.
+
+**Shared application content, pinned per run.** Every command of the tier, `create` and
+`syncDependencies` included, gets the run's `DEVPANEL_RUN_ID`, and runs as the SSH account
+(the tier has no command kinds). A tier whose instance composes the candidate with content
+staging holds besides it (a framework candidate tested inside an application) must take
+that content from a snapshot pinned by the run id, as the full tier does ("One application
+snapshot per run"), not from what staging holds at each `create`: an instance is created
+again after a pause, a drive in doubt, a stale start or a manifest change, and a deploy in
+between would otherwise put newer content under the run's candidate. `create` takes or
+finds the run's pin and builds from it; `syncDependencies` (which only follows a `create`
+in the same drive) reads that pin; both report unavailable when the pinned version is gone.
+`load` and `restart` replace only the candidate's own paths in the running instance, so
+they need no pin. The limit stays: the pin is the content as deployed at the run's first
+drive, and content that already needs a newer candidate base than the run's fails every
+drive of the run.
 
 **A run that changes dependencies.** An instance runs on the stage's installed dependencies
 and cannot install: no network, shared read-only trees. A run whose revision changes a
@@ -755,7 +775,8 @@ Then record the result in the issue, as a note on its page (*Add to this issue*,
 
 `DEVPANEL_RUN_ID` is the run's id. Every check command receives it: local and
 SSH, `kind: candidate`, `kind: privileged` or none, services and joining commands,
-finalizers, in every drive of the run (candidate and base, smoke and full, a
+finalizers, a stage instance's `create` and `syncDependencies` ("A stage instance per
+run"), in every drive of the run (candidate and base, smoke and full, a
 retry, refresh-checks, a reconciled candidate's revalidation, a diagnostic drive
 (execution-contract.md "Diagnostic drives")). It is the same for
 all of them and differs in another run. The `baselineCache.environment` command

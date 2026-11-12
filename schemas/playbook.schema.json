@@ -727,6 +727,10 @@
                       "type": "string",
                       "minLength": 1,
                       "description": "What such an exit means, said on the check result."
+                    },
+                    "reportsUnavailable": {
+                      "type": "boolean",
+                      "description": "Whether `run` may say that the drive cannot be made, as a test drive command's `reportsUnavailable`: a non-zero exit with a line `devpanel-unavailable: <reason>` (a snapshot the run pinned and that is gone) makes the check `unavailable` with that reason. Such an exit is never one of `unavailableExitCodes`, so no dependency sync follows it."
                     }
                   }
                 },
@@ -831,6 +835,10 @@
                         "maximum": 123
                       },
                       "description": "Exit statuses that mean the stage refused the sync and changed nothing (a manifest this revision did not change, a change that needs a release, another run's dependencies installed): the check is `unavailable` with what the command said."
+                    },
+                    "reportsUnavailable": {
+                      "type": "boolean",
+                      "description": "Whether `run` may say that the drive cannot be made, as `create`'s: a non-zero exit with a line `devpanel-unavailable: <reason>` makes the check `unavailable` with that reason."
                     },
                     "unavailableReason": {
                       "type": "string",

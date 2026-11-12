@@ -180,6 +180,30 @@ export default async function (t) {
       await end(engine)
     }
 
+    t.section('create and sync may report the drive unavailable (the run\'s pinned snapshot is gone): no sync follows such a create, and both read the run\'s id')
+    {
+      const gone = 'devpanel-unavailable: this run\'s application snapshot v-old is no longer on the stage'
+      const { dir, target, lines } = await tier()
+      const { create } = target.modules.instance
+      target.modules.instance.create = { ...create, reportsUnavailable: true, run: `echo "$DEVPANEL_RUN_ID" > '${dir}/create-run'; echo create {{instanceName}} >> '${dir}/log'; echo "${gone}"; exit 1` }
+      const { engine } = await scenario({ target, files: MANIFESTS })
+      const check = engine.run.checkResults.at(-1)
+      t.eq('create: unavailable, though the revision changed a manifest nothing was synced', [check.result, await lines(), engine.run.dependencySyncs, (await records()).length], ['unavailable', ['create'], undefined, 0])
+      t.ok('with what create said', check.error.includes('application snapshot v-old is no longer on the stage'), check.error)
+      t.eq('create read the run\'s id', (await fs.readFile(path.join(dir, 'create-run'), 'utf8')).trim(), engine.runId)
+      t.eq('one revision: no author round on it', engine.run.steps.filter((s) => s.stepId === 'implement').length, 1)
+      await end(engine)
+
+      const second = await tier({ sync: `echo "$DEVPANEL_RUN_ID" > '${dir}/sync-run'; echo "${gone}"; exit 1` })
+      second.target.modules.instance.syncDependencies.reportsUnavailable = true
+      const synced = await scenario({ target: second.target, files: MANIFESTS })
+      const refused = synced.engine.run.checkResults.at(-1)
+      t.eq('sync: unavailable, no second create, no revert owed', [refused.result, await second.lines(), refused.stageInstance.dependencySync.outcome, (await records()).length], ['unavailable', ['create', 'sync'], 'unavailable', 0])
+      t.ok('with what the sync said', refused.error.includes('application snapshot v-old is no longer on the stage'), refused.error)
+      t.eq('the sync read the run\'s id', (await fs.readFile(path.join(dir, 'sync-run'), 'utf8')).trim(), synced.engine.runId)
+      await end(synced.engine)
+    }
+
     t.section('an earlier sync of the run stands when a later one is refused; a sync whose answer never came is still owed')
     {
       const slotsDir = await temp('devpanel-sync-slots-')

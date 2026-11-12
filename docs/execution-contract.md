@@ -640,6 +640,16 @@ stage instance per run") is driven on an instance that belongs to the run
   (`revertFailed`) for the next attempt. `run.dependencySyncs[]` holds each sync
   (`name`, `host`, `files`, `durationMs`, `outcome` `synced | unavailable | failed`,
   `reason`) and `settled` once it was reverted or left for the release.
+- **The run's id, and a pinned snapshot.** Every instance command the check runner
+  runs inside a drive (create, sync, start, the stale path's destroy, the tier's own) is
+  a command of that drive and gets `DEVPANEL_RUN_ID` like any other
+  (project-infrastructure.md "One application snapshot per run"), so a create made
+  again after a destroy, a stale start or a manifest change can build from the same
+  pinned content as the run's first. `create` and `syncDependencies` may declare
+  `reportsUnavailable`: their `devpanel-unavailable: <reason>` makes the check
+  `unavailable` with that reason, and such a create is never read as a refusal for a
+  dependency change, so no sync follows it. The destroy at a run's end or pause, the
+  revert and gc run outside any drive and get no run id.
 - **Stage full, or held.** An exit listed in `start.busyExitCodes` (the stage runs its
   cap of instances, or a deployment or a dependency sync holds it) is asked again
   (`busyRetrySeconds`), and a run that finds every instance slot of its host taken
