@@ -52,6 +52,12 @@ const git = (args, { input = null, env = {}, encoding = 'utf8' } = {}) => new Pr
   child.stdin.on('error', () => {})
   child.stdin.end(input ?? '')
 })
+/*
+ * Take a path out of an index without a work tree. `update-index --force-remove -- <path>` makes git set one
+ * up first and die ("this operation must be run in a work tree") in a bare directory, which a run's engine
+ * Git directory is; an `--index-info` record with mode 0 removes the entry and needs none.
+ */
+const dropFromIndex = (run, entryPath, env) => run(['update-index', '-z', '--index-info'], { env, input: `0 ${'0'.repeat(40)}\t${entryPath}\0` })
 const must = async (pending) => {
   const r = await pending
   if (r.code !== 0) throw new Error(r.stderr.trim().split(NL)[0] || `git exited ${r.code}`)
@@ -179,7 +185,7 @@ export async function mergeOntoSource ({ workspace, baseline, revision, patchFil
     const next = new Map(baseline)
     next.modes = new Map(baseline.modes ?? [])
     for (const e of drift.filter((e) => e.status === 'deleted')) {
-      await must(repo(['update-index', '--force-remove', '--', e.path], { env }))
+      await must(dropFromIndex(repo, e.path, env))
       next.delete(e.path)
       next.modes.delete(e.path)
     }
@@ -211,7 +217,7 @@ export async function mergeOntoSource ({ workspace, baseline, revision, patchFil
         const srcEnv = { ...env, GIT_INDEX_FILE: path.join(scratch, 'source-index') }
         await must(src(['read-tree', workspace.sourceBase], { env: srcEnv }))
         for (const e of drift.filter((e) => !underLink(e.path))) {
-          if (e.status === 'deleted') { await must(src(['update-index', '--force-remove', '--', e.path], { env: srcEnv })); continue }
+          if (e.status === 'deleted') { await must(dropFromIndex(src, e.path, srcEnv)); continue }
           const blob = (await must(repo(['rev-parse', `${result.sourceBase}:${e.path}`]))).stdout.trim()
           const bytes = (await must(repo(['cat-file', 'blob', blob], { encoding: 'buffer' }))).stdout
           await must(src(['hash-object', '-w', '--stdin'], { input: bytes }))

@@ -40,18 +40,20 @@ const lines = (n, edit = {}) => Array.from({ length: n }, (_, i) => edit[i + 1] 
  * on a merge of the two.
  */
 const COMPATIBLE = '      - id: compatible\n        run: "! (grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs)"\n'
-async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '' }) {
+// `tracked` adds files to the source before the run; a `source` entry of null deletes that file there during the run.
+async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '', tracked = {} }) {
   let engine
   const script = scriptFor()
   const f = await engineFixture({ playbook: 'implementation', delivery: 'apply-to-source', script: async (turn) => {
     if (turn.stepId === 'implement') {
       for (const [file, text] of Object.entries(worktree)) await fs.writeFile(path.join(engine.run.workspace.path, file), text)
-      for (const [file, text] of Object.entries(source)) await fs.writeFile(path.join(f.projectPath, file), text)
+      for (const [file, text] of Object.entries(source)) await (text === null ? fs.rm(path.join(f.projectPath, file)) : fs.writeFile(path.join(f.projectPath, file), text))
     }
     return script(turn.stepId.startsWith('audit-implement-') ? { ...turn, stepId: 'audit-implementation' } : turn)
   } })
   await fs.writeFile(path.join(f.projectPath, 'server.mjs'), lines(10))
   await fs.writeFile(path.join(f.projectPath, 'changelog.txt'), 'v1 released\n')
+  for (const [file, text] of Object.entries(tracked)) await fs.writeFile(path.join(f.projectPath, file), text)
   await git(f.projectPath, 'add', '-A')
   await git(f.projectPath, 'commit', '-qm', 'source')
   await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
@@ -151,6 +153,20 @@ export default async function (t) {
       const events = (await readEvents(f.issuePath, engine.runId)).events.map((e) => e.type)
       t.ok('journaled', ['reconcile-started', 'reconciled'].every((e) => events.includes(e)) && events.at(-1) === 'finished')
       t.eq('nothing further is offered', supportedActions(engine.run), ['start-new'])
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('1b. the source deleted a tracked file meanwhile: the drift is written without a work tree')
+    {
+      // The run's engine Git directory is bare. Removing an index entry by path there made git die with "this operation
+      // must be run in a work tree", so a reconcile failed whenever anything had been deleted at the destination since the base.
+      const { f, engine } = await blockedRun({ tracked: { 'obsolete.txt': 'no longer needed\n' }, worktree: { ...CHANGELOG_ONLY.worktree }, source: { ...CHANGELOG_ONLY.source, 'obsolete.txt': null } })
+      t.eq('delivery was refused for the changelog conflict', `${engine.run.blockedReason} ${engine.run.delivery?.application?.state}`, 'source-delivery-blocked source-drift')
+      await engine.reconcileDelivery({ policy: PREPEND })
+      const attempt = engine.run.reconciliations?.at(-1)
+      t.eq('the reconcile went through and delivered', `${engine.run.status} ${engine.run.outcome} ${attempt?.state}`, 'completed resolved accepted', `${engine.run.blockedReason} ${attempt?.error}`)
+      t.eq('the source has the fix and both changelog entries', [await read(f, 'server.mjs'), await read(f, 'changelog.txt')], [lines(10, { 9: 'line 9 fixed' }), 'candidate: fixed line 9\nother: landed first\nv1 released\n'])
+      t.eq('and the deleted file stays deleted', await fs.access(path.join(f.projectPath, 'obsolete.txt')).then(() => 'present', () => 'absent'), 'absent')
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
     }
 
