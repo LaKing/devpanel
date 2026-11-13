@@ -80,6 +80,31 @@ export default async function (t) {
     t.ok('once free, the locks are taken and only the integrity check refuses (this run has no quarantine)', free.status === 409 && free.code !== 'MODULE_LOCKED', `${free.code} ${free.message}`)
     const afterIntegrity = JSON.parse(await fs.readFile(path.join(first.path, 'runs', one.runId, 'run.json'), 'utf8'))
     t.eq('a continuation that did not go on gives them back, still required', [(await readPoolLocks(POOL)).length, afterIntegrity.moduleLocks.held, afterIntegrity.moduleLocks.released?.modules], [0, [], ['@c/x', 'own-modules/a']])
+
+    t.section('a paused run gives its modules up: a start sharing one goes ahead, and resuming the paused run waits instead of being refused')
+    const recordOf = async (issue, runId) => JSON.parse(await fs.readFile(path.join(issue.path, 'runs', runId, 'run.json'), 'utf8'))
+    const until = async (test, what) => { const end = Date.now() + 20000; while (!await test()) { if (Date.now() > end) throw Error(`timed out waiting for ${what}`); await new Promise((r) => setTimeout(r, 50)) } }
+    const fourth = await sized('Pauses holding a module', ['@c/z'])
+    const fifth = await sized('Shares that module', ['@c/z'])
+    const held = await supervisor.start({ project: P, issueId: fourth.id, playbookId: f.playbookId, configRoot: f.configRoot })
+    await until(async () => (await recordOf(fourth, held.runId).catch(() => null))?.status === 'running', 'the run to be running')
+    await supervisor.pause({ project: P, issueId: fourth.id, runId: held.runId })
+    await until(async () => !supervisor.isActive(P, fourth.id), 'the pause to settle')
+    const paused = await recordOf(fourth, held.runId)
+    t.eq('the run is paused by the operator', [paused.status, paused.pause?.kind], ['paused', 'manual'])
+    t.eq('it holds nothing and owes its module', [paused.moduleLocks.held, paused.moduleLocks.owed, paused.moduleLocks.released?.reason], [[], ['@c/z'], 'paused'])
+    t.eq('the pool is free of it', (await readPoolLocks(POOL)).filter((l) => l.runId === held.runId), [])
+    const sharing = await supervisor.start({ project: P, issueId: fifth.id, playbookId: f.playbookId, configRoot: f.configRoot }).catch((e) => e)
+    t.ok('so the issue sharing the module starts while the other waits for a person', Boolean(sharing.runId), sharing.message)
+    const resumed = await supervisor.resume({ project: P, issueId: fourth.id, runId: held.runId, actor: 'operator' }).catch((e) => e)
+    t.eq('resuming the paused run is accepted, not refused MODULE_LOCKED', [resumed.code ?? null, resumed.runId], [null, held.runId], resumed.message)
+    await until(async () => (await recordOf(fourth, held.runId)).moduleLocks?.waiting, 'the resumed run to wait for its module')
+    const waiting = await recordOf(fourth, held.runId)
+    t.eq('it is live again and waits for the module, naming the holder', [waiting.status, waiting.moduleLocks.waiting.modules, waiting.moduleLocks.waiting.holders.map((h) => h.runId)], ['running', ['@c/z'], [sharing.runId]])
+    await supervisor.settle()
+    const finished = await recordOf(fourth, held.runId)
+    t.eq('once the holder ended it took the module and ran to its end', [finished.moduleLocks.retaken?.map((r) => r.modules), finished.moduleLocks.owed, ['completed', 'blocked'].includes(finished.status)], [[['@c/z']], undefined, true], finished.status)
+    t.eq('and the pool is empty again', (await readPoolLocks(POOL)).length, 0)
   } finally {
     for (const [key, env] of [['projects', 'DEVPANEL_PROJECTS_DIR'], ['control', 'DEVPANEL_FAKE_CONTROL']]) {
       if (saved[key] === undefined) delete process.env[env]

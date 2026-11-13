@@ -32,7 +32,7 @@ export default async function(t){
  await send('stop',{});await wait(s=>s.status==='stopped')
  await send('start',options);await wait(s=>s.status==='active'&&s.calls===4)
  t.eq('return to GPT creates a fresh native session',(await state()).session.id,'codex-2')
- t.ok('new native session receives shared recent conversation',JSON.parse((await state()).messages.filter(m=>m.role==='assistant').at(-1).prompt).history.some(m=>m.text==='claude replies'))
+ t.ok('new native session receives shared recent conversation',JSON.parse((await stage.request('/api/supervisor/prompts/'+(await state()).messages.filter(m=>m.role==='assistant').at(-1).invocationId)).body.prompt).history.some(m=>m.text==='claude replies'))
  await send('stop',{});await wait(s=>s.status==='stopped')
  }finally{await stage.stop()}
 }

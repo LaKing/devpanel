@@ -49,7 +49,7 @@ import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { settleRunSyncs, syncDisposition } from './runtime/sync-records.mjs'
 import { routeAutoStart } from './auto-start.mjs'
 import { poolOf, poolRecord } from './runtime/module-pool.mjs'
-import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules } from './runtime/module-locks.mjs'
+import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules, yieldForPause } from './runtime/module-locks.mjs'
 
 /*
  * Owns the lifecycle of running playbooks.
@@ -704,11 +704,16 @@ export function createSupervisor ({
           availability,
           emit: (event) => emit?.({ ...event, project, issueId, runId })
         })
-        // Its modules again, under this process (module-locks.mjs): a module another run took
-        // meanwhile refuses the resume, naming it, as a start would be refused.
-        // Every continuation re-takes them, an integrity restore or accept-partial included; only an
-        // abandon, which ends the run, does not.
-        if (engine.run.moduleLocks && integrity?.disposition !== 'abandon') {
+        // Its modules again, under this process (module-locks.mjs). A paused run gave its locks up
+        // at the pause and owes them: its answer or resume is never refused for a lock, the decision is
+        // recorded and the engine takes the set before anything goes on, waiting for a holder
+        // (takePendingModules). One paused before that rule still names locks of an earlier process:
+        // they become owed here. Every continuation of an ended run re-takes its set first, an
+        // integrity restore or accept-partial included, and a module another run took meanwhile
+        // refuses it, naming the holder, as a start would be refused; only an abandon does not.
+        if (engine.run.moduleLocks && engine.run.status === 'paused' && !integrity && !recover) {
+          if (await yieldForPause(engine.run)) await store.writeRun(issue.path, runId, engine.run)
+        } else if (engine.run.moduleLocks && integrity?.disposition !== 'abandon') {
           const { conflicts } = await reclaimRunLocks(engine.run, { project, issueId, issuePath: issue.path, platform, persist: (run) => store.writeRun(issue.path, runId, run) })
           await store.writeRun(issue.path, runId, engine.run)
           if (conflicts.length) throw occupied(lockedMessage(conflicts), { code: 'MODULE_LOCKED', holders: conflicts })
@@ -788,7 +793,7 @@ export function createSupervisor ({
     } catch (error) {
       starting.delete(k)
       if (engine && !active.has(k)) {
-        // Locks re-taken for a continuation that did not go on: an ended run gives them back (a paused one keeps its own).
+        // Locks taken for a continuation that did not go on are given back: an ended run's stay required, a paused one's owed.
         await releaseEndedRunLocks(engine.run, engine.issuePath)
         await engine.runLock?.release().catch(() => {})
       }
@@ -1256,17 +1261,19 @@ export function createSupervisor ({
   }
 
   /**
-   * A run's module locks go at its end (module-locks.mjs); a paused run keeps them, since it
-   * resumes on the same modules. Written to the run record, and the release is announced so
-   * the supervisor's ready queue reads the freed modules.
+   * A run's module locks go at its end and at a pause (module-locks.mjs): a paused run waits for
+   * a person, so it holds nothing meanwhile and owes its set, which the engine takes again before
+   * the run goes on. Written to the run record, and the release is announced so the supervisor's
+   * ready queue reads the freed modules.
    */
   async function releaseEndedRunLocks (run, issuePath) {
     await destroyStageInstances(run, issuePath)
-    if (!run?.moduleLocks || run.status === 'paused') return
+    if (!run?.moduleLocks) return
     try {
-      if (await releaseRunLocks(run)) {
+      const paused = run.status === 'paused'
+      if (paused ? await yieldForPause(run) : await releaseRunLocks(run)) {
         await store.writeRun(issuePath, run.runId, run)
-        emit?.({ type: 'module-locks-released', project: run.issue?.project ?? null, issueId: run.issue?.id ?? null, runId: run.runId, modules: run.moduleLocks.released?.modules ?? [] })
+        emit?.({ type: 'module-locks-released', project: run.issue?.project ?? null, issueId: run.issue?.id ?? null, runId: run.runId, modules: run.moduleLocks.released?.modules ?? [], ...(paused ? { paused: true } : {}) })
       }
     } catch (error) { console.warn(`module locks of run ${run.runId} could not be released: ${error.message}`) }
   }

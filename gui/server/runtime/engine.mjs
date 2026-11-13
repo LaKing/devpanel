@@ -2427,7 +2427,8 @@ export class Engine {
   }
 
   /**
-   * Take the latest revision's pending modules before anything else happens (execution-contract.md
+   * Take the latest revision's pending modules, and what the run gave up at a pause
+   * (`run.moduleLocks.owed`, module-locks.mjs yieldForPause), before anything else happens (execution-contract.md
    * "Module locks"). Waits while another live run holds one, recorded on `run.moduleLocks.waiting`,
    * a wait record beside the locks and the events, excused from the wall clock like a drive-slot
    * wait. When the waits-for graph closes a cycle the youngest run on it gives up everything it
@@ -2442,7 +2443,10 @@ export class Engine {
   async takePendingModules () {
     const record = this.run.revisions?.at(-1)
     const locks = this.run.moduleLocks
-    if (!locks || !record?.moduleLocks?.pending?.length) return true
+    // Read again at every poll: a yield moves what the run held into the revision's pending set.
+    const ofRevision = () => record?.moduleLocks?.pending ?? []
+    const wanted = () => [...new Set([...(locks.owed ?? []), ...ofRevision()])].sort()
+    if (!locks || !wanted().length) return true
     const common = { pool: locks.pool, runId: this.runId, project: locks.project, issueId: locks.issueId, issuePath: this.issuePath, startedAt: this.run.startedAt, clock: this.clock, platform: this.platform }
     const waitId = uuid()
     let from = null
@@ -2450,7 +2454,7 @@ export class Engine {
     const endWait = () => {
       if (!from) return
       this.openDriveWaits.delete(waitId)
-      ;(this.run.moduleLockWaits ??= []).push({ from, to: this.clock.iso(), modules: record.moduleLocks.pending })
+      ;(this.run.moduleLockWaits ??= []).push({ from, to: this.clock.iso(), modules: wanted() })
     }
     for (;;) {
       if (this.controller.signal.aborted) {
@@ -2460,15 +2464,21 @@ export class Engine {
         await this.persist({ type: 'module-lock-wait-stopped' })
         return false
       }
-      const pending = record.moduleLocks.pending
+      const pending = wanted()
       const got = await takeModules({ ...common, modules: pending, already: locks.held })
       if (!got.conflicts.length) {
         locks.held.push(...got.held)
         endWait()
         locks.waiting = null
         await clearWait(locks.pool, this.runId)
-        record.moduleLocks = { added: pending, ...(from ? { waitedFrom: from } : {}), ...(yielded.length ? { yielded } : {}) }
-        await this.persist({ type: 'module-locks-taken', modules: pending, revision: record.fingerprint })
+        if (locks.owed?.length) {
+          // The set of before the pause is this run's again: nothing is owed and nothing reads released.
+          ;(locks.retaken ??= []).push({ modules: locks.owed, at: this.clock.iso(), ...(from ? { waitedFrom: from } : {}) })
+          delete locks.owed
+          if (locks.released?.reason === 'paused') delete locks.released
+        }
+        if (ofRevision().length) record.moduleLocks = { added: ofRevision(), ...(from ? { waitedFrom: from } : {}), ...(yielded.length ? { yielded } : {}) }
+        await this.persist({ type: 'module-locks-taken', modules: pending, revision: record?.fingerprint ?? null })
         return true
       }
       if (!from) {
@@ -2483,8 +2493,10 @@ export class Engine {
         await releaseModules({ pool: locks.pool, held: locks.held })
         locks.held = []
         yielded = [...new Set([...yielded, ...given])].sort()
-        ;(locks.yielded ??= []).push({ modules: given, to: [...new Set(got.conflicts.map((c) => c.runId))], at: this.clock.iso(), revision: record.fingerprint })
-        record.moduleLocks.pending = [...new Set([...pending, ...given])].sort()
+        ;(locks.yielded ??= []).push({ modules: given, to: [...new Set(got.conflicts.map((c) => c.runId))], at: this.clock.iso(), revision: record?.fingerprint ?? null })
+        // With no revision's pending set to carry them (a wait for owed modules only), what was given up is owed.
+        if (record?.moduleLocks?.pending) record.moduleLocks.pending = [...new Set([...ofRevision(), ...given])].sort()
+        else locks.owed = [...new Set([...(locks.owed ?? []), ...given])].sort()
         await this.persist({ type: 'module-lock-yield', modules: given })
         continue
       }

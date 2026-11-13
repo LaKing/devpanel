@@ -1952,7 +1952,17 @@ section's owner identity, plus the module, project and issue.
   set again holding nothing, so no cycle stands; the others keep waiting. Once
   taken, the revision records `moduleLocks.added`.
 - **Release** at every run end (`releaseRunLocks`, recorded as
-  `run.moduleLocks.released`); a paused run keeps its locks. A lock whose owner
+  `run.moduleLocks.released`) and at every pause. A paused run waits for a person and
+  does nothing meanwhile, so it holds nothing: when the pause is recorded it gives up
+  every lock and owes the set (`yieldForPause`: `run.moduleLocks.owed`, and
+  `released` with `reason: paused`), and a start sharing one of those modules goes
+  ahead. Its answer or resume is never refused for a lock: the decision is recorded,
+  and the drive loop takes the owed set, together with the revision's pending
+  modules, before anything else happens, waiting for a holder exactly as growth does
+  (`moduleLocks.waiting`, the wait excused from the wall clock; the run's explanation
+  says the answer is in and what it waits for). Taken, the set is on
+  `run.moduleLocks.retaken` and nothing is owed. What another run changed in those
+  modules meanwhile reaches the resumed run at delivery, as drift ("Delivery"). A lock whose owner
   process is proved dead is taken over like a drive slot; one whose owner is
   `unknown` is never taken over; one whose owner is alive but whose run's
   `run.json` no longer reads live is stale and taken over too — unless it is a
@@ -1962,7 +1972,7 @@ section's owner identity, plus the module, project and issue.
   status still reads ended. The marker goes when the continuation proceeds or gives
   its locks back, so a run that has really ended leaves stale locks; no clock is
   compared. Every continuation of
-  a run — resume, recover, continue, refresh checks, accept a check result, and an
+  an ended run — resume, recover, continue, refresh checks, accept a check result, and an
   integrity `restored` or `accept-partial` (only `abandon` ends it) — takes its
   recorded set again under the current process (a restart made the earlier owner
   dead) before the run goes on. A module another run took meanwhile refuses it,
@@ -3058,7 +3068,8 @@ current invocation finishes and is recorded; no new turn starts afterwards.
 The request is durable and visible while the invocation finishes. The resulting
 pause has `kind: manual`. Stop remains a separate action that cancels an invocation.
 
-A paused run, whatever paused it, keeps its worktree and its module locks. A stage
+A paused run, whatever paused it, keeps its worktree and gives up its module locks,
+which it takes again before it goes on ("Module locks"). A stage
 instance it had is destroyed when the pause is recorded, and the first modules drive
 after the resume creates a new one from the revision it checks ("A stage instance per run").
 

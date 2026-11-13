@@ -23,8 +23,10 @@ export default async function(t){
  const scoped=await stage.request('/api/supervisor/campaign',{method:'POST',body:JSON.stringify({campaign:{leaveReporters:['reporter-a']}})})
  t.eq('the campaign route sets the scope while it runs',[scoped.status,scoped.body.campaign?.leaveReporters],[200,['reporter-a']])
  let state
+ // What each call was sent is read from beside the state, where the supervisor keeps it.
+ const prompts=async(s)=>Promise.all(s.messages.filter(m=>m.role==='assistant'&&m.invocationId).map(async m=>(await stage.request('/api/supervisor/prompts/'+m.invocationId)).body.prompt??''))
  const end=Date.now()+20000
- do{state=(await stage.request('/api/supervisor')).body;if(state.ownedRuns[0]?.status==='completed'&&state.status==='active'&&state.messages.some(m=>m.prompt?.includes('run-changed')))break;await new Promise(r=>setTimeout(r,50))}while(Date.now()<end)
+ do{state=(await stage.request('/api/supervisor')).body;if(state.ownedRuns[0]?.status==='completed'&&state.status==='active'&&(await prompts(state)).some(p=>p.includes('run-changed')))break;await new Promise(r=>setTimeout(r,50))}while(Date.now()<end)
  t.eq('supervisor launched an actual engine run',state.ownedRuns.length,1)
  t.eq('run reached completion',state.ownedRuns[0]?.status,'completed')
  t.ok('original report reaches supervisor',state.messages.some(m=>m.role==='tool'&&m.action.type==='get_issue'&&m.text.includes('Read this audit evidence.')))
@@ -32,7 +34,8 @@ export default async function(t){
  t.eq('engine persists the durable launch reservation identifier',run.supervisorLaunchId,state.launches[0].id)
  t.eq('issue engine performed triage',run.timeline[0]?.stepId,'triage')
  t.eq('supervisor observed actual rejected result',run.result,'rejected')
- t.ok('completion delivered back to persistent agent',state.messages.some(m=>m.prompt?.includes('run-changed')&&m.prompt.includes('triage-rejected')))
+ t.ok('completion delivered back to persistent agent',(await prompts(state)).some(p=>p.includes('run-changed')&&p.includes('triage-rejected')))
+ t.ok('and no prompt is kept in the state itself, only its size',state.messages.every(m=>m.prompt===undefined)&&state.messages.some(m=>m.promptBytes>0))
  await stage.request('/api/supervisor/stop',{method:'POST',body:'{}'})
  }finally{await stage.stop()}
 }

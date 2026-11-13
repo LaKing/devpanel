@@ -362,8 +362,17 @@ Issue text and lower-level agent responses are treated as evidence, not instruct
 that can widen the supervisor's authority.
 
 State is stored in `issues/.supervisor/state.json` with adapter ledgers alongside.
-An exclusive process-identity lock protects it. State writes are atomic and ordered.
-Messages retain exact model responses, prompts, action requests, results, and usage.
+An exclusive process-identity lock protects it. State writes are atomic and ordered,
+and a save that would write the bytes already on disk writes nothing and announces
+nothing: the poll saves every few seconds, and an idle activation must not rewrite its
+state each time. Messages retain exact model responses, action requests, results, and
+usage. What each call was sent is kept beside the state, not in it:
+`issues/.supervisor/prompts/<invocationId>.json`, read by
+`GET /api/supervisor/prompts/:invocationId`, with the message carrying only
+`promptBytes`. A prompt holds the whole panel (infrastructure, models, playbooks), so
+a few hundred of them inside `state.json` made it tens of megabytes, serialised and
+rewritten at every save and cloned for every reader. A state written that way is
+converted once, at load; prompt files older than 14 days are removed.
 Replies may contain a single JSON response object surrounded by prose or a code
 fence. Its envelope and action arguments are validated before execution; multiple
 JSON values are rejected as ambiguous. An invalid reply gets one formatting-repair

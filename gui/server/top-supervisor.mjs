@@ -112,6 +112,9 @@ export function releaseAuthorization (state, previewId, preview) {
 
 /** The supervisor's own failures in a row (a reply it could not read, a call that failed) before the activation ends on its own account; between them it waits, doubling. */
 const MAX_OWN_FAILURES = 5
+// Prompts kept beside the state (keepPrompt): how long, and how often the directory is looked through.
+const PROMPT_KEEP_DAYS = 14
+const PROMPT_PRUNE_EVERY = 50
 const OWN_FAILURE_BASE_MS = Number(process.env.DEVPANEL_SUPERVISOR_RETRY_MS ?? 30_000)
 const OWN_FAILURE_MAX_MS = 600_000
 
@@ -190,12 +193,48 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     }
   }
   let writes = Promise.resolve()
+  // The state as it was last written: a save that would write the same bytes writes nothing and tells
+  // nobody. The poll saves every few seconds whether or not anything moved, and an idle activation used
+  // to rewrite the whole file each time.
+  let written = null
   async function save () {
     const bytes = JSON.stringify(state, null, 2)
+    if (bytes === written) return writes
     const event = { status: state.status, reason: state.reason ?? null, calls: state.calls, starts: state.starts, operation: state.pending?.kind ?? null, invocationId: state.pending?.invocationId ?? null }
-    const write = writes.then(async () => { await writeAtomic(file, bytes); emit(event) })
+    const write = writes.then(async () => { await writeAtomic(file, bytes); written = bytes; emit(event) })
     writes = write.catch(() => {})
     await write
+  }
+  /*
+   * What each call was sent is kept beside the state, never in it (prompts/<invocationId>.json). A prompt
+   * carries the whole panel (infrastructure, models, playbooks), so a few hundred of them made state.json
+   * tens of megabytes, serialised and rewritten at every save and cloned for every reader of the state.
+   * A message names its call (`invocationId`) and the prompt's size (`promptBytes`); `prompt(id)` reads it.
+   * Files older than PROMPT_KEEP_DAYS go, looked at once in every PROMPT_PRUNE_EVERY writes.
+   */
+  const promptFile = (id) => path.join(dir, 'prompts', `${String(id).replace(/[^A-Za-z0-9_-]/g, '_')}.json`)
+  let promptWrites = 0
+  async function keepPrompt (invocationId, prompt) {
+    await fs.mkdir(path.join(dir, 'prompts'), { recursive: true })
+    await writeAtomic(promptFile(invocationId), prompt)
+    if (promptWrites++ % PROMPT_PRUNE_EVERY) return
+    const before = Date.now() - PROMPT_KEEP_DAYS * 86_400_000
+    for (const name of await fs.readdir(path.join(dir, 'prompts'))) {
+      const entry = path.join(dir, 'prompts', name)
+      if ((await fs.stat(entry).catch(() => null))?.mtimeMs < before) await fs.rm(entry, { force: true })
+    }
+  }
+  // A state written before prompts moved out carries one on every reply and recorded failure: moved once, here.
+  {
+    let moved = 0
+    for (const entry of [...(state.messages ?? []), ...(state.failureHistory ?? []), ...(state.pending ? [state.pending] : [])]) {
+      if (typeof entry.prompt !== 'string') continue
+      if (entry.invocationId) await keepPrompt(entry.invocationId, entry.prompt).catch(() => {})
+      entry.promptBytes = entry.prompt.length
+      delete entry.prompt
+      moved++
+    }
+    if (moved) await save()
   }
   /*
    * One call's cost into this session's accounting: reported, else estimated from
@@ -704,7 +743,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         const baselineClean = priorSessionId !== null && state.ownUsageSession === priorSessionId
         const forkFree = !asking, marksAtStart = forkMarks
         state.ownUsageSession = null
-        state.pending = { kind: 'model', invocationId, prompt, at: new Date().toISOString() }; await save()
+        // The record of what was sent is evidence, not a condition: a prompt that cannot be kept does not stop the call.
+        await keepPrompt(invocationId, prompt).catch(() => {})
+        state.pending = { kind: 'model', invocationId, promptBytes: prompt.length, at: new Date().toISOString() }; await save()
         if (controller.signal.aborted) {
           // Stop may arrive while the reservation or pending marker is saved.
           // No adapter call happened, so the reservation goes back: it is no call, on any reading of the ledger.
@@ -801,7 +842,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           message('system', `This call's cost could not be recorded (${error.message}); its reservation stays outstanding and keeps counting against the window.`)
         }
         // How long the call took, beside its tokens: what the panel reports a call cost.
-        message('assistant', response.response, { usage: response.usage, cost: spent.cost, durationMs: Date.now() - callStarted, invocationId, prompt, rawResponse: response.response })
+        message('assistant', response.response, { usage: response.usage, cost: spent.cost, durationMs: Date.now() - callStarted, invocationId, promptBytes: prompt.length, rawResponse: response.response })
         const assistantMessage = state.messages.at(-1)
         state.pending = null; await save()
         if (controller.signal.aborted) break
@@ -1272,6 +1313,11 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     }),
     /** Open questions, for Needs attention and the issue page. */
     questions: () => structuredClone((state.questions ?? []).filter((q) => !q.answer)),
+    /** What a call was sent, read from beside the state (keepPrompt); null when it was not kept or has been pruned. */
+    prompt: async (invocationId) => {
+      if (typeof invocationId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(invocationId)) throw fail('Invalid invocation id')
+      return { invocationId, prompt: await fs.readFile(promptFile(invocationId), 'utf8').catch(() => null) }
+    },
     live: async (invocationId, { after = 0 } = {}) => {
       if (typeof invocationId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(invocationId)) throw fail('Invalid invocation id')
       const entries = await readLiveFile(liveFile(invocationId), { after })

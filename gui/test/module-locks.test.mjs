@@ -80,7 +80,8 @@ export default async function (t) {
       t.eq('reclaimed under a live owner', [reclaimed.conflicts, after?.state, after?.runId], [[], 'held', 'run-r'])
       await releaseRunLocks(resumed, { dir })
 
-      // auditor-1-005: a paused run's lock was taken over after a restart; its resume is refused, and a second resume must still acquire.
+      // auditor-1-005: a lock taken over after a restart refuses the reclaim, and a second attempt must still acquire. This is the
+      // reclaim of an ended run's continuation; a paused run owes its set instead and waits for it in the engine (engine.pause-locks).
       const pausedPath = await issue('paused', 'run-p', 'paused')
       await fs.writeFile(file('@c/p'), JSON.stringify({ purpose: 'module-lock', token: 'p', module: '@c/p', issuePath: pausedPath, owner: { ...me, pid: 999999, processStartedAt: '1', runId: 'run-p' } }))
       const thief = await take('run-t', 'instance-b-project', 'issue-t', ['@c/p'])

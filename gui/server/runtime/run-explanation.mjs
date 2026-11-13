@@ -593,6 +593,15 @@ function standingOf (run, { outputs, active, ownership }) {
           detail: 'A question that would have gone to a person is with the consult panel first: two models read the code and the run\'s record and answer independently.',
           next: 'If they agree the run goes on with their answer; otherwise the question comes to you in plain words.' }
       }
+      // Waiting for modules another run holds (module-locks.mjs): after a pause the run owes its whole set
+      // (`owed`), so whoever answered it should read that the answer is in and what the run waits for.
+      const lockWait = run.moduleLocks?.waiting
+      if (lockWait?.modules?.length && !active.length) {
+        const holders = [...new Set((lockWait.holders ?? []).map((h) => h.runId).filter(Boolean))]
+        return { tone: 'waiting', headline: 'Waiting for modules another run is working on',
+          detail: `${run.moduleLocks.owed?.length ? 'The answer is recorded. ' : ''}Before it goes on this run needs ${lockWait.modules.join(', ')}, and ${holders.length ? `run ${holders.join(', ')}` : 'another run'} holds ${lockWait.modules.length === 1 ? 'it' : 'part of them'} now.`,
+          next: 'It continues by itself once the modules are free; the wait does not count against its time limit.' }
+      }
       const working = active.map((a) => ROLE(a.role))
       const doing = working.length ? `${Cap(working.join(' and '))} ${working.length === 1 ? 'is' : 'are'} working.` : 'Between turns.'
       // After a delivery return the author is reconciling a conflict with the project; the later of the two returns is what the run is doing.

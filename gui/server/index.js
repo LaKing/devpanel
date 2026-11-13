@@ -455,6 +455,8 @@ app.post('/api/supervisor/launches/retry', route(async (req, res) => res.json(aw
 // A side question, answered in a fork of the supervisor's session (202; the
 // answer arrives in the chat). Its questions to the operator, and their answers.
 app.post('/api/supervisor/ask', route(async (req, res) => res.status(202).json(await topSupervisor.ask(req.body?.text))))
+// What one of the supervisor's calls was sent: kept beside its state, not in it (top-supervisor.mjs keepPrompt).
+app.get('/api/supervisor/prompts/:invocationId', route(async (req, res) => res.json(await topSupervisor.prompt(req.params.invocationId))))
 app.get('/api/supervisor/live/:invocationId', route(async (req, res) => {
   const after = Number(req.query.after ?? 0)
   res.json(await topSupervisor.live(req.params.invocationId, { after: Number.isFinite(after) ? after : 0 }))

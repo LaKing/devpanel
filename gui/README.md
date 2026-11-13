@@ -365,6 +365,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `DELETE /api/projects/:project/issues/:id/runs/:runId` | delete a settled run (the trash icon on the issue page, acting on the click): its workspace (never an in-place checkout), `runs/<runId>/` and its step folders in the issue (turns, operator answers, the result entry). Step reservations, the spending ledger and `refs/devpanel/*` stay. Refused (409) for a live or paused run, while a run is active on the issue, or for an archived issue; 404 for an unknown run. Irreversible. Returns `{ runId, deleted, steps }` |
 | `POST /api/projects/:project/issues/:id/runs/:runId/followups` | open follow-up issues for the run's unaccepted residual risks |
 | `POST /api/supervisor/finish` | no further starts; stop once owned runs complete |
+| `GET /api/supervisor/prompts/:invocationId` | what one of the supervisor's calls was sent (`{invocationId, prompt}`; `prompt` null when it was not kept or has been pruned) |
 | `GET /api/availability` | roster, cooldowns, saved performance samples, timing definitions and refresh progress; never invokes models |
 | `POST /api/availability/refresh` | start/join a bounded hello-world measurement batch; returns 202; one call per verified model not on hold |
 | `POST /api/availability/:model` | operator hold: `{until, reason, actor}`; starts naming the model are refused until then |

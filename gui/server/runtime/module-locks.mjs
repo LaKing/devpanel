@@ -12,7 +12,8 @@ import { hostPlatform } from './platform.mjs'
  * pool (module-pool.mjs), under <issues>/.module-locks/<pool>/ (DEVPANEL_MODULE_LOCKS_DIR
  * elsewhere: the test runner). A lock carries runtime/lock.mjs owner identity, so a dead
  * owner's lock is taken over and an unknown owner's never; one whose run has ended
- * (its run.json no longer live) is stale and taken over too.
+ * (its run.json no longer live) is stale and taken over too. A paused run holds none:
+ * it gives its set up when the pause is recorded and owes it (`yieldForPause`).
  *
  * A set is taken all or nothing and never waited for while holding part of it. A run
  * that needs more while it holds some waits with a wait record beside the locks; a
@@ -184,6 +185,32 @@ export async function releaseRunLocks (run, { dir = null, clock = systemClock } 
   locks.held = []
   locks.waiting = null
   delete locks.continuation
+  return true
+}
+
+/**
+ * A paused run gives up every lock it holds: it waits for a person and does nothing meanwhile, so
+ * its modules must not stand in other runs' way. What it gave up is owed (`run.moduleLocks.owed`,
+ * and `released` with `reason: paused`): the engine takes the set again before anything goes on
+ * after the pause, waiting while another run holds part of it (engine.takePendingModules), so
+ * whoever answers the run is never refused for a lock. True when the record changed; a run that
+ * already holds nothing is left as it is, so a second call rewrites no date.
+ */
+export async function yieldForPause (run, { dir = null, clock = systemClock } = {}) {
+  const locks = run?.moduleLocks
+  if (!locks?.pool) return false
+  const given = (locks.held ?? []).map((h) => h.module)
+  if (!given.length && !locks.waiting) return false
+  await releaseModules({ pool: locks.pool, held: locks.held, dir })
+  await clearWait(locks.pool, run.runId, { dir }).catch(() => {})
+  locks.held = []
+  locks.waiting = null
+  delete locks.continuation
+  const owed = normalize([...given, ...(locks.owed ?? [])])
+  if (owed.length) {
+    locks.owed = owed
+    locks.released = { modules: owed, at: clock.iso(), reason: 'paused' }
+  }
   return true
 }
 
