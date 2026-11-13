@@ -2742,25 +2742,27 @@ The availability store lives beside the issues (`.availability.json`), is read
 before every start, fails closed when unreadable, and is cleared per model by an
 operator (`DELETE /api/availability/:model`).
 
-## Cost reporting and quota substitution
+## Cost reporting, and a quota that runs out
 
 `budgets.maxCostUsd` is advisory metadata. Reported costs and estimates never stop
 an individual run. Unknown prices remain explicit in `budgets.used.costUnknownSteps`.
 
-A confirmed provider quota failure invokes the service's replacement selector after
-failed-turn integrity verification. It considers verified models with at least the
-original context capacity, prefers another connection/account, excludes unavailable
-models and models used by other seats, and preflights each candidate. Coordinators
-retain their tool-free restrictions. Auth, runtime and integrity errors never trigger
-quota substitution.
+No model is ever put in a seat's place automatically. A confirmed provider quota
+failure records the model in the availability store (held until its reset, or an
+assumed half hour) and ends the run as `failed` with `failure.class: 'quota'`: the
+workspace, the sessions and every completed step are kept, and an operator's Resume
+continues it once the model answers again. What stops is what met the quota; the
+other seats' work is not redone. The top-level supervisor's own model is treated
+the same way: its activation stops and its runs go on (docs/top-level-supervisor.md
+"When the supervisor itself fails").
 
-The original resolved snapshot remains immutable. `modelOverrides` stores the exact
-replacement connection and effort; `modelSubstitutions` records the handoff and
-`modelFallbackChecks` retains preflight evidence and usage. The replacement starts
-with a fresh native session and the existing run context/worktree. Completed steps
-are not repeated. Exhaustion with no compatible available replacement ends the run
-with its evidence retained. The supervisor observes substitutions during monitoring
-and uses the same quota-triggered failover for its own model.
+A replacement used to be chosen by the service (another connection first, then by
+name), which once put the weakest model of the roster in an author's seat and in
+the supervisor's. The selector still exists as a mechanism (`runtime/model-fallback.mjs`,
+`engine.quotaFallback`, a playbook's `fallbackModels`, `run.modelOverrides` and
+`run.modelSubstitutions` on older records) but the server installs none. A seat
+is given another model only by a person, through `runOptions.participants` on a
+new run.
 
 ## The auditor's voice
 

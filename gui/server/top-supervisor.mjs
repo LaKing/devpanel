@@ -1,6 +1,5 @@
 import { issuesChanged, issuesPage, overviewFor, readResult, shapeResult } from './supervisor-payload.mjs'
 import { classifyFailure } from './runtime/failure.mjs'
-import { fallbackCandidates } from './runtime/model-fallback.mjs'
 import { writeAtomic } from './runtime/persistence.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -78,7 +77,7 @@ There is no activation time limit; owned runs end on their own budgets or when y
 A Triage start may be refused with code PREGATE_HOLD: the decision provider confidently judged the issue closable or lacking information. Its "pregate.proposals" say what an operator could confirm on the issue page. You cannot confirm them or start past the hold; tell the user, or choose other work.
 Routine monitoring events may be held rather than wake you. A live run's progress (phase, checks, a status between live statuses) never wakes you: it is merged per run, with progress:true, and rides with the next event that does. Other held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, capacity freeing, user messages and your own action results always wake you.
 A run-changed event's "changed" lists what moved since the last observation: status, phase, checks, blockedReason, reconcile (run.reconciliation is the latest reconcile that ended; its checks name the gate's reason and the directory get_check_log reads), landing (run.landed), delivery (run.delivery, its application or merge). A reconcile, landing or delivery always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead. A run read with reconcilePending true has an automatic reconcile undecided: it is not settled and you are not woken for it; do not land or reconcile it, the decision arrives as a run-changed event.
-Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. Actual provider quota failures trigger compatible-model substitution for coordinators and workers, preserving their run and completed work. Inspect run failures and modelSubstitutions; a failed substitution needs an available compatible model, not a budget increase. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. One live run per issue: several issues of one project may run at once, so concurrency can mean the same project. A start is refused (occupied, retryable) only beside a live in-place run, which holds the checkout, for a staging or deployment run beside another of its project, or for a coding run whose issue's modules another live run of its module pool holds (code MODULE_LOCKED, naming the holder; starts with disjoint modules run in parallel). Deliveries into one repository take turns on its delivery lock, and a remote test drive waits for a slot on its staging host; neither fails for waiting.`
+Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. A provider quota failure stops what met it, and no other model is ever substituted automatically: a run fails with failure.class quota and keeps its workspace, sessions and completed steps, the model is held as unavailable until its recorded reset, and the operator resumes the run once it answers again; your own activation stops the same way and leaves your runs running. Do not start a run on a seat model that is held unavailable, and never ask for a larger budget because of it. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. One live run per issue: several issues of one project may run at once, so concurrency can mean the same project. A start is refused (occupied, retryable) only beside a live in-place run, which holds the checkout, for a staging or deployment run beside another of its project, or for a coding run whose issue's modules another live run of its module pool holds (code MODULE_LOCKED, naming the holder; starts with disjoint modules run in parallel). Deliveries into one repository take turns on its delivery lock, and a remote test drive waits for a slot on its staging host; neither fails for waiting.`
 
 const SETTLE_INTERVAL_MS = 60_000
 // Each supervisor continue had bought rounds that repeated the last one (one
@@ -111,6 +110,11 @@ export function releaseAuthorization (state, previewId, preview) {
   return { refused: null, question: q }
 }
 
+/** The supervisor's own failures in a row (a reply it could not read, a call that failed) before the activation ends on its own account; between them it waits, doubling. */
+const MAX_OWN_FAILURES = 5
+const OWN_FAILURE_BASE_MS = Number(process.env.DEVPANEL_SUPERVISOR_RETRY_MS ?? 30_000)
+const OWN_FAILURE_MAX_MS = 600_000
+
 /** Consults one session may ask (the supervisor's own and the plain wording of reserved questions); a New session renews it. */
 const MAX_CONSULTS = 40
 
@@ -123,6 +127,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     state = { status: 'stopped', session: null, model: null, messages: [], queue: [], ownedRuns: [], previews: {}, calls: 0, starts: 0, costUsd: 0, unknownCostCalls: 0, history: emptyHistory() }
   }
   let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null
+  // The running activation is ending because of the supervisor itself, not on an operator's Stop (settleStop).
+  let ownEnding = false
   // Moved at each fork's start and end: a main call it overlapped cannot claim its own token delta.
   let forkMarks = 0
   const serial = (fn) => { const p = chain.then(fn); chain = p.catch(() => {}); return p }
@@ -624,6 +630,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     } catch (e) { monitoringFault('ready-queue', e.message) }
   }
   async function drive () {
+    let retryInMs = null
     try {
       // One wake is one durable event-processing chain: it opens when there is
       // something to process and closes when the queue drains. Its identity is on
@@ -635,7 +642,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         await save()
       }
       while (!controller.signal.aborted && state.queue.length) {
-        if (state.calls >= state.limits.maxCalls) { state.reason = 'Supervisor model-call limit reached'; controller.abort(); break }
+        if (state.calls >= state.limits.maxCalls) { state.reason = 'Supervisor model-call limit reached'; ownEnding = true; controller.abort(); break }
         if (spending.active && state.wake) {
           const verdict = admits({ policy: spending.policy, usage: ledger.usage(), subject: 'model-call', wakeCalls: ledger.wakeCalls(state.wake.id) })
           if (!verdict.ok) {
@@ -685,6 +692,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           } catch (error) {
             state.reason = `The spending ledger could not record this call, so it was not made: ${error.message}`
             message('system', state.reason)
+            ownEnding = true
             controller.abort()
             break
           }
@@ -732,21 +740,13 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             state.quotaFailures.push({ at: new Date().toISOString(), model: state.model.id, wakeId: state.wake?.id, evidence: classified.evidence })
             await ledger.settle({ id: invocationId, costUsd: spent?.costUsd ?? null })
             state.pending = null
-            const alternatives = await fallbackCandidates({ models: await models(), current: state.model,
-              excluded: state.quotaFailures.filter(f => f.wakeId === state.wake?.id).map(f => f.model), availability: tools.availability, coordinator: true })
-            if (alternatives.length) {
-              const replacement = alternatives[0]
-              state.sessionHistory ??= []
-              state.sessionHistory.push({ model: state.model.id, session: state.session, endedAt: new Date().toISOString(), reason: 'provider-quota' })
-              message('system', `Provider quota exhausted for ${state.model.id}. Continuing with ${replacement.id}; existing mission and completed work are retained.`)
-              state.model = replacement
-              state.session = null
-              state.queue.unshift(event)
-              state.status = 'active'
-              await save()
-              continue
-            }
-            message('system', 'Provider quota exhausted; no verified compatible supervisor model is currently available.')
+            // No other model is ever put in the supervisor's place automatically: a weaker
+            // one misreads the charter and the action format, and its mistakes are made
+            // with the supervisor's authority. The activation ends here, on its own
+            // account (its runs go on), and Start continues it once the model answers.
+            ownEnding = true
+            state.queue.unshift(event)
+            throw fail(`Provider quota exhausted for ${state.model.id}. No other model is substituted: the activation stops here, its runs go on, and Start continues it once the model is available again.`)
           }
           // The call's outcome is observed here, so its reservation is settled
           // here: a definite non-start is released; anything that ran is settled
@@ -766,6 +766,17 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             state.pending = null
           }
           if (e.name === 'AbortError' && e.termination) state.pending = null
+          // A call that failed on its own (not stopped by an operator, not out of quota) ended, and
+          // no action is taken from a reply that never arrived: the event goes back to the front
+          // of the queue and the activation goes on (drive's catch), instead of leaving a marker
+          // that only a New session could clear.
+          // Not a cancelled call, a runtime that could not start or a refused login: nothing
+          // would be different on a second try until a person changes something.
+          if (!controller.signal.aborted && !ownEnding && e.name !== 'AbortError' && !(e.kind === 'spawn-error' && e.started === false) && !['auth', 'environment'].includes(classified.class)) {
+            state.pending = null
+            state.queue.unshift(event)
+            e.carryOn = true
+          }
           // A failed/cancelled call may have changed session history. Retain the
           // invocation marker, rather than pretending it can safely be replayed.
           throw e
@@ -800,7 +811,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           assistantMessage.protocol = { valid: true, repairAttempt: event.type === 'protocol-repair' ? event.attempt : 0 }
         } catch (error) {
           assistantMessage.protocol = { valid: false, error: error.message }
-          if (event.type === 'protocol-repair') throw fail(`Supervisor format repair exhausted: ${error.message}; no action from the invalid replies was executed`)
+          if (event.type === 'protocol-repair') throw Object.assign(fail(`Supervisor format repair exhausted: ${error.message}; no action from the invalid replies was executed`), { carryOn: true })
           message('system', `Supervisor reply format needs repair: ${error.message}. No action from that reply was executed.`)
           state.queue.unshift({ type: 'protocol-repair', attempt: 1, error: error.message,
             instruction: 'Reformat your preceding reply as exactly one JSON object with message and action. No action from it has executed. Use the documented action arguments; do not add a second action.' })
@@ -823,12 +834,29 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           state.queue.unshift({ type: 'tool-result', action: answer.action, result })
           state.pending = null
         }
+        // A call that was read and acted on ends any streak of the supervisor's own failures.
+        state.ownFailures = 0
         state.status = 'active'; await save()
       }
     } catch (e) {
       state.reason = e.message
       message('system', e.message)
-      controller.abort()
+      const operatorStop = controller.signal.aborted
+      state.ownFailures = operatorStop ? 0 : (state.ownFailures ?? 0) + 1
+      // A reply the supervisor could not read, or a call that started and failed, does not end
+      // the activation (`carryOn`, set where the error is known for one of these): it stays
+      // active, tries what is queued again after a growing wait, and an operator's Stop ends
+      // it at any time. Everything else ends it as before, on its own account: an exhausted
+      // model (nothing is substituted), a runtime that cannot start, a cancelled call, an
+      // error before any call, an action left half done, or MAX_OWN_FAILURES in a row.
+      if (!operatorStop && !ownEnding && e.carryOn === true && state.pending?.kind !== 'action' && state.ownFailures < MAX_OWN_FAILURES) {
+        retryInMs = Math.min(OWN_FAILURE_BASE_MS * 2 ** (state.ownFailures - 1), OWN_FAILURE_MAX_MS)
+        message('system', `The activation goes on (failure ${state.ownFailures} in a row, it stops at ${MAX_OWN_FAILURES})${state.queue.length ? `; what is queued is tried again in ${Math.round(retryInMs / 1000)} s` : ''}. Stop ends it.`)
+      } else {
+        // Not an operator's Stop (that aborts the controller first): the supervisor's own ending, which leaves its runs alone.
+        if (!operatorStop) ownEnding = true
+        controller.abort()
+      }
     } finally {
       // The chain is over when there is nothing left to process. Closing the wake
       // here means the next event opens a new one with its own call allowance,
@@ -837,6 +865,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       if (controller.signal.aborted) await settleStop()
       else { state.status = 'active'; await save() }
       task = null
+      if (retryInMs != null && !controller.signal.aborted) setTimeout(() => { serial(async () => kick()).catch(() => {}) }, retryInMs).unref()
     }
   }
   /**
@@ -915,6 +944,17 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
 
   async function settleStop () {
     clearInterval(timer)
+    // An activation that ended on the supervisor's own account (its model failed or ran
+    // out, its replies could not be read, a limit of its own was reached) leaves its runs
+    // alone: they are healthy work under the run supervisor, and stopping them here once
+    // cancelled a run that was about to close. Only an operator's Stop stops runs.
+    if (ownEnding) {
+      state.status = state.pending ? 'recovery-required' : 'stopped'
+      state.finishing = false
+      message('system', 'The activation ended on the supervisor\'s own account; its runs were left as they are. Start continues it.')
+      await save()
+      return
+    }
     state.status = 'stopping'; await save()
     const errors = []
     for (const r of state.ownedRuns) {
@@ -1152,7 +1192,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       message('user',options.message)
       await fs.mkdir(path.join(dir,'workspace'),{recursive:true})
       state.observedIssues = Object.fromEntries(await Promise.all((await tools.projects()).map(async ({id:project})=>[project,JSON.stringify((await tools.listIssues(project)).map(i=>({id:i.id,status:i.status,name:i.name})))])))
-      controller = new AbortController(); await save()
+      controller = new AbortController(); ownEnding = false; await save()
       timer = setInterval(()=>serial(poll),pollMs);timer.unref()
       if (closing) controller.abort()
       else kick()
@@ -1310,6 +1350,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   }
   async function thisStop () {
     if (!['active','working','stopping'].includes(state.status)) return view()
+    ownEnding = false
     controller?.abort();state.status='stopping';await save()
     if (task) await task
     else await settleStop()

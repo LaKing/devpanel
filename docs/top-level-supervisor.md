@@ -440,6 +440,30 @@ not an ambiguous paid call. The pending turn is moved to failure history and the
 supervisor becomes stopped and retryable; no automatic retry is performed.
 
 
+### When the supervisor itself fails
+
+The supervisor's own trouble is never taken out on its runs. Three cases:
+
+- **Its model's quota runs out.** No other model is put in its place: a weaker one
+  misreads the charter and the action format, and makes its mistakes with the
+  supervisor's authority. The model is recorded as unavailable, the event that met
+  the quota stays queued, and the activation stops as `stopped` (never
+  `recovery-required`), so Start continues the same session once the model answers.
+- **A reply it could not read** (format repair exhausted) **or a call that started
+  and failed.** The activation does not end. It stays `active`, a failed call's
+  event goes back to the front of the queue and is tried again after a wait that
+  doubles from 30 seconds (10 minutes at most), and the first call that is read
+  and acted on ends the streak (`state.ownFailures`). Five failures in a row end
+  the activation.
+- **Anything a second try would not change:** a runtime that cannot start, a
+  refused login, a cancelled call, an error before any call, an action left half
+  done, a limit of its own (`maxCalls`). The activation ends, as before.
+
+In every one of these the activation ends, when it ends, **on its own account**:
+its runs are left exactly as they are, under the run supervisor, and finish, pause
+or fail by themselves. Only an operator's Stop stops the runs it owns, and Stop
+works at any time, during a wait between retries included.
+
 ### Consulting the panel before the operator
 
 The supervisor cannot read code. A technical doubt used to become an inquiry (a
@@ -1022,10 +1046,10 @@ session runaway and concurrency guards remain operational controls.
 
 Only an explicit `enforceAllowances: true` opts into the legacy calendar admission
 rules below. The live installation uses false. A real provider quota error instead
-records availability and tries verified compatible alternatives for the supervisor,
-coordinators and workers; participant substitutions require successful preflight,
-preserve completed work and start a fresh native session. Integrity quarantine
-still requires recovery.
+records availability and stops what met it: a run fails with its work kept, the
+supervisor's own activation stops and leaves its runs running, and nothing is
+substituted for either (below, "When the supervisor itself fails"). Integrity
+quarantine still requires recovery.
 
 With explicit allowance enforcement enabled, admission checks the ledger:
 

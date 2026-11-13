@@ -46,7 +46,7 @@ export default async function(t){
  const exhausted=await scenario(['bad','still bad'])
  t.eq('repair bounded to one extra attempt',exhausted.calls.length,2)
  t.eq('invalid replies execute nothing',exhausted.actions,[])
- t.eq('exhaustion reaches a stopped activation',exhausted.state.status,'stopped')
+ t.eq('exhaustion does not end the activation: it stays active for the next event, and Stop ends it',[exhausted.state.status,exhausted.state.ownFailures,/format repair exhausted/.test(exhausted.state.reason)],['active',1,true])
  t.ok('exhaustion explains why it stopped',exhausted.state.reason.includes('format repair exhausted'))
  const capped=await scenario(['bad'],1)
  t.eq('budget can prevent repair invocation',capped.calls.length,1)

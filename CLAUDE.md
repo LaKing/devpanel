@@ -479,6 +479,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   On `GET …/runs/:runId` as `metrics`, in the run summary,
   and totalled per group in `overview`; in `bySeat` the whole-run figures are a participation cohort and only
   `seat` is that seat's own turns and time. Compare groups of the same `configHash` before changing seats or models.
+- The supervisor's own trouble is never taken out on its runs (docs/top-level-supervisor.md "When the supervisor itself fails"): its model out
+  of quota stops the activation (`stopped`, nothing substituted, Start continues the session); a reply it could not read or a call that
+  started and failed leaves it `active` and is retried after a doubling wait (`state.ownFailures`, five in a row end it); whatever ends an
+  activation on its own account (`ownEnding`) leaves the owned runs as they are. Only an operator's Stop stops them.
 - The top-level supervisor is the **management plane**; coordinators and their agents are the execution plane.
   Its charter is fixed in the prompt and no message replaces it. Visibility is panel-wide and unconditional —
   `projects` is every project, a named one is checked for existence only, and `focus` merely orders attention.
@@ -674,7 +678,7 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
 - Runtime failures are classified (`runtime/failure.mjs`): `rate-limit`, `transient` and `output-limit` are retried after a
   bounded wait (`retryPolicy`, default 3 attempts, 30 s doubling, 10 min cap, provider retry-after honoured);
   `quota` records the model in the host-wide availability store (`issues/.availability.json`) and later starts
-  naming it are refused until the recorded reset (the Model availability page at `/models`, `GET/POST/DELETE
+  naming it are refused until the recorded reset, and nothing is ever substituted for it automatically: the run fails with its work kept and is resumed once the model answers (the Model availability page at `/models`, `GET/POST/DELETE
   /api/availability[/:model]`, shows every roster model's record and lets an operator clear or hold one); `auth`, `environment`, `refusal` (a provider refusing the turn's content, quoted verbatim; a person resumes once or changes the seat) and `runtime` fail the run with
   `run.failure` on record. Nothing is retried silently: every attempt is in `run.failures`.
 - Audit steps use strategy-owned templates (`audit-plan.md`, `audit-implementation.md`, `audit-draft.md`); the

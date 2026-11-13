@@ -23,11 +23,11 @@ playbook YAML, or in the start dialog. API overrides use
 optional seat. A required seat cannot be cleared. No auditors means **no independent
 audit**, explicitly recorded in closure and displayed in the issue page.
 
-A playbook may restrict automatic quota substitutions with `fallbackModels`, an
-allowlist of roster IDs captured in the run snapshot. An empty list disables
-substitution; omission preserves the normal verified-model fallback behavior.
-Availability, preflight and author/auditor independence still apply. This does not
-change the initially assigned seats or the top-level supervisor's model.
+A seat's model is never replaced automatically: when its provider's quota runs out
+the run stops with its work kept and is resumed once the model answers again
+(execution-contract.md "Cost reporting, and a quota that runs out"). A playbook's
+`fallbackModels`, an allowlist of roster IDs captured in the run snapshot, is still
+validated and recorded, but the server installs no selector that would read it.
 
 Implementation, Plan and implement, and Refactoring default to `apply-to-source`.
 Starting one authorizes engine-owned application at the destination shown in

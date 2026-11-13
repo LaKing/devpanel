@@ -40,7 +40,6 @@ import { readChat, coordinatorRole, instructionRefusal, chatView, recordInstruct
 import { captureIntegrity, integrityChanges, readIntegrity } from './runtime/integrity.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
 import { inspectSourceRepository, repositoryFaultError, usesSourceRepository } from './runtime/source-repository.mjs'
-import { createQuotaFallback } from './runtime/model-fallback.mjs'
 import { resolvePlaybook, loadConfig } from './config/load.mjs'
 import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
@@ -644,7 +643,8 @@ export function createSupervisor ({
     if (failureAdvisor) engine.failureAdvisor = failureAdvisor
     if (consult) engine.consult = consult
     armAutoReconcile(engine, record.project)
-    engine.quotaFallback = createQuotaFallback({ loadModels: async () => [...(await loadConfig({ root: configRoot })).roster.values()], availability, probeFor, root: configRoot })
+    // No quota fallback is installed (engine.quotaFallback stays unset): a seat whose model is exhausted stops its run,
+    // which keeps its work and is resumed once the model answers. A weaker model is never put in a seat automatically.
     record.engine = engine
     record.phase = 'run'
     // A stop that arrived during preflight still applies: the engine inherits it.
