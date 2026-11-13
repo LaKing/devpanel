@@ -1,0 +1,15 @@
+id: fable-5-2
+title: Claude Fable 5.2
+harness: claude
+model: claude-fable-5-2
+efforts: [low, medium, high, xhigh, max]
+defaultEffort: medium   # the consult panel's level; a higher one is chosen per seat
+contextWindow: 1000000
+verification:
+  status: verified
+  verifiedAt: ~
+  method: ~
+notes: >
+  The tier above Opus. Thinking is always on and cannot be disabled; depth is
+  controlled by effort alone. Long turns are expected, so wall-clock budgets
+  matter more than step counts when this is the author.
