@@ -63,6 +63,24 @@ export default async function (t) {
     await wait(() => sent.length === 2 && agent.get().pending === null)
     t.ok('a real change is written as before', (await fs.stat(stateFile)).ino !== before.ino)
     await agent.stop()
+    await agent.shutdown()
+
+    t.section('a poll slower than its interval does not pile up: an operator action waits for one poll at most')
+    // Each poll takes 150 ms against a 20 ms interval. Queued without limit, a second of idling leaves some fifty polls
+    // (over seven seconds) in front of whatever the operator does next.
+    let polls = 0
+    const slow = { ...tools, listIssues: async () => { polls++; await new Promise((r) => setTimeout(r, 150)); return [{ id: 'issue' }] } }
+    agent = await createTopSupervisor({ dir, models, adapter, tools: slow, pollMs: 20 })
+    await agent.start({ model: 'test-model', projects: ['one-project'], message: 'Again', limits: { maxCalls: 10 } })
+    await wait(() => agent.get().status === 'active' && agent.get().pending === null && polls > 0)
+    await new Promise((r) => setTimeout(r, 1000))
+    const pollsInASecond = polls
+    const asked = Date.now()
+    await agent.chat('Operator note')
+    const waited = Date.now() - asked
+    t.ok('the polls of an idle second ran one after another, none queued behind another', pollsInASecond <= 9, `${pollsInASecond} polls`)
+    t.ok('and the operator\'s message was taken within about one poll', waited < 600, `${waited} ms`)
+    await agent.stop()
   } finally {
     await agent?.shutdown?.().catch(() => {})
     await fs.rm(dir, { recursive: true, force: true })

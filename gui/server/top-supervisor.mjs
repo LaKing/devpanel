@@ -129,7 +129,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     if (e.code !== 'ENOENT') throw e
     state = { status: 'stopped', session: null, model: null, messages: [], queue: [], ownedRuns: [], previews: {}, calls: 0, starts: 0, costUsd: 0, unknownCostCalls: 0, history: emptyHistory() }
   }
-  let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null
+  let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null, pollPending = false
   // The running activation is ending because of the supervisor itself, not on an operator's Stop (settleStop).
   let ownEnding = false
   // Moved at each fork's start and end: a main call it overlapped cannot claim its own token delta.
@@ -1234,7 +1234,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       await fs.mkdir(path.join(dir,'workspace'),{recursive:true})
       state.observedIssues = Object.fromEntries(await Promise.all((await tools.projects()).map(async ({id:project})=>[project,JSON.stringify((await tools.listIssues(project)).map(i=>({id:i.id,status:i.status,name:i.name})))])))
       controller = new AbortController(); ownEnding = false; await save()
-      timer = setInterval(()=>serial(poll),pollMs);timer.unref()
+      // One poll queued or running at a time: a tick that finds one pending is skipped. Queued behind a slow poll
+      // they used to pile up in the serial chain, and every operator action (chat, answer, stop) waited behind them all.
+      timer = setInterval(()=>{if(pollPending)return;pollPending=true;serial(poll).catch(()=>{}).finally(()=>{pollPending=false})},pollMs);timer.unref()
       if (closing) controller.abort()
       else kick()
       return view()

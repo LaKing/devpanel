@@ -372,7 +372,9 @@ usage. What each call was sent is kept beside the state, not in it:
 `promptBytes`. A prompt holds the whole panel (infrastructure, models, playbooks), so
 a few hundred of them inside `state.json` made it tens of megabytes, serialised and
 rewritten at every save and cloned for every reader. A state written that way is
-converted once, at load; prompt files older than 14 days are removed.
+converted once, at load; prompt files older than 14 days are removed. The poll
+itself is never queued twice: a tick that finds a poll queued or running is skipped, so
+an operator action (a message, an answer, Stop) waits behind one poll at most.
 Replies may contain a single JSON response object surrounded by prose or a code
 fence. Its envelope and action arguments are validated before execution; multiple
 JSON values are rejected as ambiguous. An invalid reply gets one formatting-repair
