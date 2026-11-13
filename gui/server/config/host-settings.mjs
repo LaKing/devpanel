@@ -61,12 +61,14 @@ function parse (file) {
 }
 
 const cache = new Map()
+/** Per settings file, what this process last read valid from it. */
+const lastValid = new Map()
 
 const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
 
 /**
  * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, fullVerification, projectDiscovery, proxyLogin, projectActions,
- * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance}, defaults filled in. Read at call time and
+ * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance, operatorLanguage}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
 export function hostSettings ({ root = DEFAULT_CONFIG_ROOT, env = process.env, hostDir = hostConfigDir({ root, env }) } = {}) {
@@ -84,7 +86,27 @@ export function hostSettings ({ root = DEFAULT_CONFIG_ROOT, env = process.env, h
   const data = bootDataRoot(env)
   const impliedDataRoot = !env[HOST_CONFIG_ENV] && data && hostDir === path.join(data, 'host-config') ? data : null
   const cacheKey = `${key}\0${impliedDataRoot}`
-  if (!cache.has(cacheKey)) cache.set(cacheKey, resolve(file ? parse(file) : {}, { root, file, pending, impliedDataRoot }))
+  if (!cache.has(cacheKey)) {
+    let data
+    try { data = file ? parse(file) : {} } catch (error) {
+      // An edit that makes the file invalid must not stop a running panel: every
+      // request, seat fence and run ending reads these settings, and the schema
+      // in force is the one this process compiled at its start, so even a key a
+      // newer checkout knows is "invalid" here until the restart. What was last
+      // read valid stays in force, said once per edit; a process that never read
+      // a valid file still refuses to start on an invalid one.
+      const held = lastValid.get(`${file}\0${impliedDataRoot}`)
+      if (!held) throw error
+      if (held.warned !== key) {
+        held.warned = key
+        console.warn(`[devpanel] ${error.message}; the settings last read valid (${held.at}) stay in force until the file is corrected or the service restarted`)
+      }
+      return { ...held.settings, stale: { error: error.message, since: held.at } }
+    }
+    const settings = resolve(data, { root, file, pending, impliedDataRoot })
+    cache.set(cacheKey, settings)
+    if (file) lastValid.set(`${file}\0${impliedDataRoot}`, { settings, at: new Date().toISOString(), warned: null })
+  }
   return cache.get(cacheKey)
 }
 
@@ -111,6 +133,7 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     fence: { readOnly: (data.fence?.readOnly ?? []).map(expandHome) },
     skill: { linkBaseVariable: data.skill?.linkBaseVariable ?? null },
     reporter: { panelUrl: data.reporter?.panelUrl ?? null },
-    seatGuidance: { projects: data.seatGuidance?.projects ?? [] }
+    seatGuidance: { projects: data.seatGuidance?.projects ?? [] },
+    operatorLanguage: data.operatorLanguage ?? 'en'
   }
 }

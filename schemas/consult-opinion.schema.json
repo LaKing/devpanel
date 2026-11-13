@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "consult-opinion.schema.json",
+  "title": "Consult opinion",
+  "description": "One consult seat's answer to one question (docs/consult.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reasoning", "confidence", "ownerBrief"],
+  "properties": {
+    "verdict": { "enum": ["answer", "owner"] },
+    "choice": { "type": "string", "minLength": 1 },
+    "answer": { "type": "string", "minLength": 1 },
+    "conditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "reasoning": { "type": "string", "minLength": 1 },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["location", "observation"],
+        "properties": { "location": { "type": "string", "minLength": 1 }, "observation": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "confidence": { "enum": ["high", "medium", "low"] },
+    "ownerReason": { "enum": ["production-deployment", "irreversible-data-loss", "spending", "agreed-rule-change", "product-intent"] },
+    "ownerBrief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "why", "options", "recommendation"],
+      "properties": {
+        "question": { "type": "string", "minLength": 1 },
+        "why": { "type": "string", "minLength": 1 },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["label", "consequence"],
+            "properties": { "label": { "type": "string", "minLength": 1 }, "consequence": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "recommendation": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "verdict": { "const": "answer" } } }, "then": { "required": ["choice", "answer", "evidence"], "properties": { "evidence": { "minItems": 1 } } } },
+    { "if": { "properties": { "verdict": { "const": "owner" } } }, "then": { "required": ["ownerReason"] } }
+  ]
+}

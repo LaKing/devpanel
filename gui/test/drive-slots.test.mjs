@@ -159,8 +159,11 @@ export default async function (t) {
       t.eq('and then runs', (await Promise.all([a, b])).map((r) => r.result), ['passed', 'passed'])
 
       await new Promise((resolve) => setTimeout(resolve, 20))
-      await fs.writeFile(path.join(dir, 'settings.json'), JSON.stringify({ testDrive: { maxConcurrentDrives: 0 } }))
-      t.ok('a cap of 0 is refused', (() => { try { hostSettings(); return false } catch (error) { return /maxConcurrentDrives|>= 1/.test(error.message) } })())
+      // In a directory nothing was read from yet: under a running process an edit that makes the file invalid keeps the last valid settings.
+      const zero = path.join(dir, 'cap-zero')
+      await fs.mkdir(zero, { recursive: true })
+      await fs.writeFile(path.join(zero, 'settings.json'), JSON.stringify({ testDrive: { maxConcurrentDrives: 0 } }))
+      t.ok('a cap of 0 is refused', (() => { try { hostSettings({ hostDir: zero }); return false } catch (error) { return /maxConcurrentDrives|>= 1/.test(error.message) } })())
       process.env.DEVPANEL_HOST_CONFIG_DIR = saved.host
     }
 

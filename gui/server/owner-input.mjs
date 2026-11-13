@@ -92,7 +92,8 @@ export function createOwnerInput ({ issues, supervisor, configRoot }) {
         evidence: `Triage of run ${runId} judged the issue too large for one run; ${by} accepted the proposed split into ${record.createdIssues.length} issues.`
       })
     } else {
-      const lines = [`# Answers from the owner`, '', `Triage of run \`${runId}\` asked before starting work; ${by} answered.`, '']
+      // The consult panel answers through this same path (consult/owner-questions.mjs); the note says who did.
+      const lines = [by.startsWith('consult panel') ? '# Answers from the consult panel' : '# Answers from the owner', '', `Triage of run \`${runId}\` asked before starting work; ${by} answered.`, '']
       if (record.split === 'decline') {
         lines.push('The owner **declined** the proposed split: do the issue as one run. Do not propose the split again.', '')
       } else {

@@ -1,4 +1,5 @@
 <script setup>
+import QuestionBrief from '@/components/QuestionBrief.vue'
 import { computed, reactive, ref, watch } from 'vue'
 
 import { api } from '@/api'
@@ -66,6 +67,8 @@ async function send (choice = null) {
           <strong>{{ q.id }}.</strong> {{ q.question }}
           <v-chip size="x-small" variant="tonal" class="ml-1">{{ CATEGORY[q.category] ?? q.category }}</v-chip>
         </div>
+        <!-- Asked of the consult panel first, which did not settle it: its wording for a person. -->
+        <QuestionBrief v-if="q.brief" :brief="q.brief" :consult="q.consult" @choose="answers[q.id] = $event" />
         <div v-if="q.recommendation" class="owner__rec">
           Recommended: {{ q.recommendation }}
           <v-btn size="x-small" variant="text" color="primary" @click="answers[q.id] = q.options?.length ? q.options[0] : `Agreed: ${q.recommendation}`">Use this</v-btn>

@@ -3344,8 +3344,12 @@ export class Engine {
     // `request` is what the asker wants done, when the ask is for work rather
     // than for a decision: the reason, and the project action that would do it.
     this.run.pause = { id: uuid(), key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, kind: next.decisionKind, ...(next.request ? { request: next.request } : {}),
-      ...(next.cycleId ? { cycleId: next.cycleId, manualPending: Boolean(next.manualPending) } : {}), at: this.clock.iso() }
-    await this.persist({ type: 'paused', pauseId: this.run.pause.id, key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, ...(next.request ? { request: next.request } : {}) })
+      ...(next.cycleId ? { cycleId: next.cycleId, manualPending: Boolean(next.manualPending) } : {}),
+      // What the consult panel said before a person was asked, and its question for them (consultFirst).
+      ...(next.consult ? { consult: next.consult } : {}), ...(next.brief ? { brief: next.brief } : {}),
+      at: next.at ?? this.clock.iso() }
+    await this.persist({ type: 'paused', pauseId: this.run.pause.id, key: next.key, question: next.question, options: next.options, askedBy: next.askedBy, ...(next.request ? { request: next.request } : {}),
+      ...(next.consult ? { consult: next.consult.outcome } : {}) })
   }
 
   /**
@@ -3583,9 +3587,30 @@ export class Engine {
     const answer = text.trim()
     const ask = this.run.pause
     if (ask.options && !ask.options.includes(answer)) throw Object.assign(new Error(`the answer must be exactly one of: ${ask.options.join(', ')}`), { status: 422 })
-    const decision = { pauseId: ask.id, key: ask.key, question: ask.question, options: ask.options, ...(ask.request ? { request: ask.request } : {}), answer, actor: actor.trim(), askedBy: ask.askedBy, askedAt: ask.at, at: this.clock.iso() }
-    const invocationId = `decision-${uuid()}`
-    const response = `# Operator decision${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}Recorded by ${decision.actor} at ${decision.at}.${NL}`
+    const { decision, created } = await this.recordDecision(ask, { answer, actor: actor.trim() })
+    this.run.pause = null
+    this.run.status = 'pending'
+    await this.persist({ type: 'decision', number: created.number, key: decision.key, answer, actor: decision.actor })
+    return decision
+  }
+
+  /**
+   * The decision step of an answered question: on disk beside the agents' steps,
+   * attributed, and replayed like any other. One recorder for a person's answer
+   * (`answer`) and the consult panel's (`consultFirst`), so replay, `decisions`
+   * and the closing of an owner hold read both the same way. `ask` has the
+   * shape of `run.pause`; the waiting time is excused from the wall clock. The
+   * panel's decision gets a stable `invocationId`: a crash between the step's
+   * creation and the run's next write makes replay record the same step again,
+   * not a second one.
+   */
+  async recordDecision (ask, { answer, actor, consult = null, invocationId = `decision-${uuid()}`, waitedMs = null }) {
+    const decision = { pauseId: ask.id, key: ask.key, question: ask.question, options: ask.options ?? null, ...(ask.request ? { request: ask.request } : {}), answer, actor, askedBy: ask.askedBy, askedAt: ask.at, at: this.clock.iso(),
+      ...(consult ? { consult } : {}) }
+    const opinions = (consult?.opinions ?? []).map((o) => `### ${o.seat} (${o.model}${o.effort ? ` @ ${o.effort}` : ''})${NL}${NL}${o.error ? `No opinion: ${o.error.message}` : `**${o.verdict}** ${o.choice ?? ''}, confidence ${o.confidence}. ${o.answer ?? ''}${NL}${NL}${o.reasoning ?? ''}${NL}${(o.evidence ?? []).map((e) => `- \`${e.location}\`: ${e.observation}`).join(NL)}`}`).join(NL + NL)
+    const response = consult
+      ? `# Decision by the consult panel${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}${consult.outcome === 'resolved' ? 'Both consultants chose this answer independently' : 'The consultants did not agree; this step records what each said'} (consult ${consult.id}, recorded ${decision.at}).${NL}${NL}${opinions}${NL}`
+      : `# Operator decision${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}Recorded by ${decision.actor} at ${decision.at}.${NL}`
     const created = await this.stepStore.create({ name: 'decision', response, invocationId })
     if (!this.run.steps.some((s) => s.invocationId === invocationId)) {
       this.run.steps.push({
@@ -3593,11 +3618,129 @@ export class Engine {
         invocationId, startedAt: ask.at, endedAt: decision.at, durationMs: null, durationUnknown: null, revision: null, outputRef: null, usage: null, response, decision
       })
     }
-    this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + Math.max(0, this.clock.now() - Date.parse(ask.at))
-    this.run.pause = null
-    this.run.status = 'pending'
-    await this.persist({ type: 'decision', number: created.number, key: decision.key, answer, actor: decision.actor })
-    return decision
+    // A consult's time was credited as it ran (consultFirst), so it passes 0 here.
+    this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + (waitedMs ?? Math.max(0, this.clock.now() - Date.parse(ask.at)))
+    return { decision, created }
+  }
+
+  /**
+   * A question for a person goes to the consult panel first (docs/consult.md,
+   * execution-contract.md "The consult panel answers first").
+   *
+   * `answered`: both consultants chose the same answer; it is recorded as the
+   * decision and the run goes on. `ask`: a person must be asked, and `ask` now
+   * carries what the panel said (`consult`) and the question written for a
+   * person (`brief`). `stopped`: the run was stopped while the panel worked.
+   *
+   * The outcome is the panel's rule, never a coordinator's reading: nothing a
+   * coordinator writes turns an escalation into an answer. A `technical`
+   * request never waits for a person, so whatever the panel said is recorded
+   * as the decision and the coordinator weighs it.
+   */
+  async consultFirst (ask, { category = null } = {}) {
+    const technical = category === 'technical'
+    // A work order for the live checkout is not a question; a closed question
+    // (continue/stop) takes one of its options, which no opinion is.
+    if (category === 'live-checkout' || ask.options?.length) return 'ask'
+    if (!this.consult) return technical ? this.technicalUnasked(ask, 'no consult panel is available to this run') : 'ask'
+    const runDir = store.runDir(this.issuePath, this.runId)
+    const base = {
+      key: ask.key, question: ask.question, reason: ask.request?.reason ?? null, recommendation: ask.request?.recommendation ?? null,
+      category: ask.request?.holdCategory ?? category, askedBy: ask.askedBy, project: this.run.issue.project, issueDir: this.issuePath,
+      worktree: this.run.workspace?.state === 'removed' || this.run.workspace?.isolation === 'in-place' ? null : this.run.workspace?.path ?? null
+    }
+    // What this run already asked is read before today's configuration: a replay
+    // after a crash must find the recorded answer whether or not the panel has
+    // been switched off or its categories changed since. `run.consulting` names
+    // a consult that was cut short, with the mode it was started in.
+    const cut = this.run.consulting?.key === ask.key ? this.run.consulting : null
+    let mode = cut?.mode ?? null
+    let result = null
+    for (const m of mode ? [mode] : ['decide', 'brief']) {
+      result = await this.consult.recorded({ ...base, mode: m }, { callerDir: runDir })
+      if (result) { mode = m; break }
+    }
+    if (!result) {
+      const panel = await this.consult.panel().catch(() => null)
+      const asked = Object.values(this.run.consults ?? {})
+      const refusal = !panel?.enabled ? 'the consult panel is not configured or is switched off'
+        : asked.length >= panel.maxPerRun || (technical && asked.filter((c) => c.category === 'technical').length >= panel.maxTechnicalPerRun)
+          ? `this run has used its consults (${asked.length} of ${panel.maxPerRun}, technical at most ${panel.maxTechnicalPerRun})` : null
+      if (refusal) {
+        if (cut) { this.run.consulting = null; await this.persist({ type: 'consult-dropped', key: ask.key, reason: refusal }) }
+        return technical ? this.technicalUnasked(ask, refusal) : 'ask'
+      }
+      mode ??= (panel.alwaysHuman ?? []).includes(category) ? 'brief' : 'decide'
+      // The time the panel takes is excused from the wall clock like a wait for a
+      // person, credited per stretch it actually ran: a stop in the middle is
+      // suspended time of its own and must not be counted twice.
+      const stretch = this.clock.now()
+      const credit = () => { this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + Math.max(0, this.clock.now() - stretch) }
+      this.run.status = 'running'
+      this.run.consulting = { key: ask.key, mode, startedAt: cut?.startedAt ?? ask.at }
+      await this.persist({ type: 'consulting', key: ask.key, mode })
+      try {
+        result = await this.consult.consult({ ...base, mode }, { callerDir: runDir, signal: this.controller.signal })
+        credit()
+      } catch (error) {
+        credit()
+        if (error.name !== 'AbortError' && !this.controller.signal.aborted) {
+          // The panel is advice: a fault in it never fails the run, the question goes to a person.
+          this.run.consulting = null
+          await this.persist({ type: 'consult-failed', key: ask.key, error: String(error.message).slice(0, 400) })
+          return technical ? this.technicalUnasked(ask, `the consult failed: ${error.message}`) : 'ask'
+        }
+        // The marker stays: the consult goes on from its record when the run is resumed.
+        await this.settleAbort()
+        return 'stopped'
+      }
+    }
+    // The decision step spans the question from when it was first raised.
+    if (this.run.consulting?.key === ask.key) ask.at = this.run.consulting.startedAt
+    this.run.consulting = null
+    this.run.consults ??= {}
+    this.run.consults[result.id] = { key: ask.key, category, mode, outcome: result.outcome, reason: result.reason ?? null, rounds: result.rounds, costUsd: result.costUsd ?? null, costUnknown: Boolean(result.costUnknown), durationMs: result.durationMs, at: result.recordedAt ?? this.clock.iso() }
+    const seats = result.opinions.filter((o, i, all) => all.findLast((x) => x.seat === o.seat) === o)
+    const actor = `consult panel (${seats.map((o) => `${o.model}${o.effort ? `@${o.effort}` : ''}`).join(' + ')})`
+    const consult = { id: result.id, outcome: result.outcome, choice: result.choice ?? null, conditions: result.conditions ?? [], reason: result.reason ?? null, opinions: seats }
+    const invocationId = `decision-consult-${result.id}`
+    if (result.outcome === 'resolved') {
+      const { decision, created } = await this.recordDecision(ask, { answer: result.answerText, actor, consult, invocationId, waitedMs: 0 })
+      await this.persist({ type: 'decision', number: created.number, key: decision.key, answer: decision.answer, actor, consult: result.id })
+      return 'answered'
+    }
+    if (technical) {
+      const said = seats.map((o) => (o.error ? `${o.seat}: no opinion (${o.error.message})` : `${o.seat} (${o.confidence}): ${o.answer ?? o.reasoning}${o.conditions?.length ? ` Conditions: ${o.conditions.join('; ')}` : ''}`)).join(NL)
+      const answer = `The consult panel did not settle this (${result.reason ?? result.outcome}).${NL}${said}${NL}Decide it yourself from these and record the choice in assumptions, naming what you weighed; if it cannot be decided without the owner, raise an owner-gate request with this question.`
+      const { decision, created } = await this.recordDecision(ask, { answer, actor, consult, invocationId, waitedMs: 0 })
+      await this.persist({ type: 'decision', number: created.number, key: decision.key, answer: decision.answer, actor, consult: result.id })
+      return 'answered'
+    }
+    ask.consult = { id: result.id, outcome: result.outcome, reason: result.reason ?? null, positions: result.brief?.positions ?? seats.map((o) => ({ seat: o.seat, verdict: o.verdict ?? null, choice: o.choice ?? null, answer: o.answer ?? null, confidence: o.confidence ?? null })) }
+    if (result.brief) ask.brief = result.brief
+    // The wait for a person starts now; the panel's time is already credited.
+    ask.at = this.clock.iso()
+    return 'ask'
+  }
+
+  /** A technical question the panel could not be asked: the coordinator is told, and decides as before. */
+  async technicalUnasked (ask, why) {
+    const { decision, created } = await this.recordDecision(ask, { answer: `The consult panel was not asked: ${why}. Decide it yourself and record the choice in assumptions.`, actor: 'engine',
+      invocationId: `decision-unasked-${crypto.createHash('sha256').update(ask.key).digest('hex').slice(0, 16)}`, waitedMs: 0 })
+    await this.persist({ type: 'decision', number: created.number, key: decision.key, answer: decision.answer, actor: 'engine' })
+    return 'answered'
+  }
+
+  /** Stopped with nothing in flight: the run settles without waiting for a process to die. */
+  async settleAbort () {
+    if (this.run.status === 'cancelled') return
+    this.invocationStoppedAt = this.clock.now()
+    if (await this.pauseForShutdown({ between: 'turns' })) return
+    this.run.status = 'cancelled'
+    this.run.outcome = 'unresolved'
+    this.run.endedAt = this.clock.iso()
+    if (this.abortReason === SERVICE_SHUTDOWN) this.run.stoppedBy = SERVICE_SHUTDOWN
+    await this.persist({ type: 'cancelled', between: 'turns', stoppedBy: this.run.stoppedBy })
   }
 
   /**
@@ -4028,15 +4171,7 @@ export class Engine {
       if (this.controller.signal.aborted) {
         // Aborted between turns: nothing is in flight, so termination is already
         // true and the run settles without waiting for a process to die.
-        if (this.run.status !== 'cancelled') {
-          this.invocationStoppedAt = this.clock.now()
-          if (await this.pauseForShutdown({ between: 'turns' })) break
-          this.run.status = 'cancelled'
-          this.run.outcome = 'unresolved'
-          this.run.endedAt = this.clock.iso()
-          if (this.abortReason === SERVICE_SHUTDOWN) this.run.stoppedBy = SERVICE_SHUTDOWN
-          await this.persist({ type: 'cancelled', between: 'turns', stoppedBy: this.run.stoppedBy })
-        }
+        await this.settleAbort()
         break
       }
 
@@ -4123,7 +4258,7 @@ export class Engine {
       // past it, and nothing the coordinator wrote is read here.
       const hold = holdGatesTurn(this.snapshot, next) ? openOwnerHolds(this.run.steps, this.outputs)[0] : null
       if (hold) {
-        await this.pauseForOwnerHold(hold, next)
+        if (await this.pauseForOwnerHold(hold, next) === 'answered') continue
         break
       }
 
@@ -4372,14 +4507,19 @@ export class Engine {
       this.run.operatorRequests ??= {}
       if (decisionsOf(this.run.steps).some(d => d.key === `operator-request:${s.number}` && d.step > s.number)) continue
       this.run.operatorRequests[s.number] = { at: this.clock.iso(), ...request }
-      await this.pauseFor({
+      const ask = {
+        id: uuid(), at: this.clock.iso(),
         key: `operator-request:${s.number}`,
         question: request.question,
         options: null,
         askedBy: { phase: s.phase ?? null, stepId: s.stepId ?? null, step: s.number, role: 'coordinator' },
         decisionKind: 'operator-request',
         request: { reason: request.reason, projectAction: request.projectAction ?? null, category: request.category ?? null, recommendation: request.recommendation ?? null }
-      })
+      }
+      // The panel first: an answer it gives is this request's decision, and the next request is looked at.
+      const outcome = await this.consultFirst(ask, { category: request.category ?? null })
+      if (outcome === 'answered') continue
+      if (outcome === 'ask') await this.pauseFor(ask)
       return false
     }
     return true
@@ -4395,9 +4535,10 @@ export class Engine {
     await this.persist({ type: 'owner-holds', open: holds.filter((h) => !h.answeredByStep).map((h) => h.identity) })
   }
 
-  /** One question per pause, verbatim: the answer closes the hold by that wording. */
+  /** One question at a time, verbatim: the answer closes the hold by that wording. Returns consultFirst's outcome. */
   async pauseForOwnerHold (hold, next) {
-    await this.pauseFor({
+    const ask = {
+      id: uuid(), at: this.clock.iso(),
       key: ownerHoldKey(hold),
       question: hold.question,
       options: null,
@@ -4405,7 +4546,11 @@ export class Engine {
       askedBy: { phase: next.phase.id, stepId: hold.stepId, step: hold.latestStep, role: hold.role },
       decisionKind: 'owner-hold',
       request: { reason: hold.reason, projectAction: null, category: 'owner-gate', holdCategory: hold.category, recommendation: hold.recommendation }
-    })
+    }
+    // The panel first (consultFirst): its answer closes the hold exactly as the owner's would.
+    const outcome = await this.consultFirst(ask, { category: hold.category })
+    if (outcome === 'ask') await this.pauseFor(ask)
+    return outcome
   }
 
   /** Which budget, if any, is spent. Steps are not the only way a run runs away. */

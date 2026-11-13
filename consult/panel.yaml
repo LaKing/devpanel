@@ -1,0 +1,20 @@
+# The consult panel (docs/consult.md): two senior seats that read everything
+# read-only and answer a question before it reaches a person. Not seats of any
+# run. A file of the same name under host-config/consult/ replaces this one.
+enabled: true
+seats:
+  consultant-1:
+    model: fable-5-2
+    effort: medium
+  consultant-2:
+    model: gpt-6-astra
+    effort: medium
+maxRounds: 2            # a second round shows each seat the other's opinion, once
+turnTimeoutMinutes: 20
+maxTurnCostUsd: 5       # reserved on the spending ledger per seat turn
+maxPerRun: 6            # consults one run may ask; past it a question goes to a person as before
+maxTechnicalPerRun: 3
+alwaysHuman:            # question categories the panel never decides: it only writes the plain question
+  - authorization
+readOnly: []            # further absolute paths every consult may read (log directories, say)
+deny: []                # absolute paths shown empty even inside a readable directory

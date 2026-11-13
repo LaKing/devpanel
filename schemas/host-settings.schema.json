@@ -182,6 +182,11 @@
         }
       }
     },
+    "operatorLanguage": {
+      "type": "string",
+      "pattern": "^[a-z]{2}$",
+      "description": "The language a question to the operator is written in when the consult panel writes it (consult/prompt.mjs): an ISO 639-1 code, default en. Records, prompts and answers stay English."
+    },
     "seatGuidance": {
       "type": "object",
       "additionalProperties": false,

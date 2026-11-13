@@ -533,6 +533,21 @@ function withIgnoredSelftests (run, standing) {
  * reads the pause sees what was decided before: the same question asked again
  * says so, and earlier answers are named, the last three, newest last.
  */
+/** The consult panel's question for a person (pause.brief, a triage question's brief), as text. */
+export function briefWords (brief) {
+  if (!brief?.question) return null
+  return [brief.question, brief.why ? `Why it matters: ${brief.why}` : null,
+    brief.options?.length ? ['Options:', ...brief.options.map((o) => `- ${o.label}: ${o.consequence}`)].join('\n') : null,
+    brief.recommendation ? `Recommended: ${brief.recommendation}` : null].filter(Boolean).join('\n\n')
+}
+
+/** What the consult panel did before a person was asked (pause.consult). */
+function panelWords (consult) {
+  if (!consult) return null
+  if (consult.outcome === 'escalated') return `Two senior models were asked first and did not settle it${consult.reason ? ` (${consult.reason})` : ''}; what each said is with the question.`
+  return `The consult panel could not be asked first${consult.reason ? `: ${consult.reason}` : ''}.`
+}
+
 function answeredWords (run) {
   const answers = (run.steps ?? []).filter((s) => s.role === 'operator' && s.decision)
   if (!answers.length) return null
@@ -573,6 +588,11 @@ function standingOf (run, { outputs, active, ownership }) {
     case 'preflighting':
       return { tone: 'progress', headline: 'Starting', detail: 'Checking that the AI tools are installed and signed in before the first turn.' }
     case 'running': {
+      if (run.consulting) {
+        return { tone: 'progress', headline: 'Two senior models are answering a question of this run',
+          detail: 'A question that would have gone to a person is with the consult panel first: two models read the code and the run\'s record and answer independently.',
+          next: 'If they agree the run goes on with their answer; otherwise the question comes to you in plain words.' }
+      }
       const working = active.map((a) => ROLE(a.role))
       const doing = working.length ? `${Cap(working.join(' and '))} ${working.length === 1 ? 'is' : 'are'} working.` : 'Between turns.'
       // After a delivery return the author is reconciling a conflict with the project; the later of the two returns is what the run is doing.
@@ -600,8 +620,10 @@ function standingOf (run, { outputs, active, ownership }) {
       if (p.request) {
         // The question is what to answer; the reason is why the run cannot do it.
         const heading = { 'owner-gate': 'Waiting for you: this decision is yours', authorization: 'Waiting for you: this needs your authorization', 'requirement-conflict': "Waiting for you: the requirements can't all be met" }[p.request.category] ?? 'Waiting for you: work the run may not do itself'
-        return { tone: 'waiting', headline: heading,
-          detail: [p.question, p.request.reason, p.request.recommendation ? `Recommended: ${p.request.recommendation}` : null, answered].filter(Boolean).join('\n\n') || null,
+        // The panel's wording for a person comes first; the run's own words follow for whoever wants them.
+        const plain = briefWords(p.brief)
+        return { tone: 'waiting', headline: heading, ...(p.brief ? { brief: p.brief } : {}),
+          detail: [plain, panelWords(p.consult), plain ? `In the run's own words: ${p.question}` : p.question, p.request.reason, !plain && p.request.recommendation ? `Recommended: ${p.request.recommendation}` : null, answered].filter(Boolean).join('\n\n') || null,
           next: p.request.projectAction ? `Run the project's "${p.request.projectAction}" action, then answer with what happened.` : p.request.category === 'owner-gate' ? 'Answer below; the run continues from your answer.' : 'Do the work, then answer with what happened.' }
       }
       return { tone: 'waiting', headline: 'Waiting for your answer', detail: [p.question, answered].filter(Boolean).join('\n\n') || null, next: 'Answer below; the run continues from your answer.' }
@@ -672,8 +694,14 @@ function completed (run, outputs) {
         detail: o.reason ?? null,
         next: 'Accept the split to create the parts as new issues, or decline it to run the whole issue anyway. No work was started.' }
     }
+    // A consult that has stood for an hour was cut short; until it is resumed the questions are shown as the owner's.
+    if (o.consult?.status === 'running' && Date.now() - Date.parse(o.consult.startedAt ?? 0) < 3_600_000) {
+      return { tone: 'progress', headline: n === 1 ? 'Two senior models are answering triage\'s question' : `Two senior models are answering triage's ${n} questions`,
+        detail: o.reason ?? null, next: 'If they agree, the work starts by itself with their answers; otherwise the questions come to you. Nothing was started and no slot is held.' }
+    }
+    const briefs = (o.questions ?? []).filter((q) => q.brief).map((q) => `${q.id}. ${briefWords(q.brief)}`)
     return { tone: 'waiting', headline: n === 1 ? 'Waiting for your answer before any work starts' : `Waiting for your ${n} answers before any work starts`,
-      detail: o.reason ?? null,
+      detail: [o.reason, o.consult?.status === 'escalated' ? 'Two senior models were asked first and did not settle every question.' : null, ...briefs].filter(Boolean).join('\n\n') || null,
       next: 'Answer below; the answers start a fresh run. Nothing was started and no slot is held.' }
   }
   if (run.outcome !== 'resolved') {

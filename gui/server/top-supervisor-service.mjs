@@ -1,4 +1,5 @@
 import { readCheckLog } from './runtime/check-log.mjs'
+import * as store from './runtime/store.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -22,7 +23,7 @@ import { createAvailabilityStore } from './runtime/failure.mjs'
 import { deployStaging, deploymentReport } from './staging-deployment.mjs'
 import { deploymentCoverage, stagingPendingReport, writeDeploymentNotes } from './staging-coverage.mjs'
 
-export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null }) {
+export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null }) {
  const configRoot=process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
  const models=async()=>[...(await loadConfig({root:configRoot})).roster.values()].filter(m=>['claude','codex'].includes(m.harness))
  // Which models a run's SEATS may be filled with — a different question from
@@ -87,6 +88,20 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
  let service
  try { service=await createTopSupervisor({dir,models,adapter,emit,decisions,
   tools:{
+   // The consult panel for the supervisor's own questions (consult/consult.mjs): it reads the project, the
+   // issue's folder and, when a run is named, that run's worktree; recorded under the supervisor's directory.
+   ...(consult?{consult:async({project,issueId=null,runId=null,...request})=>{
+    let issueDir=null,worktree=null
+    if(issueId){
+     const issue=await issues.getIssue(project,issueId)
+     if(!issue.packed){
+      issueDir=issue.path
+      const run=runId?await store.readRun(issue.path,runId).catch(()=>null):null
+      if(run?.workspace?.path&&run.workspace.state!=='removed'&&run.workspace.isolation!=='in-place')worktree=run.workspace.path
+     }
+    }
+    return consult.consult({...request,askedBy:{role:'supervisor'},project,issueDir,worktree},{callerDir:dir})
+   }}:{}),
    retryInput:a=>supervisor.retryInput(a), recover:a=>supervisor.recover(a), refreshChecks:a=>supervisor.refreshChecks(a), acceptCheckResult:a=>supervisor.acceptCheckResult(a), reconcileDelivery:a=>supervisor.reconcileDelivery(a), continueRun:a=>supervisor.continueRun(a),
    availability:supervisor.availability,recordExhausted:a=>supervisor.availability.recordExhausted(a),
    projects:()=>issues.listProjects(),playbooks:()=>listPlaybooks({root:configRoot}),seatModels,

@@ -10,6 +10,7 @@ import RunTimeline from '@/components/RunTimeline.vue'
 import StartRunDialog from '@/components/StartRunDialog.vue'
 import AssessBar from '@/components/AssessBar.vue'
 import OwnerInput from '@/components/OwnerInput.vue'
+import QuestionBrief from '@/components/QuestionBrief.vue'
 import TurnDetail from '@/components/TurnDetail.vue'
 import RunTerminal from '@/components/RunTerminal.vue'
 import CoordinatorChat from '@/components/CoordinatorChat.vue'
@@ -1299,6 +1300,8 @@ watch(() => route.query.run, (runId) => {
           <!-- A paused run asked a question. Nothing is in flight; the answer is
                recorded as a step of its own and the run goes on from it. -->
           <div v-if="run.status === 'paused' && run.pause && !['manual', 'full-verification'].includes(run.pause.kind)" class="answer">
+            <!-- The consult panel's wording of the question for a person; an option fills the answer. -->
+            <QuestionBrief v-if="run.pause.brief" :brief="run.pause.brief" :consult="run.pause.consult" @choose="answerText = $event" />
             <v-text-field v-if="!proxyUser" v-model="answerActor" label="Your name" density="compact"
                           variant="outlined" hide-details class="answer__actor" />
             <div v-if="run.pause.options" class="answer__options">

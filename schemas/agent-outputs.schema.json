@@ -335,9 +335,10 @@
                 "live-checkout",
                 "owner-gate",
                 "authorization",
-                "requirement-conflict"
+                "requirement-conflict",
+                "technical"
               ],
-              "description": "live-checkout: work only the live checkout can take. owner-gate: a stop the issue itself asks for at this point (for example after the plan; ask once, approve or revise, with the plan summarised in the owner's terms), or a question a plan or an audit addresses to the owner on access, security or a documented promise, which is never answered by you or recorded as an assumption. authorization: spending, production, destroying data, publishing. requirement-conflict: acceptance criteria that cannot all hold, shown with evidence."
+              "description": "technical: a question about a technical route you cannot settle from the evidence you have (which layer to fix, whether an approach is sound, what an observed failure means). It goes to the consult panel, two senior models that read the code, and never to a person: their answer, or what each said when they differ, reaches you as a decision. Ask it instead of guessing an assumption you cannot judge. live-checkout: work only the live checkout can take. owner-gate: a stop the issue itself asks for at this point (for example after the plan; ask once, approve or revise, with the plan summarised in the owner's terms), or a question a plan or an audit addresses to the owner on access, security or a documented promise, which is never answered by you or recorded as an assumption. authorization: spending, production, destroying data, publishing. requirement-conflict: acceptance criteria that cannot all hold, shown with evidence."
             },
             "recommendation": {
               "type": "string",

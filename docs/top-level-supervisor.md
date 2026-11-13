@@ -439,6 +439,40 @@ before the child starts is recorded as a launch attempt with zero model cost,
 not an ambiguous paid call. The pending turn is moved to failure history and the
 supervisor becomes stopped and retryable; no automatic retry is performed.
 
+
+### Consulting the panel before the operator
+
+The supervisor cannot read code. A technical doubt used to become an inquiry (a
+whole analysis run) or a question to the operator written by a model that had
+not seen the code. Now `consult {question, recommendation, project, issueId?,
+runId?, reason?}` puts it to the consult panel (docs/consult.md): two senior
+models read the project, the issue and the named run's worktree read-only and
+answer independently. The action returns a `consultId` at once; the result
+arrives as a `consult-result` event (never held by the wake filter) with the
+outcome, the agreed answer and conditions or each seat's position, and the
+question as the panel would put it to a person. An agreed answer is the
+supervisor's to act on within its authority; it grants none.
+
+When a panel is wired in, `ask_operator` takes a `kind`:
+
+- `reserved` with `reservedBy` (`production`, `irreversible`, `rules-or-limits`,
+  `owner-question`, `operator-capability`): what the charter reserves to the
+  operator. The question is open at once, and a `brief`-mode consult attaches
+  the plain wording when it arrives.
+- `undecided` with a `consultId`: a question the panel did not settle
+  (`escalated` or `unavailable`). It is recorded with that consult's brief and
+  positions. A consult that resolved is refused: there is an answer.
+
+Anything else is refused with a pointer to `consult`. It is also refused for a
+run already paused on the question: a run's question went through the panel in
+the run (`pause.consult`, `pause.brief` on the run delta) and is in front of the
+operator on the issue page. The supervisor relays it and answers the run only
+with what the operator said. A triage's owner questions are consulted by the
+engine after the run's end (`ownerInput.consult`); resolved, the next run starts
+by itself. A session may ask 40 consults (the supervisor's own and the wording
+of reserved questions); a New session renews that. A consult interrupted by a
+restart is asked again and resumes from its record.
+
 ## What the supervisor is told it may choose
 
 Two failures come from the same shape of omission: the supervisor is shown a

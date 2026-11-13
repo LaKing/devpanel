@@ -39,7 +39,8 @@ export default async function (t) {
         [path.join(hostDir, 'settings.json'), '/opt/projects', `/var/lib/proxy/${os.hostname()}/users`, ['.proxy.hash', '.hash'], ['DEVPANEL', 'EDITOR'], { user: 'app', home: '/var/app' }, ['production', 'stage'], []])
       await write(path.join(hostDir, 'settings.json'), JSON.stringify({ projectsRoot: '/opt/other' }))
       t.eq('an edit is seen without a restart', hostSettings({ hostDir }).projectsRoot, '/opt/other')
-      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ resumeAfterShutdown: false }))
+      // A different length than the file before it: an edit is recognised by the file's time and size, and two writes can share a clock tick.
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ resumeAfterShutdown: false, projectsRoot: '/opt/projects' }))
       t.eq('the automatic resume can be switched off', hostSettings({ hostDir }).resumeAfterShutdown, false)
 
       const projects = await temp('devpanel-settings-projects-')
@@ -61,6 +62,25 @@ export default async function (t) {
       let syntax = null
       try { hostSettings({ hostDir }) } catch (e) { syntax = e.message }
       t.ok('so is a file that does not parse', Boolean(syntax) && syntax.includes(path.join(hostDir, 'settings.json')), syntax)
+    }
+
+    t.section('3b. a file that turns invalid under a running process keeps its last valid content')
+    {
+      const hostDir = await temp('devpanel-settings-stale-')
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ projectsRoot: '/opt/valid' }))
+      t.eq('read valid first', hostSettings({ hostDir }).projectsRoot, '/opt/valid')
+      // A key this process's schema does not know: what a newer checkout's setting looks like to an older service.
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ projectsRoot: '/opt/newer', aKeyOfANewerVersion: 'x' }))
+      const warned = []
+      const warn = console.warn
+      console.warn = (m) => warned.push(String(m))
+      let held, again
+      try { held = hostSettings({ hostDir }); again = hostSettings({ hostDir }) } finally { console.warn = warn }
+      t.eq('the last valid settings stay in force, and say they are stale', [held.projectsRoot, /additional/.test(held.stale?.error ?? ''), again.projectsRoot], ['/opt/valid', true, '/opt/valid'])
+      t.eq('said once for the edit, naming the file', [warned.length, warned[0]?.includes(path.join(hostDir, 'settings.json'))], [1, true])
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ projectsRoot: '/opt/corrected' }))
+      const corrected = hostSettings({ hostDir })
+      t.eq('a corrected file is read again', [corrected.projectsRoot, corrected.stale ?? null], ['/opt/corrected', null])
     }
 
     t.section('4. a pending host move: its carried settings, only under the default host directory')
@@ -93,9 +113,11 @@ export default async function (t) {
       const hostDir = await temp('devpanel-settings-fv-')
       await write(path.join(hostDir, 'settings.json'), JSON.stringify({ fullVerification: { at: '06:00', timeZone: 'Europe/Berlin' } }))
       t.eq('the block is read as written', hostSettings({ hostDir }).fullVerification, { at: '06:00', timeZone: 'Europe/Berlin' })
+      // Each in a directory of its own: a file that turns invalid after a valid read keeps its last valid content (3b).
       const refusal = async (block) => {
-        await write(path.join(hostDir, 'settings.json'), JSON.stringify({ fullVerification: block }))
-        try { hostSettings({ hostDir }); return null } catch (e) { return e.message }
+        const fresh = await temp('devpanel-settings-fv-bad-')
+        await write(path.join(fresh, 'settings.json'), JSON.stringify({ fullVerification: block }))
+        try { hostSettings({ hostDir: fresh }); return null } catch (e) { return e.message }
       }
       t.ok('a time that is not HH:MM is refused', /fullVerification/.test(await refusal({ at: '6:00', timeZone: 'Europe/Berlin' }) ?? ''))
       t.ok('a zone the runtime does not know is refused', /fullVerification\/timeZone/.test(await refusal({ at: '06:00', timeZone: 'Nowhere/Elsewhere' }) ?? ''))

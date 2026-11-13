@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "consult-panel.schema.json",
+  "title": "Consult panel",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["seats"],
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "seats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["consultant-1", "consultant-2"],
+      "properties": {
+        "consultant-1": { "$ref": "#/$defs/seat" },
+        "consultant-2": { "$ref": "#/$defs/seat" }
+      }
+    },
+    "maxRounds": { "type": "integer", "minimum": 1, "maximum": 3 },
+    "turnTimeoutMinutes": { "type": "number", "exclusiveMinimum": 0 },
+    "maxTurnCostUsd": { "type": "number", "exclusiveMinimum": 0 },
+    "maxPerRun": { "type": "integer", "minimum": 0 },
+    "maxTechnicalPerRun": { "type": "integer", "minimum": 0 },
+    "alwaysHuman": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "readOnly": { "type": "array", "items": { "type": "string", "pattern": "^/" } },
+    "deny": { "type": "array", "items": { "type": "string", "pattern": "^/" } }
+  },
+  "$defs": {
+    "seat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

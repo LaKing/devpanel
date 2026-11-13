@@ -50,8 +50,11 @@ export default async (t) => {
     await fs.writeFile(path.join(hostDir, 'playbooks', 'implementation.yaml'), tree.replace(/model: gpt-6\.1-sol/, 'model: fable-5-1'))
     t.eq('with a host override it resolves again', (await seats(await loadConfig({ root: CONFIG_ROOT, hostDir })))['auditor-1'], 'fable-5-1')
     let invalid = null
-    await fs.writeFile(path.join(hostDir, 'settings.json'), JSON.stringify({ harnesses: { disabled: ['other'] } }))
-    try { hostSettings({ hostDir }) } catch (e) { invalid = e }
+    // In a directory nothing was read from yet: a file that turns invalid after a valid read keeps its last valid content.
+    const badDir = `${hostDir}-invalid`
+    await fs.mkdir(badDir, { recursive: true })
+    await fs.writeFile(path.join(badDir, 'settings.json'), JSON.stringify({ harnesses: { disabled: ['other'] } }))
+    try { hostSettings({ hostDir: badDir }) } catch (e) { invalid = e } finally { await fs.rm(badDir, { recursive: true, force: true }) }
     t.ok('an unknown harness is a settings error', invalid)
 
     t.section('3. the home rule: forbidden by default, exempted only inside allowedHomePaths')

@@ -43,6 +43,9 @@ import { sweepAtStart } from './runtime/stage-instances.mjs'
 import { sweepSyncs } from './runtime/sync-records.mjs'
 import { createAdvisor, decisionProviderStatus } from './decisions/advisor.mjs'
 import { createFailureAdvisor } from './decisions/failure-advisor.mjs'
+import { createConsult } from './consult/consult.mjs'
+import { relatedProjects } from './consult/related.mjs'
+import { createOwnerQuestionConsult } from './consult/owner-questions.mjs'
 import { createPregate } from './decisions/pregate.mjs'
 import { triageAgreement } from './decisions/triage-shadow.mjs'
 import { installLogging } from './logging.mjs'
@@ -486,7 +489,9 @@ app.get('/api/attention', route(async (_req, res) => {
   // The supervisor's open questions come first: nothing else can answer them.
   const questions = (topSupervisor?.questions() ?? []).map((q) => ({
     kind: 'supervisor-question', questionId: q.id, project: q.project ?? null, issueId: q.issueId ?? null,
-    issueName: q.issueId ?? 'Supervisor', since: q.at, headline: q.question, options: q.options ?? null
+    issueName: q.issueId ?? 'Supervisor', since: q.at, headline: q.question, options: q.options ?? null,
+    // The consult panel's wording for a person and what it said, when the question went through it.
+    ...(q.brief ? { brief: q.brief } : {}), ...(q.consult ? { consult: q.consult } : {})
   }))
   res.json([...questions, ...await attentionList({ listProjects: issues.listProjects, listIssues: issues.listIssues })])
 }))
@@ -991,7 +996,24 @@ const availabilityStore = () => supervisor?.availability ?? null
 const advisor = createAdvisor({ spending: () => topSupervisor?.decisionSpending?.() ?? null, availability: availabilityStore, loadProvider })
 let wakeAdvisor = null
 const pregate = createPregate({ issues, advisor })
-supervisor = createSupervisor({ issues, emit: emitRunEvent, pregate, failureAdvisor: createFailureAdvisor({ advisor }) })
+// The consult panel (docs/consult.md): runs and the top-level supervisor put a question to it before a
+// person is asked. It borrows the supervisor's spending ledger per seat turn, like the advisor.
+const consultRoot = process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
+const consult = createConsult({
+  root: consultRoot,
+  spending: () => topSupervisor?.decisionSpending?.() ?? null,
+  availability: { check: async (id) => (await supervisor?.availability?.check(id)) ?? null, recordExhausted: async (record) => supervisor?.availability?.recordExhausted(record) },
+  relatedOf: async (project) => relatedProjects((await loadConfig({ root: consultRoot })).projects, project)
+})
+supervisor = createSupervisor({ issues, emit: emitRunEvent, pregate, failureAdvisor: createFailureAdvisor({ advisor }), consult })
+// A triage's questions for the owner go to the panel first; its agreed answers take the owner's own path.
+const ownerQuestionConsult = createOwnerQuestionConsult({
+  consult, getIssue: (project, issueId) => issues.getIssue(project, issueId), emit: emitRunEvent,
+  answer: (args) => createOwnerInput({ issues, supervisor, configRoot: process.env.DEVPANEL_CONFIG_ROOT }).answer(args)
+})
+supervisor.setAfterEnd(ownerQuestionConsult)
+// Consults of owner questions that the last shutdown cut short go on from their records.
+ownerQuestionConsult.resume({ issuesDir: issues.ISSUES_DIR }).catch((error) => console.warn(`[devpanel] owner-question consults were not resumed: ${error.message}`))
 modelPerformance = await createModelPerformanceService({ file: path.join(issues.ISSUES_DIR, '.model-performance.json'), availability: supervisor.availability })
 
 /*
@@ -1026,7 +1048,7 @@ if (hostSettings().resumeAfterShutdown) {
   if (resumed.length || refused.length) console.log(`              ${resumed.length} run(s) stopped by the last shutdown resumed, ${refused.length} refused and left stopped`)
 }
 let previousSupervisorState = null
-topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformance,
+topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformance, consult,
   decisions: ({ spending }) => (wakeAdvisor = createAdvisor({ spending, availability: availabilityStore, loadProvider })),
   emit: (event) => {
     // A working call's streamed output: its own channel, so it does not make

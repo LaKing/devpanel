@@ -1249,6 +1249,14 @@
       "type": "object",
       "description": "Operator requests the coordinator raised, keyed by the step number that raised one. Present so a request is asked exactly once, across a crash and a replay."
     },
+    "consults": {
+      "type": "object",
+      "description": "The consults this run put to the consult panel before asking a person (engine.consultFirst), keyed by consult id: key, category, mode, outcome (resolved | escalated | unavailable), reason, rounds, costUsd, durationMs, at. The opinions are under runs/<id>/consults/<consult id>/."
+    },
+    "consulting": {
+      "type": ["object", "null"],
+      "description": "Set while the consult panel works on a question of this run: key, mode, startedAt."
+    },
     "ownerHolds": {
       "type": "object",
       "description": "Owner holds the seats stated, keyed by <role>:<id>: question, category, reason, recommendation, stepId, statedByStep, latestStep and answeredByStep (null while open). Written from the recorded steps (runtime/owner-holds.mjs), which are what the engine decides from."

@@ -7,6 +7,8 @@ Some configuration belongs to one installation, not to devpanel:
   efforts or budgets, while the tracked `playbooks/` stays the shared default;
 - which decision provider is active and how it is reached (`decisions/active.yaml`,
   `decisions/<id>.yaml`), read before the tracked `decisions/` (docs/decisions.md);
+- its consult panel (`consult/panel.yaml`): other seats, bounds, further readable paths and
+  paths to mask; it replaces the tracked `consult/panel.yaml` whole (docs/consult.md);
 - roster entries that name a person's login (`account:`), or carry the installation's own
   dated verification evidence; the tracked `roster/` is the shared model catalogue;
 - release targets (`tools/releases/<site>-targets.json`): hosts, instance directories, state roots, service accounts;
@@ -43,6 +45,7 @@ host-config/
   playbooks/<id>.yaml
   decisions/active.yaml
   decisions/<id>.yaml
+  consult/panel.yaml
   releases/<site>-targets.json
   releases/README.md
   live-reports/<report>
@@ -92,6 +95,13 @@ host-config <config root>/host-config (present)   roster 21 (tree 21, host 0)   
 `gui/server/config/host-settings.mjs`). Every key is optional; an absent key keeps the
 neutral default, which names no installation:
 
+
+An invalid file refuses the server's start and `npm run config:check`. Under a running panel it does not stop
+anything: the settings last read valid stay in force, with one warning in the log per edit and `stale` on the
+settings, until the file is corrected or the service restarted. A key a newer checkout introduces is invalid to an
+older running service in exactly this way (it validates with the schema it loaded at its start), so add a new key
+after the restart that brings its code.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `projectsRoot` | the directory holding the panel's checkout | where the `<name>-project` directories are (`DEVPANEL_PROJECTS_DIR` wins) |
@@ -114,6 +124,7 @@ neutral default, which names no installation:
 | `selection.forbiddenPrefixes` | `["production", "staging"]` | projects-root entries named `<prefix>.*` are container filesystems no run may read |
 | `skill.linkBaseVariable` | none | the variable the devpanel skill client reads as its link base after `DEVPANEL_LINKBASE` |
 | `reporter.panelUrl` | none | the panel's private address for `gui/tools/provision-reporter.mjs` |
+| `operatorLanguage` | `en` | the language the consult panel writes a question for a person in (ISO 639-1; docs/consult.md) |
 | `seatGuidance.projects` | none | projects whose run seats get the installation's notes ("Seat guidance") |
 
 An invalid file is an error, not a fallback: `config:check` reports it and the server

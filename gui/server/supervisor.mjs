@@ -114,6 +114,8 @@ export function createSupervisor ({
   // `runtime` failures (decisions/failure-advisor.mjs).
   pregate = null,
   failureAdvisor = null,
+  // The consult panel (consult/consult.mjs): asked by a run before a person is. Optional: without it runs ask as before.
+  consult = null,
   // Host-wide memory of exhausted models, beside the issues. One file for every
   // project: a quota burnt by one run is a quota burnt for all of them.
   availabilityFile = path.join(issues.ISSUES_DIR ?? process.env.DEVPANEL_ISSUES_DIR ?? '.', '.availability.json'),
@@ -640,6 +642,7 @@ export function createSupervisor ({
   /** The agent phase proper, shared by a fresh start and a resume after a decision. */
   async function driveEngine (record, engine) {
     if (failureAdvisor) engine.failureAdvisor = failureAdvisor
+    if (consult) engine.consult = consult
     armAutoReconcile(engine, record.project)
     engine.quotaFallback = createQuotaFallback({ loadModels: async () => [...(await loadConfig({ root: configRoot })).roster.values()], availability, probeFor, root: configRoot })
     record.engine = engine
@@ -1026,7 +1029,16 @@ export function createSupervisor ({
     // A triage started with autoStart that closed autonomous starts its
     // recommended playbook now that the issue is free (auto-start.mjs).
     if (type === 'run-finished' && !inquiry) await autoStartAfter(project, issueId, runId)
+    // A triage that ended with questions for the owner: the consult panel is asked
+    // first (consult/owner-questions.mjs). Not awaited: the run has ended and holds nothing.
+    if (type === 'run-finished' && !inquiry && afterEnd && !HOME_PATTERN.test(issueId)) {
+      Promise.resolve().then(() => afterEnd({ project, issueId, runId })).catch((error) => console.warn(`[devpanel] consult after ${project}/${issueId} run ${runId} failed: ${error.message}`))
+    }
   }
+
+  /** What the server runs after a run's end was announced (the consult of a triage's owner questions). */
+  let afterEnd = null
+  function setAfterEnd (hook) { afterEnd = hook }
 
   /** The top-level supervisor's start gate, when one is attached (top-supervisor-service.mjs). */
   let supervisorAutoStart = null
@@ -2070,7 +2082,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading }
+  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading }
 }
 
 /**

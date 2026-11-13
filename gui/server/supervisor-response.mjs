@@ -31,10 +31,14 @@ const fields = {
   readiness: ['project'],
   // A question for the operator, shown in Needs attention; answered later as an event.
   ask_operator: ['question'],
+  // A second opinion from the consult panel (two senior read-only seats); the result arrives later as an event.
+  consult: ['question','recommendation','project'],
   // The operator's Authorize/Decline for one previewed production release, written by the server.
   ask_release_authorization: ['previewId'],
   finish: []
 }
+/** What makes a decision the operator's whatever the evidence says (ask_operator kind reserved). */
+export const RESERVED_BY=['production','irreversible','rules-or-limits','owner-question','operator-capability']
 function validate (value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       typeof value.message !== 'string' || !Object.hasOwn(value,'action') ||
@@ -58,8 +62,15 @@ function validate (value) {
       for(const k of ['project','issueId'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
       if(action.issueId!==undefined&&action.project===undefined)throw Error('issueId needs its project')
       if(action.options!==undefined&&(!Array.isArray(action.options)||!action.options.length||action.options.length>6||action.options.some(o=>typeof o!=='string'||!o.trim()||o.length>200)))throw Error('options must be 1 to 6 short strings')
+      if(action.kind!==undefined&&!['reserved','undecided'].includes(action.kind))throw Error('kind is reserved or undecided')
+      if(action.reservedBy!==undefined&&!RESERVED_BY.includes(action.reservedBy))throw Error(`reservedBy is one of ${RESERVED_BY.join(', ')}`)
+      for(const k of ['consultId','runId'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
     }
-    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
+    if(action.type==='consult'){
+      for(const k of ['issueId','runId','reason'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
+      if(action.runId!==undefined&&action.issueId===undefined)throw Error('runId needs its issueId')
+    }
+    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options','kind','reservedBy','consultId','runId']:[]),...(action.type==='consult'?['issueId','runId','reason']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='overview'?['stats']:[])]
     if(Object.keys(action).some(k=>!allowed.includes(k)))throw Error('Unexpected action argument')
     for(const k of ['offset','limit'])if(action[k]!==undefined&&(!Number.isSafeInteger(action[k])||action[k]<0))throw Error(`${k} must be a non-negative integer`)
     if(action.stats!==undefined&&action.stats!==true&&action.stats!==false&&(!Array.isArray(action.stats)||action.stats.some(x=>!['byPlaybook','bySeat'].includes(x))))throw Error('stats must be true, false or a list of byPlaybook, bySeat')

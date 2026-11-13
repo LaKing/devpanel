@@ -17,6 +17,7 @@ import { probeProjectSandbox } from '../runtime/sandbox-probe.mjs'
 import { loadConfig, resolvePlaybook, CONFIG_ROOT } from './load.mjs'
 import { discover } from './host-config.mjs'
 import { hostSettings } from './host-settings.mjs'
+import { loadPanel, resolveSeats } from '../consult/panel.mjs'
 import { preflight } from './preflight.mjs'
 import { createProbeExecutor, ProbeNotAuthorised } from '../runtime/probe-budget.mjs'
 
@@ -63,6 +64,15 @@ for (const [id, project] of config.projects) {
   if (project.infrastructure && !project.infrastructure.testDrive?.modules) console.log(`  ${mark('warn')} ${id}: a Boilerplate project without testDrive.modules; coding playbooks record its per-revision check as unavailable until it declares one (docs/project-infrastructure.md "The modules tier")`)
 }
 for (const p of config.invalidPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} is not usable, so that model stays unpriced: ${p.message}`)
+// The consult panel (docs/consult.md): a seat that cannot be used leaves every consult unavailable, so questions go to a person as before.
+try {
+  const panel = await loadPanel({ root: config.root })
+  if (!panel) console.log(`  ${mark('warn')} consult: no consult/panel.yaml; questions go to a person without a second opinion`)
+  else if (!panel.enabled) console.log(`  ${mark('warn')} consult: the panel is switched off (${panel.file})`)
+  else for (const problem of (await resolveSeats(panel, { roster: config.roster })).problems) console.log(`  ${mark('warn')} consult: ${problem} (${panel.file})`)
+} catch (error) {
+  console.log(`  ${mark('warn')} consult: ${error.message}; every consult is unavailable until it is fixed`)
+}
 // The host settings (docs/host-config.md "Host settings"): an invalid file is an error here as at server start.
 try {
   const settings = hostSettings({ root: config.root, hostDir: config.hostDir })

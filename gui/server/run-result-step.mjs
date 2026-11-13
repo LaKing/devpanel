@@ -115,6 +115,13 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
     for (const a of assumptions) lines.push(`- ${a.decision} — ${a.reason} (step ${String(a.step).padStart(3, '0')})`)
     lines.push('')
   }
+  // Questions the consult panel settled instead of a person; the owner may overrule them like an assumption.
+  const consulted = (run.steps ?? []).filter((s) => s.role === 'operator' && s.decision?.consult?.outcome === 'resolved')
+  if (consulted.length) {
+    lines.push('## Decided by the consult panel', '', 'Two senior models answered these independently and agreed, so nobody was asked. The opinions are in the named step.', '')
+    for (const s of consulted) lines.push(`- **${s.decision.question}**`, `  - ${s.decision.answer.split('\n').join('\n    ')} (step ${String(s.number).padStart(3, '0')})`)
+    lines.push('')
+  }
   const unread = (run.steps ?? []).filter((s) => s.childOutput)
   if (unread.length) {
     lines.push('## Output a command could not observe', '', 'Empty output from a Node child in these turns may not mean it printed nothing; it is not evidence either way (docs/execution-contract.md "Tooling policy").', '')

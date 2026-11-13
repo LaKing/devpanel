@@ -2426,6 +2426,15 @@ records the `split` disposition naming them; a declined split writes a note and
 starts again. The top-level supervisor has no action for this: owner questions
 are the owner's.
 
+Before the owner, the consult panel (below, "The consult panel answers first"):
+after the run's end its questions are put to the panel one by one
+(`consult/owner-questions.mjs`, `ownerInput.consult.status`). When the two
+consultants agree on every question, their answers are given through this same
+route with the panel as the actor, and the next run starts; otherwise each
+question the panel did not settle carries its `consult` and its `brief`, the
+question in plain words, for the owner. This happens once per issue, and never
+for a proposed split.
+
 ## Triage sizing and autoStart
 
 **Concurrent steps.** A single-step phase whose step declares `concurrent: true`
@@ -2495,6 +2504,10 @@ A run may stop for a human without ending. Three things ask:
   them;
 - the coordinator itself, through `operatorRequest` on its `handoff`, as a last
   resort (below).
+
+A question of the last kind, and a seat's owner hold, is put to the consult
+panel before the run pauses ("The consult panel answers first", below): the
+pause happens only when the panel did not settle it.
 
 The run's status becomes `paused`; `run.pause` holds the question, the closed
 `options` (or null for free text), which step asked and when. Nothing is in
@@ -2568,10 +2581,12 @@ or a question a plan or an audit addresses to the owner on access, security or a
 documented promise, which is never answered by the coordinator or recorded as an
 assumption),
 `authorization` (spending, production, destroying data, publishing) or
-`requirement-conflict` (criteria that cannot all hold, with evidence). There is
-no category for a technical choice: the coordinator decides it and records it in
-the handoff's `assumptions`, which the run's `result.md` lists under
-"Assumptions made" for the owner to overrule afterwards. A tool missing on the
+`requirement-conflict` (criteria that cannot all hold, with evidence), or
+`technical` (a technical route the coordinator cannot judge from the evidence it
+has: this one goes to the consult panel and never to a person, below). A
+technical choice the coordinator can judge is not a request: it decides it and
+records it in the handoff's `assumptions`, which the run's `result.md` lists
+under "Assumptions made" for the owner to overrule afterwards. A tool missing on the
 authoring host is not a question either: the check runs on the configured
 staging infrastructure or is reported `unavailable`. The engine records it in
 `run.operatorRequests` (keyed by the step that raised it, so a crash between
@@ -2620,6 +2635,45 @@ asked about a plan the audits approved. The answer reaches later turns through
 `decisions`; one that changes the approved plan is what `restartPlan` is for. What
 a seat writes only in prose the engine cannot see: the coordinator raises it as an
 `owner-gate` `operatorRequest`.
+
+### The consult panel answers first
+
+Where a run would pause for a person, on an owner hold or on a coordinator's
+`owner-gate` or `requirement-conflict` request, `engine.consultFirst` first puts
+the question to the consult panel (docs/consult.md): two senior models that are
+not seats of the run, read the project, the issue and the run's worktree
+read-only, and answer independently. `run.consulting` is set while they work and
+`run.consults` keeps each consult's outcome; the opinions are under
+`runs/<id>/consults/<consult id>/`, recorded before the result is used, so a
+replay reads the record and never asks twice.
+
+- Both chose the same answer (`resolved`): the answer, with the conditions they
+  attached, is recorded as a decision step by the same recorder as a person's
+  (`engine.recordDecision`): role `operator`, `decision.actor` naming the panel,
+  `decision.consult` carrying the consult. An owner hold closes on it as on the
+  owner's answer, `decisions` carries it to every later step, and the run does
+  not pause. `result.md` lists it under "Decided by the consult panel".
+- They did not (`escalated`), or the panel could not be asked (`unavailable`):
+  the run pauses exactly as before, and `run.pause` also holds `consult` and,
+  when escalated, `brief`: the question as the panel wrote it for a person.
+
+The outcome is the panel's mechanical rule (same option, no low confidence, one
+round of seeing each other's opinion), never a coordinator's reading: nothing a
+coordinator writes turns an escalation into an answer, so a hold stays as far
+out of its reach as it was. An `authorization` request (the panel's
+`alwaysHuman`) is only worded by the panel and always pauses; a `live-checkout`
+request and a closed question are not consulted. A run asks at most `maxPerRun`
+consults; past that it pauses as before. The time a consult takes is excused
+from the wall clock like a wait for a person; stopping the run cancels it, and
+a fault in the panel never fails the run.
+
+A `technical` request never pauses. The panel's agreed answer is the decision;
+when the consultants differ, or the panel cannot be asked, the decision step
+says what each said (or that nobody was asked) and the coordinator decides,
+recording the choice as an assumption, or raises an `owner-gate` request when it
+cannot. The handoff that carried the request is delivered after the decision,
+as for every operatorRequest, and the decision reaches later turns through
+`decisions`.
 
 ## Runtime failures, retry and availability
 

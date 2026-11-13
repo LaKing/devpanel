@@ -112,7 +112,9 @@ export function runDelta (run, { from = null } = {}) {
     blockedReason: run.blockedReason ?? null,
     actions: run.actions ?? [],
     ...(from && Object.keys(from).length ? { from } : {}),
-    ...(pause ? { pause: { id: pause.id, question: clip(pause.question, 2000), options: pause.options ?? null, kind: pause.kind ?? null, ...(pause.request ? { request: pause.request } : {}) } } : {}),
+    ...(pause ? { pause: { id: pause.id, question: clip(pause.question, 2000), options: pause.options ?? null, kind: pause.kind ?? null, ...(pause.request ? { request: pause.request } : {}),
+      // What the consult panel said before anyone was asked, and its wording of the question for the operator.
+      ...(pause.consult ? { consult: { outcome: pause.consult.outcome, reason: pause.consult.reason ?? null } } : {}), ...(pause.brief ? { brief: pause.brief } : {}) } } : {}),
     ...(failure ? { failure: { class: failure.class ?? null, message: clip(failure.message ?? failure.error ?? null, 500) } } : {}),
     ...(run.ownerInput ? { ownerInput: run.ownerInput } : {}),
     ...(run.splitSuggestion ? { splitSuggestion: run.splitSuggestion } : {}),
