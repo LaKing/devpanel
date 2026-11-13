@@ -237,10 +237,11 @@ export default async function (t) {
     await link('stage', path.join(projects, 'production.demo'))
     await link('elsewhere', path.join(base, 'outside', 'secret'))
     await link('denied', path.join(base, 'outside', 'logs'))
-    const got = await consultRoots({ project: 'demo-project', related: ['related-project', 'missing-project'], projectsDir: projects, home,
+    await fs.writeFile(path.join(base, 'outside', 'demo-project.yaml'), 'id: demo-project\n')
+    const got = await consultRoots({ project: 'demo-project', related: ['related-project', 'missing-project'], projectsDir: projects, home, files: [{ path: path.join(base, 'outside', 'demo-project.yaml'), what: 'its configuration' }],
       panel: { readOnly: [path.join(base, 'outside', 'logs'), home], deny: [path.join(projects, 'demo-project', 'private'), path.join(base, 'outside', 'logs')] } })
     const granted = got.roots.map((r) => path.relative(base, r.path)).sort()
-    t.eq('the checkout, its related project and a link to a directory under the projects root', granted, ['srv/demo-project', 'srv/fw', 'srv/related-project'])
+    t.eq('the checkout, its related project, a link to a directory under the projects root, and its configuration file', granted, ['outside/demo-project.yaml', 'srv/demo-project', 'srv/fw', 'srv/related-project'])
     const why = Object.fromEntries(got.refused.map((r) => [path.relative(base, r.path), r.why]))
     t.ok('a link into the home\'s keys is refused', /login or key directory/.test(why['home/.ssh']))
     t.ok('a link to the whole projects root is refused', /projects root/.test(why.srv))

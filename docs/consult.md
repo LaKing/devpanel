@@ -62,6 +62,8 @@ coordinator's `access: read` turn uses): read tools and a read-only shell. `cons
   top-level links lead to;
 - the issue's whole folder: report, notes, every run's steps, prompts, responses, checks and evidence;
 - the asking run's worktree;
+- the panel's configuration file of the project and of the projects tied to it (`projects/<id>.yaml`, the
+  installation's copy when it has one): how the project is checked, staged and delivered;
 - the panel's `readOnly` paths.
 
 Every root is checked before it is granted, because the fence's own canaries treat whatever lies inside a granted

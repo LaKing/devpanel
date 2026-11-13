@@ -23,7 +23,7 @@ import { hostSettings } from '../server/config/host-settings.mjs'
 import { createConsult } from '../server/consult/consult.mjs'
 import { loadPanel, resolveSeats } from '../server/consult/panel.mjs'
 import { decidePrompt, briefPrompt } from '../server/consult/prompt.mjs'
-import { relatedProjects } from '../server/consult/related.mjs'
+import { projectFiles, relatedProjects } from '../server/consult/related.mjs'
 import { consultRoots } from '../server/consult/roots.mjs'
 import { optionsFor } from '../server/consult/rule.mjs'
 import { createAvailabilityStore } from '../server/runtime/failure.mjs'
@@ -61,7 +61,7 @@ if (given.plan) {
   const panel = await loadPanel()
   if (!panel) { console.error('no consult panel is configured (consult/panel.yaml)'); process.exit(1) }
   const { seats, problems } = await resolveSeats(panel, { roster: config.roster })
-  const roots = await consultRoots({ project: given.project, issueDir, worktree, related, panel })
+  const roots = await consultRoots({ project: given.project, issueDir, worktree, related, files: projectFiles(config.projects, given.project), panel })
   const prompt = (request.mode === 'brief' ? briefPrompt : decidePrompt)({ request, options: optionsFor(request), roots: roots.roots, scratchDir: '<scratch>', language: hostSettings().operatorLanguage })
   console.log(JSON.stringify({ plan: true, mode: request.mode, seats: seats.map((s) => ({ seat: s.seat, model: s.model.id, harness: s.model.harness, effort: s.effort })), problems, cwd: roots.cwd, roots: roots.roots, masks: roots.masks, prompt }, null, 2))
   process.exit(problems.length ? 1 : 0)
@@ -71,6 +71,7 @@ if (process.env.DEVPANEL_LIVE !== '1') { console.error('a consult launches real 
 const service = createConsult({
   loadRoster: async () => config.roster,
   relatedOf: async (project) => relatedProjects(config.projects, project),
+  filesOf: async (project) => projectFiles(config.projects, project),
   availability: createAvailabilityStore(path.join(ISSUES_DIR, '.availability.json'))
 })
 const result = await service.consult(request, { callerDir: path.join(ISSUES_DIR, '.supervisor') })

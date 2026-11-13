@@ -44,7 +44,7 @@ import { sweepSyncs } from './runtime/sync-records.mjs'
 import { createAdvisor, decisionProviderStatus } from './decisions/advisor.mjs'
 import { createFailureAdvisor } from './decisions/failure-advisor.mjs'
 import { createConsult } from './consult/consult.mjs'
-import { relatedProjects } from './consult/related.mjs'
+import { projectFiles, relatedProjects } from './consult/related.mjs'
 import { createOwnerQuestionConsult } from './consult/owner-questions.mjs'
 import { createPregate } from './decisions/pregate.mjs'
 import { triageAgreement } from './decisions/triage-shadow.mjs'
@@ -1003,7 +1003,8 @@ const consult = createConsult({
   root: consultRoot,
   spending: () => topSupervisor?.decisionSpending?.() ?? null,
   availability: { check: async (id) => (await supervisor?.availability?.check(id)) ?? null, recordExhausted: async (record) => supervisor?.availability?.recordExhausted(record) },
-  relatedOf: async (project) => relatedProjects((await loadConfig({ root: consultRoot })).projects, project)
+  relatedOf: async (project) => relatedProjects((await loadConfig({ root: consultRoot })).projects, project),
+  filesOf: async (project) => projectFiles((await loadConfig({ root: consultRoot })).projects, project)
 })
 supervisor = createSupervisor({ issues, emit: emitRunEvent, pregate, failureAdvisor: createFailureAdvisor({ advisor }), consult })
 // A triage's questions for the owner go to the panel first; its agreed answers take the owner's own path.

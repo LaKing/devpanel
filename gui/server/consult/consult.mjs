@@ -61,6 +61,7 @@ function defaultFence ({ roots, scratchDir }) {
  * @param availability  the host's model availability store, or null
  * @param loadRoster    () => Map of roster entries
  * @param relatedOf     (project) => further project ids a consult on it may read
+ * @param filesOf       (project) => [{ path, what }] single files it may read as well (the project's configuration)
  * @param buildFence    ({ roots, scratchDir }) => fence spec | null; null means no proved read access, so no consult
  */
 export function createConsult ({
@@ -68,6 +69,7 @@ export function createConsult ({
   loadPanelConfig = () => loadPanel({ root }),
   loadRoster = async () => (await (await import('../config/load.mjs')).loadConfig({ root })).roster,
   relatedOf = async () => [],
+  filesOf = async () => [],
   loadAdapter = (harness) => import(pathToFileURL(path.join(HARNESS_DIR(), `${harness}.mjs`)).href),
   rootsFor = consultRoots,
   buildFence = defaultFence,
@@ -282,7 +284,7 @@ export function createConsult ({
 
       let roots
       try {
-        roots = await rootsFor({ project: request.project, issueDir: request.issueDir ?? null, worktree: request.worktree ?? null, related: await relatedOf(request.project), panel })
+        roots = await rootsFor({ project: request.project, issueDir: request.issueDir ?? null, worktree: request.worktree ?? null, related: await relatedOf(request.project), files: await filesOf(request.project), panel })
       } catch (error) { return unavailable(error.message) }
       if (roots.refused?.length) await writeJson(path.join(dir, 'roots.json'), { granted: roots.roots, masks: roots.masks, refused: roots.refused })
 
