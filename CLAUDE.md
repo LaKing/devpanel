@@ -500,7 +500,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - The supervisor's own trouble is never taken out on its runs (docs/top-level-supervisor.md "When the supervisor itself fails"): its model out
   of quota stops the activation (`stopped`, nothing substituted, Start continues the session); a reply it could not read or a call that
   started and failed leaves it `active` and is retried after a doubling wait (`state.ownFailures`, five in a row end it); whatever ends an
-  activation on its own account (`ownEnding`) leaves the owned runs as they are. Only an operator's Stop stops them.
+  activation on its own account (`ownEnding`) leaves the owned runs as they are. Only an operator's Stop stops them: a service shutdown ends the activation
+  and leaves its runs to the run supervisor (`service-shutdown`, resumed at the next start), and a `recovery-required` that only a
+  run's recovery caused ends at Start once that run is recovered.
 - The top-level supervisor is the **management plane**; coordinators and their agents are the execution plane.
   Its charter is fixed in the prompt and no message replaces it. Visibility is panel-wide and unconditional —
   `projects` is every project, a named one is checked for existence only, and `focus` merely orders attention.
@@ -543,7 +545,11 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   append-only and the decision in force is derived from its last entry.
 - `top-supervisor.mjs` / `top-supervisor-service.mjs` / `supervisor-response.mjs` — the top-level supervisor:
   one persistent native session, one proposed action per reply as a single JSON object, one formatting-repair
-  turn, existence-checked projects (visibility is panel-wide; `focus` only orders attention), preview-hash
+  turn; `infrastructure` (per project), `seatModels`, `playbooks` and `remaining.history` go in full only when the
+  session has not been sent those bytes, else as a marker naming `get_context {block, project?}`, and all again
+  every 400 000 characters for compaction (`supervisor-context.mjs`, `state.contextSent` bound to the session id
+  and written only after a call returned on it; a resume answered from another session is a failed resume, the
+  next call a new session in full; `state.lastPrompt`; docs/top-level-supervisor.md "What a prompt repeats"), existence-checked projects (visibility is panel-wide; `focus` only orders attention), preview-hash
   binding, budgets and archive permission. Limits
   are `maxCalls` (runaway guard, default 200), `maxStartsPerIssue` (retry guard, default 2), `maxRuns` (ceiling,
   default 20), `maxConcurrent` (default 1). There is deliberately no activation time limit. The run supervisor

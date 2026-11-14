@@ -55,9 +55,10 @@ export default async function(t){
  t.eq('start bound to preview hash',starts[0].configHash,'snapshot-hash')
  t.ok('native session reused',invocations.slice(1).every(i=>i.session.id==='persistent-session'))
  t.ok('runtime tools restricted on every invocation',invocations.every(i=>i.supervisorOnly===true))
- t.ok('every supervisor turn receives project infrastructure',invocations.every(i=>JSON.parse(i.prompt).infrastructure['one-project'].staging.id==='configured-stage'))
+ t.ok('the first supervisor turn receives project infrastructure in full',JSON.parse(invocations[0].prompt).infrastructure['one-project'].staging.id==='configured-stage')
+ t.ok('later turns of the same session a marker naming get_context',invocations.slice(1).every(i=>{const m=JSON.parse(i.prompt).infrastructure['one-project'];return m.staging?.id==='configured-stage'||(m.unchanged===true&&m.get==='get_context {"block":"infrastructure","project":"one-project"}')}))
  t.eq('latest performance sample reaches supervisor prompt',JSON.parse(invocations[0].prompt).seatModels[0].performance.totalMs,400)
- t.ok('and the models its run seats may be filled with',invocations.every(i=>JSON.parse(i.prompt).seatModels?.[0]?.id==='seat-model-a'))
+ t.ok('and the models its run seats may be filled with',JSON.parse(invocations[0].prompt).seatModels?.[0]?.id==='seat-model-a'&&invocations.every(i=>{const s=JSON.parse(i.prompt).seatModels;return s?.[0]?.id==='seat-model-a'||s?.unchanged===true}))
  t.ok('with what each one is and whether it may run live',JSON.parse(invocations[0].prompt).seatModels[1].verified===false&&JSON.parse(invocations[0].prompt).seatModels[1].harness==='codex')
  const originalGetRun=tools.getRun
  let raceReads=0

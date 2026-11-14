@@ -15,6 +15,8 @@ const fields = {
   get_step: ['project','issueId','runId','step'], get_file: ['project','issueId','step','name'],
   // A full verification cycle's record and the evidence its instance left, read-only, confined to issues/.verification/.
   get_verification_file: ['path'],
+  // A prompt block in full, read now (supervisor-context.mjs): what a marker stands for.
+  get_context: ['block'],
   preview: ['project','issueId','playbook'], start_run: ['project','issueId','previewId'],
   stop_run: ['project','issueId','runId'], add_note: ['project','issueId','text'],
   create_issue: ['project','input'], archive_issue: ['project','issueId'],
@@ -72,7 +74,7 @@ function validate (value) {
       for(const k of ['issueId','runId','reason'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
       if(action.runId!==undefined&&action.issueId===undefined)throw Error('runId needs its issueId')
     }
-    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options','kind','reservedBy','consultId','runId']:[]),...(action.type==='consult'?['issueId','runId','reason']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='get_verification_file'?['offset']:[]),...(action.type==='overview'?['stats']:[])]
+    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options','kind','reservedBy','consultId','runId']:[]),...(action.type==='consult'?['issueId','runId','reason']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='get_verification_file'?['offset']:[]),...(action.type==='get_context'?['project']:[]),...(action.type==='overview'?['stats']:[])]
     if(Object.keys(action).some(k=>!allowed.includes(k)))throw Error('Unexpected action argument')
     for(const k of ['offset','limit'])if(action[k]!==undefined&&(!Number.isSafeInteger(action[k])||action[k]<0))throw Error(`${k} must be a non-negative integer`)
     if(action.stats!==undefined&&action.stats!==true&&action.stats!==false&&(!Array.isArray(action.stats)||action.stats.some(x=>!['byPlaybook','bySeat'].includes(x))))throw Error('stats must be true, false or a list of byPlaybook, bySeat')

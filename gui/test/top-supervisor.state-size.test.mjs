@@ -61,7 +61,9 @@ export default async function (t) {
     t.eq('and no state event was announced', events - eventsBefore, 0)
     await agent.chat('A note')
     await wait(() => sent.length === 2 && agent.get().pending === null)
-    t.ok('a real change is written as before', (await fs.stat(stateFile)).ino !== before.ino)
+    // Read from disk, not inferred from an inode number: a rename-based write may reuse a freed one.
+    await wait(async () => (await fs.readFile(stateFile, 'utf8')).includes('A note'))
+    t.ok('a real change is written as before', (await fs.readFile(stateFile, 'utf8')).includes('A note'))
     await agent.stop()
     await agent.shutdown()
 

@@ -182,8 +182,17 @@ export default async function (t) {
   {
     const s = await setup()
     await s.start({ used: { input: 100 } })
-    t.eq('another thread answered: unknown', (await s.turn({ thread: 'thread-2', used: { input: 500 } })).basis, 'unknown')
-    t.eq('and the next', (await s.turn({ used: { input: 5 } })).basis, 'unknown')
+    // A resume answered from another thread is a failed resume (supervisor-context.mjs): the call is accounted,
+    // its reply is not acted on, and the retry opens a new session, whose first call counts only its own tokens.
+    const answers = () => s.agent.get().messages.filter((m) => m.role === 'assistant' && !m.side)
+    const before = answers().length
+    s.fake.steps.push({ thread: 'thread-2', used: { input: 500 } }, { thread: 'thread-3', used: { input: 5 } })
+    await s.agent.chat('next')
+    await wait(() => answers().length === before + 2 && s.agent.get().status === 'active' && !s.agent.get().pending && !s.agent.get().queue.length)
+    const [other, fresh] = answers().slice(-2)
+    t.eq('another thread answered: unknown, and not acted on', [other.cost.basis, other.discarded], ['unknown', 'session-mismatch'])
+    t.eq('the retry opens a new session', [s.fake.calls.at(-1).session ?? null, s.agent.get().session.id], [null, 'thread-3'])
+    t.eq('whose first call is estimated from its own tokens', fresh.cost.basis, 'estimated')
     t.eq('then estimated', (await s.turn({ used: { input: 5 } })).basis, 'estimated')
     t.eq('counters went down: unknown', (await s.turn({ resetTo: true, used: { input: 3 } })).basis, 'unknown')
     t.eq('and the next', (await s.turn({ used: { input: 5 } })).basis, 'unknown')

@@ -98,7 +98,8 @@ export default async function (t) {
         if (Date.now() > deadline) throw new Error('supervisor diagnostics timeout')
         await new Promise(resolve => setTimeout(resolve, 20))
       }
-      t.ok('supervisor receives container configuration every turn', supervisorPrompts.every(p => p.infrastructure['devpanel-project'].staging.id === 'stage'))
+      t.ok('supervisor receives container configuration in full on its first turn', supervisorPrompts[0].infrastructure['devpanel-project'].staging.id === 'stage')
+      t.ok('and a marker naming get_context on later turns of the same session', supervisorPrompts.slice(1).every(p => p.infrastructure['devpanel-project'].unchanged === true && p.infrastructure['devpanel-project'].get === 'get_context {"block":"infrastructure","project":"devpanel-project"}'))
       t.ok('supervisor receives actual remote diagnostic output', supervisorPrompts[1].event.result.stdout.includes('latest diagnostic'))
       t.eq('out-of-scope inspection never reaches SSH', diagnosticCalls, 1)
     } finally { await supervisor.shutdown() }

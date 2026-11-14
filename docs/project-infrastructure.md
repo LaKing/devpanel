@@ -1041,8 +1041,10 @@ participants can use SSH for inspection; its write fence remains enabled.
 This is not a host allowlist. Deployment inspection-only is an agent policy;
 enforce stronger restrictions through SSH accounts and permissions where needed.
 
-The top-level supervisor receives current infrastructure for every project in its
-scope on each turn. Its tool-only execution restriction remains in force. It can
+The top-level supervisor receives current infrastructure for every project: in full
+whenever its session has not been sent that project's current bytes, otherwise as a
+marker, and `get_context {block: "infrastructure", project}` reads it in full at any time
+(docs/top-level-supervisor.md "What a prompt repeats"). Its tool-only execution restriction remains in force. It can
 request `inspect_environment {project, environment, resource}` for `status` or an
 operator-declared file name; project scope is checked before dispatch. Results
 include time, exit status and bounded output. It inspects check evidence through

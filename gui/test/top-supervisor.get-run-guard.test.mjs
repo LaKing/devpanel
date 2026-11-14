@@ -128,9 +128,13 @@ export default async function (t) {
     const [later] = await h.wake(read('r1'))
     t.ok('a later wake reads in full, the run unchanged', isFull(later))
 
-    const session = await h.wake(read('r1'), () => { h.session = 's2'; return read('r1') }, read('r1'))
-    t.ok('a new native session in the wake has not seen the record', isFull(session[1]))
-    t.ok('and is short after that', isShort(session[2]))
+    // A runtime answering the resume from another session is a failed resume (supervisor-context.mjs): that
+    // reply is not acted on, its event is sent again, and the call after it opens a new native session.
+    const session = await h.wake(read('r1'), () => { h.session = 's2'; return read('r1') }, read('r1'), read('r1'))
+    t.ok('the reply that came back on another session was not acted on', h.agent.get().messages.some((m) => m.discarded === 'session-mismatch'))
+    t.ok('its event went again, to a new session', isFull(session[1]) && session[1].runId === session[0].runId)
+    t.ok('a new native session in the wake has not seen the record', isFull(session[2]))
+    t.ok('and is short after that', isShort(session[3]))
     await h.close()
   }
 

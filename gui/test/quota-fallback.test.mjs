@@ -48,7 +48,7 @@ export default async function (t) {
 
   // The supervisor's own model out of quota: nothing is substituted, the activation stops on its own account
   // and its live run is left running; a failure of another kind does not end the activation at all.
-  const wait = async (test, what) => { const end = Date.now() + 5000; while (!test()) { if (Date.now() > end) throw Error(`timed out: ${what}`); await new Promise(r => setTimeout(r, 10)) } }
+  const wait = async (test, what) => { const end = Date.now() + 5000; while (!(await test())) { if (Date.now() > end) throw Error(`timed out: ${what}`); await new Promise(r => setTimeout(r, 10)) } }
   const supervisor = async ({ invoke, runs = {} }) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-quota-supervisor-'))
     const seen = [], exhausted = [], stopped = []
@@ -78,6 +78,8 @@ export default async function (t) {
       t.eq('the model is recorded as exhausted', s.exhausted[0]?.modelId, 'a')
       t.ok('the reason says nothing was substituted', /No other model is substituted/.test(s.service.get().reason), s.service.get().reason)
       t.eq('stopped, not recovery-required: Start continues the same session', [s.service.get().status, s.service.get().model.id, s.service.get().mission], ['stopped', 'a', 'Continue existing work'])
+      // The status flips in memory before the save that carries it lands: wait for the saved state, then read it.
+      await wait(async () => JSON.parse(await fs.readFile(statePath, 'utf8')).status === 'stopped', 'the stopped state on disk')
       t.ok('the event that met the quota is kept for the next start', JSON.parse(await fs.readFile(statePath, 'utf8')).queue.length >= 1)
       t.eq('its live run was not stopped', [s.stopped, runs.live.status], [[], 'running'])
     } finally { await s.end() }

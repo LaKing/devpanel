@@ -229,7 +229,10 @@ the full chat and previous native session identities remain stored.
 A server restart retains history but requires an explicit Start; an interrupted
 operation is marked recovery-required and is not replayed. Recovery of ambiguous
 operations currently requires operator investigation; there is no generic Resume
-that could duplicate an issue-run launch.
+that could duplicate an issue-run launch. The restart stops none of the supervisor's
+runs on the supervisor's word: its shutdown ends the activation only, and the run
+supervisor stops the runs as `service-shutdown` and resumes them at the next start
+("Operator pause and resume" in the execution contract).
 
 `answer_run {project, issueId, runId, answer, pauseId}` answers the question a paused
 owned run asked, with `pauseId` copied from that inspected run’s `pause.id`.
@@ -343,6 +346,10 @@ the model's action interface. Stop the supervisor before using them:
 If the interrupted conversation is marked `recovery-required`, use New session
 after reconciliation to retire its pending operation before starting again. The
 spending ledger and its windows remain in force; the session limits begin afresh.
+Where the mark has no pending operation behind it, only runs a Stop left to
+recover, it lasts as long as they ask for recovery: once each has been recovered
+or abandoned, Start continues the same session, and until then Start is refused
+naming them.
 
 Old state is migrated once, combining retained ownership with archived sessions
 and the counters still present. This recovers the reported four owned runs even
@@ -369,8 +376,10 @@ state each time. Messages retain exact model responses, action requests, results
 usage. What each call was sent is kept beside the state, not in it:
 `issues/.supervisor/prompts/<invocationId>.json`, read by
 `GET /api/supervisor/prompts/:invocationId`, with the message carrying only
-`promptBytes`. A prompt holds the whole panel (infrastructure, models, playbooks), so
-a few hundred of them inside `state.json` made it tens of megabytes, serialised and
+`promptBytes`; `state.lastPrompt` (`chars`, the blocks sent in `full` and as markers,
+`unchanged`) reports the last call on `GET /api/supervisor`, and `lastPromptChars` on the
+status. A prompt once held the whole panel (infrastructure, models, playbooks) on every
+call, so a few hundred of them inside `state.json` made it tens of megabytes, serialised and
 rewritten at every save and cloned for every reader. A state written that way is
 converted once, at load; prompt files older than 14 days are removed. The poll
 itself is never queued twice: a tick that finds a poll queued or running is skipped, so
@@ -411,7 +420,7 @@ hidden now, only deferred.
 Every prompt carries `remaining`: authoritative counts and explicit scopes —
 session calls, session starts, session starts per issue, and occupied concurrent
 slots including reservations, with earlier sessions' usage under `history` as
-accounting —
+accounting (sent in full only when the session lacks it, see "What a prompt repeats") —
 so the model never infers a budget from run history, and `replyFormat`
 restating the envelope. A change the supervisor itself makes (a note, an
 issue, an archive) is absorbed into the poller's last-observed state, so it
@@ -480,7 +489,9 @@ The supervisor's own trouble is never taken out on its runs. Three cases:
 In every one of these the activation ends, when it ends, **on its own account**:
 its runs are left exactly as they are, under the run supervisor, and finish, pause
 or fail by themselves. Only an operator's Stop stops the runs it owns, and Stop
-works at any time, during a wait between retries included.
+works at any time, during a wait between retries included. A service shutdown is
+not a Stop either: it ends the activation as `stopped` and leaves the runs to the
+run supervisor, which resumes what the shutdown interrupted.
 
 ### Consulting the panel before the operator
 
@@ -520,7 +531,8 @@ restart is asked again and resumes from its record.
 Two failures come from the same shape of omission: the supervisor is shown a
 *default* and reads it as the *only* option.
 
-**Seats.** Every prompt carries `seatModels`, the catalogue of models a run's
+**Seats.** The prompt carries `seatModels` (in full whenever the session lacks those
+bytes, otherwise a marker; see "What a prompt repeats"), the catalogue of models a run's
 seats may be filled with — distinct from the models the supervisor itself runs
 on, which is a different question with a different answer. A playbook's listed
 participants are its *defaults*; `runOptions.participants` assigns any seat any
@@ -688,6 +700,51 @@ and **roster entry**, so "this playbook works" and "this model works in this sea
 answerable rather than inferred. Note that this is per entry, not per account: one
 person using several models is split across rows, and per-account totals would
 need an explicit `byAccount` grouping that does not exist yet.
+
+## What a prompt repeats
+
+Every prompt stays in the native session and is re-read on every later call. Four blocks
+change rarely and are large: `infrastructure` (one entry per project), `seatModels`,
+`playbooks` and `remaining.history`; sent on every call they made a prompt about 145 000
+characters. `gui/server/supervisor-context.mjs` sends each in full only when the current
+session has not been sent those exact bytes (sha256 of its JSON, per project for
+infrastructure), and otherwise a marker `{unchanged: true, since, call, get}`: the call that
+carried the copy and the action that returns it. `get_context {block, project?}` reads any
+of them in full, now; it reads only and starts nothing, and the charter tells the model to use
+it whenever it cannot find the copy a marker points at, so a marker is never the only copy.
+A changed project file sends that project's entry again, and the others stay markers.
+
+What the session was sent is `state.contextSent`, bound to the session id and written only
+after a call returned on that session, beside `readyQueueShown`: a failed or stopped call
+counts as nothing sent, so its retry carries the blocks again, and a format-repair turn
+follows a call that did return. A restart that resumes the same session resends nothing;
+New session, a model switch (the session archived) and the first call open a session that
+has been sent nothing, so their first call carries every block in full.
+
+A resume must come back on the session it was invoked with: verification proved that for
+every model the supervisor may run on (`gui/live/session-check.mjs` passes resume only on
+the same id), and silently continuing elsewhere is never acceptable (harness/README.md
+"Recovery"). A call that comes back on another session, or none, is a failed resume. Its
+session is never adopted and its reply, kept in the chat as `discarded: 'session-mismatch'`,
+is not acted on: it was written by a session given markers for context it never held. The
+old session goes to `sessionHistory` with `replacedBy`, the event is retried as after any
+failed call of the supervisor's own (`ownFailures`), and that retry opens a new session with
+every block in full. No model is substituted and no run is touched.
+
+An event owed a retry (its call failed, or came back on another session) is never dropped by
+a per-wake refusal: it is held in `deferred` (`retry: true`) and rides with the next event that
+wakes the supervisor, or wakes it after the deferral limit, in a wake with its own allowance.
+
+No adapter reports when its runtime compacts a session, and a compacted session may have lost
+the copies its markers point at. So the panel bounds that instead of detecting it: once a
+session has been sent `RESEND_AFTER_CHARS` (400 000) characters of prompts and replies since
+its last call that carried every block, the next call carries them all again. A prompt counts
+when its call is attempted, saved before the runtime is invoked, not when it returns: a call that
+failed may still have grown the session, so failures, retries and a restart in between cannot
+carry markers past the bound; only the hashes wait for a call that returned (about 100k
+tokens, under half a 200k-token window; at full prompts of 145 000 characters, one full call
+in fifteen or twenty). A fork (`ask`) copies its parent's transcript, markers and the copies
+they point at alike, and its own prompt carries none of these blocks.
 
 ## The ready queue
 
@@ -1220,7 +1277,7 @@ events produce null timings. Failures, timeouts and unexpected answers are recor
 as unsuccessful samples, never as healthy latency measurements. Changed model,
 connection or default effort marks previous samples stale.
 
-The same samples reach every supervisor turn through `seatModels[].performance`.
+The same samples reach the supervisor through `seatModels[].performance`, sent again whenever they change.
 Refresh uses the model's configured profile, account, credential and default effort.
 These operator-initiated probes use normal provider quota or API billing, separate
 from supervisor session call counts; each persisted sample records known cost and
