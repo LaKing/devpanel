@@ -5,7 +5,8 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 
 import { validateQuery } from '../server/broker/grammar.mjs'
-import { createBroker, writeGrant, revokeGrant, brokerConfigured } from '../server/broker/broker.mjs'
+import { createBroker, writeGrant, revokeGrant, brokerConfigured, environmentDriver } from '../server/broker/broker.mjs'
+import { openSocketForward, uriThroughSocket } from '../server/broker/socket-forward.mjs'
 import { SHIM } from '../server/broker/index.mjs'
 import YAML from 'yaml'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
@@ -199,6 +200,96 @@ export default async function (t) {
       t.ok('the brief names the broker tools instead of SSH', workers.every((x) => /db_query/.test(x.prompt) && /never over SSH/.test(x.prompt)))
       await releaseWorkspace(engine)
     } finally { if (savedSsh === undefined) delete process.env.DEVPANEL_SSH_BIN; else process.env.DEVPANEL_SSH_BIN = savedSsh }
+  }
+
+  t.section('5. a database that listens on a socket only: an SSH socket forward per query, after the grant')
+  {
+    t.eq('the URI keeps credentials, database and options; only the host becomes the socket',
+      uriThroughSocket('mongodb://reader:s3cret@ignored.example:27017/app?authSource=admin', '/tmp/dpm-x/s'), 'mongodb://reader:s3cret@%2Ftmp%2Fdpm-x%2Fs/app?authSource=admin')
+    t.eq('without credentials, and with several hosts named', uriThroughSocket('mongodb://a:1,b:2/?replicaSet=rs', '/tmp/s'), 'mongodb://%2Ftmp%2Fs/?replicaSet=rs')
+    t.ok('a host-discovering URI is refused', /mongodb\+srv/.test(refused(() => uriThroughSocket('mongodb+srv://reader:x@cluster.example/app', '/tmp/s')) ?? ''))
+
+    // What stands in for SSH: it serves the local end of `-L <local>:<remote>` and pipes it to the remote socket,
+    // which here is a socket of this test. It records its arguments and pid, and fails when told to.
+    const dir = await temp('broker-forward-')
+    const fakeSsh = path.join(dir, 'ssh')
+    const seenFile = path.join(dir, 'seen.json')
+    await fs.writeFile(fakeSsh, `#!${process.execPath}
+const fs = require('node:fs'); const net = require('node:net')
+const args = process.argv.slice(2)
+fs.writeFileSync(${JSON.stringify(seenFile)}, JSON.stringify({ args, pid: process.pid }))
+if (process.env.FAKE_SSH_FAIL) { process.stderr.write('Permission denied (publickey).\\n'); process.exit(255) }
+const [local, remote] = args[args.indexOf('-L') + 1].split(':')
+net.createServer((conn) => { const up = net.connect(remote); conn.pipe(up); up.pipe(conn); up.on('error', () => conn.destroy()); conn.on('error', () => up.destroy()) }).listen(local)
+process.on('SIGTERM', () => process.exit(0))
+`, { mode: 0o755 })
+    const remotePath = path.join(dir, 'mongod.sock')
+    const remote = net.createServer((conn) => conn.on('data', (chunk) => conn.end(`pong:${chunk}`)))
+    await new Promise((resolve) => remote.listen(remotePath, resolve))
+    const ask = (socket) => new Promise((resolve, reject) => { const c = net.connect(socket); let out = ''; c.on('data', (d) => { out += d }); c.on('end', () => resolve(out)); c.on('error', reject); c.write('ping') })
+    const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
+    const seenBy = async () => JSON.parse(await fs.readFile(seenFile, 'utf8'))
+    const savedSsh = process.env.DEVPANEL_SSH_BIN
+    process.env.DEVPANEL_SSH_BIN = fakeSsh
+    try {
+      const ssh = { hostRef: 'ssh-config:reader@production.invalid', workdir: '/srv' }
+      const forward = await openSocketForward({ ssh, remotePath })
+      t.eq('what goes in at the local end comes out of the remote socket', await ask(forward.localPath), 'pong:ping')
+      const seen = await seenBy()
+      t.ok('SSH carries the forward only: no command, fails when the forward does, the destination last',
+        seen.args.includes('-N') && seen.args.includes('ExitOnForwardFailure=yes') && seen.args.includes('BatchMode=yes') && seen.args.at(-1) === 'reader@production.invalid' && seen.args[seen.args.indexOf('-L') + 1] === `${forward.localPath}:${remotePath}`, JSON.stringify(seen.args))
+      t.eq('the local end is in a directory only the panel\'s user can enter', (await fs.stat(path.dirname(forward.localPath))).mode & 0o777, 0o700)
+      await forward.close()
+      t.eq('closed: the process is gone and so is the directory', [alive(seen.pid), await fs.stat(path.dirname(forward.localPath)).then(() => true, () => false)], [false, false])
+      t.ok('a relative socket path is refused before anything is started', /absolute/.test((await openSocketForward({ ssh, remotePath: 'mongod.sock' }).catch((e) => e)).message))
+
+      process.env.FAKE_SSH_FAIL = '1'
+      const failed = await openSocketForward({ ssh, remotePath }).catch((e) => e)
+      delete process.env.FAKE_SSH_FAIL
+      t.ok('an SSH that ends first is reported with what it said', /ended before it was ready \(exit 255\): Permission denied/.test(failed.message), failed.message)
+
+      // The driver over the forward: the URI names the local socket, the connection is direct, and both are closed together.
+      const env = { id: 'production', kind: 'production', ssh, database: { uriRef: 'env:DEVPANEL_TEST_SOCKET_URI', socket: { path: remotePath }, databases: [{ name: 'app' }] } }
+      process.env.DEVPANEL_TEST_SOCKET_URI = 'mongodb://reader:s3cret@ignored/app?authSource=admin'
+      const connects = []
+      const connect = async (uri, options) => {
+        connects.push({ uri, options })
+        const socket = decodeURIComponent(/@([^/]+)\//.exec(uri)[1])
+        return { run: async () => [{ answered: await ask(socket) }], close: async () => { connects.at(-1).closed = true } }
+      }
+      const driver = await environmentDriver(env, { connect })
+      t.eq('the driver is given the forwarded socket and a direct connection', [/^mongodb:\/\/reader:s3cret@%2F.*%2Fm\.sock\/app\?authSource=admin$/.test(connects[0].uri), connects[0].options], [true, { direct: true }])
+      t.ok('the local end is named as the driver recognises a socket (.sock)', forward.localPath.endsWith('.sock'), forward.localPath)
+      t.eq('a query goes through the forward', await driver.run({}), [{ answered: 'pong:ping' }])
+      const pid = (await seenBy()).pid
+      await driver.close()
+      t.eq('closing the driver closes the forward', [connects[0].closed, alive(pid)], [true, false])
+      const broken = await environmentDriver(env, { connect: async () => { throw new Error('authentication failed') } }).catch((e) => e)
+      t.eq('a connection that fails leaves no forward behind', [broken.message, alive((await seenBy()).pid)], ['authentication failed', false])
+      const plain = []
+      await environmentDriver({ ...env, database: { ...env.database, socket: undefined } }, { connect: async (uri, options) => { plain.push([uri, options]); return {} }, forward: async () => { throw new Error('no forward for a network database') } })
+      t.eq('a database on the network is connected by its URI as before', plain, [['mongodb://reader:s3cret@ignored/app?authSource=admin', undefined]])
+
+      // Through the broker: nothing is opened for a call the grant check refuses.
+      const issuePath = await temp('broker-forward-issue-')
+      const runDir = path.join(issuePath, 'runs', 'r1')
+      await fs.mkdir(runDir, { recursive: true })
+      const broker = createBroker({ loadInfrastructure: async () => ({ staging: { id: 'stage', ssh: { hostRef: 'ssh-config:stage.invalid' }, files: {} }, deployments: [env] }), inspect: async () => ({ available: true }),
+        driverFor: (e) => environmentDriver(e, { connect }) })
+      const { token } = broker.openTurn({ project: 'p', issueId: 'i', issuePath, runId: 'r1', runDir, invocationId: 'inv', seat: 'analyst' })
+      const query = { tool: 'db_query', args: { environment: 'production', query: { op: 'count', database: 'app', collection: 'users' } } }
+      await fs.rm(seenFile, { force: true })
+      const denied = await broker.call(token, query).catch((e) => e)
+      t.eq('without a grant the call is refused and SSH was never started', [denied.code, await fs.stat(seenFile).then(() => true, () => false)], ['FORBIDDEN', false])
+      await writeGrant(issuePath, { environment: 'production', reason: 'audit', expiresAt: new Date(Date.now() + 3600_000).toISOString() })
+      const answered = await broker.call(token, query)
+      t.eq('with the grant the query runs through the forward and is recorded', [answered.result, Boolean(answered.receipt), alive((await seenBy()).pid)], [[{ answered: 'pong:ping' }], true, false])
+    } finally {
+      if (savedSsh === undefined) delete process.env.DEVPANEL_SSH_BIN; else process.env.DEVPANEL_SSH_BIN = savedSsh
+      delete process.env.DEVPANEL_TEST_SOCKET_URI
+      delete process.env.FAKE_SSH_FAIL
+      await new Promise((resolve) => remote.close(resolve))
+    }
   }
   await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
 }

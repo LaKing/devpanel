@@ -385,7 +385,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   `database`, each seat with tools gets a per-turn MCP server (`inspect_environment`, `db_query`) over a per-turn Unix
   socket; token bound to run/invocation/seat, grants checked per call (staging by declaration, production by an
   operator grant in `<issue>/grants.json`), allow-list query grammar, caps, evidence in `runs/<id>/evidence/broker/`
-  before the result returns. Inert today: no project declares a database and the `mongodb` driver is not installed.
+  before the result returns. A database declared with `socket: { path }` listens on no network: each query reaches it through an
+  SSH socket forward over the environment's own `ssh`, opened after the grant check and closed with the query
+  (`broker/socket-forward.mjs`); the driver is the optional dependency `mongodb`. docs/project-infrastructure.md "Brokered database access".
 - `supervisor.mjs` — issue-run lifecycle: one live run per issue, durable and stoppable before it spends,
   ownership reconstructed at startup (a live run with a dead owner is `recovery-required`, not stopped).
   `runtime/source-repository.mjs` proves the source checkout readable in `start()` — after the project and

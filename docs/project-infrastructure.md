@@ -929,6 +929,54 @@ project opts out with `classifyUnstable: false` on `infrastructure.testDrive` or
 test's module with a string `module` beside `test` in its report, a directory
 relative to the project: the classification then needs no module of its own making.
 
+## Brokered database access
+
+A seat never reads an environment's database over SSH or with a credential of its
+own. Where an environment declares a `database`, every seat with tools gets two
+tools through the panel for the length of its turn (`gui/server/broker/`):
+`inspect_environment` (the declared diagnostics) and `db_query`, a read-only
+allow-list grammar (`find`, `count`, `distinct`, `aggregate` without writing or
+code-running stages, `listCollections`) against the declared databases and
+collections, capped in time, documents and bytes, each call recorded under
+`runs/<id>/evidence/broker/` before its result returns.
+
+```yaml
+deployments:
+  - id: production
+    ssh: { hostRef: ssh-config:app@production.example, workdir: /srv }
+    database:
+      uriRef: file:/home/panel/.config/devpanel/shop-production-db.uri
+      socket: { path: /var/lib/shop/mongodb/mongod.sock }
+      databases:
+        - name: shop
+          collections: ['orders', 'customers']   # absent or ['*']: every collection
+      caps: { timeMs: 10000, documents: 200, bytes: 1048576 }
+```
+
+- **`uriRef`** names where the connection URI is (`file:` or `env:`), resolved on
+  the panel host outside every fence; the URI itself is never in configuration,
+  a prompt or run metadata. Its principal must be read-only (the MongoDB `read`
+  role on the named databases): the grammar refuses writes, the principal is what
+  makes them impossible. Provisioning it is operator work.
+- **`socket`** is for a database that listens on no network, only on a Unix
+  socket inside its environment. Each query then reaches it through an SSH socket
+  forward over the environment's own `ssh` connection, opened after the grant
+  check and closed with the query (`socket-forward.mjs`); no tunnel stands
+  between queries. The URI's host part is ignored (its credentials, default
+  database and options are kept), the connection is direct (a replica-set member
+  is asked alone, its peers are never discovered), and the SSH account must be
+  able to connect to the socket file. Without `socket` the URI is connected as
+  written.
+- **Staging** is granted to the project by declaring it. A **deployment**
+  environment additionally needs an operator grant on the run's own issue
+  (`POST /api/projects/:project/issues/:id/grants {environment, reason,
+  expiresAt, seats?}`, the issue page's grant form; `…/grants/:grantId/revoke`),
+  checked on every call as it stands then. The top-level supervisor cannot grant.
+- The driver is the optional dependency `mongodb` of `gui/`; without it a query
+  answers `UNAVAILABLE`.
+- The declaration is part of the run's snapshot: a run started before it was
+  declared has no broker.
+
 ## What participants receive
 
 The infrastructure configuration contributes to the preview/configuration hash

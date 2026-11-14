@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { validateQuery, GrammarError } from './grammar.mjs'
 import { reference } from '../runtime/ssh.mjs'
+import { openSocketForward, uriThroughSocket } from './socket-forward.mjs'
 
 /*
  * The broker (phase 3 of the seat-access fence): what a
@@ -24,6 +25,10 @@ import { reference } from '../runtime/ssh.mjs'
  *  - Each call is recorded under `runs/<id>/evidence/broker/NNN.json` BEFORE its
  *    result returns; a failed write refuses the result.
  *  - Redaction is a display feature (decision 1), not a boundary.
+ *  - A database declared with a `socket` listens on no network: each query
+ *    reaches it through an SSH socket forward over the environment's own SSH
+ *    connection, opened after the grant check and closed with the query
+ *    (socket-forward.mjs).
  */
 
 export const DEFAULT_CAPS = Object.freeze({ timeMs: 10000, documents: 200, bytes: 1024 * 1024 })
@@ -74,11 +79,16 @@ export async function revokeGrant (issuePath, id) {
   return grant
 }
 
-/** The real driver, loaded only when a database is configured and used. */
-export async function mongoDriver (uri) {
+/**
+ * The real driver, loaded only when a database is configured and used.
+ * `direct`: talk to the one server the URI names and discover nothing. A member
+ * of a replica set advertises its peers by addresses that mean something only
+ * inside its environment; through a forwarded socket only that one end exists.
+ */
+export async function mongoDriver (uri, { direct = false } = {}) {
   let mongodb
   try { mongodb = await import('mongodb') } catch { throw new BrokerError('the MongoDB driver is not installed on this panel', 'UNAVAILABLE') }
-  const client = new mongodb.MongoClient(uri, { readPreference: 'secondaryPreferred', serverSelectionTimeoutMS: 5000 })
+  const client = new mongodb.MongoClient(uri, { readPreference: 'secondaryPreferred', serverSelectionTimeoutMS: 5000, ...(direct ? { directConnection: true } : {}) })
   await client.connect()
   return {
     async run ({ database, collection, op, filter = {}, projection, sort, limit, skip, field, pipeline, maxTimeMS, signal }) {
@@ -103,11 +113,31 @@ export async function mongoDriver (uri) {
 }
 
 /**
+ * The driver for an environment's declared database: by its URI, or, when the
+ * declaration names a `socket`, through an SSH socket forward that lives as long
+ * as the driver (closed with it, also when the connection fails).
+ */
+export async function environmentDriver (env, { connect = mongoDriver, forward = openSocketForward } = {}) {
+  const uri = await reference(env.database.uriRef)
+  if (!uri) throw new BrokerError(`the connection reference of ${env.id} resolves to nothing`, 'UNAVAILABLE')
+  if (!env.database.socket) return connect(uri)
+  let tunnel
+  try { tunnel = await forward({ ssh: env.ssh, remotePath: env.database.socket.path }) } catch (error) { throw new BrokerError(error.message, 'UNAVAILABLE') }
+  try {
+    const driver = await connect(uriThroughSocket(uri, tunnel.localPath), { direct: true })
+    return { run: (request) => driver.run(request), close: async () => { try { await driver.close?.() } finally { await tunnel.close() } } }
+  } catch (error) {
+    await tunnel.close()
+    throw error
+  }
+}
+
+/**
  * @param loadInfrastructure (project) => the project's infrastructure (configured, current)
  * @param inspect           ({project, environment, resource}) => the inspection result
  * @param driverFor         (environment) => a driver { run(request) } for its database
  */
-export function createBroker ({ loadInfrastructure, inspect, driverFor = async (env) => mongoDriver(await reference(env.database.uriRef)), clock = { now: () => Date.now(), iso: () => new Date().toISOString() } }) {
+export function createBroker ({ loadInfrastructure, inspect, driverFor = environmentDriver, clock = { now: () => Date.now(), iso: () => new Date().toISOString() } }) {
   const turns = new Map()
   const sequences = new Map()
 

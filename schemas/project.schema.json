@@ -303,6 +303,21 @@
                 }
               }
             },
+            "socket": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "description": "The database listens only on a Unix socket inside this environment (no TCP port): each query reaches it through an SSH socket forward over this environment's own `ssh` connection, opened for the query and closed with it. The host part of the referenced URI is ignored and replaced by the forwarded socket; its credentials, default database and options are kept. The SSH account must be able to connect to the socket file.",
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^/[^\\u0000]+$",
+                  "description": "Absolute path of the database's listening socket on the environment's host."
+                }
+              }
+            },
             "caps": {
               "type": "object",
               "additionalProperties": false,
