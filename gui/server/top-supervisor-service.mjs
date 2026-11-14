@@ -22,6 +22,7 @@ import { performanceForModel } from './model-performance.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
 import { deployStaging, deploymentReport } from './staging-deployment.mjs'
 import { deploymentCoverage, stagingPendingReport, writeDeploymentNotes } from './staging-coverage.mjs'
+import { settledRunCache } from './settled-run-cache.mjs'
 
 export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null }) {
  const configRoot=process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
@@ -75,13 +76,14 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
  // A packed issue (archived, or an answered inquiry that packed itself) has no run folders, but its bundle keeps every
  // run record: monitoring and the start gate read the ending and the cost from there, so packing between two polls
  // is an ordinary ending and not a vanished run. Steps stay in the bundle; restore the issue to read them.
- const detail=async(project,issueId,runId)=>{
-  const issue=await issues.getIssue(project,issueId)
+ const read=async(issue,project,issueId,runId)=>{
   if(!issue.packed)return summariseRun(await full(project,issueId,runId))
   const record=await issues.readRunRecord(project,issueId,runId)
   if(!record)throw Object.assign(new Error('no such run'),{status:404})
   return summarisePackedRun({runId,project,issueId,record})
  }
+ // Monitoring reads every owned run every few seconds: a settled run's summary is kept until its record changes.
+ const detail=settledRunCache({locate:(project,issueId)=>issues.getIssue(project,issueId),read,isActive:(project,issueId)=>supervisor.isActive(project,issueId)})
  const mutate=async fn=>{const value=await fn();changed();return value}
  const dir=process.env.DEVPANEL_SUPERVISOR_DIR ?? path.join(issues.ISSUES_DIR,'.supervisor')
  const lock=await acquire(path.join(dir,'.owner.lock'),{purpose:'top-level-supervisor'})

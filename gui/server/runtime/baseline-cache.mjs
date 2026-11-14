@@ -3,7 +3,6 @@ import { createReadStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import { runProcess } from './process.mjs'
 import { sshConnection, shellQuote } from './ssh.mjs'
 
 /*
@@ -99,6 +98,9 @@ export async function baselineIdentity ({ target, targetKey, baseCommit, signal 
   const files = cache.files ?? []
   const remote = target.kind === 'ssh'
   const connection = remote ? await sshConnection(target.ssh) : null
+  // Imported here: config/load.mjs reads `tierTarget` from this module, and what only resolves configuration
+  // (npm run overview, config:check) must load nothing that spawns.
+  const { runProcess } = await import('./process.mjs')
   const exec = (script) => remote
     ? runProcess({ command: connection.command, args: [...connection.args, `sh -c ${shellQuote(script)}`], signal })
     : runProcess({ command: '/bin/sh', args: ['-c', script], signal })

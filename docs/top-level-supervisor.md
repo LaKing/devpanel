@@ -375,6 +375,12 @@ rewritten at every save and cloned for every reader. A state written that way is
 converted once, at load; prompt files older than 14 days are removed. The poll
 itself is never queued twice: a tick that finds a poll queued or running is skipped, so
 an operator action (a message, an answer, Stop) waits behind one poll at most.
+A session owns its settled runs until New session, and the poll reads every owned run:
+a settled run's summary is therefore kept and read again only when its `run.json` or
+its issue's `issue.json` was written (their time and size, taken before the read), or
+after five minutes at the latest (`server/settled-run-cache.mjs`). A live or paused
+run, one under an automatic reconcile, one the run supervisor holds active and a
+packed issue are read every time, as before.
 Replies may contain a single JSON response object surrounded by prose or a code
 fence. Its envelope and action arguments are validated before execution; multiple
 JSON values are rejected as ambiguous. An invalid reply gets one formatting-repair
