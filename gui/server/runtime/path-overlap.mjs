@@ -34,6 +34,14 @@ import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
  * The checkout's uncommitted paths (modified, staged, untracked; both names of
  * a rename), for the project page's warning: manual edits a live run is also
  * touching. Read-only, bounded like every launch-path git read.
+ *
+ * A path that lies under a link is left out. A checkout that commits its links
+ * dereferenced has every file of a linked directory in HEAD and a link in its
+ * place on disk, so git reports all of them deleted: that is the layout, not an
+ * edit, and it made every file a framework run touches an overlap in every
+ * application linking the framework. Such a file belongs to the checkout the
+ * link points into, and that project's page is the one that warns. The link
+ * itself stays: it is this checkout's own entry.
  */
 export async function checkoutPaths (projectPath) {
   const { stdout } = await gitRead('git', ['-C', projectPath, 'status', '--porcelain', '-z', '--untracked-files=all'],
@@ -44,7 +52,20 @@ export async function checkoutPaths (projectPath) {
     paths.push(tokens[i].slice(3))
     if (/^[RC]/.test(tokens[i])) paths.push(tokens[++i])
   }
-  return [...new Set(paths.filter(Boolean))]
+  const linked = new Map()
+  const own = []
+  for (const file of new Set(paths.filter(Boolean))) if (!await underLink(projectPath, path.dirname(file), linked)) own.push(file)
+  return own
+}
+
+/** Whether a directory of the checkout is a link or lies under one; `known` keeps each directory's answer for the listing. */
+async function underLink (root, directory, known) {
+  if (directory === '.' || directory === '') return false
+  if (known.has(directory)) return known.get(directory)
+  const answer = await underLink(root, path.dirname(directory), known) ||
+    await fs.lstat(path.join(root, directory)).then((stat) => stat.isSymbolicLink(), () => false)
+  known.set(directory, answer)
+  return answer
 }
 
 const MAX_FILES_SHOWN = 30

@@ -301,6 +301,33 @@ export default async function (t) {
       }
     }
 
+    t.section('the project page: a checkout that commits its links dereferenced does not count the linked files as its edits')
+    {
+      // HEAD holds the linked directory's files, the disk a link in their place: git lists every one of them as deleted.
+      const instance = path.join(root, 'dereferenced-project')
+      await fs.mkdir(path.join(instance, '@linked', 'mod'), { recursive: true })
+      await fs.mkdir(path.join(instance, 'own'), { recursive: true })
+      await fs.writeFile(path.join(instance, '@linked', 'mod', 'a.mjs'), 'export const a = 1\n')
+      await fs.writeFile(path.join(instance, '@linked', 'mod', 'b.mjs'), 'export const b = 1\n')
+      await fs.writeFile(path.join(instance, 'own', 'app.mjs'), 'export const app = 1\n')
+      await git(root, 'init', '-q', instance)
+      await git(instance, 'add', '.')
+      await git(instance, 'commit', '-qm', 'dereferenced')
+      await fs.rm(path.join(instance, '@linked'), { recursive: true })
+      await fs.symlink('../framework-project/@shared', path.join(instance, '@linked'))
+      await fs.writeFile(path.join(instance, 'own', 'app.mjs'), 'edited by hand\n')
+      const status = await git(instance, 'status', '--porcelain')
+      t.ok('git itself lists the linked files as deleted', / D @linked\/mod\/a\.mjs/.test(status) && / D @linked\/mod\/b\.mjs/.test(status), status)
+      const dirty = await checkoutPaths(instance)
+      t.eq('only the link and the checkout\'s own edit are its uncommitted paths', dirty.sort(), ['@linked', 'own/app.mjs'])
+      const owner = await liveRow(root, 'framework-project', framework, async (worktree) => { await fs.writeFile(path.join(worktree, '@shared', 'mod', 'a.mjs'), 'changed by a live run') })
+      const read = inspector({ 'framework-project': [owner] })
+      const reading = await read({ project: 'app-project', projectPath: instance, paths: dirty })
+      t.eq('so a live framework run touching a linked file is no overlap here', reading.state, 'none', reading.detail)
+      const unfiltered = await read({ project: 'app-project', projectPath: instance, paths: [...dirty, '@linked/mod/a.mjs'] })
+      t.eq('which the deleted listing alone would have made one', [unfiltered.state, pathsOf(unfiltered.overlaps[0] ?? { files: [] })], ['overlap', ['@linked/mod/a.mjs']], unfiltered.detail)
+    }
+
     t.section('a third project writing into the same owner, and the owner as the candidate')
     {
       // A materialized worktree: the link replaced by a copy, delivered through its recorded binding.

@@ -276,11 +276,20 @@ watch([project, archived], () => {
       </div>
     </div>
 
-    <v-alert v-if="checkoutOverlap?.state === 'overlap'" type="warning" variant="tonal" density="compact" class="mb-3"
+    <!-- A reading that blocks nothing, so it is information: one line per run, its files only when opened. -->
+    <v-alert v-if="checkoutOverlap?.state === 'overlap'" type="info" variant="tonal" density="compact" class="mb-3"
              data-test="checkout-overlap">
-      Uncommitted changes in this checkout are also being changed by a live run:
-      <span v-for="(o, i) in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`">{{ i ? '; ' : ' ' }}run {{ o.runId }} of {{ o.issueId }} touches {{ o.files.map((f) => f.path).join(', ') }}{{ o.more ? ` and ${o.more} more` : '' }}</span>.
+      Uncommitted changes in this checkout are also being changed by a live run.
       Nothing is blocked: its delivery merges with these edits and stops only on lines both changed.
+      <details v-for="o in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`" class="mt-1" data-test="checkout-overlap-run">
+        <summary>
+          {{ o.files.length + (o.more || 0) }} {{ o.files.length + (o.more || 0) === 1 ? 'file' : 'files' }} —
+          <router-link :to="`/projects/${encodeURIComponent(o.project)}/${encodeURIComponent(o.issueId)}`">{{ o.issueId }}</router-link>
+          <span :title="o.runId"> (run {{ o.runId.slice(-8) }}<span v-if="o.project !== String(project)"> of {{ o.project }}</span>)</span>
+        </summary>
+        <div v-for="f in o.files" :key="f.path"><code>{{ f.path }}</code></div>
+        <div v-if="o.more">and {{ o.more }} more</div>
+      </details>
     </v-alert>
 
     <v-alert v-if="moduleLocks?.held?.length" type="info" variant="tonal" density="compact" class="mb-3"
