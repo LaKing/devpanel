@@ -72,8 +72,21 @@ export function resumeUnavailable (run) {
  * closure again. A run that never recorded a revision has nothing to continue.
  */
 export const CONTINUABLE_BLOCKS = ['closure-conditions-unmet', 'refreshed-checks-failed', 'checks-failed-unchanged', 'checks-inconclusive']
+
+/**
+ * A delivery conflict went back to the author (engine.returnFromDelivery) and no revision was recorded since:
+ * the worktree is the engine's merge onto the current source, conflict markers included, and nothing approved
+ * describes it. A run that ended in that state reads as drift (`candidate-changed-since-approval`), yet nobody
+ * edited an approved change: the author's round is what it lacks, and Continue gives it.
+ */
+export function unansweredDeliveryReturn (run) {
+  const last = run?.deliveryReturns?.at(-1)
+  return Boolean(last) && !(run.steps ?? []).some((s) => s.revision && Number(s.number) > Number(last.step))
+}
+
 export function continueUnavailable (run) {
-  if (run.status !== 'blocked' || !CONTINUABLE_BLOCKS.includes(run.blockedReason)) return 'Only a run stopped at closure can be continued.'
+  const continuable = CONTINUABLE_BLOCKS.includes(run.blockedReason) || (run.blockedReason === 'candidate-changed-since-approval' && unansweredDeliveryReturn(run))
+  if (run.status !== 'blocked' || !continuable) return 'Only a run stopped at closure can be continued.'
   if (run.abandonment || run.integrity?.status === 'abandoned') return 'This run was abandoned.'
   if (run.journal?.recoveryRequired || run.recovery?.required || run.integrity?.status !== 'clear') return 'Resolve the run’s recovery or integrity condition first.'
   if (Object.values(run.participants ?? {}).some(p => p.pendingInvocation || p.state === 'recovery-required')) return 'An invocation still needs recovery.'

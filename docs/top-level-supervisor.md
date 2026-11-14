@@ -381,6 +381,7 @@ its issue's `issue.json` was written (their time and size, taken before the read
 after five minutes at the latest (`server/settled-run-cache.mjs`). A live or paused
 run, one under an automatic reconcile, one the run supervisor holds active and a
 packed issue are read every time, as before.
+
 Replies may contain a single JSON response object surrounded by prose or a code
 fence. Its envelope and action arguments are validated before execution; multiple
 JSON values are rejected as ambiguous. An invalid reply gets one formatting-repair

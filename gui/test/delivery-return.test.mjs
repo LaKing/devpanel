@@ -7,6 +7,7 @@ import { resolvePlaybook } from '../server/config/load.mjs'
 import { conflictRegions } from '../server/runtime/delivery-return.mjs'
 import { undeliveredApproval } from '../server/runtime/carry-forward.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { supportedActions } from '../server/supervisor.mjs'
 import { runMetrics } from '../server/runtime/run-metrics.mjs'
 import { engineFixture, scriptFor, simulateProcessDeath, cleanupFixtures } from './fakes/fixture.mjs'
 
@@ -32,7 +33,7 @@ const NO_MARKERS = '      - id: no-markers\n        run: "! grep -q \'<<<<<<<\' 
  * after the reviews and before delivery. `policy`: what the host's reconcile
  * policy reads as (null: no host, as in an engine nothing supervises).
  */
-async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null } = {}) {
+async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', commands = NO_MARKERS, first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null } = {}) {
   let engine = null
   let confirms = 0
   const prompts = []
@@ -61,7 +62,7 @@ async function scenario ({ author = null, beforeDelivery = null, policy = {}, pl
   await fs.writeFile(path.join(f.projectPath, 'blob.bin'), Buffer.from([0, 1, 2, 3]))
   await git(f.projectPath, 'add', '-A')
   await git(f.projectPath, 'commit', '-qm', 'source')
-  await fs.appendFile(path.join(f.configRoot, `playbooks/${playbook}.yaml`), `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n${NO_MARKERS}`)
+  await fs.appendFile(path.join(f.configRoot, `playbooks/${playbook}.yaml`), `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n${commands}`)
   const options = { base: 'working-tree', ...(playbook === 'implementation' ? { participants: { 'auditor-1': { model: 'opus-5' } } } : {}) }
   const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
@@ -226,6 +227,69 @@ export default async function (t) {
       t.eq('driven on, it completes and delivers', `${again.run.status} ${again.run.outcome}`, 'completed resolved', `${again.run.blockedReason} ${again.run.delivery?.error} ${JSON.stringify(again.run.closure?.deliveryNotReturned ?? again.run.closure?.conditions)}`)
       t.eq('on one more author round', rounds(s.prompts, 'implement'), [0, 1])
       t.eq('the source holds the reconciliation', await source(s.f), RECONCILED)
+      await done(again)
+    }
+
+    t.section('9. an earlier round that only a failed check had kept from passing does not end the loop after a return')
+    {
+      // Round 0 is approved by the reviewer while its check fails (a marker line in the file); round 1 fixes it and is
+      // delivered into the conflict. The return drops the check results of the revision it replaces: replay must still
+      // read round 0 as a round the loop went past, and give the author round 2.
+      const { f, engine, prompts } = await scenario({
+        first: { worktree: { 'server.mjs': CANDIDATE + '<<<<<<< left in by mistake\n' }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } },
+        author: async (round, file) => { await fs.writeFile(file, round === 1 ? CANDIDATE : RECONCILED) } })
+      const run = engine.run
+      t.eq('the first round\'s check failed and the second passed before the return', run.checkHistory?.filter((c) => !c.tier || c.tier === 'full').slice(0, 2).map((c) => c.result), ['failed', 'passed'], JSON.stringify(run.checkHistory?.map((c) => [c.result, c.tier ?? null])))
+      t.eq('the conflict went back once', run.deliveryReturns?.length, 1)
+      t.eq('the author got the round after the return, no confirmation was asked on the unreconciled tree', [rounds(prompts, 'implement'), prompts.filter((p) => p.stepId === 'confirm').length], [[0, 1, 2], 2])
+      t.eq('the run completes and delivers', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.conditions)}`)
+      t.eq('the source holds the reconciliation', await source(f), RECONCILED)
+      await done(engine)
+    }
+
+    t.section('10. approved in an earlier round than the last one recorded: the return still reaches the author')
+    {
+      // As it happened live: round 0 is approved and its check fails, round 1 answers with the same bytes and the loop
+      // stops (checks-failed-unchanged); Refresh checks then passes on that revision, so replay reads round 0 as the
+      // deciding round while round 1 is the last one recorded. Delivery conflicts and returns: the loop must give the
+      // author round 2, not ask for a confirmation of the unreconciled tree.
+      const toggle = path.join(await fs.mkdtemp(path.join((await import('node:os')).tmpdir(), 'devpanel-return-toggle-')), 'passes')
+      const s = await scenario({
+        // Fails on the candidate only (the base lacks the fixed line), so the failure is not an inherited one.
+        commands: `${NO_MARKERS}      - id: toggle\n        run: "! grep -q 'line 9 fixed' server.mjs || test -f ${toggle}"\n`, author: async (round, file) => { if (round >= 2) await fs.writeFile(file, RECONCILED) } })
+      t.eq('stopped on the failed check answered unchanged', [`${s.engine.run.status} ${s.engine.run.blockedReason}`, rounds(s.prompts, 'implement')], ['blocked checks-failed-unchanged', [0, 1]])
+      await fs.writeFile(toggle, '')
+      const again = await s.reopen()
+      await again.refreshClosureChecks(null)
+      await again.drive()
+      const run = again.run
+      t.eq('the refreshed check passed, delivery conflicted and went back once', [run.deliveryReturns?.length, run.steps.find((x) => x.decision?.deliveryReturn)?.decision.key], [1, 'implement-review:return'], `${run.status} ${run.blockedReason}`)
+      t.eq('the author got round 2', rounds(s.prompts, 'implement'), [0, 1, 2])
+      t.eq('the run completes and delivers', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.conditions)}`)
+      t.eq('the source holds the reconciliation', await source(s.f), RECONCILED)
+      await done(again)
+      await fs.rm(path.dirname(toggle), { recursive: true, force: true })
+    }
+
+    t.section('11. a run that ended with the return unanswered reads as such, and Continue gives the author the round')
+    {
+      // The record an earlier defect left behind: the return is on it, the author never ran, and the run ended blocked
+      // as if an approved change had been edited.
+      const s = await scenario({ policy: null, author: resolve() })
+      const again = await s.reopen()
+      again.reconcilePolicy = () => ({})
+      t.eq('the conflict is returned by a finalize', await again.finalize({ mayReturnDelivery: true }), 'returned')
+      Object.assign(again.run, { status: 'blocked', outcome: 'unresolved', blockedReason: 'candidate-changed-since-approval', endedAt: again.clock.iso() })
+      t.eq('Continue is offered, where plain drift offers only a new run', [supportedActions(again.run), supportedActions({ ...again.run, deliveryReturns: undefined })], [['continue', 'start-new'], ['start-new']])
+      const told = explainRun(again.run)
+      t.ok('the explanation says what happened and what to do', /before the author answered a delivery conflict/.test(told.headline) && told.detail.includes('server.mjs') && /Continue/.test(told.next), JSON.stringify(told))
+      await again.continueRun({ text: 'Reconcile the conflict.', actor: 'operator' })
+      await again.drive()
+      t.eq('it completes and delivers', `${again.run.status} ${again.run.outcome}`, 'completed resolved', `${again.run.blockedReason} ${again.run.delivery?.error} ${JSON.stringify(again.run.closure?.conditions)}`)
+      t.eq('on one author round after the return', rounds(s.prompts, 'implement'), [0, 1])
+      t.ok('whose prompt quotes the conflict', (s.prompts.find((p) => p.stepId === 'implement' && p.round === 1)?.prompt ?? '').includes('line 5 by someone else'))
+      t.eq('the source holds the reconciliation', await source(s.f), RECONCILED)
+      t.eq('once a revision answers the return, drift is drift again', supportedActions({ ...again.run, status: 'blocked', blockedReason: 'candidate-changed-since-approval' }), ['start-new'])
       await done(again)
     }
   } finally {

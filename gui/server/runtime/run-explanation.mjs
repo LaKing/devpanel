@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, checksOnlyBlock, continueUnavailable, CONTINUABLE_BLOCKS, reconcilePending, reconcileUnavailable, resumeUnavailable, SERVICE_SHUTDOWN } from './run-control.mjs'
+import { acceptCheckUnavailable, checksOnlyBlock, continueUnavailable, CONTINUABLE_BLOCKS, reconcilePending, reconcileUnavailable, resumeUnavailable, unansweredDeliveryReturn, SERVICE_SHUTDOWN } from './run-control.mjs'
 import { acceptedRiskWords, refusedAcceptance, runResult } from './run-result.mjs'
 import { openCleanup, STRUCTURAL } from './cleanup-barrier.mjs'
 import { riskStatement } from './residual-risks.mjs'
@@ -819,6 +819,12 @@ function blocked (run, outputs, kept) {
         unmet: (run.closure?.blockers ?? []).map((b) => ({ id: null, text: typeof b === 'string' ? b : (b.description ?? JSON.stringify(b)) })),
         next: 'Start a new run once the blockers are addressed.' }
     case 'candidate-changed-since-approval':
+      // Not an edit: the engine's own merge after a delivery conflict, which the author never got to answer.
+      if (unansweredDeliveryReturn(run)) {
+        return { ...base, headline: 'Stopped before the author answered a delivery conflict',
+          detail: `Delivery conflicted with the source in ${(run.deliveryReturns.at(-1).conflicts ?? []).map((c) => c.path).join(', ') || 'the approved paths'} and the change went back to its author, but the run ended before that round. The worktree holds the approved change on the current source with the conflicts as markers.`,
+          next: 'Continue gives the author the round to reconcile it; the result is checked, reviewed and delivered as usual.' }
+      }
       return { ...base, headline: 'Stopped: the change was edited after it was approved', detail: 'The approval no longer describes what would be delivered.', next: 'Start a new run.' }
     case 'closure-conditions-unmet': {
       // An older triage workflow demanded implementation criteria of a

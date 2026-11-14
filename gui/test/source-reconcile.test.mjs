@@ -323,7 +323,7 @@ export default async function (t) {
       t.eq('driven to its end and delivered', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.deliveryNotReturned ?? run.closure?.conditions)}`)
       t.eq('on one return, with the author\'s round after it', [run.deliveryReturns?.length, run.steps.filter((x) => x.stepId === 'implement').length], [1, 2])
       t.eq('the source holds the author\'s reconciliation', await read(s.f, 'server.mjs'), lines(10, { 5: 'line 5 by both' }))
-      t.ok('the time it stood blocked is not its wall clock', run.finalizations?.at(-1)?.returned?.suspendedMs > 0 && run.controlSuspendedMs >= run.finalizations.at(-1).returned.suspendedMs, JSON.stringify(run.finalizations?.at(-1)?.returned))
+      t.ok('the time it stood blocked is not its wall clock', run.finalizations?.at(-1)?.suspendedMs > 0 && run.controlSuspendedMs >= run.finalizations.at(-1).suspendedMs, JSON.stringify(run.finalizations?.at(-1)?.suspendedMs))
       t.ok('announced as resumed, then as ended once', types(events).indexOf('run-resumed') > -1 && types(events).indexOf('run-resumed') < types(events).indexOf('run-finished') && finishes(events) === 1, types(events).join(' '))
       await supervisor.shutdown?.()
       if (controlBefore === undefined) delete process.env.DEVPANEL_FAKE_CONTROL

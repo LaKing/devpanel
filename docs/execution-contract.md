@@ -1546,12 +1546,16 @@ author"), under the same refusals and the same bound. The run is live again and
 the supervisor drives it on like an answered one: the route answers `status:
 pending` with `decision.deliveryReturn`, a `run-resumed` event follows, and the
 end is announced when the run really ends. The time the run stood blocked is a
-stop, not its wall clock (`finalizations[].returned.suspendedMs`, added to
-`controlSuspendedMs`), and the module locks its end gave back are owed
+stop, not its wall clock, at every finalize, returned or not
+(`finalizations[].suspendedMs`, added to `controlSuspendedMs`), and the module
+locks its end gave back are owed
 (`moduleLocks.owed`): the engine takes them before any turn and waits for a
 holder, the finalize is never refused for them. This is how a run left blocked
 at a conflict that could not be returned when it closed (a defect since fixed,
-an unreadable reconcile policy) gets its author round. An unmet confirmation is
+an unreadable reconcile policy) gets its author round. The reopened loop gives
+that round whichever round replay reads as the approving one: no round recorded
+before a Continue or a return ends the loop (a round can read as passing in
+hindsight, once Refresh checks passed a revision whose check had failed). An unmet confirmation is
 not returned by a finalize; that still blocks. `engine.finalize()` called with
 nothing to drive the run on (no `mayReturnDelivery`) returns nothing and says so
 in `closure.deliveryNotReturned`.
@@ -2858,6 +2862,18 @@ fresh closure confirmation follow, and the earlier confirmations are superseded.
 Budget limits may be raised as for resume, and the time the run stood still is not
 counted. `run.continueHistory` records each Continue. Resume is not offered here:
 replaying an unchanged record reaches the same closure.
+
+No round recorded before the decision ends the reopened loop on replay, not only
+the last one: an earlier round can read as passing in hindsight (approved while
+its check failed, then passed by Refresh checks), and the loop would otherwise end
+there and skip the author's turn. The same holds for the engine's own returns.
+
+Continue is also offered to a run that reads `candidate-changed-since-approval`
+while a delivery return is unanswered (`unansweredDeliveryReturn`: the latest
+`run.deliveryReturns` entry has no revision recorded after its step). There the
+worktree is the engine's merge onto the current source with the conflicts as
+markers, nobody edited an approved change, and the author's round is what the run
+lacks. Plain drift still offers only a new run.
 
 ### The engine returns an unmet confirmation to review
 

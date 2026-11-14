@@ -598,6 +598,11 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     const continued = new Set(decisions.filter((d) => d.key === continueKey(phase) || d.key === returnKey(phase)).map((d) =>
       Math.max(-1, ...steps.filter((s) => s.phase === phase.id && s.role !== 'operator' && Number.isInteger(s.round) && Number(s.number) < Number(d.step)).map((s) => s.round))))
     let maxRounds = Math.max(phase.loop.maxRounds + granted, ...[...continued].map((r) => r + 2))
+    // The loop is reopened after its last recorded round, so no earlier round may end it on replay either. One
+    // can read as passing in hindsight: approved while its check failed, answered with the same bytes in the
+    // round after (which stopped the loop), then passed by Refresh checks; or its check results dropped by a
+    // delivery return. Without this the reopened loop would end at that round and skip the author's turn.
+    const reopenedAfter = Math.max(-1, ...continued)
     let lastNumber = 0
     // Substantial findings per round (a failed check counts as one): whether the
     // loop is converging, for `extend-if-converging`.
@@ -738,7 +743,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
         review = { ...review, verdict: 'changes-needed', checksFailed: true }
       } else checksOnlyFailed = null
       if (review && continued.has(round)) review = { ...review, verdict: 'changes-needed', operatorContinued: true }
-      if (review && evaluate(phase.loop.until, { review })) satisfied = true
+      if (review && round > reopenedAfter && evaluate(phase.loop.until, { review })) satisfied = true
       weight[round] = findings + (review?.checksFailed || review?.operatorContinued ? 1 : 0)
       named[round] = t.named
       // One extra round, never asked for, when the last regular round made
@@ -4664,17 +4669,19 @@ export class Engine {
     }
     await fs.access(this.run.workspace.path).catch(() => { throw Object.assign(new Error(`the worktree ${this.run.workspace.path} no longer exists`), { status: 409 }) })
     const previous = this.run.blockedReason
+    // The time the run stood blocked is a stop, not its wall clock (as a Resume or Continue counts it), whether
+    // this finalize completes it, leaves it blocked or returns it to its author: a later continuation of the run
+    // would otherwise find every hour it waited here charged to its budget.
     const stoppedAt = Date.parse(this.run.endedAt ?? '')
-    this.run.finalizations = [...(this.run.finalizations ?? []), { at: this.clock.iso(), previousBlock: previous, previousDelivery: this.run.delivery ?? null }]
+    const suspendedMs = Number.isFinite(stoppedAt) ? Math.max(0, this.clock.now() - stoppedAt) : 0
+    this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
+    this.run.finalizations = [...(this.run.finalizations ?? []), { at: this.clock.iso(), previousBlock: previous, previousDelivery: this.run.delivery ?? null, suspendedMs }]
     this.run.status = 'running'
     this.run.blockedReason = null
     this.run.endedAt = null
     await this.persist({ type: 'finalizing', previousBlock: previous })
     if (await this.evaluateClosure({ mayReturnDelivery }) === 'returned') {
-      // The run goes on: the time it stood blocked is a stop, not its wall clock (as a Resume or Continue counts it).
-      const suspendedMs = Number.isFinite(stoppedAt) ? Math.max(0, this.clock.now() - stoppedAt) : 0
-      this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
-      this.run.finalizations.at(-1).returned = { deliveryReturn: this.run.deliveryReturns?.length ?? null, suspendedMs }
+      this.run.finalizations.at(-1).returned = { deliveryReturn: this.run.deliveryReturns?.length ?? null }
       await this.persist({ type: 'finalize-returned', suspendedMs })
       return 'returned'
     }

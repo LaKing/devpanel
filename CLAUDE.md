@@ -295,7 +295,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   (**Continue playbook**, `engine.continueRun`, supervisor `continue_run`): an operator decision step
   `<phase>:continue` carrying the instruction, the closure record and the issue notes added since the run began;
   replay counts the loop's last round as not passed and runs one more, then confirms again. Resume would only
-  replay to the same closure.
+  replay to the same closure. No round before the decision ends the reopened loop (one can read as passing in
+  hindsight, after Refresh checks). Also offered where a delivery return went unanswered and the run reads
+  `candidate-changed-since-approval` (`unansweredDeliveryReturn`, run-control.mjs).
 - Accept check result (`engine.acceptCheckResult`, supervisor `accept_check_result_run`): named failures of the latest full check on an
   approved revision stop blocking it, recorded on `run.closure.acceptedCheckRisk` only once every other condition but delivery is met (a
   missing confirmation is asked for first; `run.checkAcceptanceRequest` accepts nothing). `verificationLevel` stays `review-only`; delivery
