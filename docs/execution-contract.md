@@ -3264,7 +3264,8 @@ no previous green cycle that fails makes the gate fail, and the run blocks
 commands), read from that drive's `drive.json`. Its deliveries count as tested only when the
 whole suite ran to an answer and a selftest report parses out of a report command's output
 (`suiteRanOf`: not skipped behind a failed readiness, no timeout or signal); the entry's
-`coverageEstablished` says so, and only then do the runs its snapshot covered stop counting
+`coverageEstablished` says so, and only then do the runs delivered before its snapshot (covered,
+or indeterminate because their paths changed since) stop counting
 toward the next cycle (server/verification-trigger.mjs). A cycle's Deployment run is held to the same
 standard (`fullTierRanOf`): its release completed, every required command of its full drive ran and
 answered on its own exit (a timed-out last command, which skips nothing, proves nothing), and a

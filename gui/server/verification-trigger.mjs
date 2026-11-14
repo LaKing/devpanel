@@ -5,10 +5,16 @@
  * `fullVerification.afterDeliveries`, default 10, 0 = off).
  *
  * A delivery stops counting only when a cycle entry of its project established coverage
- * (`coverageEstablished`: the whole suite ran, full-verification-drive.mjs suiteRanOf) and
- * lists it in `coverage.covered`. One the snapshot could not establish (indeterminate), one
- * delivered after the snapshot (notShipped) and every delivery of an entry that never tested
- * (refused, failed before its suite, incomplete) keep counting.
+ * (`coverageEstablished`: the whole suite ran, full-verification-drive.mjs suiteRanOf) on a
+ * snapshot taken after it: the entry lists it in `coverage.covered` (the snapshot held its
+ * bytes) or in `coverage.indeterminate` (delivered before the snapshot, its bytes not found as
+ * delivered). One delivered after the snapshot (notShipped) and every delivery of an entry that
+ * never tested (refused, failed before its suite, incomplete) keep counting.
+ *
+ * Decision: an indeterminate delivery is accounted for too. Its paths were changed since, by a
+ * person or a later hand landing, and the checkout as it stood was tested whole; no later cycle
+ * can read it differently, so counting it on kept a stage due for ever (seen live on the first
+ * instance cycle: 97 such deliveries on one stage). The coverage record keeps saying which is which.
  *
  * That alone would start the next cycle as soon as one ended without testing. A stage whose
  * latest automatic cycle established nothing for it is therefore held back: its next automatic
@@ -29,20 +35,20 @@ export const establishes = (entry) => entry?.coverageEstablished === true
  * `records` are the cycle records newest first (full-verification-drive.mjs cycleRecords).
  */
 export async function deliveryCounts ({ stages, deliveriesOf, records, threshold }) {
-  const covered = new Map()
+  const accounted = new Map()
   for (const record of records) {
     for (const entry of record.projects ?? []) {
       if (!establishes(entry)) continue
-      const set = covered.get(entry.project) ?? new Set()
-      for (const c of entry.coverage?.covered ?? []) set.add(c.runId)
-      covered.set(entry.project, set)
+      const set = accounted.get(entry.project) ?? new Set()
+      for (const c of [...(entry.coverage?.covered ?? []), ...(entry.coverage?.indeterminate ?? [])]) set.add(c.runId)
+      accounted.set(entry.project, set)
     }
   }
   const out = []
   for (const { host, stage, projects } of stages) {
     const runs = []
     for (const project of projects) {
-      for (const d of await deliveriesOf(project)) if (!covered.get(project)?.has(d.runId)) runs.push({ project, ...d })
+      for (const d of await deliveriesOf(project)) if (!accounted.get(project)?.has(d.runId)) runs.push({ project, ...d })
     }
     const ofStage = (record) => (record.projects ?? []).filter((e) => projects.includes(e.project) && (e.host ?? null) === host)
     // Newest first: the latest cycle that established coverage here, and the latest automatic one that did not.

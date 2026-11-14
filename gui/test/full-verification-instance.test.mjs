@@ -229,7 +229,8 @@ export default async function (t) {
       t.eq('ten more after that cycle began: the next one starts', [second.trigger, second.deliveries.count], ['deliveries', 20])
       t.eq('its suite failed its own test: red, and the suite ran', [second.verdict, second.projects[0].suiteRan?.passed, second.projects[0].coverageEstablished], ['red', false, true])
       const after = await check()
-      t.eq('what it covered stops counting; the delivery its snapshot could not establish still counts', [after.count, after.runs.map((r) => r.runId), after.due], [1, ['app-project-r2'], false])
+      t.eq('what was delivered before its snapshot stops counting, the delivery whose bytes it could not find included', [after.count, after.runs.map((r) => r.runId), after.due], [0, [], false])
+      t.eq('the record still says which was which', [second.projects[0].coverage.indeterminate.map((c) => c.runId), second.projects[0].coverage.covered.some((c) => c.runId === 'app-project-r2')], [['app-project-r2'], false])
       threshold = 0
       delivered('app-project', 20, '2026-11-14T12:00:00.000Z')
       const off = await fv.deliveryCheck()

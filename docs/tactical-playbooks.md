@@ -597,10 +597,12 @@ instant and a skipped one fires shifted forward.
 
 **The delivery count** is per stage (a staging host, summing the projects that stage there)
 and counts the deliveries to the source since `COVERAGE_BASELINE` (staging-coverage.mjs) that
-no cycle has covered yet. A delivery stops counting only when a cycle entry of its project
-proved its snapshot held the delivery's bytes and ran the whole suite on it
-(`coverageEstablished`); a delivery the snapshot could not establish (`indeterminate`), one
-delivered after the snapshot (`notShipped`) and every delivery of an entry that never got to
+no cycle has tested yet. A delivery stops counting only when a cycle entry of its project
+ran the whole suite (`coverageEstablished`) on a snapshot taken after it: the entry lists it as
+`covered` (the snapshot held its bytes) or as `indeterminate` (its paths were changed since, by
+a person or a hand landing; the checkout as it stood was tested whole and no later cycle can
+read it differently, so it is accounted for and the record keeps the distinction). A delivery
+made after the snapshot (`notShipped`) and every delivery of an entry that never got to
 its suite (refused, readiness failed, incomplete) keep counting. A stage whose latest automatic
 cycle established nothing is held back until as many deliveries again were made after that
 cycle began (`suppressed` in `GET /api/verification/latest`'s `deliveries`), so a stage that
