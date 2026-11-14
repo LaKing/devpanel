@@ -194,7 +194,8 @@
                 "properties": {
                   "id": {
                     "type": "string",
-                    "pattern": "^Q[0-9]+$"
+                    "pattern": "^Q[0-9]+$",
+                    "description": "Q1, Q2, … in the order the questions are listed: a positional label, never a name."
                   },
                   "question": {
                     "type": "string",
@@ -208,7 +209,7 @@
                       "authorization",
                       "missing-information"
                     ],
-                    "description": "owner-gate: the issue itself asks to stop for the owner's confirmation. requirement-conflict: criteria that cannot all hold, with evidence. authorization: spending, production, destroying data, publishing. missing-information: something only the owner knows (an account, a name, an intent) that no worker can find."
+                    "description": "what makes the question the owner's:\nowner-gate: the issue itself asks to stop for the owner's confirmation.\nrequirement-conflict: criteria that cannot all hold, with evidence.\nauthorization: spending, production, destroying data, publishing.\nmissing-information: something only the owner knows (an account, a name, an intent) that no worker can find."
                   },
                   "recommendation": {
                     "type": "string",
@@ -1269,7 +1270,8 @@
                 "properties": {
                   "id": {
                     "type": "string",
-                    "pattern": "^Q[0-9]+$"
+                    "pattern": "^Q[0-9]+$",
+                    "description": "Q1, Q2, … in the order the questions are listed: a positional label, never a name."
                   },
                   "question": {
                     "type": "string",
@@ -1283,7 +1285,7 @@
                       "authorization",
                       "missing-information"
                     ],
-                    "description": "owner-gate: the issue itself asks to stop for the owner's confirmation. requirement-conflict: criteria that cannot all hold, with evidence. authorization: spending, production, destroying data, publishing. missing-information: something only the owner knows (an account, a name, an intent) that no worker can find."
+                    "description": "what makes the question the owner's:\nowner-gate: the issue itself asks to stop for the owner's confirmation.\nrequirement-conflict: criteria that cannot all hold, with evidence.\nauthorization: spending, production, destroying data, publishing.\nmissing-information: something only the owner knows (an account, a name, an intent) that no worker can find."
                   },
                   "recommendation": {
                     "type": "string",

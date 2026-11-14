@@ -126,6 +126,87 @@ export default async function (t) {
     await releaseWorkspace(engine)
   }
 
+  t.section('3a. the triage contract spells out an owner question, and a wrong category is repaired with the allowed values')
+  {
+    // Rendered one level deep, the contract named `questions` as "array of objects" and
+    // nothing more: a triage asking the owner anything had to guess the item fields.
+    const { extractOutput } = await import('../server/runtime/structured-output.mjs')
+    const base = scriptFor()
+    const wrongCategory = { fit: true, issuePresent: true, reasoning: 'r', acceptanceCriteria: [{ id: 'AC1', statement: 's', verifiable: true }], autonomy: { verdict: 'needs-owner-input', reason: 'r', questions: [{ id: 'Q1', question: 'which?', category: 'access', recommendation: 'this one' }] } }
+    const { seen, script } = recording((turn) =>
+      turn.stepId === 'triage' && turn.attempt === 1 ? fence(wrongCategory) : base(turn))
+    const f = await engineFixture({ script })
+    const engine = await start(f)
+    await engine.drive({ maxTurns: 2 })
+
+    const triage = seen.find((s) => s.stepId === 'triage' && s.attempt === 1)
+    const lines = triage.prompt.split(NL)
+    const at = lines.findIndex((l) => l.startsWith('    - questions: array of objects'))
+    t.ok('the triage prompt names autonomy.questions', at > 0, lines.find((l) => l.includes("questions")))
+    const items = []
+    // Item fields sit at eight spaces; a description's further lines sit deeper, under their field.
+    for (let i = at + 1; i < lines.length && lines[i].startsWith('        '); i++) if (lines[i].startsWith('        - ')) items.push(lines[i].trim())
+    const field = (name) => items.find((l) => l.startsWith(`- ${name} `) || l.startsWith(`- ${name}:`))
+    for (const name of ['id', 'question', 'category', 'recommendation']) t.ok(`its item field ${name} is listed as required`, Boolean(field(name)?.startsWith(`- ${name} (required):`)), field(name))
+    t.ok('the id pattern is stated', field('id')?.includes('matching ^Q[0-9]+$'), field('id'))
+    t.ok('the category values are stated', field('category')?.includes('one of "owner-gate", "requirement-conflict", "authorization", "missing-information"'), field('category'))
+    const splitAt = lines.findIndex((l) => l.startsWith('    - split: array of objects'))
+    t.ok('autonomy.split items are listed too', splitAt > 0 && lines[splitAt + 1]?.startsWith('        - title (required):') && lines[splitAt + 2]?.startsWith('        - scope (required):'), lines.slice(splitAt, splitAt + 3).join(NL))
+
+    // A question written from nothing but the rendered description satisfies the contract.
+    const question = {}
+    for (const line of items) {
+      const [, name, required] = line.match(/^- (\w+)( \(required\))?:/) ?? []
+      if (!required) continue
+      const pattern = line.match(/matching (\S+)/)?.[1]
+      const choices = line.match(/one of ((?:"[^"]*"(?:, )?)+)/)?.[1]
+      question[name] = choices ? JSON.parse(`[${choices}]`)[0] : pattern ? 'Q1' : `the ${name}`
+      if (pattern) t.ok('the sample id fits the stated pattern', new RegExp(pattern).test(question[name]))
+    }
+    const snapshot = JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'resolved-playbook.json'), 'utf8'))
+    const sample = { ...wrongCategory, autonomy: { verdict: 'needs-owner-input', reason: 'r', questions: [question] } }
+    const judged = await extractOutput(fence(sample), 'triageResult', { contracts: snapshot.contracts })
+    t.eq('the sample owner question satisfies the snapshot contract', judged.valid, true, judged.error)
+
+    const repair = seen.find((s) => s.stepId === 'triage' && s.attempt === 2)
+    t.ok('the wrong category got a repair turn', Boolean(repair))
+    t.ok('which names the field and the allowed values', repair?.prompt.includes('/autonomy/questions/0/category must be equal to one of the allowed values ("owner-gate", "requirement-conflict", "authorization", "missing-information")'), repair?.prompt.split(NL).find((l) => l.includes('category')))
+    await releaseWorkspace(engine)
+  }
+
+  t.section('3b. a triage replaying d789bb76\'s owner question: the named id is numbered, the category is repaired with the shape restated')
+  {
+    const base = scriptFor()
+    const asked = (category) => ({ fit: true, issuePresent: true, reasoning: 'r', acceptanceCriteria: [{ id: 'AC1', statement: 's', verifiable: true }], autonomy: { verdict: 'needs-owner-input', reason: 'r', questions: [{ id: 'close-or-dedupe', question: 'Close it as a duplicate?', category, recommendation: 'Close it.' }] } })
+    const { seen, script } = recording((turn) =>
+      turn.stepId === 'triage' && turn.attempt === 1 ? fence(asked('scope')) : turn.stepId === 'triage' && turn.attempt === 2 ? fence(asked('owner-gate')) : base(turn))
+    const f = await engineFixture({ script })
+    const engine = await start(f)
+    await engine.drive({ maxTurns: 3 })
+
+    const repair = seen.find((s) => s.stepId === 'triage' && s.attempt === 2)
+    const why = repair?.prompt.split(NL).find((l) => l.startsWith('Your previous response was not accepted')) ?? ''
+    t.ok('the repair names the allowed categories', why.includes('/autonomy/questions/0/category must be equal to one of the allowed values ("owner-gate", "requirement-conflict", "authorization", "missing-information")'), why)
+    t.ok('and does not complain about the id', !why.includes('/id '), why)
+    const first = seen.find((s) => s.stepId === 'triage' && s.attempt === 1)
+    const categories = ['owner-gate', 'requirement-conflict', 'authorization', 'missing-information']
+    for (const [turn, seenTurn] of [['the triage prompt', first], ['the repair turn', repair]]) {
+      const lines = seenTurn?.prompt.split(NL) ?? []
+      t.ok(`${turn} states the id as Q1, Q2 … by position`, lines.some((l) => l.trim().startsWith('- id (required): string, matching ^Q[0-9]+$ — Q1, Q2, …')), lines.filter((l) => l.includes('- id ')).join(NL))
+      const at = lines.findIndex((l) => l.startsWith('        - category (required): one of "owner-gate", "requirement-conflict", "authorization", "missing-information"'))
+      const following = at < 0 ? [] : lines.slice(at + 1, at + 1 + categories.length)
+      t.ok(`${turn} lists the four categories on four lines of their own, one each, under the category field`,
+        at >= 0 && categories.every((c, i) => following[i]?.startsWith(`            ${c}: `) && categories.filter((o) => o !== c).every((o) => !following[i].includes(`${o}:`))),
+        lines.slice(Math.max(at, 0), Math.max(at, 0) + 1 + categories.length).join(NL))
+    }
+    const accepted = engine.run.steps.find((s) => s.stepId === 'triage' && s.attempt === 2)
+    const output = accepted ? JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'outputs', `${accepted.number}.json`), 'utf8')) : null
+    t.eq('the repaired answer is accepted', output?.valid, true, output?.error)
+    t.eq('with its question numbered Q1', output?.output?.autonomy?.questions?.map((q) => q.id), ['Q1'])
+    t.eq('and owner input recorded under that id', engine.run.ownerInput?.questions?.map((q) => q.id), ['Q1'], JSON.stringify(engine.run.ownerInput))
+    await releaseWorkspace(engine)
+  }
+
   // ------------------------------------------------------------ plan findings
   t.section('4. a plan finding the implementation dropped keeps the loop open')
   {

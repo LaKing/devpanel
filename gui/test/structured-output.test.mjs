@@ -63,6 +63,7 @@ export default async function (t) {
 
     const bad = await extractOutput(fence(JSON.stringify({ verdict: 'maybe', artifactRevision: null, findings: [] })), 'reviewResult', { root })
     t.ok('an enum violation is reported with its path', /\/verdict/.test(bad.error), bad.error)
+    t.ok('and with the allowed values', /\/verdict must be equal to one of the allowed values \("approved", "changes-needed"/.test(bad.error), bad.error)
 
     const long = await extractOutput(fence(JSON.stringify({ targetRole: 'author', prompt: 'x'.repeat(2950) })), 'handoff', { root })
     t.ok('a length violation names the actual length and how much to cut', /\/prompt must NOT have more than 2400 characters \(it has 2950; shorten by at least 550\)/.test(long.error), long.error)
@@ -181,5 +182,58 @@ export default async function (t) {
     const text = describeContract('handoff', schema.$defs.handoff)
     t.ok('operatorRequest is offered', /operatorRequest \(optional\)/.test(text), text)
     t.ok('with question, reason and the suggested action', /- question \(required\)/.test(text) && /- reason \(required\)/.test(text) && /- projectAction:/.test(text), text)
+
+    // The two-seat triage's investigators answer triageDisposition: its owner questions sit two levels down.
+    const disposition = describeContract('triageDisposition', schema.$defs.triageDisposition)
+    t.ok('triageDisposition states the question items, their id pattern and categories',
+      disposition.includes('        - id (required): string, matching ^Q[0-9]+$') &&
+      disposition.includes('        - category (required): one of "owner-gate", "requirement-conflict", "authorization", "missing-information"') &&
+      disposition.includes('        - recommendation (required):') && disposition.includes('        - title (required):'), disposition)
+    const lines = disposition.split(NL)
+    const at = lines.findIndex((l) => l.startsWith('        - category (required):'))
+    t.eq('each category is explained on a line of its own, indented under the field',
+      lines.slice(at + 1, at + 5).map((l) => l.match(/^ {12}([a-z-]+): /)?.[1] ?? l), ['owner-gate', 'requirement-conflict', 'authorization', 'missing-information'])
+    t.ok('and says the id is Q1, Q2, … by position',disposition.includes('        - id (required): string, matching ^Q[0-9]+$ — Q1, Q2, … in the order the questions are listed'), disposition)
+  }
+
+  t.section('10. an owner question id is numbered by position; a category outside the enum is still repaired with the allowed values')
+  {
+    // A faithful fixture of d250 run d789bb76's outputs/006.json (investigator, triageDisposition):
+    // complete and useful, rejected after repair for "id":"close-or-dedupe","category":"scope".
+    const d789bb76 = {
+      disposition: 'needs-information',
+      reasoning: 'The reported assistant personality error is the one an earlier open issue already tracks.',
+      response: 'This looks like the same defect as the earlier report; the owner should decide whether to close it or merge the two.',
+      issues: [],
+      windowDecision: 'keep',
+      size: 'minor',
+      sizeReason: 'Closing or merging a duplicate is a single decision.',
+      affectedModules: [],
+      autonomy: {
+        verdict: 'needs-owner-input',
+        reason: 'Whether to close this report as a duplicate or merge it is the owner\'s intent.',
+        questions: [{ id: 'close-or-dedupe', question: 'Close this report as a duplicate of the earlier one, or keep both?', category: 'scope', recommendation: 'Close it as a duplicate; the earlier issue carries the evidence.' }]
+      }
+    }
+    const asWritten = await extractOutput('Done.' + NL + fence(JSON.stringify(d789bb76)), 'triageDisposition', { root })
+    t.eq('as written it is still a contract violation', asWritten.classification, 'contract-violation')
+    t.ok('for the category alone, the id no longer counts', !/\/id /.test(asWritten.error ?? '') && /\/autonomy\/questions\/0\/category must be equal to one of the allowed values/.test(asWritten.error ?? ''), asWritten.error)
+    t.ok('and the repair names the allowed values', asWritten.error?.includes('("owner-gate", "requirement-conflict", "authorization", "missing-information")'), asWritten.error)
+
+    const repaired = { ...d789bb76, autonomy: { ...d789bb76.autonomy, questions: [{ ...d789bb76.autonomy.questions[0], category: 'owner-gate' }, { question: 'Tell the reporter?', category: 'missing-information', recommendation: 'Yes.' }] } }
+    const r = await extractOutput(fence(JSON.stringify(repaired)), 'triageDisposition', { root })
+    t.eq('with an allowed category it is a valid triage disposition', r.valid, true, r.error)
+    t.eq('its questions are numbered Q1, Q2 by position', r.output?.autonomy.questions.map((q) => q.id), ['Q1', 'Q2'])
+    t.eq('nothing else in a question changed', r.output?.autonomy.questions[0].question, d789bb76.autonomy.questions[0].question)
+    t.eq('the ids as written are kept in the diagnostics', r.diagnostics.questionIds, [['close-or-dedupe', null]])
+
+    const conforming = { ...repaired, autonomy: { ...repaired.autonomy, questions: [{ ...repaired.autonomy.questions[0], id: 'Q2' }, { ...repaired.autonomy.questions[1], id: 'Q5' }] } }
+    const kept = await extractOutput(fence(JSON.stringify(conforming)), 'triageDisposition', { root })
+    t.eq('conforming ids are left as they are', kept.output?.autonomy.questions.map((q) => q.id), ['Q2', 'Q5'])
+    t.eq('and nothing is recorded as numbered', kept.diagnostics.questionIds, undefined)
+
+    const missing = { ...repaired, autonomy: { ...repaired.autonomy, questions: [{ id: 'x', question: 'q', category: 'owner-gate' }] } }
+    const m = await extractOutput(fence(JSON.stringify(missing)), 'triageDisposition', { root })
+    t.ok('a missing recommendation stays a contract violation', m.valid === false && /must have required property 'recommendation'/.test(m.error ?? ''), m.error)
   }
 }

@@ -143,7 +143,9 @@ export function contractError (value, contract, { ajv, id, defs } = {}) {
     // shortened blind and missed it twice in a row (2026-11-01).
     const at = (pointer) => pointer.split('/').slice(1).reduce((v, k) => v?.[k.replace(/~1/g, '/').replace(/~0/g, '~')], value)
     const length = (e) => e.keyword === 'maxLength' && typeof at(e.instancePath) === 'string' ? ` (it has ${at(e.instancePath).length}; shorten by at least ${at(e.instancePath).length - e.params.limit})` : ''
-    const detail = validate.errors.slice(0, 5).map((e) => `${e.instancePath || '/'} ${e.message}${length(e)}`).join('; ')
+    // An enum violation names the allowed values, so the repair need not guess again.
+    const allowed = (e) => e.keyword === 'enum' && Array.isArray(e.params?.allowedValues) ? ` (${e.params.allowedValues.map((v) => JSON.stringify(v)).join(', ')})` : ''
+    const detail = validate.errors.slice(0, 5).map((e) => `${e.instancePath || '/'} ${e.message}${length(e)}${allowed(e)}`).join('; ')
     return `does not satisfy the ${contract} contract — ${detail}`
   }
   return null
@@ -172,6 +174,27 @@ function toleratedHandoffPrompt (value, earlier, validator) {
   return { path: '/prompt', limit, length: characters.length, lengths }
 }
 
+/*
+ * An owner question's id is a positional label (Q1, Q2, …), so one written as a
+ * name ("close-or-dedupe") or left out loses nothing when it is numbered by
+ * position. A triage that ends protocol-blocked over malformed owner questions
+ * discards its valid findings, and the id need not be one of the reasons a
+ * repair is spent on. Only the id is numbered; a category outside the enum, or
+ * a missing question or recommendation, stays a contract violation.
+ */
+const QUESTION_CONTRACTS = new Set(['triageResult', 'triageDisposition'])
+const QUESTION_ID = /^Q[0-9]+$/
+
+function numberQuestions (value) {
+  const questions = value?.autonomy?.questions
+  if (!Array.isArray(questions) || !questions.length || !questions.every((q) => q && typeof q === 'object' && !Array.isArray(q))) return null
+  if (questions.every((q) => typeof q.id === 'string' && QUESTION_ID.test(q.id))) return null
+  return {
+    from: questions.map((q) => q.id ?? null),
+    value: { ...value, autonomy: { ...value.autonomy, questions: questions.map((q, i) => ({ ...q, id: `Q${i + 1}` })) } }
+  }
+}
+
 /**
  * Extract and validate.
  *
@@ -181,7 +204,8 @@ function toleratedHandoffPrompt (value, earlier, validator) {
  *   output          the object (the closest candidate when invalid, for diagnosis)
  *   error           one sentence a participant can act on
  *   classification  no-structured-output | contract-violation | ambiguous-output
- *   diagnostics     candidate counts and the per-candidate errors
+ *   diagnostics     candidate counts and the per-candidate errors; `questionIds` the
+ *                   ids each candidate wrote when its owner questions were numbered
  *
  * `contracts` is the snapshot's { hash, defs }; when given, validation is
  * compiled from it and the live schema files are not consulted.
@@ -208,8 +232,13 @@ export async function extractOutput (text, contract, { root, contracts = null, l
   }
 
   const validator = await validatorFor(contracts, root)
-  const judged = candidates.map((c) => ({ ...c, problem: contractError(c.value, contract, validator) }))
+  const judged = candidates.map((c) => {
+    const renumbered = QUESTION_CONTRACTS.has(contract) ? numberQuestions(c.value) : null
+    const value = renumbered?.value ?? c.value
+    return { ...c, value, renumbered: renumbered?.from ?? null, problem: contractError(value, contract, validator) }
+  })
   diagnostics.errors = judged.map((c) => c.problem)
+  if (judged.some((c) => c.renumbered)) diagnostics.questionIds = judged.map((c) => c.renumbered)
   const fits = judged.filter((c) => c.problem === null)
 
   if (fits.length === 1 || (fits.length > 1 && fits.every((c) => same(c.value, fits[0].value)))) {
@@ -252,25 +281,39 @@ export function describeContract (name, def) {
   const lines = [`Contract \`${name}\` — a JSON object with these fields:`]
   const required = new Set(def.required ?? [])
   for (const [field, spec] of Object.entries(def.properties ?? {})) {
-    lines.push(`- ${field}${required.has(field) ? ' (required)' : ' (optional)'}: ${describeType(spec)}${spec.description ? ` — ${spec.description}` : ''}`)
-    // One level in, for the shape of an array's items or of a nested object.
-    // A field described only as "object" is a field an agent has to guess at.
-    const nested = spec.items?.properties ? spec.items : (spec.properties ? spec : null)
-    if (nested) {
-      const req = new Set(nested.required ?? [])
-      for (const [sub, subSpec] of Object.entries(nested.properties)) {
-        lines.push(`    - ${sub}${req.has(sub) ? ' (required)' : ''}: ${describeType(subSpec)}${subSpec.description ? ` — ${subSpec.description}` : ''}`)
-      }
-    }
+    lines.push(`- ${field}${required.has(field) ? ' (required)' : ' (optional)'}: ${describeType(spec)}${described(spec, '')}`)
+    describeNested(spec, '    ', lines)
   }
   if (def.additionalProperties === false) lines.push('No other fields are accepted.')
   return lines.join(NL)
+}
+
+/*
+ * Every level in, for the shape of an array's items or of a nested object.
+ * A field described only as "object" is a field an agent has to guess at: one
+ * level only left the items of autonomy.questions unstated, and a triage asking
+ * the owner a question had to guess their fields and category.
+ */
+function describeNested (spec, indent, lines) {
+  const nested = spec.items?.properties ? spec.items : (spec.properties ? spec : null)
+  if (!nested) return
+  const req = new Set(nested.required ?? [])
+  for (const [sub, subSpec] of Object.entries(nested.properties)) {
+    lines.push(`${indent}- ${sub}${req.has(sub) ? ' (required)' : ''}: ${describeType(subSpec)}${described(subSpec, indent)}`)
+    describeNested(subSpec, indent + '    ', lines)
+  }
+}
+
+// A description written over several lines (one per allowed value) keeps them,
+// each indented under its field so the nesting still reads.
+function described (spec, indent) {
+  return spec.description ? ` — ${spec.description.split(NL).join(`${NL}${indent}    `)}` : ''
 }
 
 function describeType (spec) {
   if (Object.hasOwn(spec, 'const')) return JSON.stringify(spec.const)
   if (spec.enum) return `one of ${spec.enum.map((v) => JSON.stringify(v)).join(', ')}`
   const type = Array.isArray(spec.type) ? spec.type.join(' | ') : spec.type ?? 'value'
-  if (type === 'array') return `array of ${spec.items?.type === 'object' ? 'objects' : spec.items?.type ?? 'values'}${spec.minItems != null ? `, at least ${spec.minItems} items` : ''}${spec.maxItems != null ? `, at most ${spec.maxItems} items` : ''}${spec.items?.maxLength != null ? `, each at most ${spec.items.maxLength} characters` : ''}`
-  return `${type}${spec.maxLength != null ? `, at most ${spec.maxLength} characters` : ''}`
+  if (type === 'array') return `array of ${spec.items?.type === 'object' ? 'objects' : spec.items?.type ?? 'values'}${spec.minItems != null ? `, at least ${spec.minItems} items` : ''}${spec.maxItems != null ? `, at most ${spec.maxItems} items` : ''}${spec.items?.maxLength != null ? `, each at most ${spec.items.maxLength} characters` : ''}${spec.items?.pattern != null ? `, each matching ${spec.items.pattern}` : ''}${spec.items?.enum ? `, each ${describeType(spec.items)}` : ''}`
+  return `${type}${spec.maxLength != null ? `, at most ${spec.maxLength} characters` : ''}${spec.pattern != null ? `, matching ${spec.pattern}` : ''}`
 }
