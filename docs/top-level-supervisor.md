@@ -825,6 +825,16 @@ resolved ending for 15 minutes; what the filter holds rides along. An event alre
 in that poll carries it as `capacityFreed` instead of costing a second call. It is an offer:
 the mission decides, and `action: null` is a fine answer.
 
+A poll reads the queue again only when what it already holds of the queue's inputs moved:
+the listings with each issue's latest run, the owned runs, the session's counters and
+campaign. With nothing moved it reads it once per idle interval (`queueIdleMs`, ten polls:
+30 seconds), which is when it learns what no poll holds: a lock or a wait that changed
+under a live run with no step recorded, a spending window rolling over, a reporter's
+level, a project file. Reading the queue reads the whole configuration and walks every
+pool's checkouts; on an idle panel that was a third of a processor every three seconds.
+The pool is read once per reading for all its members, and a configuration file is
+parsed once per content (`config/load.mjs`), each load getting its own copy.
+
 There is no wake when nothing could start (nothing ready, finishing, no starts left), or
 for what a prompt already showed the model, such as its own `set_disposition`: a reading
 in a prompt that returned is the new baseline. The poll runs between turns, so a release

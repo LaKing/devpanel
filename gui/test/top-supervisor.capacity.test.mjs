@@ -20,11 +20,14 @@ const polls = () => new Promise((r) => setTimeout(r, 150)) // several polls at p
 const issue = (id, over = {}) => ({ id, name: id, status: 'open', openedOn: '2026-01-01', ...over })
 const record = (runId, issueId) => ({ runId, status: 'running', outcome: null, issue: { project: P, id: issueId }, playbook: { id: 'x' } })
 
-/** A running supervisor over project p. `h.onCall` runs during a model call; `h.starting` names the issue a preview goes on to start. */
-async function setup ({ rows = [], holders = {}, oracle = null, limits = LIMITS, maxDeferMs } = {}) {
+/**
+ * A running supervisor over project p. `h.onCall` runs during a model call; `h.starting` names the issue a preview goes on to start.
+ * Every poll reads the queue (queueIdleMs 0) unless a section is about the idle interval: these facts move with no listing beside them.
+ */
+async function setup ({ rows = [], holders = {}, oracle = null, limits = LIMITS, maxDeferMs, queueIdleMs = 0 } = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-capacity-'))
   temps.push(dir)
-  const h = { dir, rows, holders, levels: {}, runs: {}, prompts: [], script: [], failures: [], onCall: null, starting: null, startRefusal: null, nextRun: 1 }
+  const h = { dir, rows, holders, levels: {}, runs: {}, prompts: [], script: [], failures: [], onCall: null, starting: null, startRefusal: null, nextRun: 1, factReads: 0 }
   const adapter = { invoke: async (args) => {
     if (h.failures.length) throw h.failures.shift()
     const prompt = JSON.parse(args.prompt)
@@ -36,7 +39,7 @@ async function setup ({ rows = [], holders = {}, oracle = null, limits = LIMITS,
   } }
   const tools = {
     projects: async () => [{ id: P }], playbooks: async () => [], listIssues: async () => h.rows,
-    readyQueueFacts: async () => ({ holders: h.holders, reportLevels: h.levels }),
+    readyQueueFacts: async () => { h.factReads++; return { holders: h.holders, reportLevels: h.levels } },
     preview: async () => ({ ok: true, configHash: 'h' }),
     start: async (p) => {
       if (h.startRefusal) throw h.startRefusal
@@ -56,7 +59,7 @@ async function setup ({ rows = [], holders = {}, oracle = null, limits = LIMITS,
     readVerificationFile: (a) => readVerificationFile({ verificationDir: path.join(dir, 'verification'), path: a.path, offset: a.offset ?? 0 })
   }
   h.agent = await createTopSupervisor({ dir, models: async () => [{ id: 'm', title: 'M', model: 'wire', defaultEffort: 'high', verification: { status: 'verified' } }], adapter, tools, pollMs: 20, emit: (e) => h.onSave?.(e),
-    ...(maxDeferMs ? { maxDeferMs } : {}),
+    ...(maxDeferMs ? { maxDeferMs } : {}), queueIdleMs,
     ...(oracle ? { decisions: ({ spending }) => createAdvisor({ spending, loadProvider: async () => CONFIG, createOracle: () => oracle }) } : {}) })
   h.idle = () => { const s = h.agent.get(); return s.status === 'active' && !s.pending && !s.queue.length && !s.wake }
   h.begin = async (calls = 1) => { const n = h.prompts.length; await h.agent.start({ model: 'm', projects: [P], message: 'go', limits }); await wait(() => h.prompts.length >= n + calls && h.idle()) }
@@ -194,6 +197,38 @@ export default async function (t) {
     t.eq('the ending carries the offer', [raced.prompts.at(-1).event.type, raced.prompts.at(-1).event.capacityFreed?.next.id], ['run-changed', 'b'])
     await h.close()
     await raced.close()
+  }
+
+  t.section('idle polls: the queue is read again only when what a poll holds of its inputs moved')
+  {
+    // An idle interval no test reaches: a reading here can only come from a moved input.
+    const h = await setup({ rows: [issue('a')], holders: { [P]: { issueId: 'other', runId: 'rx' } }, queueIdleMs: 3600000 })
+    await h.begin(1)
+    await polls()
+    const settled = h.factReads
+    await polls()
+    t.eq('several polls with nothing moved read nothing', h.factReads, settled)
+    h.rows.push(issue('z', { status: 'closed' }))
+    await wait(() => h.factReads > settled)
+    t.ok('a moved listing is read at the next poll', h.factReads > settled)
+    await wait(() => h.idle())
+    await polls()
+    const again = h.factReads
+    await polls()
+    t.eq('and then it is quiet again', h.factReads, again)
+    await h.close()
+  }
+
+  t.section('idle polls: what no poll holds is still noticed, within the idle interval')
+  {
+    const h = await setup({ rows: [issue('a')], holders: { [P]: { issueId: 'other', runId: 'rx' } }, queueIdleMs: 100 })
+    await h.begin(1)
+    t.eq('it waits for the checkout', h.prompts[0].readyQueue.rows[0].blockedBy[0].kind, 'checkout-held')
+    // Only the facts move: no listing, owned run or counter says so.
+    delete h.holders[P]
+    await wait(() => h.prompts.length === 2 && h.idle())
+    t.eq('the release wakes it', [h.prompts[1].event.type, h.prompts[1].event.next.id], ['capacity-freed', 'a'])
+    await h.close()
   }
 
   t.section('measurement: a call Stop keeps from the adapter is released, so it is no call on the ledger')

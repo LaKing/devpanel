@@ -125,9 +125,15 @@ export async function getValidator (root = CONFIG_ROOT) {
 
 export const schemaId = (name) => `https://devpanel/schemas/${name}.schema.json`
 
+// Parsing is most of a load (seven tenths, measured) and the same bytes parse to the same data, so one parse is kept
+// per file and reused while the file's hash is the same. Every read gets its own copy: callers extend what they read.
+const parsed = new Map()
 async function readYaml (file) {
   const text = await fs.readFile(file, 'utf8')
-  return { data: YAML.parse(text), hash: sha256(text) }
+  const hash = sha256(text)
+  let known = parsed.get(file)
+  if (known?.hash !== hash) parsed.set(file, known = { hash, data: YAML.parse(text) })
+  return { data: structuredClone(known.data), hash }
 }
 
 function validate (ajv, name, data, file, errors, field = '') {

@@ -826,12 +826,14 @@ export function createFullVerification ({
   async function openIssues (record) {
     const out = []
     record.outcome.issues = out
-    // The first cycle of a date names its issues exactly; a later one adds its id (one name per day, issues.js).
+    // The first cycle of a date names its issues by the date; a later one by its id, in the date's place: an issue's
+    // id is a slug of the name's beginning (issues.js slugify) and one id opens once a day, so an id at the name's
+    // end was cut off and the later cycle's issue was refused as already opened.
     const later = Number(record.id.split('.').pop()) > 1
     // An incomplete entry (declared browser checks with no instance command) is not green either: it gets its issue.
     for (const entry of record.projects.filter((e) => !e.verifiedThrough && ['red', 'incomplete'].includes(e.verdict))) {
       const stage = entry.stage ?? 'configuration'
-      const name = `Full verification ${record.date}: ${entry.project} red on ${stage}${later ? ` (cycle ${record.id})` : ''}`
+      const name = `Full verification ${later ? record.id : record.date}: ${entry.project} red on ${stage}`
       const item = { project: entry.project, stage, name, runId: entry.runId ?? null, issueId: null, failingCount: 0, attachments: [] }
       out.push(item)
       try {

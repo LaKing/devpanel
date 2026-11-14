@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { createFullVerification, nextTrigger, localDate, stageOf } from '../server/full-verification.mjs'
+import { slugify } from '../server/issues.js'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { TARGET_MISSING } from '../server/config/release-plan.mjs'
 import { createSupervisor } from '../server/supervisor.mjs'
@@ -184,7 +185,7 @@ export default async function (t) {
       t.eq('the same freeze', w.calls.freezes, ['2026-11-07.1', '2026-11-07.2'])
       t.eq('the same runs', w.calls.starts.filter((s) => s.cycle === '2026-11-07.2').length, 2)
       t.eq('the same record shape', second.projects.map((p) => p.project).sort(), record.projects.map((p) => p.project).sort())
-      t.eq('a later cycle of the date opens its own issue, named with its id', [w.calls.issues.length, w.calls.issues[1].input.split('\n')[0], w.calls.issues[1].openedBy.from.cycle], [2, '# Full verification 2026-11-07: lib-project red on stage (cycle 2026-11-07.2)', '2026-11-07.2'])
+      t.eq('a later cycle of the date opens its own issue, named with its id', [w.calls.issues.length, w.calls.issues[1].input.split('\n')[0], w.calls.issues[1].openedBy.from.cycle], [2, '# Full verification 2026-11-07.2: lib-project red on stage', '2026-11-07.2'])
       t.eq('the scheduled cycle of the day is kept beside it', (await readJson(path.join(verificationDir, '2026-11-07', 'cycle.1.json'))).id, '2026-11-07.1')
       fv.stop()
     }
@@ -416,7 +417,10 @@ export default async function (t) {
       const second = await run()
       t.eq('a later red cycle that date opens a separate issue', [second.id, w.calls.issues.length], ['2026-11-07.2', 2])
       const again = w.calls.issues[1]
-      t.eq('named with its cycle id', again.input.split('\n')[0], '# Full verification 2026-11-07: shop-project red on stage (cycle 2026-11-07.2)')
+      t.eq('named with its cycle id', again.input.split('\n')[0], '# Full verification 2026-11-07.2: shop-project red on stage')
+      // The id an issue takes is a slug of its name's beginning: the two cycles' issues of one long-named project must not share it.
+      const long = (id) => slugify(`Full verification ${id}: a-long-named-shop.example-project red on its-stage`)
+      t.ok('and so under another issue id than the first cycle\'s, however long the project\'s name', long('2026-11-07') !== long('2026-11-07.2'))
       t.eq('with its own cycle and run', [again.openedBy.from.cycle, again.openedBy.from.runId], ['2026-11-07.2', 'run-shop-project-2'])
       t.ok('and its own evidence', again.input.includes('`run-shop-project-2`') && again.input.includes('expected 3, got 4'))
       t.eq('the first issue was neither reused nor rewritten', [w.calls.issues[0].input, w.calls.attachments.length], [issue.input, 2])

@@ -19,6 +19,23 @@ export default async function (t) {
   t.eq('unoccupied optional seats are omitted', Object.keys(good.resolved.participants).sort(), ['auditor-1', 'coordinator', 'implementer'])
   t.eq('the default seats', Object.fromEntries(Object.entries(good.resolved.participants).sort(([a], [b]) => a.localeCompare(b)).map(([role, p]) => [role, `${p.model.id}/${p.effort}`])), { 'auditor-1': 'gpt-6.1-sol/medium', coordinator: 'opus-5-5/low', implementer: 'opus-5-5/medium' })
 
+  t.section('a file is parsed once per content, and no load can change what the next one reads')
+  {
+    const root = await sandbox(async () => {})
+    const first = await loadConfig({ root })
+    const entry = first.roster.get('opus-5-5')
+    entry.title = 'changed by a caller'
+    ;(entry.efforts ?? []).push('invented')
+    const second = await loadConfig({ root })
+    t.ok('a second load of the same bytes is not the first one\'s objects', second.roster.get('opus-5-5') !== entry)
+    t.ok('nor carries what a caller did to them', second.roster.get('opus-5-5').title !== 'changed by a caller' && !(second.roster.get('opus-5-5').efforts ?? []).includes('invented'))
+    t.eq('same bytes, same hash', second.roster.get('opus-5-5').hash, entry.hash)
+    await patch(path.join(root, 'roster/opus-5-5.yaml'), 'title: Claude Opus 5.5', 'title: Edited on disk')
+    const third = await loadConfig({ root })
+    t.eq('an edited file is read as edited', third.roster.get('opus-5-5').title, 'Edited on disk')
+    t.ok('under another hash', third.roster.get('opus-5-5').hash !== entry.hash)
+  }
+
   // The implementation playbook occupies auditor-1 by default; tests that need a
   // particular auditor replace it in the sandbox copy, the way an operator would.
   const PLAYBOOK = 'playbooks/implementation.yaml'

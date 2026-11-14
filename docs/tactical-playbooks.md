@@ -683,8 +683,9 @@ cycle acts on its verdict:
   shows the first 30; every failing test with its excerpt is in `failing-tests.md` on the
   issue's report step (split into `failing-tests-<n>.md` parts when it would exceed the
   attachment limit). `openedBy.from` names the cycle (`via: full-verification`, `cycle`,
-  the run). Every red cycle opens its own issues: a later cycle of the same date adds
-  ` (cycle <id>)` to the name, since an issue name opens once a day.
+  the run). Every red cycle opens its own issues: a later cycle of the same date is named
+  by its id in the date's place (`Full verification <id>: …`), since an issue id is the
+  beginning of its name and opens once a day.
 - **No stage verified** (`no-stages`): nothing runs.
 
 An `incomplete` entry counts as red. Admission then reopens, whatever the outcome was, and the paused runs resume.

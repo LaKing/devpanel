@@ -48,7 +48,7 @@ import { forgetRunDrives } from './runtime/selftest-history.mjs'
 import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { settleRunSyncs, syncDisposition } from './runtime/sync-records.mjs'
 import { routeAutoStart } from './auto-start.mjs'
-import { poolOf, poolRecord } from './runtime/module-pool.mjs'
+import { poolIdOf, poolOf, poolRecord } from './runtime/module-pool.mjs'
 import { conflictsWith, endContinuation, lockedMessage, locksModules, oweReleased, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules, yieldForPause } from './runtime/module-locks.mjs'
 
 /*
@@ -543,8 +543,12 @@ export function createSupervisor ({
    * The project's module pool read now (module-pool.mjs), with each member's modules-tier
    * target for subscriber drives: `{ pool, record }`, or null when the project has none.
    */
-  async function modulePoolOf (project, root = configRoot, loaded = null) {
+  async function modulePoolOf (project, root = configRoot, loaded = null, pools = null) {
     const config = loaded ?? await loadConfig({ root })
+    // A pool reads the same for each of its members, and reading it walks every member's checkout: a caller
+    // reading several projects at once (the ready queue) passes one map and the pool is walked once for all.
+    const id = pools ? poolIdOf(project, config.projects) : null
+    if (id && pools.has(id)) return pools.get(id)
     const pool = await poolOf(project, { projects: config.projects, resolvePath: (p) => resolveProjectPath(p, { projectsDir }) })
     if (!pool) return null
     const targets = {}
@@ -552,7 +556,9 @@ export function createSupervisor ({
       const infra = config.projects.get(m.project)?.infrastructure
       targets[m.project] = infra?.testDrive?.modules ? modulesTarget(infra) : null
     }
-    return { pool, record: { ...poolRecord(pool), targets } }
+    const read = { pool, record: { ...poolRecord(pool), targets } }
+    if (id) pools.set(id, read)
+    return read
   }
 
   /**
@@ -560,8 +566,8 @@ export function createSupervisor ({
    * and, for an issue, the modules its triage named and which of them another live run
    * holds. Read-only; null when the project has no pool. An observation: start() decides.
    */
-  async function moduleLockReading ({ project, issueId = null, playbook = null, config = null }) {
-    const read = await modulePoolOf(project, configRoot, config)
+  async function moduleLockReading ({ project, issueId = null, playbook = null, config = null, pools = null }) {
+    const read = await modulePoolOf(project, configRoot, config, pools)
     if (!read) return null
     const { pool } = read
     const held = (await readPoolLocks(pool.id, { platform })).map((l) => ({ ...l, owner: pool.modules.get(l.module)?.owner ?? null }))

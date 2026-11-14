@@ -120,11 +120,13 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     let reporters=null
     // One configuration read per queue reading, shared by every project's pool reading.
     const config=await loadConfig({root:configRoot}).catch(()=>null)
+    // And one pool reading per pool: a framework and its instances share theirs.
+    const pools=new Map()
     for(const [project,rows] of Object.entries(issuesByProject)){
      holders[project]=await supervisor.checkoutHolder(project,rows)
      for(const issue of rows)if(issue.report){reporters??=await readReporters();reportLevels[`${project}/${issue.id}`]=await reportStartLevel(issue,{reporters})}
      // Module locks of the project's pool (module-locks.mjs): what each issue's triage named that another live run holds, and live runs waiting for a module.
-     const locks=config&&supervisor.moduleLockReading?await supervisor.moduleLockReading({project,config}).catch(()=>null):null
+     const locks=config&&supervisor.moduleLockReading?await supervisor.moduleLockReading({project,config,pools}).catch(()=>null):null
      if(!locks)continue
      for(const issue of rows){
       const conflicts=conflictsWith(locks.held,issue.sizing?.affectedModules??[],{project,issueId:issue.id})

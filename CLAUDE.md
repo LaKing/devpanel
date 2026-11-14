@@ -476,7 +476,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   when it says something new: the declared campaign's issues (no campaign: the whole panel) in dependency order, each
   with `blockedBy[].until {event, at}`; an observation, `start_run` still decides. When an issue that waited could start
   now (`supervisor.checkoutHolder` reads which live in-place run holds a project's checkout, owned run or not) a `capacity-freed` event wakes it with `next`,
-  past the wake filter. docs/top-level-supervisor.md "The ready queue".
+  past the wake filter. A poll reads the queue only when its inputs moved (listings, owned runs, counters), else once per `queueIdleMs` (ten polls). docs/top-level-supervisor.md "The ready queue".
 - `runtime/run-metrics.mjs` — convergence measurements read off the run record, never stored by the engine:
   round EXECUTIONS per phase ((cycle, round) pairs a seat ran in, with `cycles` and `maxDepth`) beside cycle
   restarts and ignored `restartPlan` requests; the elapsed time split into agent time / operator wait /

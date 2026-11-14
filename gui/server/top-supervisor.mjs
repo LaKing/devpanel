@@ -123,7 +123,7 @@ const OWN_FAILURE_MAX_MS = 600_000
 /** Consults one session may ask (the supervisor's own and the plain wording of reserved questions); a New session renews it. */
 const MAX_CONSULTS = 40
 
-export async function createTopSupervisor ({ dir, models, adapter, tools, emit = () => {}, pollMs = 3000, decisions = null, maxDeferMs = DEFAULT_MAX_DEFER_MS, resendAfterChars = RESEND_AFTER_CHARS }) {
+export async function createTopSupervisor ({ dir, models, adapter, tools, emit = () => {}, pollMs = 3000, queueIdleMs = pollMs * 10, decisions = null, maxDeferMs = DEFAULT_MAX_DEFER_MS, resendAfterChars = RESEND_AFTER_CHARS }) {
   await fs.mkdir(dir, { recursive: true })
   const file = path.join(dir, 'state.json')
   let state
@@ -694,10 +694,24 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
    * miss this one, so the news waits one poll, once: a run whose record never catches up cannot hold it longer.
    */
   let capacityHeldBack = false
+  /*
+   * Reading the queue reads the whole configuration, every pool's checkouts and its locks, and a poll comes every
+   * pollMs: on an idle panel that was a third of a processor for an answer that could not differ. So a poll reads
+   * it only when what it already holds of the queue's inputs moved (the listings with each issue's latest run, the
+   * owned runs, the session's counters: what buildReadyQueue takes from the state), and otherwise once per
+   * queueIdleMs, for what no poll holds: a lock or a wait changing under a live run with no step recorded, a
+   * spending window rolling over, a reporter's level, a project file. Those are told that much later, once.
+   */
+  let queueRead = { at: 0, inputs: null }
+  const queueInputs = (listed) => JSON.stringify([listed, state.ownedRuns.map((r) => [r.runId, r.status, r.observedStatus ?? null]), state.limits, state.starts ?? 0,
+    state.startsByIssue ?? null, state.launches ?? null, state.failedLaunches ?? null, state.campaign ?? null, state.focus ?? null, Boolean(state.finishing), state.capacityRefused ?? null])
   async function noticeFreedCapacity (listed) {
     if (!tools.readyQueueFacts) return
     try {
+      const inputs = queueInputs(listed)
+      if (!capacityHeldBack && inputs === queueRead.inputs && Date.now() - queueRead.at < queueIdleMs) return
       const queue = await readQueue(listed)
+      queueRead = { at: Date.now(), inputs }
       const found = freedSince(state.queueObserved ?? null, queue, { refused: state.capacityRefused ?? {} })
       const endingUnseen = found && state.ownedRuns.some((r) => {
         const seen = r.observedStatus ?? r.status
