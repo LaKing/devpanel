@@ -280,6 +280,8 @@ export default async function (t) {
       again.reconcilePolicy = () => ({})
       t.eq('the conflict is returned by a finalize', await again.finalize({ mayReturnDelivery: true }), 'returned')
       Object.assign(again.run, { status: 'blocked', outcome: 'unresolved', blockedReason: 'candidate-changed-since-approval', endedAt: again.clock.iso() })
+      // The closure that read it as drift recorded the tree it found: a revision no step produced.
+      again.run.revisions.push({ fingerprint: `sha256:${'d'.repeat(64)}`, byStep: null, at: again.clock.iso(), detectedAt: 'closure' })
       t.eq('Continue is offered, where plain drift offers only a new run', [supportedActions(again.run), supportedActions({ ...again.run, deliveryReturns: undefined })], [['continue', 'start-new'], ['start-new']])
       const told = explainRun(again.run)
       t.ok('the explanation says what happened and what to do', /before the author answered a delivery conflict/.test(told.headline) && told.detail.includes('server.mjs') && /Continue/.test(told.next), JSON.stringify(told))

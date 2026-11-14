@@ -3518,7 +3518,10 @@ export class Engine {
     const checkpoint = await readIntegrity(this.integrityDir(), this.run.integrity.checkpoint)
     const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
     if (current.hash !== checkpoint.hash) throw Object.assign(new Error('The retained workspace changed; resolve integrity before continuing.'), { status: 409 })
-    const byStep = this.run.steps.find((s) => s.number === this.run.revisions.at(-1).byStep)
+    // The latest revision a step produced: one that closure only detected (a tree nobody's turn recorded, as after
+    // an unanswered delivery return) names no step, and the loop to reopen is the one behind the candidate before it.
+    const produced = this.run.revisions.findLast((r) => r.byStep != null)
+    const byStep = this.run.steps.find((s) => s.number === produced?.byStep)
     const phase = this.snapshot.phases.find((p) => p.loop && p.id === byStep?.phase)
     if (!phase) throw Object.assign(new Error('No review loop produced this run’s candidate; there is nothing to continue.'), { status: 409 })
     const { limits, suspendedMs, wallClock } = await this.continuationLimits({ budgets, acceptShortWallClock })
