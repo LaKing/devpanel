@@ -49,7 +49,7 @@ import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { settleRunSyncs, syncDisposition } from './runtime/sync-records.mjs'
 import { routeAutoStart } from './auto-start.mjs'
 import { poolOf, poolRecord } from './runtime/module-pool.mjs'
-import { conflictsWith, endContinuation, lockedMessage, locksModules, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules, yieldForPause } from './runtime/module-locks.mjs'
+import { conflictsWith, endContinuation, lockedMessage, locksModules, oweReleased, readPoolLocks, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules, yieldForPause } from './runtime/module-locks.mjs'
 
 /*
  * Owns the lifecycle of running playbooks.
@@ -1455,6 +1455,12 @@ export function createSupervisor ({
    * the lock, the worktree settled afterwards by the same rules as any finish.
    * `reconcile` first merges the approved patch onto the drifted source under
    * the project's current `workspace.reconcile` policy (engine.reconcileDelivery).
+   *
+   * A finalize whose delivery meets a text conflict with the source gives it back
+   * to the author (engine.returnFromDelivery), as the drive loop's own closure
+   * does: the run is live again and is driven on here like an answered one. The
+   * modules its end gave back are owed, never a refusal: the return is already on
+   * the record, and the engine takes them before any turn, waiting for a holder.
    */
   async function finalize ({ project, issueId, runId, reconcile = false, actor = 'operator' }) {
     const action = reconcile ? 'reconcile-delivery' : 'finalize'
@@ -1495,20 +1501,38 @@ export function createSupervisor ({
         engine.run.workspace.retainedReason = null
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
       }
-      const record = { runId, issuePath: issue.path, project, issueId, phase: action, engine, reservation: null, controller: new AbortController(), stopping: false, finished: null }
+      const record = { runId, issuePath: issue.path, project, issueId, phase: action, engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null }
       active.set(k, record)
       starting.delete(k)
       emit?.({ type: reconcile ? 'run-reconciling' : 'run-finalizing', project, issueId, runId })
-      try {
-        if (reconcile) await engine.reconcileDelivery({ policy, actor })
-        else await engine.finalize()
-      } catch (error) {
-        await failRecord(record, error)
-      } finally {
+      const settle = async () => {
         await settleWorkspace(record)
         active.delete(k)
         await announceEnd(project, issueId, runId)
       }
+      let returned = false
+      try {
+        if (reconcile) await engine.reconcileDelivery({ policy, actor })
+        else returned = await engine.finalize({ mayReturnDelivery: true }) === 'returned'
+      } catch (error) {
+        await failRecord(record, error)
+      }
+      if (returned) {
+        const decision = { deliveryReturn: engine.run.deliveryReturns?.length ?? null }
+        record.finished = (async () => {
+          try {
+            if (oweReleased(engine.run)) await store.writeRun(engine.issuePath, engine.runId, engine.run)
+            emit?.({ type: 'run-resumed', project, issueId, runId, decision })
+            await driveEngine(record, engine)
+          } catch (error) {
+            await failRecord(record, error)
+          } finally {
+            await settle()
+          }
+        })()
+        return { runId, status: 'pending', decision }
+      }
+      await settle()
       return { runId, status: engine.run.status, outcome: engine.run.outcome, blockedReason: engine.run.blockedReason,
         ...(reconcile ? { reconciliation: engine.run.reconciliations?.at(-1) ?? null } : {}) }
     } catch (error) {

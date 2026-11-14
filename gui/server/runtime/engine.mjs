@@ -4648,8 +4648,14 @@ export class Engine {
    * fingerprint is re-derived, approvals must still name it, delivery must
    * still rebuild it — so this can only complete what was already earned, never
    * bypass a condition. An operator asks for it after the cause was fixed.
+   *
+   * `mayReturnDelivery`: the caller drives the run on when this answers
+   * 'returned'. Then a text conflict with the source goes back to the author as
+   * it does at the drive loop's own closure (returnFromDelivery): the run is
+   * live again, on the current source, and nothing is finished here. Only that
+   * return is opened; an unmet confirmation still blocks, as a finalize always did.
    */
-  async finalize () {
+  async finalize ({ mayReturnDelivery = false } = {}) {
     if (this.run.status !== 'blocked' || !FINALIZABLE_BLOCKS.includes(this.run.blockedReason)) {
       throw Object.assign(new Error(`this run is not waiting at delivery (status ${this.run.status}, ${this.run.blockedReason ?? 'no block'})`), { status: 409 })
     }
@@ -4658,12 +4664,20 @@ export class Engine {
     }
     await fs.access(this.run.workspace.path).catch(() => { throw Object.assign(new Error(`the worktree ${this.run.workspace.path} no longer exists`), { status: 409 }) })
     const previous = this.run.blockedReason
+    const stoppedAt = Date.parse(this.run.endedAt ?? '')
     this.run.finalizations = [...(this.run.finalizations ?? []), { at: this.clock.iso(), previousBlock: previous, previousDelivery: this.run.delivery ?? null }]
     this.run.status = 'running'
     this.run.blockedReason = null
     this.run.endedAt = null
     await this.persist({ type: 'finalizing', previousBlock: previous })
-    await this.evaluateClosure()
+    if (await this.evaluateClosure({ mayReturnDelivery }) === 'returned') {
+      // The run goes on: the time it stood blocked is a stop, not its wall clock (as a Resume or Continue counts it).
+      const suspendedMs = Number.isFinite(stoppedAt) ? Math.max(0, this.clock.now() - stoppedAt) : 0
+      this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
+      this.run.finalizations.at(-1).returned = { deliveryReturn: this.run.deliveryReturns?.length ?? null, suspendedMs }
+      await this.persist({ type: 'finalize-returned', suspendedMs })
+      return 'returned'
+    }
     this.run.endedAt = this.clock.iso()
     await this.persist({ type: 'finished', reason: 'finalize', outcome: this.run.outcome, blockedReason: this.run.blockedReason })
     return this.run
@@ -5107,12 +5121,12 @@ export class Engine {
     }
   }
 
-  async closeOn (candidate, { mayReturn = false } = {}) {
+  async closeOn (candidate, { mayReturn = false, mayReturnDelivery = mayReturn } = {}) {
     await this.assertJournal()
     if (this.run.integrity?.status === 'quarantined' || this.run.integrity?.status === 'abandoned' || this.run.recovery?.required) return
     // A delivery return the process died in: the worktree may be half moved, so
     // nothing below can read it. The move is done again from what was kept.
-    if (this.run.pendingDeliveryReturn) return this.resumeDeliveryReturn({ mayReturn })
+    if (this.run.pendingDeliveryReturn) return this.resumeDeliveryReturn({ mayReturn: mayReturnDelivery })
     if (this.run.integrity && !this.run.revisions.length) {
       const role = this.run.integrity.latest?.role ?? Object.keys(this.run.participants)[0]
       if (!await this.beginIntegrity(role, { invocationId: `closure-${uuid()}` })) return
@@ -5430,12 +5444,12 @@ export class Engine {
       const target = refusal ? null : this.deliveryReturnTarget()
       if (refusal) deliveryNotReturned = refusal === LEFT_TO_RECONCILE ? null : refusal
       else if (!target) deliveryNotReturned = 'no author step of this run produced the candidate'
-      else if (mayReturn) {
+      else if (mayReturnDelivery) {
         const back = await this.returnFromDelivery({ ...target, policy: reconcilePolicy, approved: { revision: current, artifactRef: this.run.delivery.artifactRef } })
         if (back.returned) return 'returned'
         if (back.interrupted) return
         deliveryNotReturned = back.refusal
-      } else deliveryNotReturned = 'this closure ran outside the drive loop (finalize), which gives no author round'
+      } else deliveryNotReturned = 'this closure ran outside the drive loop (a finalize nothing drives on), which gives no author round'
     }
 
     if (conditions.deliveryCompleted) {

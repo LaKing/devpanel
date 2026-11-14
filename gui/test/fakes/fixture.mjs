@@ -67,8 +67,11 @@ export async function cleanupFixtures () {
   await Promise.all(temps.splice(0).map((d) => fs.rm(d, { recursive: true, force: true }).catch(() => {})))
 }
 
-/** Pull the rendered revision out of a prompt, the way a real agent would read it. */
-const revisionIn = (prompt) => (prompt.match(/sha256:[0-9a-f]{64}/) ?? [null])[0]
+/**
+ * Pull the rendered revision out of a prompt, the way a real agent would read it: the one the prompt
+ * calls current, where it says so. After a delivery return an earlier revision is quoted before it.
+ */
+const revisionIn = (prompt) => prompt.match(/Current revision: (sha256:[0-9a-f]{64})/)?.[1] ?? (prompt.match(/sha256:[0-9a-f]{64}/) ?? [null])[0]
 
 /**
  * Responses that satisfy every output contract. `plan` shapes the run:

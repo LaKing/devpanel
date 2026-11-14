@@ -1539,6 +1539,23 @@ reason, and every attempt is recorded under `run.finalizations`. It takes the
 same exclusivity as a start (one live run per issue, ownership through the
 lock) and the worktree is settled afterwards by the same disposal rules.
 
+One thing a finalize does beyond completing: when its delivery meets a text
+conflict with the source, the conflict goes back to the author exactly as at the
+drive loop's own closure ("The engine returns a delivery conflict to the
+author"), under the same refusals and the same bound. The run is live again and
+the supervisor drives it on like an answered one: the route answers `status:
+pending` with `decision.deliveryReturn`, a `run-resumed` event follows, and the
+end is announced when the run really ends. The time the run stood blocked is a
+stop, not its wall clock (`finalizations[].returned.suspendedMs`, added to
+`controlSuspendedMs`), and the module locks its end gave back are owed
+(`moduleLocks.owed`): the engine takes them before any turn and waits for a
+holder, the finalize is never refused for them. This is how a run left blocked
+at a conflict that could not be returned when it closed (a defect since fixed,
+an unreadable reconcile policy) gets its author round. An unmet confirmation is
+not returned by a finalize; that still blocks. `engine.finalize()` called with
+nothing to drive the run on (no `mayReturnDelivery`) returns nothing and says so
+in `closure.deliveryNotReturned`.
+
 ### Reconciling a delivery with drifted source
 
 When source delivery refuses because edits in the destination conflict with the

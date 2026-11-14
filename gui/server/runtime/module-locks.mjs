@@ -189,6 +189,21 @@ export async function releaseRunLocks (run, { dir = null, clock = systemClock } 
 }
 
 /**
+ * An ended run that goes on without an answer (a finalize that returned a delivery conflict to its
+ * author, supervisor.finalize) owes the set its end gave back: nothing is taken here, the engine
+ * takes it before any turn and waits for a holder (engine.takePendingModules). True when something
+ * became owed; the caller writes the record.
+ */
+export function oweReleased (run) {
+  const locks = run?.moduleLocks
+  const modules = locks?.released?.modules ?? []
+  if (!locks?.pool || !modules.length) return false
+  locks.owed = normalize([...modules, ...(locks.owed ?? [])])
+  delete locks.released
+  return true
+}
+
+/**
  * A paused run gives up every lock it holds: it waits for a person and does nothing meanwhile, so
  * its modules must not stand in other runs' way. What it gave up is owed (`run.moduleLocks.owed`,
  * and `released` with `reason: paused`): the engine takes the set again before anything goes on

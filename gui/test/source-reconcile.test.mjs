@@ -83,6 +83,8 @@ const until = async (test, label) => {
 }
 const CHANGELOG_ONLY = { worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'candidate: fixed line 9\nv1 released\n' }, source: { 'changelog.txt': 'other: landed first\nv1 released\n' } }
 const CODE_CONFLICT = { worktree: { 'server.mjs': lines(10, { 5: 'line 5 by the candidate' }) }, source: { 'server.mjs': lines(10, { 5: 'line 5 by someone else' }) } }
+// A conflict neither the automatic reconcile nor the author can take: a finalize leaves the run blocked at it.
+const BINARY_CONFLICT = { tracked: { 'blob.bin': Buffer.from([0, 1, 2, 3]) }, worktree: { 'blob.bin': Buffer.from([0, 9, 9, 9]) }, source: { 'blob.bin': Buffer.from([0, 7, 7, 7]) } }
 const DECLARED = "'**/changelog.txt': prepend"
 const PREPEND = { '**/changelog.txt': 'prepend' }
 // A clean code edit at delivery merges by itself (source-merge.mjs); a run blocks for reconcile only beside this changelog conflict.
@@ -289,7 +291,7 @@ export default async function (t) {
 
     t.section('2g. an automatic reconcile does not apply: announced at once, as before')
     {
-      const s = await supervisedRun(CODE_CONFLICT)
+      const s = await supervisedRun(BINARY_CONFLICT)
       const { supervisor, events } = s.open()
       await supervisor.finalize(s.ids)
       t.eq('announced by the time finalize returns', finishes(events), 1)
@@ -299,6 +301,33 @@ export default async function (t) {
       await periods()
       t.eq('still once', finishes(events), 1)
       await supervisor.shutdown?.()
+    }
+
+    t.section('2g-2. a text conflict in code met by a finalize goes back to the author, and the run is driven on')
+    {
+      // The run closed where nothing could read the reconcile policy, so the conflict was not returned then.
+      const s = await supervisedRun(CODE_CONFLICT)
+      // The supervisor drives the run on with seats of its own: the fake runtime as a module, its author resolving the conflict.
+      const control = path.join(s.f.issuesDir, 'control.json')
+      await fs.writeFile(control, JSON.stringify({ ledger: path.join(s.f.issuesDir, 'ledger.jsonl'), writes: { implement: { file: 'server.mjs', text: lines(10, { 5: 'line 5 by both' }) } } }))
+      await fs.writeFile(path.join(s.f.configRoot, 'harness', 'fake.mjs'), `export * from ${JSON.stringify(path.join(process.cwd(), 'test', 'fakes', 'harness-module.mjs'))}\n`)
+      const controlBefore = process.env.DEVPANEL_FAKE_CONTROL
+      process.env.DEVPANEL_FAKE_CONTROL = control
+      t.eq('blocked at delivery, nothing returned', [`${s.engine.run.status} ${s.engine.run.blockedReason}`, s.engine.run.deliveryReturns ?? null], ['blocked source-delivery-blocked', null])
+      const { supervisor, events } = s.open()
+      const answer = await supervisor.finalize(s.ids)
+      t.eq('finalize answers that the run goes on', [answer.status, answer.decision], ['pending', { deliveryReturn: 1 }])
+      t.eq('nothing is announced as ended yet', finishes(events), 0)
+      await until(() => finishes(events) > 0, 'the end of the returned run')
+      const run = await record(s.f, s.runId)
+      t.eq('driven to its end and delivered', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.deliveryNotReturned ?? run.closure?.conditions)}`)
+      t.eq('on one return, with the author\'s round after it', [run.deliveryReturns?.length, run.steps.filter((x) => x.stepId === 'implement').length], [1, 2])
+      t.eq('the source holds the author\'s reconciliation', await read(s.f, 'server.mjs'), lines(10, { 5: 'line 5 by both' }))
+      t.ok('the time it stood blocked is not its wall clock', run.finalizations?.at(-1)?.returned?.suspendedMs > 0 && run.controlSuspendedMs >= run.finalizations.at(-1).returned.suspendedMs, JSON.stringify(run.finalizations?.at(-1)?.returned))
+      t.ok('announced as resumed, then as ended once', types(events).indexOf('run-resumed') > -1 && types(events).indexOf('run-resumed') < types(events).indexOf('run-finished') && finishes(events) === 1, types(events).join(' '))
+      await supervisor.shutdown?.()
+      if (controlBefore === undefined) delete process.env.DEVPANEL_FAKE_CONTROL
+      else process.env.DEVPANEL_FAKE_CONTROL = controlBefore
     }
 
     t.section('2h. the lock is held when the attempt starts: it never ran, and the release waits for the lock')
@@ -370,7 +399,7 @@ export default async function (t) {
       for (const [label, scenario, failFor, expected] of [
         ['transient, reconcile applies', CHANGELOG_ONLY, 1, 'completed'],
         ['many periods, reconcile applies', CHANGELOG_ONLY, 10, 'completed'],
-        ['many periods, reconcile does not apply', CODE_CONFLICT, 10, 'blocked']
+        ['many periods, reconcile does not apply', BINARY_CONFLICT, 10, 'blocked']
       ]) {
         let failing = false
         const wrap = (issues) => readsThrough(issues, async (...args) => {

@@ -315,7 +315,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   the diff since the engine's merge), confirmed and delivered with nothing carried. At most 2 per run (`run.deliveryReturns`);
   the move is journaled (`run.pendingDeliveryReturn`) and redone after a crash, else `delivery-return-interrupted`. A non-text
   conflict, a materialized path, any other refusal, an unreadable reconcile policy or the bound block as before with
-  `closure.deliveryNotReturned`; conflicts only on declared append paths stay the automatic reconcile's.
+  `closure.deliveryNotReturned`; conflicts only on declared append paths stay the automatic reconcile's. A `finalize` of a run
+  left blocked at such a conflict returns it the same way and the supervisor drives the run on (`supervisor.finalize`: blocked time
+  excused from the wall clock, the released module locks owed).
 - Checks-only stops: an approved revision whose check failed and that the author answers unchanged ends the loop as
   `checks-failed-unchanged`; that, or `rounds-exhausted` with every auditor approving the latest revision and its check
   not passing (`checksOnlyBlock`, run-control.mjs), offers `refresh-checks` to rerun the checks on the candidate.

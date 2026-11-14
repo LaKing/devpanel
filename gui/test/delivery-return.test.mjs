@@ -207,6 +207,27 @@ export default async function (t) {
       t.eq('the source was not written', await source(f), SOURCE)
       await done(engine)
     }
+
+    t.section('8. a run left blocked at the conflict: a finalize whose caller drives on gives the author the round')
+    {
+      // Blocked because the return could not be made when the run closed (here: no reconcile policy to read).
+      const s = await scenario({ policy: null, author: resolve() })
+      t.eq('blocked at delivery, nothing returned', [`${s.engine.run.status} ${s.engine.run.blockedReason}`, s.engine.run.deliveryReturns ?? null], ['blocked source-delivery-blocked', null])
+      let again = await s.reopen()
+      again.reconcilePolicy = () => ({})
+      await again.finalize()
+      t.eq('a plain finalize stays blocked and says why', [`${again.run.status} ${again.run.blockedReason}`, /nothing drives on/.test(again.run.closure?.deliveryNotReturned ?? '')], ['blocked source-delivery-blocked', true], again.run.closure?.deliveryNotReturned)
+      t.eq('the source is untouched', await source(s.f), SOURCE)
+      again = await s.reopen()
+      again.reconcilePolicy = () => ({})
+      t.eq('a finalize that may return answers returned', await again.finalize({ mayReturnDelivery: true }), 'returned')
+      t.eq('the run is live again with the return on its record, not ended', [again.run.status, again.run.blockedReason, again.run.endedAt, again.run.deliveryReturns?.length], ['running', null, null, 1])
+      await again.drive()
+      t.eq('driven on, it completes and delivers', `${again.run.status} ${again.run.outcome}`, 'completed resolved', `${again.run.blockedReason} ${again.run.delivery?.error} ${JSON.stringify(again.run.closure?.deliveryNotReturned ?? again.run.closure?.conditions)}`)
+      t.eq('on one more author round', rounds(s.prompts, 'implement'), [0, 1])
+      t.eq('the source holds the reconciliation', await source(s.f), RECONCILED)
+      await done(again)
+    }
   } finally {
     await cleanupFixtures()
   }
