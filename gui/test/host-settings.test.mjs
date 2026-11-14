@@ -121,7 +121,15 @@ export default async function (t) {
       }
       t.ok('a time that is not HH:MM is refused', /fullVerification/.test(await refusal({ at: '6:00', timeZone: 'Europe/Berlin' }) ?? ''))
       t.ok('a zone the runtime does not know is refused', /fullVerification\/timeZone/.test(await refusal({ at: '06:00', timeZone: 'Nowhere/Elsewhere' }) ?? ''))
-      t.ok('both keys are required', /fullVerification/.test(await refusal({ at: '06:00' }) ?? ''))
+      t.ok('both keys are required together', /fullVerification/.test(await refusal({ at: '06:00' }) ?? '') && /fullVerification/.test(await refusal({ timeZone: 'Europe/Berlin' }) ?? ''))
+      t.ok('a negative delivery count is refused', /afterDeliveries/.test(await refusal({ afterDeliveries: -1 }) ?? ''))
+
+      t.section('6b. the delivery trigger: 10 by default, a block may hold the count alone, 0 turns it off')
+      t.eq('absent: a cycle per 10 deliveries', hostSettings({ root, hostDir: path.join(root, 'host-config'), env: {} }).verificationTrigger, { afterDeliveries: 10 })
+      t.eq('a schedule alone keeps the default', hostSettings({ hostDir }).verificationTrigger, { afterDeliveries: 10 })
+      const countOnly = await temp('devpanel-settings-fv-count-')
+      await write(path.join(countOnly, 'settings.json'), JSON.stringify({ fullVerification: { afterDeliveries: 0 } }))
+      t.eq('the count alone: no schedule, the trigger as written', [hostSettings({ hostDir: countOnly }).fullVerification, hostSettings({ hostDir: countOnly }).verificationTrigger], [null, { afterDeliveries: 0 }])
     }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))

@@ -107,6 +107,15 @@ infrastructure:
       #   start:   { run: '/opt/stage-tools/instance.sh start {{instanceName}}', busyExitCodes: [4], busyRetrySeconds: 30 }
       #   destroy: { run: '/opt/stage-tools/instance.sh destroy {{instanceName}}' }
       #   gc:      { run: '/opt/stage-tools/instance.sh gc' }
+      #   # The full verification on an instance of its own (docs/project-infrastructure.md
+      #   # "The full verification on a stage instance"): create, start, ready as above, then
+      #   # the whole suite, the whole browser run (needed when `browser` is declared above)
+      #   # and these collectors. On a host with instances the cycle never uses the base instance.
+      #   fullSuite:
+      #     test:    { id: full-suite, run: '/opt/stage-tools/full-suite.sh {{instance}}', report: selftest, timeoutSeconds: 3600 }
+      #     browser: { id: full-browser, run: '/opt/stage-tools/browser-check.sh {{instance}}', timeoutSeconds: 1800 }
+      #     finallyCommands:
+      #       - { id: collect-log, run: 'cat {{instance}}/runtime/log/current/project.log' }
     # Under structured confinement (`kind` on every command) load, restart, ready,
     # test and the collector are `kind: privileged`: they act on the stage instance,
     # which a candidate command cannot see; lint may be `kind: candidate`.

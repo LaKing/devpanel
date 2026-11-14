@@ -396,6 +396,40 @@ export async function stagingRunCoverage ({ snapshotPath, snapshotAt, ...project
   return record
 }
 
+/**
+ * A project's deliveries to its development checkout from COVERAGE_BASELINE on, in delivery
+ * order: what the full verification's delivery trigger counts (verification-trigger.mjs).
+ */
+export async function deliveriesOf (project) {
+  const state = await projectState(project)
+  return state.deliveries.map((d) => ({ issueId: d.issueId, runId: d.runId, at: d.at ?? null, kind: d.kind, action: d.action }))
+}
+
+/**
+ * What a full verification cycle's snapshot of the checkout holds of the deliveries it was given
+ * (`candidates`, run ids; all of them when null), read like a staging release's snapshot:
+ * covered (its bytes, or a later delivery's built on them), indeterminate (unknown content, or
+ * the snapshot differs) or notShipped (delivered after the snapshot). No staging release is
+ * consulted and nothing is written: the cycle record keeps it (full-verification.mjs).
+ */
+export async function cycleSnapshotCoverage ({ snapshotPath, snapshotAt, candidates = null, ...project }) {
+  const state = await projectState(project)
+  const wanted = candidates ? new Set(candidates) : null
+  const record = { basis: 'cycle-snapshot', covered: [], indeterminate: [], notShipped: [] }
+  const read = treeReader(snapshotPath)
+  for (const d of state.deliveries) {
+    if (wanted && !wanted.has(d.runId)) continue
+    const name = { issueId: d.issueId, runId: d.runId }
+    if (!before(d, snapshotAt)) { record.notShipped.push(name); continue }
+    await contentOf(d)
+    if (!d.content.entries) { record.indeterminate.push({ ...name, reason: d.content.reason, paths: [] }); continue }
+    const { paths, superseded } = await compare(d, state.deliveries, read, snapshotAt)
+    if (paths.length) record.indeterminate.push({ ...name, reason: 'snapshot-differs', paths })
+    else record.covered.push({ ...name, ...(superseded.length ? { superseded } : {}) })
+  }
+  return record
+}
+
 /** Whether the checkout holds a run's bytes now: information, or the live list's test for a hand change. */
 async function checkoutHolds (d, deliveries, read) {
   if (!d.content.entries || !read) return { reading: 'unknown', paths: [] }

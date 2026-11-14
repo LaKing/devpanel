@@ -62,6 +62,9 @@ for (const p of config.unmatchedPricing ?? []) console.log(`  ${mark('warn')} ro
 // one that declares none gets an unavailable check on each revision until it does.
 for (const [id, project] of config.projects) {
   if (project.infrastructure && !project.infrastructure.testDrive?.modules) console.log(`  ${mark('warn')} ${id}: a Boilerplate project without testDrive.modules; coding playbooks record its per-revision check as unavailable until it declares one (docs/project-infrastructure.md "The modules tier")`)
+  const modules = project.infrastructure?.testDrive?.modules
+  if (modules?.instance && !modules.instance.fullSuite) console.log(`  ${mark('warn')} ${id}: modules.instance without fullSuite; the full verification refuses this stage (FULL_SUITE_UNDECLARED) and never releases to its base instance (docs/project-infrastructure.md "The full verification on a stage instance")`)
+  if (modules?.browser && modules.instance?.fullSuite && !modules.instance.fullSuite.browser) console.log(`  ${mark('warn')} ${id}: modules.browser without modules.instance.fullSuite.browser; the full verification's entry for this project is incomplete (BROWSER_CHECKS_UNBOUND), never green`)
 }
 for (const p of config.invalidPricing ?? []) console.log(`  ${mark('warn')} roster-pricing: ${p.file} is not usable, so that model stays unpriced: ${p.message}`)
 // The consult panel (docs/consult.md): a seat that cannot be used leaves every consult unavailable, so questions go to a person as before.

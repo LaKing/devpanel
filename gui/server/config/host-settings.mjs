@@ -54,7 +54,7 @@ function parse (file) {
   try { data = JSON.parse(fs.readFileSync(file, 'utf8')) } catch (error) { throw new Error(`host settings ${file}: ${error.message}`) }
   if (!compiled()(data)) throw new Error(`host settings ${file}: ${validate.errors.map((e) => `${e.instancePath || '/'} ${e.message}`).join('; ')}`)
   // A zone the runtime does not know would schedule nothing, silently: refused like any other error.
-  if (data.fullVerification) {
+  if (data.fullVerification?.timeZone) {
     try { new Intl.DateTimeFormat('en-US', { timeZone: data.fullVerification.timeZone }) } catch (error) { throw new Error(`host settings ${file}: /fullVerification/timeZone ${error.message}`) }
   }
   return data
@@ -67,7 +67,7 @@ const lastValid = new Map()
 const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
 
 /**
- * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, fullVerification, projectDiscovery, proxyLogin, projectActions,
+ * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, fullVerification, verificationTrigger, projectDiscovery, proxyLogin, projectActions,
  * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance, operatorLanguage}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
@@ -120,7 +120,9 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     nestedRepositories: data.nestedRepositories ?? 'gitlink',
     resumeAfterShutdown: data.resumeAfterShutdown !== false,
     // The daily full verification (server/full-verification.mjs); null: no scheduled cycle.
-    fullVerification: data.fullVerification ? { at: data.fullVerification.at, timeZone: data.fullVerification.timeZone } : null,
+    fullVerification: data.fullVerification?.at ? { at: data.fullVerification.at, timeZone: data.fullVerification.timeZone } : null,
+    // The full verification's delivery trigger (server/verification-trigger.mjs): a cycle per this many deliveries on a stage; 0 is off.
+    verificationTrigger: { afterDeliveries: data.fullVerification?.afterDeliveries ?? 10 },
     projectDiscovery: data.projectDiscovery ? { pattern: data.projectDiscovery.pattern, markers: data.projectDiscovery.markers ?? DEFAULT_PROJECT_MARKERS } : null,
     proxyLogin: {
       usersDir: data.proxyLogin?.usersDir ? data.proxyLogin.usersDir.replaceAll('{hostname}', os.hostname()) : null,

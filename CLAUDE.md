@@ -406,18 +406,30 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operator capability on the project page. An action may declare `effect: commit-checkout` (`projects/<id>.yaml`
   or a `# DEVPANEL effect:` header; the host settings may name another marker word) to state what it does rather than leave it inferred from a filename — a script
   may also version, publish, restart or deploy.
-- `full-verification.mjs` — the daily full verification: at the host settings' `fullVerification {at, timeZone}`
-  (or `POST /api/verification/start`) `supervisor.freeze` closes admission (starts and continuations refused
-  `FULL_VERIFICATION_FREEZE`; `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last
+- `full-verification.mjs` — the full verification: after `fullVerification.afterDeliveries` (default 10, 0 off)
+  deliveries per stage that no cycle covered (`verification-trigger.mjs`: a delivery retires only from an entry whose
+  whole suite ran, `coverageEstablished`; a stage whose last automatic cycle proved nothing waits for as many more), on
+  request (`POST /api/verification/start`), or at the optional `fullVerification {at, timeZone}`, `supervisor.freeze`
+  closes admission to writing runs (`run-exclusivity.mjs writesCheckout`: delivery, release or in place; starts,
+  continuations, finalize and reconcile refused `FULL_VERIFICATION_FREEZE`, an automatic reconcile deferred to the thaw,
+  operations still in admission tracked as `pendingWrites` and re-checked before delivery; Analysis, Triage and inquiries
+  go on; `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last
   statement before the runtime call; live runs pause as `full-verification`, `manualPending` when an operator pause
-  was pending too), waits until no run of an issue is left, starts one Deployment run (environment staging,
-  `runOptions.fullVerification`) per `infrastructure.staging` in the run home `issues/<project>/.verification-<date>/`
-  (`issues.getRunHolder`, never an issue), one at a time per staging host; the run drives the full tier after its
-  staging release against the previous green cycle (`runtime/full-verification-drive.mjs`); still frozen, handles the
+  was pending too), waits until no writing run or pending operation is left, then per stage, one at a time per staging
+  host: on a host with dynamic instances (a project there declares `testDrive.modules.instance`) no run and no release —
+  the checkout snapshotted (`gitWorktreeProvider`), `modules.instance.fullSuite` driven on an instance of the cycle's own
+  (`instanceCycleTarget` through `runChecks`, an instance slot waited for), destroyed however it ends, the outputs kept in
+  `issues/.verification/<date>/<cycle id>/<project>/`, the snapshot's covered deliveries recorded
+  (`staging-coverage.mjs cycleSnapshotCoverage`), a release entry on that host refused `HOST_HAS_INSTANCES`, a missing
+  suite `FULL_SUITE_UNDECLARED`, `modules.browser` without `fullSuite.browser` `incomplete`; elsewhere one Deployment run
+  (environment staging, `runOptions.fullVerification`) per `infrastructure.staging` in the run home
+  `issues/<project>/.verification-<date>/` (`issues.getRunHolder`, never an issue); each drive against the previous green
+  cycle of its mode (`runtime/full-verification-drive.mjs`); still frozen, handles the
   outcome (all green: each framework's `checkpoint --minor`, then its instances' `checkpoint` in `poolMembers` order,
   stopping at the first failure, through the engine-only `args` of `startProjectAction`; any red: no action, one issue
   per red project with its failing tests, excerpts and `failing-tests.md`, `openedBy.from {via: 'full-verification', cycle}`);
-  then thaws, resumes what it paused and keeps `issues/.verification/<date>/cycle.json` (`outcome`). execution-contract.md "Full verification freeze".
+  then thaws, resumes what it paused, keeps `issues/.verification/<date>/cycle.json` (`outcome`) and tells the top-level
+  supervisor (`verification-ended`, always waking: outcome, record, evidence); it resolves no issue. execution-contract.md "Full verification freeze".
 - `runtime/path-overlap.mjs` — would this candidate write files another live run, of its project or another, is touching? Compared at the real destination, through links (`related` plays no part): expected paths from the issue's earlier runs (retained worktree, patch, plan text; none reads `unknown`, never `none`), a live run's from its worktree now and its plan. On readiness and preview as `pathOverlap`, an information prerequisite; every start reads it again and records `run.startOverlap`. It refuses nothing, for operator and supervisor alike. docs/top-level-supervisor.md "Readiness".
 - `runtime/module-pool.mjs` + `runtime/module-locks.mjs` + `runtime/module-hooks.mjs` — a framework project and the instances naming it (`framework:` in projects/<id>.yaml) share one module pool (the framework's modules plus each instance's own, owned by the member whose real checkout holds them). A coding run locks its issue's triage modules at start (a module another live run holds refuses the start, 409 retryable `MODULE_LOCKED` naming the holder, before anything is reserved; the ready queue shows `blockedBy module-lock` and `capacity-freed` says `module-lock-released`), grows the lock with each revision's affected modules before any review (waiting, wall clock excused; the youngest run of a wait cycle yields and re-takes its whole set), and releases it at its end and at a pause (a paused run owes its set, `moduleLocks.owed`: its answer or resume is never refused for a lock, the decision is recorded and the engine takes the set again before anything goes on, waiting for a holder; lock.mjs identity: dead taken over, unknown never, a run that ended is stale). With the framework's `modulePool.hookReader`, a hook signature change puts every subscriber in the pool into `affectedModules.viaHooks` (module, project, hooks), locked, tested in the drive or in a subscriber drive of its project; a failed reading makes the modules check unavailable. `moduleLocks` on readiness, preview and the project page. execution-contract.md "Module locks", "The modules tier".
 - `staging-coverage.mjs` — which delivered runs a staging release carried, from content: each delivery's patch names its blobs per path, a staging release (a Deployment run in the staging environment, or an older Staging run) compares its snapshot once as it releases (`run.release.coverage`), an older green one is read from its retained archive. `stagingPendingReport` is `GET /api/projects/:project/staging-pending` and `overview`'s `stagingPending`: `pending`, `indeterminate`, `batch.ready`, and deliveries from before `COVERAGE_BASELINE` only as `history.count` (their content is never read). It starts nothing. `deploy_staging` names its candidates `indeterminate` (`deployed-content-unproven`) and clears nothing: only a staging release does. Notes go through `issues.createEngineNote`, kept beside an archived issue until restored. docs/staging-deployment.md "What a release covers".

@@ -3176,15 +3176,29 @@ approval of any outstanding finding or automatic resolution of the issue.
 
 ### Full verification freeze
 
-The daily full verification (tactical-playbooks.md "The daily full verification",
-`server/full-verification.mjs`) closes admission while it runs. `supervisor.freeze(cycleId)`
-sets the freeze and asks every run of an issue that this process drives to stop:
+The full verification (tactical-playbooks.md "The daily full verification",
+`server/full-verification.mjs`; started after `fullVerification.afterDeliveries` deliveries on
+a stage, on request, or at `fullVerification.at`) closes admission to *writing* runs while it
+runs. A run writes when what it can do to the checkout says so (run-exclusivity.mjs
+`writesCheckout`): its playbook delivers anything (`completion.delivery.action` other than
+`none`), it releases (staging, deployment), or it works in place; a run whose snapshot cannot
+be read is taken to write. Analysis, Triage and inquiries only read: the freeze neither asks,
+refuses nor waits for them, and they may start. `supervisor.freeze(cycleId)` sets the freeze
+and asks every writing run this process drives to stop:
 
-- **No run starts.** `supervisor.start()` refuses every start but the cycle's own with
-  409 `FULL_VERIFICATION_FREEZE` (`started: false`, `retryable: true`): the panel, the
-  top-level supervisor's `start_run` and a triage's autoStart alike. Resume, answer,
-  Continue and refresh-checks of an issue's run are refused the same way; finalize
-  (delivery, no seat turn) is not.
+- **No writing run starts.** `supervisor.start()` refuses a start whose resolved playbook writes,
+  and every start of another cycle, with 409 `FULL_VERIFICATION_FREEZE` (`started: false`,
+  `retryable: true`): the panel, the top-level supervisor's `start_run` and a triage's autoStart
+  alike. Resume, answer, Continue and refresh-checks of a writing run are refused the same way.
+- **No delivery starts.** Finalize and reconcile-delivery are refused the same way, before
+  anything is read. An automatic reconcile due during the freeze is put off, not spent, and
+  tried once when admission opens again. An operation admitted before the freeze but not yet
+  driving (a start, a continuation, a finalize or a reconcile still in its admission) is
+  pending (`pendingWrites`): the freeze lists it, `busy()` waits for it, and a finalize or
+  reconcile re-checks the freeze immediately before it delivers, with nothing awaited between
+  the check and the call, so one caught by a freeze is refused there and delivers nothing; one
+  already delivering is waited for. A writing run past its last turn pauses at the engine's
+  loop boundary before closure and delivery.
 - **No seat turn begins beyond the one in flight.** The freeze is its own field,
   `run.freezeRequested {cycleId, at}` (`engine.requestFreeze`, set synchronously; a
   reservation carries it into its engine), so an operator's pause already pending cannot
@@ -3198,8 +3212,15 @@ sets the freeze and asks every run of an issue that this process drives to stop:
   full-verification` with `pause.cycleId`. A plain resume continues such a pause, like a
   manual one. When an operator's pause was pending as well, the pause records
   `manualPending: true`: the cycle leaves that run paused for the operator.
-- **The cycle starts** once no run of an issue is left in the process (`supervisor.busy()`),
-  so no seat turn is running. Its own Deployment runs carry `run.fullVerification
+- **The cycle takes its snapshot** once no writing run or pending writing operation is left in
+  the process (`supervisor.busy()`), so no seat turn or delivery writes the checkout. On a
+  stage host with dynamic instances it starts no run at all: it snapshots the checkout itself
+  (`gitWorktreeProvider`, under the delivery locks), drives `modules.instance.fullSuite` on an
+  instance of its own (`runtime/full-verification-drive.mjs instanceCycleTarget`, through
+  `runChecks`: an instance slot of `testDrive.maxInstances`, waited for) and destroys it
+  however the drive ends (`destroyRunInstances(driveId)`; an interrupted cycle's at the next
+  start, `recover()`, and by the instance sweep). It never releases to such a host's base
+  instance: an entry that would is refused `HOST_HAS_INSTANCES`. Elsewhere its own Deployment runs carry `run.fullVerification
   {cycleId}`, live in the project's run home `issues/<project>/.verification-<date>/`
   (id `verification-<date>`; never an issue: no list, count or lookup of issues reads it,
   and its parent is the project's issue folder, so release and action locks, the git
@@ -3212,10 +3233,13 @@ sets the freeze and asks every run of an issue that this process drives to stop:
   "What the outcome does"). It never throws: a failure of its own is `outcome.error`, and
   admission reopens after it all the same, and also after a cycle that failed.
 - **When the cycle ends** (its runs settled: completed, blocked, failed or paused all
-  count, and the outcome handled), `supervisor.thaw()` opens admission and the cycle resumes every run of an issue, or of an earlier cycle,
+  count, and the outcome handled), `supervisor.thaw()` opens admission, runs the automatic
+  reconciles it put off, and the cycle resumes every run of an issue, or of an earlier cycle,
   paused as `full-verification` without `manualPending` (`actor: service`, `origin:
   full-verification`), with every refusal of an ordinary resume; refusals and the runs
-  left for an operator are in the cycle record.
+  left for an operator are in the cycle record. The top-level supervisor is then told
+  (`verification-ended`, always waking: verdict, outcome, record path, each entry's evidence
+  directory and covered runs). The cycle resolves no issue.
 
 A service shutdown during the freeze records a frozen run's stop as that pause. At the
 next start, before `resumeInterrupted`, `recover()` marks an unfinished cycle record
@@ -3234,6 +3258,20 @@ not apply: it is keyed by the exact base commit, and each day's checkout has ano
 inherited failure passes; a new failure, a comparison that cannot be made, or a drive with
 no previous green cycle that fails makes the gate fail, and the run blocks
 `full-verification-checks-failed` without restore, so the stage keeps what was released.
+
+**The full check on a stage instance.** The same comparison, against the latest green
+*instance* drive of the stage (`previousGreen` matches `mode`; a release drive runs other
+commands), read from that drive's `drive.json`. Its deliveries count as tested only when the
+whole suite ran to an answer and a selftest report parses out of a report command's output
+(`suiteRanOf`: not skipped behind a failed readiness, no timeout or signal); the entry's
+`coverageEstablished` says so, and only then do the runs its snapshot covered stop counting
+toward the next cycle (server/verification-trigger.mjs). A cycle's Deployment run is held to the same
+standard (`fullTierRanOf`): its release completed, every required command of its full drive ran and
+answered on its own exit (a timed-out last command, which skips nothing, proves nothing), and a
+declared selftest report parses. The snapshot is always a `working-tree` one, whatever base the
+project's runs take. A cycle that ends while the top-level supervisor cannot be told (the service
+stopped mid-cycle and `recover()` marked it interrupted) keeps `announce: pending` on its record and
+is told once the supervisor exists, once.
 
 #### What the wall clock counts
 

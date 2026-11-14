@@ -575,43 +575,80 @@ inspections do not deploy either instance.
 
 ## The daily full verification
 
-Every day, at a time the host settings name, the panel finishes the seat turns in flight,
-starts nothing new, and verifies every project on its stage with the Deployment playbook
-(environment staging, full checks): the day's changes together. "Full verification now"
-starts the same cycle by hand.
+A full verification cycle verifies every project on its stage with its whole suite: the
+changes delivered since the last cycle, together. It starts in three ways:
 
-**Configure it** in the host settings (docs/host-config.md "Host settings"):
+- **After every ten deliveries** to the source on one stage since the last cycle that covered
+  them (the host settings' `fullVerification.afterDeliveries`, default 10; 0 turns this off).
+- **On request**: "Full verification now", `POST /api/verification/start`.
+- **Daily**, when the host settings name a time (`fullVerification.at` and `timeZone`); optional.
+
+**Configure it** in the host settings (docs/host-config.md "Host settings"); every key is optional:
 
 ```json
-{ "fullVerification": { "at": "06:00", "timeZone": "Europe/Berlin" } }
+{ "fullVerification": { "afterDeliveries": 10, "at": "06:00", "timeZone": "Europe/Berlin" } }
 ```
 
-`at` is HH:MM local to `timeZone`, an IANA zone the runtime must know. Without the block
-there is no scheduled cycle; the hand start still works. The schedule fires once per local
+`at` is HH:MM local to `timeZone`, an IANA zone the runtime must know; the two go together.
+Without them there is no scheduled cycle; the other triggers still work. The schedule fires once per local
 date, when the clock reaches `at`; a service that starts after that time waits for the
 next day (no catch-up). On a daylight-saving change an ambiguous time is its earlier
 instant and a skipped one fires shifted forward.
 
-**What freezes and resumes.** At the time admission closes: no run starts, and no seat
-turn begins beyond the one in flight. Live runs pause at their next step boundary as
-`paused: full-verification` and resume when the cycle ends; a run an operator had also
-asked to pause stays paused for that operator. The cycle starts only when no seat turn is
-running. Details are in execution-contract.md "Full verification freeze".
+**The delivery count** is per stage (a staging host, summing the projects that stage there)
+and counts the deliveries to the source since `COVERAGE_BASELINE` (staging-coverage.mjs) that
+no cycle has covered yet. A delivery stops counting only when a cycle entry of its project
+proved its snapshot held the delivery's bytes and ran the whole suite on it
+(`coverageEstablished`); a delivery the snapshot could not establish (`indeterminate`), one
+delivered after the snapshot (`notShipped`) and every delivery of an entry that never got to
+its suite (refused, readiness failed, incomplete) keep counting. A stage whose latest automatic
+cycle established nothing is held back until as many deliveries again were made after that
+cycle began (`suppressed` in `GET /api/verification/latest`'s `deliveries`), so a stage that
+cannot be tested does not cycle without end; a hand start is never held. The panel counts after
+each run's end and every 15 minutes, never while a cycle runs or admission is frozen. Only a
+stage a cycle can verify counts. The staging pending list (staging releases) is a separate
+reading and a cycle changes nothing there.
 
-**What runs.** One Deployment run in environment staging for each configured stage: a
+**What freezes and resumes.** While a cycle runs, *writing* runs stop: a run whose playbook
+delivers, releases (staging, deployment) or works in place (run-exclusivity.mjs
+`writesCheckout`). None starts, continues, finalizes or reconciles, no seat turn of one begins
+beyond the one in flight, and live ones pause at their next step boundary as
+`paused: full-verification` and resume when the cycle ends; a run an operator had also asked
+to pause stays paused for that operator. Read-only runs (Analysis, Triage, inquiries) keep
+running and may start. The cycle takes its snapshot only when no writing run has a seat turn
+or a delivery in flight. Details are in execution-contract.md "Full verification freeze".
+
+**What runs, on a stage host with dynamic instances** (a project there declares
+`testDrive.modules.instance`, project-infrastructure.md "The full verification on a stage
+instance"): no run and no release. The cycle snapshots each project's development checkout as
+it stands (always as a `working-tree` base, uncommitted deliveries included, whatever base the project's runs take; the framework composed with its application by the
+instance's own `create`, as the modules tier does it), creates a dynamic instance of the
+cycle's own from it (counted against `testDrive.maxInstances`, waiting for a free slot),
+runs the project's whole suite there (`modules.instance.fullSuite.test`) and, where the
+project declares browser checks, its whole browser run (`fullSuite.browser`), then the
+collectors, and destroys the instance however the drive ended. The base stage instance of
+such a host is never released to, loaded into, restarted or written: a project on that host
+without an instance of its own is refused (`HOST_HAS_INSTANCES`), one without a full suite too
+(`FULL_SUITE_UNDECLARED`). The drive is compared with the latest green instance drive of that
+stage: a failure already there is inherited, a new one is red. Tests the suite skips on an
+instance by design (no network, no provisioned secret: the selftest report's skipped entries)
+are listed as `notOnInstance`, neither failures nor passes. A project declaring
+`testDrive.modules.browser` whose full suite names no browser run is `incomplete`: never green.
+
+**What runs, elsewhere.** One Deployment run in environment staging for each configured stage: a
 project's `infrastructure.staging`. The candidate is the project's development checkout as
 it stands (the strategy's `working-tree` base). After the staging release the engine drives
 the project's full check tier on the same snapshot and compares it with the previous green
-cycle of that stage; a new failure blocks the run. Runs on one staging host go one at a
-time and hosts run side by side, each drive within the host's drive slots. A project with
+cycle of that stage; a new failure blocks the run. The runs live in the project's run home
+`issues/<project>/.verification-<date>/`, which is not an issue, and the runs themselves change,
+deliver and open nothing. A green cycle release counts as a green staging release (production
+promotion, staging coverage).
+
+In either mode, stages on one staging host go one at a time and hosts run side by side. A project with
 no infrastructure, or whose staging declares `fullVerification: instances` (a framework
 verified through the applications that deploy it), is recorded as verified through its
-instances and gets no run. A stage whose run cannot start (a missing release target,
-`TARGET_MISSING`, or another refusal) is a red entry with the refusal.
-
-The runs live in the project's run home `issues/<project>/.verification-<date>/`, which is
-not an issue, and the runs themselves change, deliver and open nothing. A green cycle release counts as
-a green staging release (production promotion, staging coverage).
+instances. A stage that cannot be verified (a missing release target, `TARGET_MISSING`, or
+another refusal) is a red entry with the refusal.
 
 **What the outcome does.** When the runs have settled, and before admission reopens, the
 cycle acts on its verdict:
@@ -648,17 +685,38 @@ cycle acts on its verdict:
   ` (cycle <id>)` to the name, since an issue name opens once a day.
 - **No stage verified** (`no-stages`): nothing runs.
 
-Admission then reopens, whatever the outcome was, and the paused runs resume.
+An `incomplete` entry counts as red. Admission then reopens, whatever the outcome was, and the paused runs resume.
+
+**What the top-level supervisor is told.** When a cycle ended it gets a `verification-ended`
+event, which always wakes it: the verdict, what the outcome did (the checkpoint chain or the
+issues opened), the record's path and, per project, its stage, mode, instance, evidence
+directory, the delivered runs it covered and those still counting. The cycle resolves no
+issue; settling one whose only open item was a pending live verification is the supervisor's
+decision, from that evidence, which it reads with `get_verification_file` (read-only, confined to
+`issues/.verification/`). A cycle that ended while nobody could be told (the service stopped and
+recovery marked it interrupted) is told once the supervisor exists, once (`announce` on the record).
+
+**What is kept.** An instance drive's directory, `issues/.verification/<date>/<cycle id>/<project>/`,
+keeps what the instance produced after it is destroyed: every command's log and output (the
+selftest report, the project log, the browser-check report, as the collectors print them) in
+`checks/full-verification/`, and `drive.json` (the drive and its comparison, which the next
+cycle compares with). The entry names it as `evidence` (`dir`, `files`, the report, browser and
+collector commands).
 
 **Where the record is.** Each cycle writes `issues/.verification/<date>/cycle.json` at
-every step: `id`, `trigger` (`schedule` or `hand`), `by`, `schedule`, `state` (`frozen`,
+every step: `id`, `trigger` (`schedule`, `hand` or `deliveries`, with `deliveries`: the stage, its count, the threshold and the runs), `by`, `schedule`, `state` (`frozen`,
 `running`, `outcome`, `resuming`, `ended`, `interrupted`, `failed`), `frozenAt`, `seatsIdleAt`,
 `startedAt`, `endedAt`, `verdict` (`green`, `red`, `no-stages`: any red entry, a project whose
 configuration cannot be read included, makes it `red`), the runs it waited on,
 and one entry per project: its stage and host, `runId`, `status`, `release`, `check`
 (result, gate, baseline cycle, new failures, `failingTests` with their basis, the selftest
 comparison's verdict and reason, the drive's files and their hashes), `verdict`,
-`startedAt`, `endedAt`, `durationMs`, or `verifiedThrough: instances`, or a `refusal`. The
+`startedAt`, `endedAt`, `durationMs`, or `verifiedThrough: instances`, or a `refusal`; `coverage`
+(the delivered runs its snapshot `covered`, `indeterminate`, `notShipped`) with `snapshotAt` and
+`coverageEstablished`; and for an instance drive `mode: instance`, `driveId`, `instance` (name,
+root, slot, waits, create/start/ready times, `destroyed`), `snapshot`, `suiteRan`, `browser`,
+`evidence`, `check.notOnInstance`, any `incomplete`. `protectedHosts` names the hosts with
+dynamic instances and who declares them. The
 runs it resumed, those left paused for an operator and the refused resumes are listed too,
 and `outcome`: `bump` (`chain` with each step's project, args, operation, status and
 versions, `versions`, `failed`, `notRun`, or the `reason` nothing ran) or `issues` (per red

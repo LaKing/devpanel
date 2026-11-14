@@ -2,7 +2,8 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { cycleGate, driveFiles, fullVerificationDrive } from '../server/runtime/full-verification-drive.mjs'
+import { cycleGate, driveFiles, fullVerificationDrive, instanceCycleTarget, notOnInstanceOf, previousGreen, suiteRanOf } from '../server/runtime/full-verification-drive.mjs'
+import { driveCommands } from '../server/runtime/instance-drive.mjs'
 
 export const name = 'full verification drive — the full tier on the snapshot, judged against the previous green cycle'
 
@@ -65,6 +66,71 @@ export default async function (t) {
       t.eq('a drive that could not run is not passed', cycleGate({ result: 'unavailable' }), 'unavailable')
       t.eq('a failed drive with inherited failures passes', cycleGate({ result: 'failed' }, { failures: { verdict: 'baseline-known' }, selftest: { verdict: 'baseline-known' } }), 'passed')
       t.eq('a failed drive with a new selftest failure is red', cycleGate({ result: 'failed' }, { failures: { verdict: 'baseline-known' }, selftest: { verdict: 'new-failures' } }), 'failed')
+    }
+
+    t.section('5. the cycle on a stage instance: create, start, ready, the whole suite and browser run, collectors; every command names the instance')
+    {
+      const modules = {
+        collections: ['@*'],
+        lint: { id: 'lint', run: '/opt/stage-tools/lint.sh {{instance}} {{files}}' },
+        load: { id: 'load', run: '/opt/stage-tools/load.sh {{instance}}' },
+        restart: { id: 'restart', run: '/opt/stage-tools/reload.sh {{instance}}' },
+        ready: { id: 'ready', run: '/opt/stage-tools/instance.sh ready {{instanceName}}' },
+        test: { id: 'module-selftest', run: '/opt/stage-tools/selftest.sh {{instance}} {{filters}}' },
+        finallyCommands: [{ id: 'collect-selftest-report', run: 'cat {{instance}}/runtime/selftest.report', report: 'selftest' }],
+        instance: {
+          root: '/opt/stage-instances',
+          create: { run: '/opt/stage-tools/instance.sh create {{instanceName}} "$PWD"' },
+          start: { run: '/opt/stage-tools/instance.sh start {{instanceName}}', busyExitCodes: [4] },
+          destroy: { run: '/opt/stage-tools/instance.sh destroy {{instanceName}}' },
+          fullSuite: {
+            test: { id: 'full-suite', run: '/opt/stage-tools/full-suite.sh {{instance}}', timeoutSeconds: 3600 },
+            browser: { id: 'full-browser', run: '/opt/stage-tools/browser-check.sh {{instance}}' },
+            finallyCommands: [{ id: 'collect-log', run: 'cat {{instance}}/runtime/log/current/project.log' }]
+          }
+        }
+      }
+      const infra = { staging: { id: 'stage', ssh: { hostRef: 'ssh-config:stage', workdir: '/opt' }, projectRoot: '/opt/stage-base' }, testDrive: { modules } }
+      const cycleTarget = instanceCycleTarget(infra, 'dp-fv-1')
+      const fresh = driveCommands(cycleTarget, true)
+      t.eq('a fresh drive: create, start, ready, the suite, the browser run', fresh.map((c) => c.id), ['instance-create', 'instance-start', 'ready', 'full-suite', 'full-browser'])
+      t.eq('then the tier\'s collectors and the suite\'s', cycleTarget.finallyCommands.map((c) => c.id), ['collect-selftest-report', 'collect-log'])
+      t.eq('the suite and the browser run each go on past their own failure', fresh.filter((c) => ['full-suite', 'full-browser'].includes(c.id)).map((c) => c.ownFailureContinues), [true, true])
+      t.eq('the full tier, no lint, on the stage host', [cycleTarget.tier, cycleTarget.kind, fresh.some((c) => c.id === 'lint')], ['full', 'ssh', false])
+      const every = [...fresh, ...cycleTarget.finallyCommands, cycleTarget.stageInstance.destroy]
+      t.ok('every command names the cycle\'s instance', every.every((c) => c.run.includes('/opt/stage-instances/dp-fv-1') || c.run.includes('dp-fv-1')), every.map((c) => c.run).join(' | '))
+      t.eq('none names the base instance', every.filter((c) => c.run.includes('/opt/stage-base')).map((c) => c.id), [])
+      t.eq('no full suite declared: no target', instanceCycleTarget({ ...infra, testDrive: { modules: { ...modules, instance: { ...modules.instance, fullSuite: undefined } } } }, 'dp-x'), null)
+
+      t.section('6. suiteRanOf: only the whole suite run to an answer, with a report that parses, proves the deliveries were tested')
+      const dir = await runDirOf('suite-ran')
+      const drive = path.join(dir, 'checks', 'full-verification')
+      await fs.mkdir(drive, { recursive: true })
+      const reportText = report({ tests: [{ test: 'a: works' }, { test: 'b: breaks', error: 'boom' }, { test: 'c: provider', skipped: 'external: no provider on an instance' }] })
+      const rec = (id, passed, extra = {}) => ({ id, passed, exitCode: passed ? 0 : 1, ...extra })
+      const ran = async ({ commands, skipped = [], files = {} }) => {
+        await fs.rm(drive, { recursive: true, force: true })
+        await fs.mkdir(drive, { recursive: true })
+        for (const [name, text] of Object.entries(files)) await fs.writeFile(path.join(drive, name), text)
+        return suiteRanOf({ runDir: dir, check: { dir: 'checks/full-verification', commands, skipped }, target: cycleTarget, suiteId: 'full-suite' })
+      }
+      const upTo = [rec('instance-create', true), rec('instance-start', true)]
+      t.eq('ready failed, the suite skipped behind it: not run', await ran({ commands: [...upTo, rec('ready', false), rec('collect-selftest-report', true)], skipped: [{ id: 'full-suite', required: true }], files: { 'collect-selftest-report.stdout': reportText } }), null)
+      t.eq('the suite timed out: not an answer', await ran({ commands: [...upTo, rec('ready', true), rec('full-suite', false, { timedOut: true, exitCode: 124 }), rec('collect-selftest-report', true)], files: { 'collect-selftest-report.stdout': reportText } }), null)
+      const failedOwn = await ran({ commands: [...upTo, rec('ready', true), rec('full-suite', false), rec('collect-selftest-report', true)], files: { 'collect-selftest-report.stdout': reportText } })
+      t.eq('the suite failed its own tests, its report parses: ran (a parsed report with failures, and no baseline at all)', [failedOwn?.command, failedOwn?.passed, failedOwn?.exitCode, failedOwn?.report.command], ['full-suite', false, 1, 'collect-selftest-report'])
+      t.eq('the suite passed, its report did not parse: not proved', await ran({ commands: [...upTo, rec('ready', true), rec('full-suite', true), rec('collect-selftest-report', true)], files: { 'collect-selftest-report.stdout': 'no report here\n' } }), null)
+      t.eq('the collector failed and printed nothing (a not-applicable entry, no unread one): not proved', await ran({ commands: [...upTo, rec('ready', true), rec('full-suite', true), rec('collect-selftest-report', false)], files: {} }), null)
+      t.eq('the suite passed, its report parses: ran', (await ran({ commands: [...upTo, rec('ready', true), rec('full-suite', true), rec('collect-selftest-report', true)], files: { 'collect-selftest-report.stdout': reportText } }))?.passed, true)
+      t.eq('tests the report skipped are named, with their reason: not on an instance by design', await notOnInstanceOf({ runDir: dir, check: { dir: 'checks/full-verification', commands: [rec('collect-selftest-report', true)] }, target: cycleTarget }),
+        [{ command: 'collect-selftest-report', test: 'c: provider', reason: 'external: no provider on an instance' }])
+
+      t.section('7. an instance drive is compared only with earlier instance drives')
+      const records = path.join(root, '.verification-modes')
+      await fs.mkdir(path.join(records, '2026-11-14'), { recursive: true })
+      await fs.writeFile(path.join(records, '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', projects: [{ project: 'app-project', stage: 'stage', verdict: 'green', runId: 'r1', runDir: '/x', check: { dir: 'checks/full-verification' } }] }))
+      t.eq('a release entry (no mode) is no instance baseline', await previousGreen({ verificationDir: records, project: 'app-project', stage: 'stage', mode: 'instance' }), null)
+      t.eq('it is a release baseline', (await previousGreen({ verificationDir: records, project: 'app-project', stage: 'stage' }))?.runId, 'r1')
     }
   } finally {
     await fs.rm(root, { recursive: true, force: true })

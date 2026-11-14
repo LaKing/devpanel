@@ -11,31 +11,52 @@ import { stagedReleasePassed } from './runtime/run-result.mjs'
 import { failureFingerprints, selftestReport } from './runtime/baseline-failures.mjs'
 import { poolMembers } from './runtime/module-pool.mjs'
 import { startProjectAction } from './project-actions.mjs'
-import { projectPath, projectsRoot } from './project-path.mjs'
+import { projectPath, projectsRoot, resolveProjectPath } from './project-path.mjs'
+import { cycleRecords, driveFiles, DRIVE_DIR, fullTierRanOf, fullVerificationDrive, instanceCycleTarget, notOnInstanceOf, suiteRanOf } from './runtime/full-verification-drive.mjs'
+import { instanceName } from './runtime/instance-drive.mjs'
+import { destroyRunInstances } from './runtime/stage-instances.mjs'
+import { gitWorktreeProvider } from './runtime/launch.mjs'
+import { gitStoreDir } from './runtime/git-store.mjs'
+import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries } from './staging-coverage.mjs'
+import { deliveryCounts } from './verification-trigger.mjs'
 
 /*
- * The daily full verification (docs/tactical-playbooks.md "The daily full
+ * The full verification (docs/tactical-playbooks.md "The daily full
  * verification", execution-contract.md "Full verification freeze").
  *
- * At the host settings' `fullVerification.at` in its `timeZone` (or by hand,
- * POST /api/verification/start) a cycle:
- *   1. closes admission (supervisor.freeze): no run starts or continues, and every
- *      live run of an issue pauses at its next step boundary as `full-verification`;
- *   2. waits until no run of an issue is left in this process, so no seat turn runs;
- *   3. starts one Deployment run (environment staging, `fullVerification`) per
- *      configured stage, in the project's run home issues/<project>/.verification-<date>/,
- *      one at a time per staging host and hosts side by side: the candidate is the
- *      development checkout as it stands, and the run drives the full check tier on
- *      it against the previous green cycle (runtime/full-verification-drive.mjs);
+ * On request (POST /api/verification/start), once `fullVerification.afterDeliveries`
+ * deliveries happened on one stage (verification-trigger.mjs), and at the host settings'
+ * `fullVerification.at` in its `timeZone` when given, a cycle:
+ *   1. closes admission for writing runs (supervisor.freeze): none starts, continues or
+ *      delivers, and every live one pauses at its next step boundary as `full-verification`;
+ *      read-only runs (no delivery, no release, not in place) go on;
+ *   2. waits until no writing run or delivery is left in this process (supervisor.busy);
+ *   3. verifies every configured stage, one at a time per staging host and hosts side by
+ *      side, against the previous green cycle of the same mode
+ *      (runtime/full-verification-drive.mjs):
+ *      - on a stage host with dynamic instances (a project there declares
+ *        `testDrive.modules.instance`) it starts no run: it snapshots the development
+ *        checkout, drives `modules.instance.fullSuite` on an instance of its own (counted
+ *        against testDrive.maxInstances, waited for), keeps what the instance produced
+ *        under issues/.verification/<date>/<cycle id>/<project>/ and destroys it however
+ *        the drive ends. Nothing is ever released to, loaded into or restarted on the base
+ *        instance of such a host: a project there without an instance is refused
+ *        (HOST_HAS_INSTANCES), one without a full suite too (FULL_SUITE_UNDECLARED);
+ *      - elsewhere it starts one Deployment run (environment staging, `fullVerification`)
+ *        in the project's run home issues/<project>/.verification-<date>/, which releases
+ *        the development checkout as it stands and drives the full check tier on it;
  *      a project with no infrastructure, or whose staging declares
- *      `fullVerification: instances`, is recorded as verified through its instances;
+ *      `fullVerification: instances`, is recorded as verified through its instances.
+ *      Each entry records the delivered runs its snapshot covered;
  *   4. waits until those runs settle and handles the outcome while admission is still
  *      closed: every stage green, each framework's `checkpoint` runs with --minor and
  *      then each instance's `checkpoint` (runtime/module-pool.mjs poolMembers order),
  *      stopping at the first that fails; any stage red, no action runs and one issue
  *      opens per red project with its failing tests and their excerpts;
  *   5. opens admission and resumes the runs it paused;
- *   6. writes issues/.verification/<date>/cycle.json at every step.
+ *   6. writes issues/.verification/<date>/cycle.json at every step, and tells the
+ *      top-level supervisor (`onEnded`) the outcome and where the evidence is. The cycle
+ *      resolves no issue.
  */
 
 export const HOUR = 60 * 60 * 1000
@@ -84,12 +105,43 @@ export function nextTrigger ({ at, timeZone }, nowMs) {
   throw new Error(`no ${at} in ${timeZone} within three days of ${new Date(nowMs).toISOString()}`)
 }
 
-/** What a project is to the cycle: a stage to release to, or verified through its instances. */
+/**
+ * What a project is to the cycle: a stage to release to, a stage verified on a dynamic
+ * instance of the cycle's own (`mode: 'instance'`, its staging declares
+ * testDrive.modules.instance), or verified through its instances.
+ */
 export function stageOf (project, infra) {
   if (!infra) return { project, stage: null, verifiedThrough: 'instances', reason: 'the project has no infrastructure' }
   if (infra.staging?.fullVerification === 'instances') return { project, stage: infra.staging.id, verifiedThrough: 'instances', reason: 'its staging declares fullVerification: instances' }
-  return { project, stage: infra.staging.id, host: infra.staging.ssh?.hostRef ?? infra.staging.id }
+  const host = infra.staging.ssh?.hostRef ?? infra.staging.id
+  return infra.testDrive?.modules?.instance ? { project, stage: infra.staging.id, host, mode: 'instance' } : { project, stage: infra.staging.id, host }
 }
+
+/**
+ * The staging hosts that have dynamic instances, each with the projects that declare them: no cycle releases there.
+ * Read from every project's infrastructure (project -> infra), a project verified through its instances included:
+ * its declaration makes the host's base instance people's as much as any other's.
+ */
+export function protectedHosts (infras) {
+  const hosts = new Map()
+  for (const [project, infra] of infras) {
+    if (!infra?.staging || !infra.testDrive?.modules?.instance) continue
+    const host = infra.staging.ssh?.hostRef ?? infra.staging.id
+    hosts.set(host, [...(hosts.get(host) ?? []), project])
+  }
+  return hosts
+}
+
+/** The refusal of a release to a host with dynamic instances, or null. */
+const hostRefusal = (entry, hosts) => entry.mode !== 'instance' && hosts.has(entry.host)
+  ? { code: 'HOST_HAS_INSTANCES', message: `${entry.host} has dynamic stage instances (declared by ${hosts.get(entry.host).join(', ')}); its base instance is never released to, loaded into or restarted. Declare testDrive.modules.instance with a fullSuite for ${entry.project}.` }
+  : null
+
+/** Whether an entry can be verified at all, so its deliveries may start a cycle (verification-trigger.mjs). */
+const verifiable = (entry, infra, hosts) => Boolean(entry.stage && !entry.verifiedThrough && !hostRefusal(entry, hosts) && (entry.mode !== 'instance' || infra?.testDrive?.modules?.instance?.fullSuite))
+
+/** A run id for one cycle drive: names the instance, the snapshot ref and the drive's DEVPANEL_RUN_ID. */
+export const driveIdOf = (cycleId, project) => `fv-${String(cycleId).replace(/[^A-Za-z0-9]+/g, '-')}-${String(project).replace(/[^A-Za-z0-9]+/g, '-')}`.toLowerCase()
 
 /**
  * The failing tests of a stage's full check, each with its basis: a failure the previous green
@@ -209,7 +261,8 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
   const lines = [`# ${name}`, '',
     `The daily full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
     `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
-    entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
+    entry.mode === 'instance' ? `- Drive: \`${entry.driveId}\` on stage instance \`${entry.instance?.name ?? 'none created'}\`${entry.instance?.destroyed ? (entry.instance.destroyed.passed ? ' (destroyed)' : ` (its destroy failed: ${entry.instance.destroyed.error})`) : ''}; evidence \`${entry.evidence?.dir ?? entry.runDir ?? 'none'}\`` : entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
+  if (entry.incomplete) lines.push(`- Incomplete: ${entry.incomplete.reason}: ${entry.incomplete.message}`)
   if (entry.status) lines.push(`- Run status: ${entry.status}${entry.blockedReason ? ` (${entry.blockedReason})` : ''}${entry.release ? `; release ${entry.release.status}` : ''}`)
   if (entry.refusal) lines.push(`- Not started: ${entry.refusal.code ? `${entry.refusal.code}: ` : ''}${entry.refusal.message}`)
   if (entry.check) {
@@ -268,9 +321,27 @@ export function createFullVerification ({
   },
   maxAttachmentBytes = issues.MAX_FILE_BYTES ?? 25 * 1024 * 1024,
   pollMs = 5000,
-  log = console
+  log = console,
+  // A cycle on a stage instance (runInstanceStage): the snapshot of a project's checkout and its release,
+  // the drive (runtime/checks.mjs runChecks underneath), the destroy of the drive's instances, the coverage
+  // of its snapshot, and the project's checkout.
+  provision = (args) => gitWorktreeProvider.create(args),
+  releaseWorkspace = (workspace) => gitWorktreeProvider.release(workspace),
+  drive = undefined,
+  destroyInstances = (driveId, options) => destroyRunInstances(driveId, options),
+  coverageOf = (args) => cycleSnapshotCoverage({ ...args, listIssues: (p, o) => issues.listIssues(p, o), listHomes: (p) => issues.listRunHomes?.(p) ?? [] }),
+  projectPathOf = (project) => resolveProjectPath(project),
+  // The delivery trigger (verification-trigger.mjs): how many deliveries a stage takes, and a project's deliveries.
+  afterDeliveries = () => hostSettings().verificationTrigger.afterDeliveries,
+  deliveriesOf = async (project) => projectDeliveries({ project, projectPath: await projectPathOf(project).catch(() => null), listIssues: (p, o) => issues.listIssues(p, o), listHomes: (p) => issues.listRunHomes?.(p) ?? [] }),
+  deliveryPollMs = 15 * 60 * 1000,
+  /** Told when a cycle ended (the top-level supervisor's verification-ended event); never throws into the cycle. */
+  onEnded = null
 } = {}) {
   let cancel = null
+  let cancelDeliveries = null
+  let deliveryCheckRunning = null
+  let lastDeliveryCheck = null
   let current = null
   let running = null
   let stopped = false
@@ -344,16 +415,74 @@ export function createFullVerification ({
       .catch((error) => log.warn?.(`[devpanel] the scheduled full verification did not start: ${error.message}`))
   }
 
+  // ----------------------------------------------------- the delivery trigger
+
+  /** Each project's infrastructure, as the cycle reads it; a project whose configuration cannot be read is left out here. */
+  async function readStages () {
+    const entries = []
+    const infras = new Map()
+    for (const p of await issues.listProjects()) {
+      const id = p.id ?? p
+      const infra = await infrastructureOf(id).catch(() => undefined)
+      if (infra === undefined) continue
+      infras.set(id, infra)
+      entries.push(stageOf(id, infra))
+    }
+    return { entries, infras }
+  }
+
+  /** The stages a cycle can verify, with their projects: what the delivery trigger counts, per stage host. */
+  async function countableStages () {
+    const { entries, infras } = await readStages()
+    const hosts = protectedHosts(infras)
+    const stages = new Map()
+    for (const e of entries.filter((x) => verifiable(x, infras.get(x.project), hosts))) {
+      const s = stages.get(e.host) ?? { host: e.host, stage: e.stage, projects: [] }
+      s.projects.push(e.project)
+      stages.set(e.host, s)
+    }
+    return [...stages.values()]
+  }
+
+  /**
+   * Count each stage's deliveries (verification-trigger.mjs) and start a cycle when one is due.
+   * Coalesced: a check asked for while one runs gets that one. Never throws.
+   */
+  function deliveryCheck () {
+    if (deliveryCheckRunning) return deliveryCheckRunning
+    deliveryCheckRunning = (async () => {
+      const threshold = afterDeliveries()
+      if (!threshold || running || supervisor.frozen?.()) return lastDeliveryCheck
+      const counts = await deliveryCounts({ stages: await countableStages(), deliveriesOf, records: await cycleRecords(verificationDir), threshold })
+      lastDeliveryCheck = { at: clock.iso(), threshold, stages: counts.map(({ runs, ...c }) => ({ ...c, runs: runs.map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, at: r.at })) })) }
+      const due = counts.find((c) => c.due)
+      if (due && !running) {
+        await startCycle({ trigger: 'deliveries', by: 'deliveries', deliveries: { host: due.host, stage: due.stage, count: due.count, threshold, runs: due.runs.map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, at: r.at })) } })
+      }
+      return lastDeliveryCheck
+    })().catch((error) => { log.warn?.(`[devpanel] the full verification's delivery check failed: ${error.message}`); return null })
+      .finally(() => { deliveryCheckRunning = null })
+    return deliveryCheckRunning
+  }
+
+  /** The delivery check every `deliveryPollMs`, beside the one after each run's end (noteRunEnded). */
+  function armDeliveries () {
+    cancelDeliveries?.()
+    cancelDeliveries = null
+    if (stopped) return
+    cancelDeliveries = clock.after(deliveryPollMs, () => { armDeliveries(); deliveryCheck() })
+  }
+
   // --------------------------------------------------------------- the cycle
 
   /** Start a cycle and return a copy of its record as frozen; the cycle goes on in the background. */
-  async function startCycle ({ trigger, by = null, scheduledFor = null }) {
+  async function startCycle ({ trigger, by = null, scheduledFor = null, deliveries = null }) {
     if (running) throw Object.assign(new Error(`a full verification cycle is already running (${current.id})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: current.id })
     const s = readSettings()
     const timeZone = s?.timeZone ?? 'UTC'
     const date = localDate(clock.now(), timeZone)
     const record = {
-      id: null, date, trigger, by, scheduledFor, schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
+      id: null, date, trigger, by, scheduledFor, ...(deliveries ? { deliveries } : {}), schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
       state: 'frozen', verdict: null, frozenAt: clock.iso(), seatsIdleAt: null, startedAt: null, endedAt: null,
       asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], refused: [], outcome: null, error: null
     }
@@ -389,16 +518,29 @@ export function createFullVerification ({
       record.state = 'running'
       record.startedAt = clock.iso()
       const projects = await issues.listProjects()
+      const infras = new Map()
       for (const p of projects) {
         const id = p.id ?? p
         const infra = await infrastructureOf(id).catch((error) => ({ error: error.message }))
+        if (!infra?.error) infras.set(id, infra)
         record.projects.push(infra?.error ? { project: id, stage: null, verdict: 'red', refusal: { code: 'INFRASTRUCTURE_INVALID', message: infra.error } } : stageOf(id, infra))
+      }
+      // A host with dynamic instances is protected whole: no project's entry releases there.
+      const protectedOnes = protectedHosts(infras)
+      if (protectedOnes.size) record.protectedHosts = Object.fromEntries(protectedOnes)
+      for (const entry of record.projects.filter((e) => e.stage && !e.verifiedThrough && !e.verdict)) {
+        const refusal = hostRefusal(entry, protectedOnes) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
+          ? { code: 'FULL_SUITE_UNDECLARED', message: `${entry.project} runs on dynamic stage instances but declares no testDrive.modules.instance.fullSuite: the whole suite has no instance command, and the base instance is never used instead` }
+          : null)
+        if (refusal) Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false })
       }
       await write(record)
       const hosts = new Map()
       for (const entry of record.projects.filter((e) => e.stage && !e.verifiedThrough && !e.verdict)) hosts.set(entry.host, [...(hosts.get(entry.host) ?? []), entry])
-      // One run at a time per staging host; hosts side by side (drive slots still decide each drive).
-      await Promise.all([...hosts.values()].map(async (entries) => { for (const entry of entries) await runStage(record, entry) }))
+      // One stage at a time per staging host; hosts side by side (drive slots and instance slots still decide each drive).
+      await Promise.all([...hosts.values()].map(async (entries) => {
+        for (const entry of entries) await (entry.mode === 'instance' ? runInstanceStage(record, entry, infras.get(entry.project)) : runStage(record, entry, protectedOnes))
+      }))
       // Every entry that is not verified through its instances counts, a project whose
       // configuration could not be read included: one red entry makes the cycle red.
       const judged = record.projects.filter((e) => !e.verifiedThrough)
@@ -416,12 +558,174 @@ export function createFullVerification ({
       await resumeFrozen(record).catch((error) => { record.error ??= `resuming: ${error.message}` })
       record.state = record.error ? 'failed' : 'ended'
       record.endedAt = clock.iso()
+      // Owed to the top-level supervisor until it was told, so a restart in between still tells it (announcePending).
+      record.announce = 'pending'
       await write(record).catch((error) => log.warn?.(`[devpanel] the full verification record ${record.id} could not be written: ${error.message}`))
+      await announce(record)
     }
   }
 
-  async function runStage (record, entry) {
+  /**
+   * Tell the top-level supervisor that a cycle ended (verification-ended), once: the record says it is owed
+   * (`announce: 'pending'`) until a delivery succeeded, then `delivered` with `announcedAt`. Nothing it does can fail
+   * the cycle; without a listener the notice stays owed.
+   */
+  async function announce (record) {
+    if (!onEnded || record.announce !== 'pending') return false
+    // The file that holds this cycle now: cycle.json, or the cycle.<n>.json a later cycle of its date rotated it to.
+    const file = await recordFileOf(record).catch(() => null)
+    try {
+      await onEnded(endedNotice(record, file))
+    } catch (error) {
+      log.warn?.(`[devpanel] the end of full verification ${record.id} could not be announced: ${error.message}`)
+      return false
+    }
+    Object.assign(record, { announce: 'delivered', announcedAt: clock.iso() })
+    await writeRecord(record).catch((error) => log.warn?.(`[devpanel] the announcement of full verification ${record.id} could not be recorded: ${error.message}`))
+    return true
+  }
+
+  /** The file holding a cycle's record, found by its id among its date's cycle.json and cycle.<n>.json; null when none does. */
+  async function recordFileOf (record) {
+    for (const name of await fs.readdir(path.join(verificationDir, record.date)).catch(() => [])) {
+      if (!/^cycle(\.\d+)?\.json$/.test(name)) continue
+      const file = path.join(verificationDir, record.date, name)
+      const onDisk = await fs.readFile(file, 'utf8').then(JSON.parse, () => null)
+      if (onDisk?.id === record.id) return file
+    }
+    return null
+  }
+
+  /** Write a record back to the file it was read from (cycle.json, or an earlier cycle.<n>.json of its date). */
+  async function writeRecord (record) {
+    const file = await recordFileOf(record)
+    if (file) { await writeJson(file, record); changed(record); return }
+    await write(record)
+  }
+
+  /** What the top-level supervisor is told when a cycle ended: its outcome, the file its record is in and where each entry's evidence is. */
+  function endedNotice (record, file = null) {
+    const runIds = (list) => (list ?? []).map((c) => c.runId)
+    return {
+      cycleId: record.id, date: record.date, trigger: record.trigger, by: record.by, state: record.state, verdict: record.verdict, error: record.error ?? null,
+      record: file ?? path.join(verificationDir, record.date, 'cycle.json'),
+      outcome: {
+        bump: record.outcome?.bump ? { chain: record.outcome.bump.chain.map((s) => ({ project: s.project, args: s.args, status: s.status, versionAfter: s.versionAfter ?? null })), failed: record.outcome.bump.failed ?? null } : null,
+        issues: (record.outcome?.issues ?? []).map((i) => ({ project: i.project, issueId: i.issueId, name: i.name })),
+        reason: record.outcome?.reason ?? null
+      },
+      projects: record.projects.map((e) => ({
+        project: e.project, stage: e.stage ?? null, mode: e.mode ?? null, verdict: e.verdict ?? null, refusal: e.refusal?.code ?? null, incomplete: e.incomplete?.reason ?? null,
+        instance: e.instance?.name ?? null, evidence: e.evidence?.dir ?? e.runDir ?? null, coverageEstablished: e.coverageEstablished === true,
+        covered: e.coverageEstablished ? runIds(e.coverage?.covered) : [],
+        stillCounting: [...(e.coverageEstablished ? [] : runIds(e.coverage?.covered)), ...runIds(e.coverage?.indeterminate), ...runIds(e.coverage?.notShipped)]
+      })),
+      next: 'The cycle resolved no issue. Its evidence (selftest report, project log, browser-check report) stays under each entry\'s evidence directory; an issue whose only open item is a pending live verification of a covered run may be settled from it, by you, with a disposition naming that evidence.'
+    }
+  }
+
+  /** An entry's full check as the record keeps it; `parsed` names the failures each failed command's own output names. */
+  const checkRecord = (check, parsed) => ({
+    dir: check.result?.dir ?? null, result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline ?? null, baseCommit: check.baseCommit ?? null, files: check.files ?? {},
+    newFailures: [...(check.selftest?.newFailures ?? []), ...(check.failures?.newFailures ?? [])].map((f) => ({ command: f.command, test: f.test })),
+    failingTests: failingTestsOf(check, parsed),
+    selftestVerdict: check.selftest?.verdict ?? null,
+    selftestReason: check.selftest?.reason ?? null,
+    unread: (check.selftest?.unread ?? []).map((u) => ({ command: u.command, reason: u.reason })),
+    failedCommands: (check.result?.commands ?? []).filter((c) => !c.passed).map((c) => ({ id: c.id, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, log: c.log ?? null, stderr: c.stderr ?? null })),
+    ...((check.result?.skipped ?? []).length ? { skipped: check.result.skipped.map((s) => ({ id: s.id, reason: s.reason })) } : {})
+  })
+
+  /** The failures a failed drive's commands name in their own output, for the commands no comparison judged. */
+  const parsedFailures = (runDir, check) => check?.result?.result === 'failed'
+    ? failureFingerprints({ runDir, check: check.result, target: { commands: (check.result.commands ?? []).map((c) => ({ id: c.id, required: c.required })) } }).catch(() => [])
+    : []
+
+  const pick = (coverage) => coverage && !coverage.error
+    ? { basis: coverage.basis ?? null, covered: coverage.covered ?? [], indeterminate: coverage.indeterminate ?? [], notShipped: coverage.notShipped ?? [] }
+    : coverage?.error ? { error: coverage.error, covered: [], indeterminate: [], notShipped: [] } : null
+
+  /**
+   * A stage on a host with dynamic instances: no run, no release. The cycle snapshots the project's
+   * development checkout (gitWorktreeProvider, as a run's working-tree base, under the delivery locks),
+   * reads which delivered runs that snapshot covers, drives the full suite on an instance of its own
+   * (runChecks takes an instance slot of testDrive.maxInstances, waiting for one, and creates it from
+   * the snapshot) and always destroys what the drive id holds and releases the snapshot, however it ended.
+   * Everything the instance produced stays in the drive's directory under the cycle record.
+   */
+  async function runInstanceStage (record, entry, infra) {
+    const suite = infra.testDrive.modules.instance.fullSuite
+    const driveId = driveIdOf(record.id, entry.project)
+    const home = path.join(verificationDir, record.date, record.id, entry.project)
+    const target = instanceCycleTarget(infra, instanceName(driveId))
+    Object.assign(entry, { state: 'starting', driveId, runDir: home, recordFile: 'drive.json', startedAt: clock.iso(), instance: { name: target.stageInstance.name, root: target.stageInstance.root } })
+    let workspace = null
+    let projectDir = null
+    try {
+      await fs.mkdir(home, { recursive: true })
+      const resolution = await resolve('deployment', { root: configRoot, runOptions: { environment: 'staging' }, projectId: entry.project })
+      if (!resolution.ok) throw Object.assign(new Error(resolution.errors.map((e) => `${e.field}: ${e.message}`).join('; ')), { code: 'CONFIGURATION_INVALID' })
+      const resolved = resolution.resolved
+      projectDir = await projectPathOf(entry.project)
+      // The candidate: the development checkout as it stands now, as a run's working-tree base takes it.
+      workspace = await provision({ projectPath: projectDir, runId: driveId, root: home, clock,
+        // Always the tree as it stands, uncommitted deliveries included, whatever base the project's runs take (`head`, a commit).
+        policy: { ...(resolved.workspace ?? {}), base: 'working-tree', requireCleanBase: false, selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, store: gitStoreDir(entry.project), nested: hostSettings().nestedRepositories } })
+      Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: { baseCommit: workspace.baseCommit ?? null, base: workspace.base ?? null }, snapshotAt: clock.iso(), state: 'running' })
+      await write(record)
+      const records = await cycleRecords(verificationDir)
+      const counting = (await deliveryCounts({ stages: [{ host: entry.host, stage: entry.stage, projects: [entry.project] }], deliveriesOf, records, threshold: 0 }).catch(() => [{ runs: null }]))[0].runs
+      entry.coverage = pick(await Promise.resolve().then(() => coverageOf({ project: entry.project, projectPath: projectDir, snapshotPath: workspace.path, snapshotAt: entry.snapshotAt, candidates: counting?.map((r) => r.runId) ?? null }))
+        .catch((error) => ({ error: error.message })))
+      await write(record)
+      const check = await fullVerificationDrive({ target, workspace, runDir: home, runId: driveId, project: entry.project, stage: entry.stage, verificationDir, clock, mode: 'instance', ...(drive ? { drive } : {}),
+        onDriveWait: async (w) => {
+          if (w.phase === 'start') entry.waiting = { reason: w.reason, since: w.from }
+          else { entry.waits = [...(entry.waits ?? []), { reason: entry.waiting?.reason ?? null, from: w.from, to: w.to }]; delete entry.waiting }
+          await write(record).catch(() => {})
+        } })
+      await fs.writeFile(path.join(home, 'drive.json'), JSON.stringify({ driveId, cycleId: record.id, project: entry.project, fullVerification: { check } }, null, 2))
+      const suiteRan = await suiteRanOf({ runDir: home, check: check.result, target, suiteId: suite.test.id })
+      const notOnInstance = await notOnInstanceOf({ runDir: home, check: check.result, target })
+      const incomplete = infra.testDrive.modules.browser && !suite.browser
+        ? { reason: 'BROWSER_CHECKS_UNBOUND', message: 'the project declares browser checks (testDrive.modules.browser) but modules.instance.fullSuite.browser names no whole browser run on an instance, so they did not run' }
+        : null
+      const reports = [...target.commands, ...(target.finallyCommands ?? [])].filter((c) => c.report).map((c) => c.id)
+      Object.assign(entry, {
+        state: 'settled', endedAt: clock.iso(),
+        instance: { ...entry.instance, ...(check.result?.stageInstance ?? {}) },
+        check: { ...checkRecord(check, await parsedFailures(home, check)), notOnInstance },
+        suiteRan,
+        browser: suite.browser ? 'declared' : incomplete ? 'unbound' : 'not-declared',
+        evidence: { dir: path.join(home, check.result?.dir ?? DRIVE_DIR), files: Object.keys(await driveFiles(home, check.result)).sort(), selftestReports: reports, browser: suite.browser ? [suite.browser.id] : [], collectors: (target.finallyCommands ?? []).map((c) => c.id) },
+        ...(incomplete ? { incomplete } : {}),
+        verdict: incomplete ? 'incomplete' : check.gating === 'passed' ? 'green' : 'red'
+      })
+    } catch (error) {
+      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
+    } finally {
+      // Only a drive whose whole suite ran proves the deliveries its snapshot holds (verification-trigger.mjs).
+      entry.coverageEstablished = Boolean(entry.suiteRan) && entry.verdict !== 'incomplete' && entry.state === 'settled'
+      const destroyed = await Promise.resolve().then(() => destroyInstances(driveId, { reason: 'cycle-ended', clock })).catch((error) => [{ name: entry.instance.name, passed: false, error: error.message }])
+      const mine = (destroyed ?? []).find((d) => d?.name === entry.instance.name)
+      entry.instance = { ...entry.instance, destroyed: mine ? { passed: mine.passed, at: mine.at ?? clock.iso(), ...(mine.error ? { error: mine.error } : {}) } : (entry.instance.destroyed ?? { passed: true, at: clock.iso(), held: false }) }
+      if (workspace) await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: projectDir })).then(() => { entry.workspace.released = true }, (error) => { entry.workspace.retained = error.message })
+    }
+    entry.endedAt ??= clock.iso()
+    entry.durationMs = Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt))
+    await write(record)
+  }
+
+  async function runStage (record, entry, hosts = new Map()) {
+    // Never a release to a host with dynamic instances, whoever asks.
+    const refused = hostRefusal(entry, hosts)
+    if (refused) {
+      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: refused, coverageEstablished: false })
+      await write(record)
+      return
+    }
     entry.state = 'starting'
+    entry.mode = 'release'
     try {
       const home = await issues.ensureRunHome(entry.project, record.date, report(entry))
       entry.issueId = home.id
@@ -443,24 +747,23 @@ export function createFullVerification ({
       const check = run.fullVerification?.check ?? null
       // The failures each failed command's own output names (the parser the baseline comparison uses),
       // for a command no comparison judged; an unreadable output names none.
-      const parsed = check?.result?.result === 'failed'
-        ? await failureFingerprints({ runDir: entry.runDir, check: check.result, target: { commands: (check.result.commands ?? []).map((c) => ({ id: c.id, required: c.required })) } }).catch(() => [])
-        : []
+      const parsed = await parsedFailures(entry.runDir, check)
       Object.assign(entry, {
         state: 'settled', status: run.status, outcome: run.outcome ?? null, blockedReason: run.blockedReason ?? null,
         release: run.release ? { status: run.release.status, environment: run.release.environment ?? null } : null,
         endedAt: run.endedAt ?? clock.iso(),
-        check: check ? { dir: check.result?.dir ?? null, result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline ?? null, baseCommit: check.baseCommit ?? null, files: check.files ?? {},
-          newFailures: [...(check.selftest?.newFailures ?? []), ...(check.failures?.newFailures ?? [])].map((f) => ({ command: f.command, test: f.test })),
-          failingTests: failingTestsOf(check, parsed),
-          selftestVerdict: check.selftest?.verdict ?? null,
-          selftestReason: check.selftest?.reason ?? null,
-          unread: (check.selftest?.unread ?? []).map((u) => ({ command: u.command, reason: u.reason })),
-          failedCommands: (check.result?.commands ?? []).filter((c) => !c.passed).map((c) => ({ id: c.id, exitCode: c.exitCode ?? null, timedOut: c.timedOut === true, log: c.log ?? null, stderr: c.stderr ?? null })) } : null,
-        verdict: stagedReleasePassed(run.release, run) && check?.gating === 'passed' ? 'green' : 'red'
+        check: check ? checkRecord(check, parsed) : null,
+        verdict: stagedReleasePassed(run.release, run) && check?.gating === 'passed' ? 'green' : 'red',
+        // What the release's snapshot carried (staging-coverage.mjs stagingRunCoverage, on the run's record).
+        snapshotAt: run.startedAt ?? entry.startedAt,
+        coverage: pick(run.release?.coverage)
       })
+      // The released snapshot was tested only when its full drive ran every required command to an answer of its own
+      // (no skip, timeout, signal or unavailable) and a selftest report parsed out of a report command's output.
+      entry.suiteRan = check?.result ? await fullTierRanOf({ runDir: entry.runDir, check: check.result, selftest: check.selftest }) : null
+      entry.coverageEstablished = Boolean(run.release?.status === 'completed' && entry.suiteRan)
     } catch (error) {
-      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
+      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message }, coverageEstablished: false })
     }
     entry.durationMs = entry.startedAt ? Math.max(0, Date.parse(entry.endedAt ?? clock.iso()) - Date.parse(entry.startedAt)) : null
     await write(record)
@@ -525,7 +828,8 @@ export function createFullVerification ({
     record.outcome.issues = out
     // The first cycle of a date names its issues exactly; a later one adds its id (one name per day, issues.js).
     const later = Number(record.id.split('.').pop()) > 1
-    for (const entry of record.projects.filter((e) => !e.verifiedThrough && e.verdict === 'red')) {
+    // An incomplete entry (declared browser checks with no instance command) is not green either: it gets its issue.
+    for (const entry of record.projects.filter((e) => !e.verifiedThrough && ['red', 'incomplete'].includes(e.verdict))) {
       const stage = entry.stage ?? 'configuration'
       const name = `Full verification ${record.date}: ${entry.project} red on ${stage}${later ? ` (cycle ${record.id})` : ''}`
       const item = { project: entry.project, stage, name, runId: entry.runId ?? null, issueId: null, failingCount: 0, attachments: [] }
@@ -583,16 +887,47 @@ export function createFullVerification ({
   }
 
   return {
-    /** Arm the schedule. Absent `fullVerification` block: the timer only reads the settings again hourly. */
-    start () { stopped = false; arm() },
-    stop () { stopped = true; cancel?.(); cancel = null },
-    /** "Full verification now": the same freeze, runs and record as the scheduled cycle. */
+    /** Arm the schedule and the delivery trigger. Absent `fullVerification.at`: the timer only reads the settings again hourly. */
+    start () { stopped = false; arm(); armDeliveries() },
+    stop () { stopped = true; cancel?.(); cancel = null; cancelDeliveries?.(); cancelDeliveries = null },
+    /** "Full verification now": the same freeze, stages and record as the other triggers. */
     startNow: ({ by = 'operator' } = {}) => startCycle({ trigger: 'hand', by }),
-    /** A cycle the previous process left unfinished is marked interrupted; the runs it paused are resumed. */
+    /**
+     * Deliver every end still owed to the top-level supervisor (a cycle recover() marked interrupted, or one whose
+     * announcement failed), once each; called when the supervisor exists. Returns the cycle ids told.
+     */
+    async announcePending () {
+      const told = []
+      for (const record of (await cycleRecords(verificationDir)).reverse()) {
+        if (record.announce === 'pending' && SETTLED_CYCLE.includes(record.state) && await announce(record)) told.push(record.id)
+      }
+      return told
+    },
+    /** A run ended: it may have delivered, so count the stages' deliveries again (coalesced). */
+    noteRunEnded: () => deliveryCheck(),
+    deliveryCheck,
+    /**
+     * A cycle the previous process left unfinished is marked interrupted; the runs it paused are
+     * resumed, and what its instance drives left is destroyed and released (the sweep at the panel's
+     * start removes an instance whose owner died as well).
+     */
     async recover () {
       const record = await latestRecord()
       if (record && !SETTLED_CYCLE.includes(record.state)) {
-        Object.assign(record, { state: 'interrupted', endedAt: clock.iso(), error: 'the service stopped before the cycle ended; its runs were not resumed automatically' })
+        // Ended by recovery: owed to the top-level supervisor like any end, told once it exists (announcePending).
+        Object.assign(record, { state: 'interrupted', endedAt: clock.iso(), error: 'the service stopped before the cycle ended; its runs were not resumed automatically', announce: 'pending' })
+        for (const entry of (record.projects ?? []).filter((e) => e.driveId)) {
+          if (entry.state !== 'settled' && entry.state !== 'refused') Object.assign(entry, { state: 'interrupted', verdict: entry.verdict ?? 'red', coverageEstablished: false })
+          if (!entry.instance?.destroyed) {
+            const destroyed = await Promise.resolve().then(() => destroyInstances(entry.driveId, { reason: 'cycle-interrupted', clock })).catch((error) => [{ name: entry.instance?.name, passed: false, error: error.message }])
+            const mine = (destroyed ?? []).find((d) => d?.name === entry.instance?.name)
+            entry.instance = { ...(entry.instance ?? {}), destroyed: mine ? { passed: mine.passed, at: clock.iso(), ...(mine.error ? { error: mine.error } : {}) } : { passed: true, at: clock.iso(), held: false } }
+          }
+          if (entry.workspace && !entry.workspace.released && !entry.workspace.retained) {
+            const projectDir = await projectPathOf(entry.project).catch(() => null)
+            await Promise.resolve().then(() => releaseWorkspace({ ...entry.workspace, projectPath: projectDir })).then(() => { entry.workspace.released = true }, (error) => { entry.workspace.retained = error.message })
+          }
+        }
         await write(record)
       }
       const resumed = { id: record?.id ?? null, resumed: [], heldForOperator: [], refused: [] }
@@ -605,6 +940,7 @@ export function createFullVerification ({
         schedule: s ? { at: s.at, timeZone: s.timeZone, next: new Date(nextTrigger(s, clock.now())).toISOString() } : null,
         active: Boolean(running),
         frozen: supervisor.frozen?.() ?? null,
+        deliveries: lastDeliveryCheck,
         cycle: running ? current : await latestRecord()
       }
     },

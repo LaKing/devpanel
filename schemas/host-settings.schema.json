@@ -29,9 +29,10 @@
     "fullVerification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["at", "timeZone"],
-      "description": "The daily full verification (docs/tactical-playbooks.md \"The daily full verification\"): at `at` local time in `timeZone` admission closes, live runs pause at their next step boundary, and once no seat turn is running one Deployment run (environment staging, full checks) starts per configured stage; the record is issues/.verification/<date>/cycle.json. Absent: no scheduled cycle (a hand start still works).",
+      "dependentRequired": { "at": ["timeZone"], "timeZone": ["at"] },
+      "description": "The full verification (docs/tactical-playbooks.md \"The daily full verification\"): a cycle closes admission for writing runs, waits until none has a seat turn in flight, verifies every configured stage (on a dynamic stage instance of its own where the stage host has them, else by one staging Deployment run) and records issues/.verification/<date>/cycle.json. It starts on request (POST /api/verification/start), after `afterDeliveries` deliveries per stage, and, when `at` and `timeZone` are both given, daily at `at` local time in `timeZone`. Absent `at`: no scheduled cycle.",
       "properties": {
+        "afterDeliveries": { "type": "integer", "minimum": 0, "description": "A cycle starts by itself once this many deliveries to the source since the last cycle that covered them have happened on one stage. Default 10; 0 turns the delivery trigger off." },
         "at": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$", "description": "HH:MM, 24-hour, local to timeZone." },
         "timeZone": { "type": "string", "minLength": 1, "description": "An IANA time zone, e.g. Europe/Berlin; one the runtime does not know is an error." }
       }

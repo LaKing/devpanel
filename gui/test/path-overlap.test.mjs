@@ -385,7 +385,8 @@ export default async function (t) {
       const service = await createTopSupervisor({ dir: path.join(root, 'top'), models: async () => [{ id: 'm', model: 'wire', verification: { status: 'verified' } }], tools, adapter, pollMs: 10000 })
       await service.start({ model: 'm', projects: ['p'], message: 'one launch', limits: { maxRuns: 4, maxStartsPerIssue: 2, maxCalls: 20, maxConcurrent: 2 } })
       const until = Date.now() + 5000
-      while (!(service.get().calls >= 3 && !service.get().pending)) {
+      // The call counter moves before the adapter is invoked, so it alone can read 3 while the third call has not been sent.
+      while (!(events.length >= 3 && service.get().calls >= 3 && !service.get().pending)) {
         if (Date.now() > until) throw new Error('Timed out waiting for the supervisor')
         await new Promise((resolve) => setTimeout(resolve, 5))
       }

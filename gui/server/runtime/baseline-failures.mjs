@@ -378,6 +378,24 @@ export function failedSelftests (report) {
   return namedAs(selftestStates(report).state, 'FAIL')
 }
 
+/**
+ * The tests the report says were skipped and never failed, with the reason the tester gave
+ * (a string `skipped`, else `reason`): on a stage instance these are the tests that cannot run
+ * there by design (no network, no provisioned secret), neither failures nor passes.
+ */
+export function skippedSelftests (report) {
+  const { state } = selftestStates(report)
+  const reasons = new Map()
+  const walk = (o) => {
+    if (Array.isArray(o)) return o.forEach(walk)
+    if (!o || typeof o !== 'object') return
+    if (typeof o.test === 'string' && o.skipped && !reasons.has(o.test)) reasons.set(o.test, typeof o.skipped === 'string' ? o.skipped : (typeof o.reason === 'string' ? o.reason : null))
+    Object.values(o).forEach(walk)
+  }
+  walk(report)
+  return [...state].filter(([, s]) => s === 'SKIP').map(([test]) => ({ test, reason: reasons.get(test) ?? null }))
+}
+
 /** The names of the report's tests that passed. */
 export const passedSelftests = (report) => namedAs(selftestStates(report).state, 'PASS')
 

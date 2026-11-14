@@ -17,7 +17,7 @@ import { runProcess } from '../server/runtime/process.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
 import {
-  COVERAGE_BASELINE, DEPLOYMENT_UNPROVEN, deploymentCoverage, holds, parsePatchContent, resumeArchivedCoverageNotes, resumeCoverageNotes, stagingPendingReport,
+  COVERAGE_BASELINE, DEPLOYMENT_UNPROVEN, cycleSnapshotCoverage, deliveriesOf, deploymentCoverage, holds, parsePatchContent, resumeArchivedCoverageNotes, resumeCoverageNotes, stagingPendingReport,
   stagingRunCoverage, writeDeploymentNotes, writeRunCoverageNotes
 } from '../server/staging-coverage.mjs'
 
@@ -206,6 +206,27 @@ export default async function (t) {
       const coverage = await w.cover(await w.snapshot({ f: 'b\n' }), T(4))
       t.eq('delivered after the snapshot: this release does not speak for it, whatever the bytes', [ids(coverage.notShipped), ids(coverage.covered), ids(coverage.indeterminate)], [['late'], [], []])
       t.eq('and it stays pending', ids((await w.report()).pending), ['late'])
+    }
+
+    t.section('a full verification cycle\'s snapshot: what it covered, from content, for the runs it was given; no staging list changes')
+    {
+      const w = await world()
+      w.issue('i1'); w.issue('i2'); w.issue('i3'); w.issue('i4'); w.issue('rel')
+      await w.write('f', 'b\n')
+      await w.deliver('i1', 'held', T(1), [['f', 'a\n', 'b\n']])
+      await w.deliver('i2', 'edited', T(2), [['g', 'a\n', 'b\n']])
+      await w.deliver('i3', 'after', T(5), [['h', null, 'x\n']])
+      await w.deliver('i4', 'already', T(1), [['k', null, 'y\n']])
+      // A green staging release covered `already` before: the cycle reads content regardless of staging.
+      w.staging('rel', 'release', T(2), { coverage: { covered: [{ runId: 'already' }], indeterminate: [] } })
+      const snapshot = await w.snapshot({ f: 'b\n', g: 'by hand\n', k: 'y\n' })
+      const cycle = await cycleSnapshotCoverage({ ...w.ctx, listHomes: async () => [], snapshotPath: snapshot, snapshotAt: T(4) })
+      t.eq('covered by its bytes, indeterminate where the snapshot differs, not shipped after it', [ids(cycle.covered), ids(cycle.indeterminate), ids(cycle.notShipped)], [['already', 'held'], ['edited'], ['after']])
+      t.eq('what differs is named', [cycle.basis, cycle.indeterminate[0].reason, cycle.indeterminate[0].paths], ['cycle-snapshot', 'snapshot-differs', ['g']])
+      const given = await cycleSnapshotCoverage({ ...w.ctx, listHomes: async () => [], snapshotPath: snapshot, snapshotAt: T(4), candidates: ['held'] })
+      t.eq('only the runs it was given (those still counting)', [ids(given.covered), ids(given.indeterminate), ids(given.notShipped)], [['held'], [], []])
+      t.eq('the staging pending list is the staging releases\' alone: the run the cycle covered stays pending there', ids((await w.report()).pending), ['held'])
+      t.eq('the trigger counts every delivery from the baseline on, in order', (await deliveriesOf({ ...w.ctx, listHomes: async () => [] })).map((d) => d.runId), ['already', 'held', 'edited', 'after'])
     }
 
     t.section('hand-changed: indeterminate, never silently covered')

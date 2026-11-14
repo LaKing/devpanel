@@ -475,6 +475,53 @@ mode: only `create` checks it.
 Under structured confinement (`kind` on the commands) `instance` is refused, because
 creating an instance reads the candidate and manages units.
 
+### The full verification on a stage instance
+
+On a staging host where any project declares `modules.instance` (one verified through its
+instances, `fullVerification: instances`, included), the full verification
+(tactical-playbooks.md "The daily full verification") never releases to, loads into,
+restarts or writes the base instance. It starts no run there: for each project it snapshots
+the development checkout as it stands (always a `working-tree` snapshot, whatever base the
+project's runs take, under the delivery locks), creates a dynamic instance of the cycle's own from it with the tier's `create`
+(so the framework is composed with its application exactly as the modules tier does it),
+`start` and `ready`, then runs the whole suite and the whole browser run declared here, then
+the tier's `finallyCommands` and these:
+
+```yaml
+    modules:
+      # ... the tier, with instance: as above ...
+      instance:
+        # ... root, create, start, destroy ...
+        fullSuite:
+          # The whole selftest suite on the instance; never a filter.
+          test: { id: full-suite, run: '/opt/stage-tools/full-suite.sh {{instance}}', report: selftest, timeoutSeconds: 3600 }
+          # The whole browser-check run, required when the tier declares `browser`.
+          browser: { id: full-browser, run: '/opt/stage-tools/browser-check.sh {{instance}}', timeoutSeconds: 1800 }
+          # What the instance produced, printed into the drive's logs so it outlives the instance.
+          finallyCommands:
+            - { id: collect-log, run: 'cat {{instance}}/runtime/log/current/project.log' }
+```
+
+Every command names the instance (`{{instance}}` or `{{instanceName}}`); none takes
+`{{files}}`, `{{filter}}` or `{{filters}}`; the tier's own `finallyCommands` must name it too
+once `fullSuite` is declared, and a selftest report must be collected (the suite or a
+finalizer with `report: selftest`). The instance's name is derived from the cycle and project
+(`fv-<cycle id>-<project>`, the drive's `DEVPANEL_RUN_ID` too), it takes an instance slot of
+`testDrive.maxInstances` and waits for one, as a run's does (no drive slot), and it is
+destroyed when the drive ends, whatever the outcome; an interrupted cycle's instance is
+destroyed at the next start (`recover()`, and the sweep of dead owners). Everything the drive
+wrote stays under `issues/.verification/<date>/<cycle id>/<project>/`: the logs and outputs
+of every command in `checks/full-verification/` and `drive.json`.
+
+Refused, never released to the base instead: a project on such a host without `modules.instance`
+(`HOST_HAS_INSTANCES`) and one with `modules.instance` but no `fullSuite`
+(`FULL_SUITE_UNDECLARED`); `config:check` warns of the second. A project declaring
+`modules.browser` without `fullSuite.browser` gets an `incomplete` entry (`BROWSER_CHECKS_UNBOUND`),
+never green; `config:check` warns of it too. Tests the suite reports as skipped (an instance
+has no outbound network and no provisioned secret) are listed as `notOnInstance`, neither
+failures nor passes. Add `fullSuite` to a project file only once the panel runs code that
+knows it: an older panel refuses the unknown key.
+
 ### Module pool and hook reader
 
 An application that composes a framework through symlinked collections names it:

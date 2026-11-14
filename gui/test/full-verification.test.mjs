@@ -507,6 +507,22 @@ export default async function (t) {
       t.ok('together the parts hold every test and excerpt', tests.every((test, i) => joined.includes(`\`collect: ${test}\` (unjudged)`) && joined.includes(`\nerr-${i + 1}\n`)))
       t.eq('the body and the record name every part', [parts.every((p) => split.calls.issues[0].input.includes(`\`${p.name}\``)), splitRecord.outcome.issues[0].attachments], [true, parts.map((p) => p.name)])
     }
+
+    t.section('17. a release-mode drive proves its deliveries only when every required command answered on its own and its report parsed')
+    {
+      const dir = 'checks/full-verification'
+      const report = '== /opt/app/runtime/selftest.report\n{"tests":[{"test":"a: works"}]}\n'
+      const recordOf = async (check, files = {}) => {
+        const w = await worldIn('devpanel-fv-release-ran-', { checks: { 'app-project': check }, files: { 'app-project': files } })
+        return (await (await cycleOf(w, {}, { projects: ['app-project'] })).run()).projects[0]
+      }
+      const timedOut = await recordOf({ result: { result: 'failed', dir, commands: [{ id: 'build', required: true, passed: true, exitCode: 0 }, { id: 'selftest', required: true, passed: false, exitCode: 124, timedOut: true }] }, gating: 'failed', selftest: { reports: [{ command: 'selftest', verdict: 'not-applicable' }] } }, { 'selftest.stdout': report })
+      t.eq('the last suite command timed out (nothing skipped): no coverage established', [timedOut.check.result, timedOut.check.skipped, timedOut.suiteRan, timedOut.coverageEstablished], ['failed', undefined, null, false])
+      const unparsed = await recordOf({ result: { result: 'passed', dir, commands: [{ id: 'selftest', required: true, passed: true, exitCode: 0 }] }, gating: 'passed', selftest: { reports: [{ command: 'selftest', verdict: 'none' }] } }, { 'selftest.stdout': 'no report\n' })
+      t.eq('every command passed but the declared report does not parse: none either', [unparsed.suiteRan, unparsed.coverageEstablished], [null, false])
+      const ran = await recordOf({ result: { result: 'failed', dir, commands: [{ id: 'selftest', required: true, passed: false, exitCode: 1 }] }, gating: 'failed', selftest: { reports: [{ command: 'selftest', verdict: 'not-applicable' }] } }, { 'selftest.stdout': report })
+      t.eq('the suite failed its own tests and its report parsed: established', [ran.suiteRan?.report?.command, ran.coverageEstablished], ['selftest', true])
+    }
   } finally {
     for (const d of temps) await fs.rm(d, { recursive: true, force: true })
   }

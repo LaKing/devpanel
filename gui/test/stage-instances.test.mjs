@@ -14,6 +14,8 @@ import { checkSummary } from '../server/runtime/check-summary.mjs'
 import { CREATE_ID, driveCommands, INSTANCE_NAME, instanceName, instanceVerdict, instanceWords, START_ID } from '../server/runtime/instance-drive.mjs'
 import { destroyInstance, destroyRunInstances, holdInstance, holdsInstance, instanceCap, LOCAL_HOST, sweepInstances } from '../server/runtime/stage-instances.mjs'
 import { createSupervisor } from '../server/supervisor.mjs'
+import { createFullVerification, driveIdOf } from '../server/full-verification.mjs'
+import { runChecks } from '../server/runtime/checks.mjs'
 
 export const name = 'stage instances — one per run: the name, create on the first drive and reuse after, the exits that mean "needs an install" and "host full", an instance in doubt, the cap, the sweep that spares live owners, and the destroy at every end and pause'
 
@@ -130,6 +132,13 @@ export default async function (t) {
       t.ok('the collector names no instance', modulesErrors({ modules: { ...target.modules, instance: { ...instance, gc: { run: 'gc {{instanceName}}' } } } }).some((e) => e.includes('gc.run')))
       t.ok('command kinds are refused with an instance', modulesErrors({ modules: { ...target.modules, load: { ...target.modules.load, kind: 'privileged' } } }).some((e) => e.includes('unstructured')))
       t.ok('the engine\'s own ids are reserved', modulesErrors({ modules: { ...target.modules, finallyCommands: [{ ...REPORT, id: CREATE_ID }] } }).some((e) => e.includes(CREATE_ID)))
+      // The full verification's own suite (full-verification-drive.mjs instanceCycleTarget).
+      const named = { ...target.modules, finallyCommands: [{ ...REPORT, run: `${REPORT.run} {{instance}}` }] }
+      const suite = (fullSuite, modules = named) => modulesErrors({ modules: { ...modules, instance: { ...instance, fullSuite } } })
+      t.eq('a full suite naming the instance passes', suite({ test: { id: 'full-suite', run: 'suite-it {{instance}}' }, finallyCommands: [{ id: 'collect-log', run: 'cat {{instance}}/log' }] }), [])
+      t.ok('a full suite command naming no instance is refused: it would run on a fixed instance', suite({ test: { id: 'full-suite', run: 'suite-it /opt/stage' } }).some((e) => e.includes('fullSuite.test.run must name the instance')))
+      t.ok('the whole suite takes no filter', suite({ test: { id: 'full-suite', run: 'suite-it {{instance}} {{filter}}' } }).some((e) => e.includes('whole suite')))
+      t.ok('with a full suite, the tier\'s own collectors must name the instance too', suite({ test: { id: 'full-suite', run: 'suite-it {{instance}}' } }, target.modules).some((e) => e.includes('modules.finallyCommands collect')))
     }
 
     t.section('the cap: a host keeps so many instances; a run over it waits and is never refused')
@@ -318,6 +327,61 @@ export default async function (t) {
           else process.env[env] = saved[key]
         }
       }
+    }
+
+    t.section('the full verification on a stage instance: the checkout snapshotted, an instance of the cycle\'s own that waits for a free slot, the whole suite, destroyed at the end')
+    {
+      const f = await engineFixture()
+      const dir = await temp('devpanel-instance-cycle-')
+      const log = path.join(dir, 'log')
+      const say = (word) => `echo ${word} {{instanceName}} >> '${log}'`
+      const lines = async () => (await fs.readFile(log, 'utf8').catch(() => '')).split(NL).filter(Boolean).map((l) => l.split(' ')[0])
+      const modules = {
+        collections: ['@*'],
+        lint: { id: 'lint', run: `true {{instance}} {{files}}` },
+        load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') }, ready: { id: 'ready', run: say('ready') },
+        test: { id: 'module-selftest', run: 'true {{instance}} {{filter}}' },
+        finallyCommands: [{ id: 'collect', run: `${say('collect')} && echo "== runtime/selftest.report" && echo '{"tests":[{"test":"@c/a: works"},{"test":"mail: provider","skipped":"external"}]}'`, report: 'selftest' }],
+        instance: {
+          root: path.join(dir, 'instances'), max: 1,
+          create: { run: `${say('create')} && mkdir -p {{instance}}` }, start: { run: say('start') }, destroy: { run: `${say('destroy')} && rm -rf {{instance}}` },
+          fullSuite: { test: { id: 'full-suite', run: `${say('suite')} && test -d {{instance}}` }, finallyCommands: [{ id: 'collect-log', run: `${say('log')} && echo READY` }] }
+        }
+      }
+      const infra = { staging: { id: 'stage', ssh: { hostRef: 'ssh-config:stage', workdir: '/opt' }, projectRoot: path.join(dir, 'base') }, testDrive: { modules } }
+      // The slot this host's one instance takes is held by another run: the cycle must wait for it, not fail.
+      const other = { name: 'other-run-instance', root: path.join(dir, 'instances', 'other-run-instance'), max: 1, destroy: { run: 'true' } }
+      await holdInstance({ instance: other, host: LOCAL_HOST, kind: 'local', runId: 'other-run' })
+      const issuesDir = await temp('devpanel-instance-cycle-issues-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const fv = createFullVerification({
+        supervisor: { freeze: async () => [], thaw: () => true, frozen: () => null, busy: () => [], isActive: () => false, start: async () => { throw new Error('no release run') }, resume: async () => ({}) },
+        issues: { ISSUES_DIR: issuesDir, listProjects: async () => [{ id: P }], listIssues: async () => [], createIssue: async () => ({ id: 'red' }), addStepFile: async () => {} },
+        clock: f.clock, settings: () => null, verificationDir, pollMs: 50, log: { warn () {} },
+        infrastructureOf: async () => infra,
+        resolve: async () => ({ ok: true, resolved: { workspace: { base: 'working-tree' }, fence: { selection: 0, repository: 0 }, liveExecution: { blockers: [] } } }),
+        projectPathOf: async () => f.projectPath,
+        // The stage host is this machine: the target's commands run locally, through the real check runner and instance slots.
+        drive: (args) => runChecks({ ...args, target: { ...args.target, kind: 'local' } }),
+        coverageOf: async ({ candidates }) => ({ basis: 'cycle-snapshot', covered: (candidates ?? []).map((runId) => ({ runId })), indeterminate: [], notShipped: [] }),
+        deliveriesOf: async () => [{ issueId: 'i', runId: 'delivered-1', at: '2026-01-01T00:00:00.000Z' }],
+        projectsConfig: async () => new Map(), versionOf: async () => null, runAction: async () => ({ status: 'completed' })
+      })
+      const started = await fv.startNow({ by: 'tester' })
+      const recordFile = path.join(verificationDir, started.date, 'cycle.json')
+      const entryOf = async () => (await fs.readFile(recordFile, 'utf8').then(JSON.parse).catch(() => null))?.projects?.[0]
+      await until('the cycle to wait for a free instance slot', async () => (await entryOf())?.waiting?.reason === 'instances-full')
+      t.eq('the host is at its cap: the cycle waits, nothing created yet', await lines(), [])
+      await destroyInstance(other.name, { reason: 'run-completed' })
+      await fv.settle()
+      const entry = await entryOf()
+      const name = instanceName(driveIdOf(started.id, P))
+      t.eq('then it creates its own instance from the snapshot, runs the whole suite and the collectors, and destroys it', await lines(), ['create', 'start', 'ready', 'suite', 'collect', 'log', 'destroy'])
+      t.eq('green, on that instance, the wait recorded', [entry.verdict, entry.instance.name, entry.waits?.[0]?.reason, entry.suiteRan?.command, entry.coverageEstablished], ['green', name, 'instances-full', 'full-suite', true])
+      t.eq('the instance is gone, its slot free, the snapshot released', [await exists(path.join(dir, 'instances', name)), holdsInstance(name), entry.instance.destroyed.passed, entry.workspace.released, await exists(entry.workspace.path)], [false, false, true, true, false])
+      t.eq('the test that cannot run on an instance is named as such', entry.check.notOnInstance.map((s) => [s.test, s.reason]), [['mail: provider', 'external']])
+      t.eq('what the instance produced is kept under the cycle record', await fs.readFile(path.join(entry.evidence.dir, 'collect-log.stdout'), 'utf8').then((s) => s.trim()), 'READY')
+      t.eq('and the delivered run it covered', entry.coverage.covered.map((c) => c.runId), ['delivered-1'])
     }
   } finally {
     for (const dir of temps) await fs.rm(dir, { recursive: true, force: true }).catch(() => {})

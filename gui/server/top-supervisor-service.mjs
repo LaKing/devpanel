@@ -1,4 +1,4 @@
-import { readCheckLog } from './runtime/check-log.mjs'
+import { readCheckLog, readVerificationFile } from './runtime/check-log.mjs'
 import * as store from './runtime/store.mjs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -168,6 +168,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     try { const record=JSON.parse(await fs.readFile(file,'utf8'));return record.project===a.project&&record.id===a.issueId&&record.runIds?.includes(a.runId) } catch(e){if(e.code==='ENOENT')return false;throw e}
    },
    getCheckLog:async a=>readCheckLog({...a,issuePath:(await issues.getIssue(a.project,a.issueId)).path}),
+   // The full verification's records and the evidence its instances left (full-verification.mjs), read-only and confined.
+   readVerificationFile:a=>readVerificationFile({verificationDir:path.join(issues.ISSUES_DIR,'.verification'),path:a.path,offset:a.offset??0}),
    getStep:async a=>{
     const d=await full(a.project,a.issueId,a.runId)
     const response=await readStepResponse(issues,a.project,a.issueId,a.step).catch(()=>null)

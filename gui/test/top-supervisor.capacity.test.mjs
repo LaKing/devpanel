@@ -6,6 +6,7 @@ import { createAdvisor } from '../server/decisions/advisor.mjs'
 import { alwaysWakes } from '../server/decisions/wake-filter.mjs'
 import { runDelta, summariseRun } from '../server/supervisor-summary.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
+import { readVerificationFile } from '../server/runtime/check-log.mjs'
 import { fakeOracle } from './fakes/decision-oracle.mjs'
 
 export const name = 'top-level supervisor — the ready queue in its prompt, woken when capacity frees, runs as deltas'
@@ -51,7 +52,8 @@ async function setup ({ rows = [], holders = {}, oracle = null, limits = LIMITS,
       after?.()
       return read
     },
-    stop: async (r) => { h.runs[r.runId].status = 'cancelled' }
+    stop: async (r) => { h.runs[r.runId].status = 'cancelled' },
+    readVerificationFile: (a) => readVerificationFile({ verificationDir: path.join(dir, 'verification'), path: a.path, offset: a.offset ?? 0 })
   }
   h.agent = await createTopSupervisor({ dir, models: async () => [{ id: 'm', title: 'M', model: 'wire', defaultEffort: 'high', verification: { status: 'verified' } }], adapter, tools, pollMs: 20, emit: (e) => h.onSave?.(e),
     ...(maxDeferMs ? { maxDeferMs } : {}),
@@ -337,6 +339,28 @@ export default async function (t) {
     const ended = h.prompts.at(-1).event
     t.eq('an ending wakes, as a delta', [ended.changed, ended.run.status, ended.run.failure.class, ended.run.steps], [['status'], 'failed', 'runtime', undefined])
     t.eq('its progress entry is outdated, not carried', ended.deferred, undefined)
+    await h.close()
+  }
+
+  t.section('verification-ended: the end of a full verification cycle wakes the supervisor with its outcome and evidence')
+  {
+    t.eq('it always wakes, whatever a provider would say', alwaysWakes({ type: 'verification-ended' }), true)
+    const h = await setup()
+    await h.begin()
+    const calls = h.prompts.length
+    await h.agent.noteVerification({ cycleId: '2026-11-14.1', verdict: 'green', record: '/issues/.verification/2026-11-14/cycle.json', projects: [{ project: P, instance: 'dp-fv-1', evidence: '/issues/.verification/2026-11-14/2026-11-14.1/p/checks/full-verification', covered: ['r9'] }], next: 'The cycle resolved no issue.' })
+    await wait(() => h.prompts.length === calls + 1 && h.idle())
+    const event = h.prompts.at(-1).event
+    t.eq('it arrives as its own event, with the record, the evidence and what was covered', [event.type, event.cycleId, event.record, event.projects[0].evidence, event.projects[0].covered], ['verification-ended', '2026-11-14.1', '/issues/.verification/2026-11-14/cycle.json', '/issues/.verification/2026-11-14/2026-11-14.1/p/checks/full-verification', ['r9']])
+    // It reads the record with its own read-only action, and nothing outside the records.
+    await fs.mkdir(path.join(h.dir, 'verification', '2026-11-14'), { recursive: true })
+    await fs.writeFile(path.join(h.dir, 'verification', '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', verdict: 'green' }))
+    h.script.push({ type: 'get_verification_file', path: '2026-11-14/cycle.json' }, { type: 'get_verification_file', path: '../state.json' })
+    await h.agent.chat('read the cycle record')
+    await wait(() => h.prompts.length === calls + 4 && h.idle())
+    const [read, escaped] = h.prompts.slice(-2).map((p) => p.event)
+    t.eq('get_verification_file returns the record', JSON.parse(read.result.text), { id: '2026-11-14.1', verdict: 'green' })
+    t.ok('and refuses a path out of the records', /full verification records/.test(JSON.stringify(escaped)), JSON.stringify(escaped).slice(0, 300))
     await h.close()
   }
 

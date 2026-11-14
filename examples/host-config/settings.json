@@ -10,5 +10,5 @@
   "skill": { "linkBaseVariable": "EDITOR_LINKBASE" },
   "reporter": { "panelUrl": "https://192.0.2.10" },
   "seatGuidance": { "projects": ["devpanel-project"] },
-  "fullVerification": { "at": "06:00", "timeZone": "Europe/Berlin" }
+  "fullVerification": { "afterDeliveries": 10, "at": "06:00", "timeZone": "Europe/Berlin" }
 }

@@ -19,6 +19,15 @@ export const exclusivityOf = (resolved) => resolved
   ? { inPlace: resolved.workspace?.isolation === 'in-place', release: ['staging', 'deployment'].includes(resolved.tactic) }
   : { unknown: true }
 
+/**
+ * Whether a run can write the project's checkout, which is what the full verification's freeze
+ * pauses (execution-contract.md "Full verification freeze"): it works in place, it releases
+ * (staging, deployment), or its playbook delivers anything. A run that cannot be read is
+ * treated as writing. Analysis, Triage and inquiries (no delivery, own worktree) only read.
+ */
+export const writesCheckout = (resolved) => !resolved || resolved.workspace?.isolation === 'in-place' ||
+  ['staging', 'deployment'].includes(resolved.tactic) || (resolved.completion?.delivery?.action ?? 'none') !== 'none'
+
 export const conflicts = (mine, theirs) => Boolean(mine.unknown || theirs.unknown || mine.inPlace || theirs.inPlace || (mine.release && theirs.release))
 
 export const conflictMessage = (holder) => `this run cannot share the project with the live run of issue ${holder.issueId} (an in-place run holds the checkout; release runs keep the staging or deployment target); wait for it to finish`

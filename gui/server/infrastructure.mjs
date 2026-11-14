@@ -203,6 +203,23 @@ function instanceErrors (modules, all) {
   for (const c of all) if ([CREATE_ID, START_ID, SYNC_ID, DESTROY_ID].includes(c.id)) errors.push(`modules: ${c.id} is the id of the engine's own instance command; rename it`)
   for (const slot of ['load', 'restart', 'ready', 'test']) if (!namesInstance(modules[slot].run)) errors.push(`modules.${slot}.run must name the instance ({{instance}} or {{instanceName}}): with modules.instance every drive runs on the run's own instance`)
   if (all.some((c) => c.kind)) errors.push('modules.instance needs an unstructured tier (no command kinds): creating an instance reads the candidate and manages units')
+  // The full verification on an instance (full-verification-drive.mjs instanceCycleTarget): each command
+  // names the cycle's instance, so none of them can act on the base instance or another run's.
+  const suite = instance.fullSuite
+  if (suite) {
+    const own = [...[['test', suite.test], ['browser', suite.browser]].filter(([, c]) => c).map(([slot, c]) => ({ slot, ...c })), ...(suite.finallyCommands ?? [])]
+    for (const c of own) {
+      const label = c.slot ? `modules.instance.fullSuite.${c.slot}` : `modules.instance.fullSuite.finallyCommands ${c.id}`
+      if (!namesInstance(c.run)) errors.push(`${label}.run must name the instance ({{instance}} or {{instanceName}}): the full verification never runs on a fixed instance`)
+      if (/\{\{(files|filters?|tests)\}\}/.test(c.run)) errors.push(`${label}.run runs the whole suite: {{files}}, {{filter}} and {{filters}} do not apply`)
+      if (c.kind) errors.push(`${label}: modules.instance needs an unstructured tier (no command kinds)`)
+      if (c.slot && c.required === false) errors.push(`${label}: the whole suite and the browser run are required`)
+    }
+    for (const c of all) if (!c.slot && !namesInstance(c.run)) errors.push(`modules.finallyCommands ${c.id}: the full verification runs it on the cycle's instance, so it must name the instance ({{instance}} or {{instanceName}})`)
+    const ids = [...all, ...own].map((c) => c.id)
+    if (new Set(ids).size !== ids.length) errors.push('modules.instance.fullSuite: command ids must be unique beside the tier\'s own')
+    if (![...all.filter((c) => !c.slot), ...own].some((c) => isSelftestReport(c.report))) errors.push('modules.instance.fullSuite: neither fullSuite.test nor a finalizer declares report: selftest, so nothing would show which tests ran')
+  }
   return errors
 }
 

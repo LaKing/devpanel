@@ -778,6 +778,29 @@ so both arrive in one call. A run's status is written before its lock is release
 ending can also wake first and the release be told by the next poll: one more call, when no
 prompt in between showed it.
 
+### When a full verification cycle ends
+
+A cycle (tactical-playbooks.md "The daily full verification": after ten deliveries per stage,
+on request, or daily) tells the supervisor its end as a `verification-ended` event
+(`topSupervisor.noteVerification`, queued while it is not active), which the wake filter never
+holds. It carries `cycleId`, `trigger`, `verdict`, `record` (the file that holds that cycle's
+record when it is told: `issues/.verification/<date>/cycle.json`, or the `cycle.<n>.json` a later
+cycle of the same date rotated it to), `outcome` (the checkpoint chain or the issues it
+opened) and per project `stage`, `mode`, `verdict`, `refusal`, `incomplete`, `instance`,
+`evidence` (the drive directory that keeps the selftest report, the project log and the
+browser-check report after the instance was destroyed), `covered` (the delivered runs it
+proved) and `stillCounting`. The cycle resolves no issue: an issue whose only open item is a
+pending live verification of a covered run is the supervisor's to settle, reading that
+evidence and recording a disposition that names it. It reads it with `get_verification_file
+{path, offset?}` (`runtime/check-log.mjs readVerificationFile`): read-only and confined to
+`issues/.verification/` — a cycle's `cycle.json`, an instance drive's `drive.json`, an evidence
+file (paged by 32 000 characters) or a directory there to list it; a path given absolute, as the
+event gives it, or relative to the records; `..`, a path outside and a link leading outside are
+refused. A cycle that ended while no supervisor could hear it (the service stopped mid-cycle and
+recovery marked it interrupted, or a delivery failed) stays owed on its record (`announce:
+pending`) and is told once the supervisor exists (`announcePending` at the panel's start), once
+(`announce: delivered`, `announcedAt`).
+
 ### Calls per started run
 
 `npm run --silent supervisor-calls -- --from YYYY-MM-DD --to YYYY-MM-DD` (from `gui/`;

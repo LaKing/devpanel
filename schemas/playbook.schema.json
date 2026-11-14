@@ -898,6 +898,28 @@
                       "minimum": 1
                     }
                   }
+                },
+                "fullSuite": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "test"
+                  ],
+                  "description": "The full verification on an instance (docs/project-infrastructure.md \"The full verification on a stage instance\"): a cycle creates an instance of its own from the development checkout (create, start, ready as above), runs `test` (the whole selftest suite) and `browser` (the whole browser-check run, when declared), then the tier's finallyCommands and these. Every command names the instance; none takes {{filter}}, {{filters}} or {{files}}. Without it, a cycle refuses this project's stage (FULL_SUITE_UNDECLARED) and never releases to the base instance. A project declaring `browser` above must declare `browser` here too, else its cycle entry is incomplete.",
+                  "properties": {
+                    "test": {
+                      "$ref": "#/$defs/checkTarget/properties/commands/items",
+                      "description": "The whole selftest suite on the instance, naming {{instance}} or {{instanceName}}."
+                    },
+                    "browser": {
+                      "$ref": "#/$defs/checkTarget/properties/commands/items",
+                      "description": "Optional: the whole browser-check run on the instance, naming {{instance}} or {{instanceName}}."
+                    },
+                    "finallyCommands": {
+                      "$ref": "#/$defs/checkTarget/properties/commands",
+                      "description": "Optional: further collectors (the instance's project log, a browser-check report), after the tier's own; each names the instance."
+                    }
+                  }
                 }
               }
             }

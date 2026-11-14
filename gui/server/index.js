@@ -1014,7 +1014,10 @@ const ownerQuestionConsult = createOwnerQuestionConsult({
   consult, getIssue: (project, issueId) => issues.getIssue(project, issueId), emit: emitRunEvent,
   answer: (args) => createOwnerInput({ issues, supervisor, configRoot: process.env.DEVPANEL_CONFIG_ROOT }).answer(args)
 })
-supervisor.setAfterEnd(ownerQuestionConsult)
+// After a run's end: the owner-question consult, and the full verification counts the stages' deliveries again.
+supervisor.setAfterEnd(async (ended) => {
+  try { await ownerQuestionConsult(ended) } finally { fullVerification?.noteRunEnded() }
+})
 // Consults of owner questions that the last shutdown cut short go on from their records.
 ownerQuestionConsult.resume({ issuesDir: issues.ISSUES_DIR }).catch((error) => console.warn(`[devpanel] owner-question consults were not resumed: ${error.message}`))
 modelPerformance = await createModelPerformanceService({ file: path.join(issues.ISSUES_DIR, '.model-performance.json'), availability: supervisor.availability })
@@ -1041,7 +1044,10 @@ loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT })
   .catch((error) => console.warn(`[devpanel] stage instance sweep: ${error.message}`))
 // A cycle the last process left unfinished is marked interrupted, and the runs its
 // freeze paused are resumed, before anything else can start.
-fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction })
+// A cycle's end is the top-level supervisor's news (verification-ended), created further down.
+fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction,
+  // Not ready yet: the notice stays owed (cycle.json `announce: pending`) and announcePending delivers it below.
+  onEnded: (notice) => { if (!topSupervisor) throw new Error('the top-level supervisor is not ready yet'); return topSupervisor.noteVerification(notice) } })
 await fullVerification.recover().catch((error) => console.warn(`[devpanel] full verification recovery: ${error.message}`))
 // What the last shutdown cancelled comes back, before the top-level supervisor or
 // anyone else could take its project's slot. Recovery above is untouched: a run
@@ -1064,6 +1070,8 @@ topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformanc
   },
   changed: () => io?.emit('issues:changed', { reason: 'supervisor-action' })
 })
+// A full verification cycle recovery marked interrupted above, or whose end could not be told, is told now, once.
+await fullVerification.announcePending().catch((error) => console.warn(`[devpanel] full verification announcements: ${error.message}`))
 if (recovered.length) {
   console.log(`              ${recovered.length} run(s) from a previous process need recovery`)
 }
