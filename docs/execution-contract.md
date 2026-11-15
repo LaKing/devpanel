@@ -1965,7 +1965,8 @@ section's owner identity, plus the module, project and issue.
   subscriber drive runs on modules the run does not hold); a replay after a crash
   finds them pending and does the same. A module another live run holds is waited for — never while holding part
   of the new set — with `run.moduleLocks.waiting {modules, holders, since}`, a wait
-  record beside the locks, `module-lock-wait` events, and the time excused from the
+  record beside the locks (rewritten at every poll), a `module-lock-wait` event when
+  the wait begins and whenever its modules or holders change (not at every poll), and the time excused from the
   wall clock like a drive-slot wait (`run.moduleLockWaits`). Before each poll the
   run walks the waits-for graph; when it leads back to itself, the **youngest** run
   on the cycle (latest `startedAt`, then run id) gives up every lock it holds

@@ -2456,6 +2456,7 @@ export class Engine {
     const waitId = uuid()
     let from = null
     let yielded = []
+    let recorded = null   // what the last module-lock-wait event named
     const endWait = () => {
       if (!from) return
       this.openDriveWaits.delete(waitId)
@@ -2491,8 +2492,15 @@ export class Engine {
         this.openDriveWaits.set(waitId, { from: Date.parse(from) })
       }
       locks.waiting = { modules: pending, holders: got.conflicts, since: from }
+      // The wait file is rewritten at every poll (other runs read it for the waits-for graph);
+      // the event, and with it the run.json write and the log line, only when what the run
+      // waits for changed: at the wait's beginning, and on a change of modules or holders.
       await writeWait(locks.pool, { runId: this.runId, project: locks.project, issueId: locks.issueId, startedAt: this.run.startedAt, wants: pending, holders: got.conflicts }, { clock: this.clock })
-      await this.persist({ type: 'module-lock-wait', modules: pending, holders: got.conflicts })
+      const waitingFor = JSON.stringify([pending, got.conflicts])
+      if (waitingFor !== recorded) {
+        await this.persist({ type: 'module-lock-wait', modules: pending, holders: got.conflicts })
+        recorded = waitingFor
+      }
       if (locks.held.length && await yieldsIn(locks.pool, { runId: this.runId, startedAt: this.run.startedAt, wants: pending }, { platform: this.platform })) {
         const given = locks.held.map((h) => h.module)
         await releaseModules({ pool: locks.pool, held: locks.held })
