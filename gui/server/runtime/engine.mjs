@@ -5027,6 +5027,7 @@ export class Engine {
       await writeJson(path.join(kept, 'previous-baseline.json'), Object.fromEntries(baseline))
       await writeJson(path.join(kept, 'previous-baseline-modes.json'), Object.fromEntries(baseline.modes ?? []))
     }
+    await this.hook('beforeDeliveryRebase')
     const rebase = await rebaseOntoSource({ workspace: { ...ws, baseCommit: from.baseCommit, ...(ws.repository ? { sourceBase: from.sourceBase } : {}) }, baseline, revision: from.revision,
       patchFile: path.join(runDir, from.artifactRef), policy: policy ?? {}, runDir, runId: this.runId, n, clock: this.clock, extraPaths: resume?.paths ?? [] })
     if (rebase.state !== 'rebased') return { refusal: rebase.reason }

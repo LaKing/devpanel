@@ -2973,11 +2973,20 @@ decision step replays to the author's round like any other.
 
 Returned: `apply-to-source` deliveries refused `source-drift` whose conflicts are
 all `text`, of a run in a worktree, whose candidate an author step of the run
-produced. At most two per run (`MAX_DELIVERY_RETURNS`). Not returned, and blocked
-`source-delivery-blocked` exactly as before with the reason in
+produced. At most two per run (`MAX_DELIVERY_RETURNS`). A text conflict under a
+materialized link is returned like any other: the conflict markers are written
+into the link's copy in the worktree, the recorded conflict names its `link`, the
+quoted conflict tells the author it edits that copy, and the reconciled revision
+is delivered through the link owner's checkout (owner delivery). Not returned,
+and blocked `source-delivery-blocked` exactly as before with the reason in
 `run.closure.deliveryNotReturned` and in the run explanation: a binary file, a
-symlink, a mode change, an addition or deletion on one side, a path under a
-materialized link, any other refusal (`selection-rules-changed`, an unverifiable
+symlink, a mode change, an addition or deletion on one side, a change to a
+materialized link itself (replaced, retargeted, become a directory or the
+reverse; checked again before and after the engine's merge, so a link that
+changes after delivery's refusal is still refused: "the materialized link …
+changed since the snapshot"), owner selection rules that changed
+(`selection-rules-changed`, at delivery or before the move), a path whose
+parent resolves outside the worktree, any other refusal (an unverifiable
 delivery), a reconciled candidate, a third conflict (`bound-reached`), a merge that
 no longer conflicts when the engine makes it, an engine that cannot read the
 project's reconcile policy (one no supervisor drives), and Finalize (it runs outside

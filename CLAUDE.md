@@ -315,8 +315,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   with the conflicts as markers, and records an `automatic` decision step `<phase>:return` (`decision.deliveryReturn`) quoting
   them, replayed like any return (review loop or single seat). The reconciled revision is checked, reviewed (the auditor gets
   the diff since the engine's merge), confirmed and delivered with nothing carried. At most 2 per run (`run.deliveryReturns`);
-  the move is journaled (`run.pendingDeliveryReturn`) and redone after a crash, else `delivery-return-interrupted`. A non-text
-  conflict, a materialized path, any other refusal, an unreadable reconcile policy or the bound block as before with
+  the move is journaled (`run.pendingDeliveryReturn`) and redone after a crash, else `delivery-return-interrupted`. A text conflict
+  under a materialized link is returned too: the markers go into the link's copy (the conflict names its `link`) and the reconciled
+  revision is delivered through the owner's checkout. A non-text conflict, a changed materialized link itself (replaced or retargeted,
+  checked again around the merge), changed owner selection (`selection-rules-changed`), any other refusal, an unreadable reconcile policy or the bound block as before with
   `closure.deliveryNotReturned`; conflicts only on declared append paths stay the automatic reconcile's. A `finalize` of a run
   left blocked at such a conflict returns it the same way and the supervisor drives the run on (`supervisor.finalize`: blocked time
   excused from the wall clock, the released module locks owed).

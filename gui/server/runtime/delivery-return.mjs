@@ -6,6 +6,7 @@ import { candidateDiff } from './diff.mjs'
 import { HARDENED, engineGitEnv, repositoryGitArgs, worktreeGitArgs } from './engine-git.mjs'
 import { runEpoch } from './launch.mjs'
 import { additionRule, mergeOntoSource } from './source-reconcile.mjs'
+import { selectionState } from './selection.mjs'
 
 /*
  * A delivery conflict goes back to the author, in the same run
@@ -29,9 +30,15 @@ import { additionRule, mergeOntoSource } from './source-reconcile.mjs'
  * and `run.deliveryReturns` keeps the old base, the approved patch and the
  * conflicts. Replay only sees the decision step and gives the loop its round.
  *
- * Only a text conflict is returned. A binary file, a symlink, a mode change, an
- * addition or deletion on one side, or a path under a materialized link stays a
- * blocked run: nothing an author can settle by editing lines.
+ * Only a text conflict is returned. A binary file, a symlink, a mode change, or
+ * an addition or deletion on one side stays a blocked run: nothing an author can
+ * settle by editing lines. A text conflict under a materialized link is returned
+ * like any other: the worktree holds the link's copy, B′ holds the owner's bytes
+ * as delivery read them through the link, and delivery dispatches the reconciled
+ * file to its owner's checkout (owner-delivery.mjs). What is not lines stays
+ * refused: a link whose target or resolution changed since the snapshot, or an
+ * owner selection that changed (`selection-rules-changed`), checked again around
+ * the merge (materializedChange).
  */
 
 export const MAX_DELIVERY_RETURNS = 2
@@ -81,11 +88,35 @@ export function deliveryReturnRefusal ({ run, application, policy, reconciled = 
   if (policy == null) return "the project's reconcile policy could not be read, so the engine cannot tell a declared append path from the author's work"
   if (run.workspace?.isolation === 'in-place') return 'the run works in place'
   if (!run.workspace?.gitDir) return 'the run records no Git directory for its worktree (provisioned before they were recorded)'
-  const materialized = run.workspace.symlinks?.materialized ?? []
-  const other = application.conflicts.find((c) => c.kind !== 'text' || materialized.some((root) => c.path === root || c.path.startsWith(root + '/')))
-  if (other) return `${other.path} is not a text conflict the author can resolve (${other.kind === 'text' ? 'under a materialized link' : other.kind})`
+  const other = application.conflicts.find((c) => c.kind !== 'text')
+  if (other) return `${other.path} is not a text conflict the author can resolve (${other.kind})`
   if (application.conflicts.every((c) => additionRule(policy, c.path)) && !run.reconciliations?.length) return LEFT_TO_RECONCILE
   if ((run.deliveryReturns?.length ?? 0) >= MAX_DELIVERY_RETURNS) return 'bound-reached'
+  return null
+}
+
+/**
+ * What changed about the run's materialized links since the snapshot, or null:
+ * a link that no longer points where it did or resolves elsewhere (replaced,
+ * retargeted, turned into a directory), or owner selection rules that differ
+ * (`selection-rules-changed`, as source delivery says it). Either makes the
+ * destination something other than what the approved change was cut from, and
+ * no editing of lines settles that.
+ */
+export async function materializedChange (workspace) {
+  const materialized = workspace.symlinks?.materialized ?? []
+  const source = workspace.source?.path
+  if (!materialized.length || !source) return null
+  for (const root of materialized) {
+    const link = (workspace.symlinks.escaping ?? []).find((l) => l.path === root)
+    const target = await fs.readlink(path.join(source, root)).catch(() => null)
+    if (!link || target !== link.target) return `the materialized link ${root} changed since the snapshot (${target === null ? 'no longer a link' : `now points to ${target}`}): the link itself is not a conflict the author can resolve`
+    const bound = (workspace.symlinks.owners ?? []).find((o) => o.path === root)
+    if (bound?.resolved && await fs.realpath(path.join(source, root)).catch(() => null) !== bound.resolved) return `the materialized link ${root} resolves elsewhere than at the snapshot: the link itself is not a conflict the author can resolve`
+  }
+  const rules = await selectionState({ sourcePath: source, symlinks: workspace.symlinks }).catch((error) => ({ error }))
+  if (rules?.error) return `selection-rules-changed: the materialized source cannot be read as it was at launch (${rules.error.message})`
+  if (rules?.changed.length) return `selection-rules-changed: the owner ignore rules changed since the snapshot (${rules.changed.slice(0, 3).join('; ')}${rules.changed.length > 3 ? '; …' : ''})`
   return null
 }
 
@@ -101,6 +132,8 @@ export function deliveryReturnRefusal ({ run, application, policy, reconciled = 
  */
 export async function rebaseOntoSource ({ workspace, baseline, revision, patchFile, policy = {}, runDir, runId, n, clock, extraPaths = [] }) {
   const ref = `refs/devpanel/delivery-return/${runId}-${n}`
+  const changedBefore = await materializedChange(workspace)
+  if (changedBefore) return { state: 'refused', reason: changedBefore }
   const merge = await mergeOntoSource({ workspace, baseline, revision, patchFile, policy, ref, runDir, clock, keepConflicts: true })
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-return-'))
   const release = async () => {
@@ -122,14 +155,15 @@ export async function rebaseOntoSource ({ workspace, baseline, revision, patchFi
     const materialized = workspace.symlinks?.materialized ?? []
     const conflicts = []
     for (const p of merge.conflicts) {
-      if (materialized.some((root) => p === root || p.startsWith(root + '/'))) return await refuse(`${p} lies under a materialized link: its owner's checkout is not the author's to merge`)
       const modes = stages.get(p) ?? []
       if (modes.length !== 3 || new Set(modes).size !== 1 || !['100644', '100755'].includes(modes[0])) return await refuse(`${p} is not a text conflict (an addition, a deletion, a mode change or a symlink on one side)`)
       const bytes = await fs.readFile(path.join(dir, p))
       if (bytes.subarray(0, 8000).includes(0)) return await refuse(`${p} is binary`)
       const regions = conflictRegions(bytes.toString('utf8'))
       if (!regions.length) return await refuse(`${p} conflicts but the merge left no conflict marker in it`)
-      conflicts.push({ path: p, regions })
+      // Under a materialized link the worktree file is the link's copy; delivery writes it to the owner's checkout.
+      const link = materialized.find((root) => p === root || p.startsWith(root + '/'))
+      conflicts.push({ path: p, regions, ...(link ? { link } : {}) })
     }
 
     // The merged tree as a commit over B′: what the author starts from, kept so
@@ -143,6 +177,19 @@ export async function rebaseOntoSource ({ workspace, baseline, revision, patchFi
     await must(git([...repositoryGitArgs(workspace.path, workspace.gitDir), 'update-ref', `${ref}-merged`, mergeCommit]))
     const changed = (await inTree(['diff', '--name-only', '--no-renames', '-z', sourceBase, mergeCommit])).stdout.split(NUL).filter(Boolean)
     const paths = [...new Set([...merge.drift, ...changed, ...extraPaths])].sort()
+    // Decided before anything is journaled: a path whose nearest existing parent
+    // resolves outside the worktree (a link inside a materialized copy, say) is a
+    // refusal now, not an interrupted move after the journal.
+    const worktreeRoot = await fs.realpath(workspace.path)
+    for (const p of paths) {
+      let parent = path.dirname(path.join(worktreeRoot, p))
+      while (parent !== worktreeRoot && !(await fs.lstat(parent).then(() => true, () => false))) parent = path.dirname(parent)
+      const real = await fs.realpath(parent)
+      if (real !== worktreeRoot && !real.startsWith(worktreeRoot + path.sep)) return await refuse(`${p} resolves outside the worktree`)
+    }
+    // The links and owner selections must still be what the merge read.
+    const changedAfter = await materializedChange(workspace)
+    if (changedAfter) return await refuse(changedAfter)
 
     const write = async () => {
       const root = await fs.realpath(workspace.path)
@@ -185,16 +232,17 @@ export async function rebaseOntoSource ({ workspace, baseline, revision, patchFi
 export function recordedConflicts (conflicts) {
   const bounded = (lines) => lines.length > QUOTED_LINES ? { lines: lines.slice(0, QUOTED_LINES), omitted: lines.length - QUOTED_LINES } : { lines }
   let quoted = 0
-  return conflicts.map((c) => ({ path: c.path, regions: c.regions.map((r) => quoted++ < QUOTED_REGIONS
+  return conflicts.map((c) => ({ path: c.path, ...(c.link ? { link: c.link } : {}), regions: c.regions.map((r) => quoted++ < QUOTED_REGIONS
     ? { start: r.start, end: r.end, source: bounded(r.source), approved: bounded(r.approved) }
     : { start: r.start, end: r.end }) }))
 }
 
 const side = (s) => !s ? ['  (not quoted: read it in the file)'] : [...(s.lines.length ? s.lines.map((l) => `    ${l}`) : ['    (no lines)']), ...(s.omitted ? [`    … ${s.omitted} more lines, in the file`] : [])]
+const underLink = (c) => c.link ? ` (under the materialized link ${c.link}: edit this worktree's copy; delivery writes it to the link owner's checkout)` : ''
 
 /** Each conflicting path with its marker lines in the worktree file and both sides. */
 export const quoteConflicts = (conflicts) => conflicts.flatMap((c) => c.regions.map((r) => [
-  `${c.path} lines ${r.start}–${r.end} (the conflict markers, in the worktree file now):`,
+  `${c.path} lines ${r.start}–${r.end} (the conflict markers, in the worktree file now)${underLink(c)}:`,
   '  the source now:', ...side(r.source),
   '  the approved change:', ...side(r.approved)
 ].join(NL))).join(NL + NL)

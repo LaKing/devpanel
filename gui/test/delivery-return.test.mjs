@@ -1,10 +1,12 @@
 import fs from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { startRun, resumeRun, worktreeDiffDelivery, releaseOwnership } from '../server/runtime/launch.mjs'
+import { startRun, resumeRun, worktreeDiffDelivery, releaseOwnership, reconstructInto, discardReconstruction } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
-import { conflictRegions } from '../server/runtime/delivery-return.mjs'
+import { conflictRegions, deliveryReturnRefusal } from '../server/runtime/delivery-return.mjs'
+import { fingerprint } from '../server/runtime/fingerprint.mjs'
 import { undeliveredApproval } from '../server/runtime/carry-forward.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
@@ -33,7 +35,7 @@ const NO_MARKERS = '      - id: no-markers\n        run: "! grep -q \'<<<<<<<\' 
  * after the reviews and before delivery. `policy`: what the host's reconcile
  * policy reads as (null: no host, as in an engine nothing supervises).
  */
-async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', commands = NO_MARKERS, first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null } = {}) {
+async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', commands = NO_MARKERS, first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null, setup = null, symlinks = null } = {}) {
   let engine = null
   let confirms = 0
   const prompts = []
@@ -60,10 +62,11 @@ async function scenario ({ author = null, beforeDelivery = null, policy = {}, pl
   const f = await engineFixture({ playbook, delivery: 'apply-to-source', script })
   await fs.writeFile(path.join(f.projectPath, 'server.mjs'), lines(10))
   await fs.writeFile(path.join(f.projectPath, 'blob.bin'), Buffer.from([0, 1, 2, 3]))
+  await setup?.(f)
   await git(f.projectPath, 'add', '-A')
   await git(f.projectPath, 'commit', '-qm', 'source')
   await fs.appendFile(path.join(f.configRoot, `playbooks/${playbook}.yaml`), `\nchecks:\n  requirement: required\n  target:\n    kind: local\n    retryFailed: 0\n    commands:\n${commands}`)
-  const options = { base: 'working-tree', ...(playbook === 'implementation' ? { participants: { 'auditor-1': { model: 'opus-5' } } } : {}) }
+  const options = { base: 'working-tree', ...(symlinks ? { symlinks } : {}), ...(playbook === 'implementation' ? { participants: { 'auditor-1': { model: 'opus-5' } } } : {}) }
   const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
   engine = await startRun({ ...f, issue: { ...f.issue, project: 'devpanel-project' }, deliveryProvider: worktreeDiffDelivery, expectConfigHash: resolved.resolved.configHash, runOptions: options })
@@ -78,6 +81,44 @@ async function scenario ({ author = null, beforeDelivery = null, policy = {}, pl
     return engine
   }
   return { f, engine, prompts, died, reopen }
+}
+
+/*
+ * Materialized links (selection v1): each owner is a repository of its own, linked
+ * into the project, made a known project so launch may copy its selection. The
+ * project's `shared` (and `vendor`) become copies in the worktree; writing
+ * `first.source` through the project path writes the owner's file.
+ */
+const temps = []
+const savedProjectsDir = process.env.DEVPANEL_PROJECTS_DIR
+async function ownerRepo (files) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-return-owner-'))
+  temps.push(dir)
+  await git(dir, 'init', '-q', '-b', 'main')
+  await git(dir, 'config', 'user.email', 'test@example.invalid')
+  await git(dir, 'config', 'user.name', 'Owner')
+  for (const [file, text] of Object.entries(files)) {
+    await fs.mkdir(path.dirname(path.join(dir, file)), { recursive: true })
+    await fs.writeFile(path.join(dir, file), text)
+  }
+  await git(dir, 'add', '-A')
+  await git(dir, 'commit', '-qm', 'owner')
+  return dir
+}
+/** `links`: { name in the project: [owner, directory in it] }. */
+const linking = (links) => async (f) => {
+  const projects = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-return-projects-'))
+  temps.push(projects)
+  await fs.mkdir(path.join(projects, 'devpanel-project'))
+  for (const [i, [name, [owner, dir]]] of Object.entries(links).entries()) {
+    await fs.symlink(owner, path.join(projects, `p${i}-project`))
+    await fs.symlink(path.join(owner, dir), path.join(f.projectPath, name))
+  }
+  process.env.DEVPANEL_PROJECTS_DIR = projects
+}
+const markersIn = (...files) => `      - id: no-markers\n        run: "! grep -rq '<<<<<<<' ${files.join(' ')}"\n`
+const writeAll = (files) => async (round, file, engine) => {
+  for (const [rel, text] of Object.entries(files)) await fs.writeFile(path.join(engine.run.workspace.path, rel), text)
 }
 
 const resolve = (text = RECONCILED) => async (round, file) => { await fs.writeFile(file, text) }
@@ -294,7 +335,160 @@ export default async function (t) {
       t.eq('once a revision answers the return, drift is drift again', supportedActions({ ...again.run, status: 'blocked', blockedReason: 'candidate-changed-since-approval' }), ['start-new'])
       await done(again)
     }
+
+    t.section('materialized links: a text conflict is returnable, what is not lines is not')
+    {
+      const run = { workspace: { gitDir: '/g', symlinks: { materialized: ['shared'] } } }
+      const conflict = (kind) => ({ state: 'source-drift', conflicts: [{ path: 'shared/shared.txt', kind }] })
+      t.eq('a text conflict under a link is returned', deliveryReturnRefusal({ run, application: conflict('text'), policy: {} }), null)
+      t.eq('a symlink conflict under a link is not', deliveryReturnRefusal({ run, application: conflict('symlink'), policy: {} }), 'shared/shared.txt is not a text conflict the author can resolve (symlink)')
+      t.ok('nor a delivery the selection rules refused', /did not end in a conflict.*selection-rules-changed/.test(deliveryReturnRefusal({ run, application: { state: 'selection-rules-changed' }, policy: {} })))
+    }
+
+    t.section('12. a conflict only under a materialized link: returned, reconciled in the copy, delivered to the owner')
+    {
+      const owner = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      let seen = null
+      const { f, engine, prompts } = await scenario({ symlinks: 'materialize', setup: linking({ shared: [owner, 'modules'] }), commands: markersIn('server.mjs', 'shared'),
+        first: { worktree: { 'shared/shared.txt': CANDIDATE }, source: { 'shared/shared.txt': SOURCE, 'other.txt': 'landed meanwhile\n' } },
+        author: async (round, file, e) => { const copy = path.join(e.run.workspace.path, 'shared/shared.txt'); seen = await fs.readFile(copy, 'utf8'); await fs.writeFile(copy, RECONCILED) } })
+      const run = engine.run
+      t.eq('the link was materialized', run.workspace.symlinks?.materialized, ['shared'])
+      t.eq('the run completes and delivers', `${run.status} ${run.outcome} ${Boolean(run.delivery?.completedAt)}`, 'completed resolved true', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.deliveryNotReturned ?? run.closure?.conditions)}`)
+      const back = run.steps.find((s) => s.decision?.key === 'implement-review:return')
+      t.eq('one automatic decision step by the engine', [back?.decision?.actor, back?.decision?.automatic, back?.decision?.deliveryReturn], ['engine', true, 1])
+      const entry = run.deliveryReturns?.[0]
+      t.eq('the conflict is on the record with its link', entry?.conflicts.map((c) => [c.path, c.link, c.regions.length]), [['shared/shared.txt', 'shared', 1]])
+      t.ok('the author found the markers in the materialized copy, the approved change on the owner\'s current file', seen?.includes('<<<<<<<') && seen.includes('line 1 elsewhere') && seen.includes('line 9 fixed') && seen.includes('line 5 by someone else') && seen.includes('line 5 by the candidate'), seen)
+      const implement1 = prompts.find((p) => p.stepId === 'implement' && p.round === 1)?.prompt ?? ''
+      t.ok('its prompt quotes the path and says it is the link\'s copy, delivered to the owner', /shared\/shared\.txt lines \d+–\d+/.test(implement1) && implement1.includes('under the materialized link shared') && implement1.includes('line 5 by someone else'))
+      t.eq('the owner checkout holds the reconciliation', await fs.readFile(path.join(owner, 'modules/shared.txt'), 'utf8'), RECONCILED)
+      t.ok('the project link stays a link', (await fs.lstat(path.join(f.projectPath, 'shared'))).isSymbolicLink())
+      t.eq('and what landed in the project meanwhile stays', await source(f, 'other.txt'), 'landed meanwhile\n')
+      t.ok('delivered through the owner\'s checkout', (run.delivery.application.owners ?? []).some((o) => o.path === owner), JSON.stringify(run.delivery.application.owners))
+      const final = run.revisions.at(-1)
+      t.ok('a new revision over the moved base, nothing carried', final.baseCommit === entry.sourceBase && run.workspace.baseCommit === entry.sourceBase && run.approvals.length > 0 && run.approvals.every((a) => a.revision === final.fingerprint && Number(a.step) > Number(back.number)))
+      t.eq('checked as its own revision', [run.checkResults.at(-1)?.revision, run.checkResults.at(-1)?.result], [final.fingerprint, 'passed'])
+      t.eq('delivered as that revision', run.delivery.revision, final.fingerprint)
+      t.eq('the worktree\'s HEAD names the moved base', (await exec('git', ['--git-dir', run.workspace.gitDir, 'rev-parse', 'HEAD'])).stdout.trim(), entry.sourceBase)
+      t.ok('nothing says a link was a reason not to return', !JSON.stringify(run.closure ?? {}).includes('materialized link') && !JSON.stringify(explainRun(run)).includes('under a materialized link'))
+      // AC4: B′ plus the delivered patch rebuilds the revision under B′'s baseline.
+      const dir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-return-rebuild-')), 'candidate')
+      temps.push(path.dirname(dir))
+      try {
+        await reconstructInto({ dir, workspacePath: run.workspace.path, baseCommit: run.workspace.baseCommit, patchFile: path.join(f.issuePath, 'runs', engine.runId, run.delivery.artifactRef), gitDir: run.workspace.gitDir })
+        const rebuilt = await fingerprint(dir, { baseCommit: run.workspace.baseCommit, baseline: engine.baseline })
+        t.eq('the rebuild from B′ and the patch reproduces the revision', rebuilt.fingerprint, final.fingerprint)
+        t.ok('with the path under the link among the changed paths', rebuilt.entries.some((e) => e.path === 'shared/shared.txt' && e.status !== 'unchanged'), JSON.stringify(rebuilt.entries.filter((e) => e.status !== 'unchanged').map((e) => e.path)))
+      } finally {
+        await discardReconstruction({ dir, workspacePath: run.workspace.path, gitDir: run.workspace.gitDir })
+      }
+      await done(engine)
+    }
+
+    t.section('13. conflicts under a link and on the project\'s own path: both returned, both delivered')
+    {
+      const owner = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const { f, engine } = await scenario({ symlinks: 'materialize', setup: linking({ shared: [owner, 'modules'] }), commands: markersIn('server.mjs', 'shared'),
+        first: { worktree: { 'server.mjs': CANDIDATE, 'shared/shared.txt': CANDIDATE }, source: { 'server.mjs': SOURCE, 'shared/shared.txt': SOURCE } },
+        author: writeAll({ 'server.mjs': RECONCILED, 'shared/shared.txt': RECONCILED }) })
+      const run = engine.run
+      t.eq('the run completes and delivers', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.deliveryNotReturned ?? run.closure?.conditions)}`)
+      t.eq('one return quoting both, the link named on its own', run.deliveryReturns?.[0]?.conflicts.map((c) => [c.path, c.link ?? null]), [['server.mjs', null], ['shared/shared.txt', 'shared']])
+      t.eq('the project holds its reconciliation', await source(f), RECONCILED)
+      t.eq('the owner holds its', await fs.readFile(path.join(owner, 'modules/shared.txt'), 'utf8'), RECONCILED)
+      await done(engine)
+    }
+
+    t.section('14. two links owned by different checkouts: each owner gets its reconciliation')
+    {
+      const one = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const two = await ownerRepo({ 'lib/vendor.txt': lines(10) })
+      const { engine } = await scenario({ symlinks: 'materialize', setup: linking({ shared: [one, 'modules'], vendor: [two, 'lib'] }), commands: markersIn('server.mjs', 'shared', 'vendor'),
+        first: { worktree: { 'shared/shared.txt': CANDIDATE, 'vendor/vendor.txt': CANDIDATE }, source: { 'shared/shared.txt': SOURCE, 'vendor/vendor.txt': SOURCE } },
+        author: writeAll({ 'shared/shared.txt': RECONCILED, 'vendor/vendor.txt': RECONCILED }) })
+      const run = engine.run
+      t.eq('the run completes and delivers', `${run.status} ${run.outcome}`, 'completed resolved', `${run.blockedReason} ${run.delivery?.error} ${JSON.stringify(run.closure?.deliveryNotReturned ?? run.closure?.conditions)}`)
+      t.eq('one return, each conflict with its link', run.deliveryReturns?.[0]?.conflicts.map((c) => [c.path, c.link]), [['shared/shared.txt', 'shared'], ['vendor/vendor.txt', 'vendor']])
+      t.eq('both owner checkouts hold the reconciliation', [await fs.readFile(path.join(one, 'modules/shared.txt'), 'utf8'), await fs.readFile(path.join(two, 'lib/vendor.txt'), 'utf8')], [RECONCILED, RECONCILED])
+      t.ok('delivered through both owners', [one, two].every((o) => (run.delivery.application.owners ?? []).some((x) => x.path === o)), JSON.stringify(run.delivery.application.owners))
+      await done(engine)
+    }
+
+    t.section('15. a change to the link itself is not returned: replaced before delivery, or retargeted before the move')
+    {
+      const owner = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const linked = { symlinks: 'materialize', setup: linking({ shared: [owner, 'modules'] }), commands: markersIn('server.mjs', 'shared'), author: resolve(),
+        first: { worktree: { 'shared/shared.txt': CANDIDATE }, source: { 'shared/shared.txt': SOURCE } } }
+      const replaced = await scenario({ ...linked, beforeDelivery: async (n, fx) => {
+        const bytes = await fs.readFile(path.join(fx.projectPath, 'shared/shared.txt'))
+        await fs.rm(path.join(fx.projectPath, 'shared'))
+        await fs.mkdir(path.join(fx.projectPath, 'shared'))
+        await fs.writeFile(path.join(fx.projectPath, 'shared/shared.txt'), bytes)
+      } })
+      let run = replaced.engine.run
+      t.eq('the link became a directory: blocked, nothing returned', [`${run.status} ${run.blockedReason}`, run.deliveryReturns ?? null, rounds(replaced.prompts, 'implement')], ['blocked source-delivery-blocked', null, [0]], run.delivery?.error)
+      t.ok('the closure says delivery did not end in a conflict', /did not end in a conflict/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
+      await done(replaced.engine)
+
+      const elsewhere = await ownerRepo({ 'modules/shared.txt': SOURCE })
+      // A fresh owner: the first case left its change in the other one's file.
+      const fresh = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const retargeted = await scenario({ ...linked, setup: linking({ shared: [fresh, 'modules'] }), hooks: { beforeDeliveryRebase: async (e) => {
+        delete e.hooks.beforeDeliveryRebase
+        const link = path.join(e.run.workspace.source.path, 'shared')
+        await fs.rm(link)
+        await fs.symlink(path.join(elsewhere, 'modules'), link)
+      } } })
+      run = retargeted.engine.run
+      t.eq('the link retargeted after the conflict: blocked, nothing returned', [`${run.status} ${run.blockedReason}`, run.deliveryReturns ?? null, run.pendingDeliveryReturn ?? null], ['blocked source-delivery-blocked', null, null])
+      t.ok('the closure names the link', /materialized link shared changed since the snapshot/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
+      t.ok('the run explanation says so', JSON.stringify(explainRun(run)).includes('materialized link shared changed'))
+      t.eq('the worktree still holds the approved change', await fs.readFile(path.join(run.workspace.path, 'shared/shared.txt'), 'utf8'), CANDIDATE)
+      await done(retargeted.engine)
+    }
+
+    t.section('16. changed owner selection rules are refused as selection-rules-changed, before delivery or before the move')
+    {
+      const owner = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const linked = { symlinks: 'materialize', setup: linking({ shared: [owner, 'modules'] }), commands: markersIn('server.mjs', 'shared'), author: resolve(),
+        first: { worktree: { 'shared/shared.txt': CANDIDATE }, source: { 'shared/shared.txt': SOURCE } } }
+      const before = await scenario({ ...linked, beforeDelivery: async () => { await fs.appendFile(path.join(owner, '.gitignore'), 'generated-*\n') } })
+      let run = before.engine.run
+      t.eq('blocked at delivery, nothing returned', [`${run.status} ${run.blockedReason}`, run.delivery?.application?.state, run.deliveryReturns ?? null], ['blocked source-delivery-blocked', 'selection-rules-changed', null], run.delivery?.error)
+      t.ok('the closure names the reason', /selection-rules-changed/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
+      await done(before.engine)
+
+      const other = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const during = await scenario({ ...linked, setup: linking({ shared: [other, 'modules'] }), hooks: { beforeDeliveryRebase: async (e) => {
+        delete e.hooks.beforeDeliveryRebase
+        await fs.appendFile(path.join(other, '.gitignore'), 'generated-*\n')
+      } } })
+      run = during.engine.run
+      t.eq('changed after the conflict: blocked, nothing returned', [`${run.status} ${run.blockedReason}`, run.deliveryReturns ?? null], ['blocked source-delivery-blocked', null])
+      t.ok('the reason starts selection-rules-changed', /^selection-rules-changed:/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
+      await done(during.engine)
+    }
+
+    t.section('17. a crash while the worktree is moved, with a path under a link: the move is done again')
+    {
+      const owner = await ownerRepo({ 'modules/shared.txt': lines(10) })
+      const s = await scenario({ symlinks: 'materialize', setup: linking({ shared: [owner, 'modules'] }), commands: markersIn('server.mjs', 'shared'),
+        first: { worktree: { 'server.mjs': CANDIDATE, 'shared/shared.txt': CANDIDATE }, source: { 'server.mjs': SOURCE, 'shared/shared.txt': SOURCE } },
+        author: writeAll({ 'server.mjs': RECONCILED, 'shared/shared.txt': RECONCILED }),
+        hooks: { afterDeliveryRebase: (e) => { delete e.hooks.afterDeliveryRebase; crash() } } })
+      t.eq('the process died inside the move, journaled with the link path', [s.died?.simulatedCrash, s.engine.run.pendingDeliveryReturn?.state, s.engine.run.pendingDeliveryReturn?.paths?.includes('shared/shared.txt'), s.engine.run.deliveryReturns ?? null], [true, 'writing', true, null])
+      const again = await s.reopen()
+      await again.drive()
+      t.eq('it completes and delivers', `${again.run.status} ${again.run.outcome}`, 'completed resolved', `${again.run.blockedReason} ${again.run.pendingDeliveryReturn?.error} ${again.run.delivery?.error}`)
+      t.eq('one return, marked resumed, no journal left', [again.run.deliveryReturns.length, again.run.deliveryReturns[0].resumed, again.run.pendingDeliveryReturn ?? null], [1, true, null])
+      t.eq('the owner and the project hold the reconciliation', [await fs.readFile(path.join(owner, 'modules/shared.txt'), 'utf8'), await source(s.f)], [RECONCILED, RECONCILED])
+      await done(again)
+    }
   } finally {
+    if (savedProjectsDir === undefined) delete process.env.DEVPANEL_PROJECTS_DIR
+    else process.env.DEVPANEL_PROJECTS_DIR = savedProjectsDir
+    await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
     await cleanupFixtures()
   }
 }
