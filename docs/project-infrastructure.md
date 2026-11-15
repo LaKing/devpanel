@@ -522,6 +522,58 @@ has no outbound network and no provisioned secret) are listed as `notOnInstance`
 failures nor passes. Add `fullSuite` to a project file only once the panel runs code that
 knows it: an older panel refuses the unknown key.
 
+**The rerun of failed tests alone.** When the whole suite failed on named tests and nothing
+else, each failed test runs again alone on the same instance before the cycle destroys it. A
+test that passes alone is flaky: it does not make the entry red, and it is never silent. A
+test that fails again, or whose rerun proves nothing, leaves the entry red as before. The
+rerun is on by default. It needs a command that selects named tests; a whole module is never
+rerun in place of a test:
+
+```yaml
+        fullSuite:
+          # ... test, browser, finallyCommands ...
+          rerun:
+            # A command of its own: {{test}} reruns one test per command, {{tests}} the failed tests of one module.
+            test: { id: rerun-tests, run: '/opt/stage-tools/selftest-tests.sh {{instance}} {{tests}}', timeoutSeconds: 600 }
+            # Or, instead of `test`: the tier's own test command takes test names where it takes filters.
+            # namedTests: true
+            maxTests: 10    # the default
+          # rerun: false    # opts out
+```
+
+With neither `test` nor `namedTests` the entry records `cannot-select-named-tests` and stays
+red as before. Declare `namedTests` only once the tier's selftest CLI is known to run a test
+named in place of a filter. `rerun.test` follows the template rules of `{{filter}}`, names the
+instance, and its id is unique beside the tier's and the suite's own.
+
+What decides it, and what the entry records (`rerun.reason`):
+
+- no rerun for a failure that is not a failed test (`not-a-test-failure`): the instance did
+  not stay up (a failed create, start or ready), the suite timed out, was killed or did not
+  run, another required command (a collector) failed or was skipped, a selftest report could
+  not be read, or a failed entry is a whole suite or thread;
+- no rerun when the suite's reports name more distinct failed tests than `maxTests`
+  (`over-bound`), counting tests inherited from the previous green cycle too. The bound only
+  decides whether an entry the gate made red is rerun: an entry whose gate passed, every
+  reported failure inherited, stays green however many there are;
+- otherwise the failed tests not inherited from the previous green cycle are rerun, each
+  drive in `checks/full-verification-rerun-<n>/` beside `checks/full-verification/`. The
+  drive is not fresh: no load, no restart, only the rerun command and the collectors.
+
+A test passes alone only when its command ran and passed (or ended by its own exit while its
+report fails another test of the group), the collectors passed and the report names it `PASS`.
+A rerun that times out, a failed collector or an unreadable report is `not-observed`, never a
+pass. Every test passed alone: the entry is green with `flaky` named in `cycle.json`, the
+verification API and the `verification-ended` event. Each flaky test is written to
+`issues/<project>/.selftest-history/` as a failure and a pass on one tree, so the unstable
+classification sees it. The project's open flaky-test issue gets a note, or one opens
+(`openedBy.from.subject: flaky-tests`). The checkpoint chain runs as for any green cycle. A red
+entry's issue lists only the tests that failed twice and names the flaky ones apart.
+
+The rerun runs on the state the whole suite left, with no restart. Leftovers can make a test
+fail again (red, as before), and a test that failed only beside others and passes alone is
+exactly what the flaky record is for.
+
 ### Module pool and hook reader
 
 An application that composes a framework through symlinked collections names it:

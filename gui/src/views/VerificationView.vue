@@ -101,6 +101,8 @@ function invocationOf (project) {
         <p v-if="runs[p.project]?.explanation?.detail" class="verify__detail">{{ runs[p.project].explanation.detail }}</p>
         <p v-if="p.check?.failingTests?.length">Failing tests: {{ p.check.failingTests.map((f) => `${f.command}: ${f.test} (${f.basis})`).join('; ') }}</p>
         <p v-else-if="p.check?.newFailures?.length">New failures: {{ p.check.newFailures.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
+        <p v-if="p.flaky?.length">Flaky (passed alone on the same instance): {{ p.flaky.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
+        <p v-else-if="p.rerun?.state === 'skipped'">No rerun of failed tests: {{ p.rerun.message }}</p>
         <RunTimeline v-if="runs[p.project]?.timeline" :timeline="runs[p.project].timeline" :active="runs[p.project].active ?? []"
                      :selected="selected[p.project] == null ? null : String(selected[p.project])" @select="selected = { ...selected, [p.project]: $event }" />
         <LiveOutput v-if="invocationOf(p.project)" :key="invocationOf(p.project).id" :project="p.project" :issue-id="p.issueId" :run-id="p.runId"

@@ -3228,7 +3228,9 @@ and asks every writing run this process drives to stop:
   instance of its own (`runtime/full-verification-drive.mjs instanceCycleTarget`, through
   `runChecks`: an instance slot of `testDrive.maxInstances`, waited for) and destroys it
   however the drive ends (`destroyRunInstances(driveId)`; an interrupted cycle's at the next
-  start, `recover()`, and by the instance sweep). It never releases to such a host's base
+  start, `recover()`, and by the instance sweep). Before that destroy, a red entry whose
+  suite failed on named tests and nothing else **reruns each failed test alone on the same
+  instance** (`runtime/full-verification-rerun.mjs`, "The rerun of failed tests" below). It never releases to such a host's base
   instance: an entry that would is refused `HOST_HAS_INSTANCES`. Elsewhere its own Deployment runs carry `run.fullVerification
   {cycleId}`, live in the project's run home `issues/<project>/.verification-<date>/`
   (id `verification-<date>`; never an issue: no list, count or lookup of issues reads it,
@@ -3255,6 +3257,56 @@ next start, before `resumeInterrupted`, `recover()` marks an unfinished cycle re
 `interrupted` and resumes the runs paused as `full-verification`; the cycle's own runs
 are not resumed automatically (their homes are not issues, so `resumeInterrupted` never
 lists them; `reconcile` does, so a crash leaves them `recovery-required` like any run).
+
+**The rerun of failed tests.** One test failing once in a suite of thousands does not decide
+a cycle. When an instance entry's drive is not green, `rerunPlan` decides, before the instance
+is destroyed, whether its failed tests run again alone, and the entry always records why or
+why not (`entry.rerun {state: ran | skipped | failed, reason, message, bound, reported}`):
+
+- `opted-out`: the project declares `modules.instance.fullSuite.rerun: false`.
+- `cannot-select-named-tests`: nothing selects a named test. The rerun is on by default, but
+  it needs `fullSuite.rerun.test` (a template holding `{{test}}` or `{{tests}}`) or
+  `rerun.namedTests: true` (the tier's `test` command takes test names where it takes
+  filters). A whole module is never rerun in place of a test.
+- `incomplete`: the entry is incomplete, so no rerun can make it green.
+- `not-a-test-failure`: the instance did not stay up (a failed create, start or ready), the
+  suite did not answer on its own (`suiteRanOf`: it did not run, timed out or was killed), a
+  required command other than the suite failed or was skipped, a selftest report could not
+  be read, or a failed entry is a suite or thread (`isSuiteLevel`). None of these is ever
+  rerun into green.
+- `over-bound`: the suite's reports name more distinct failed tests than
+  `fullSuite.rerun.maxTests` (default 10), counted before anything inherited is taken out.
+  The bound limits which entries the gate made red may be rerun; it never overrides a passed
+  gate, so an entry whose every reported failure is inherited stays green as before.
+- `no-named-tests`: every failed test fails in the previous green drive too (inherited).
+- `release-mode`: a red release-mode entry, which has no instance of the cycle's own.
+
+Otherwise each failed test not inherited from the previous green cycle runs alone: one
+command per test (`{{test}}`, `{{filter}}`), or one per module holding only that module's
+failed tests (`{{tests}}`, `{{filters}}`), each a drive of its own in
+`checks/full-verification-rerun-<n>/` under the entry's record directory, on the instance the
+suite used. The instance is still the cycle's, so no load, restart or new slot happens: the
+drive runs the rerun command and the collectors. A test counts as passed alone only when
+the drive was not unavailable, the instance stayed up, the rerun command ran and passed, or
+ended by its own exit (`exitedOnItsOwn`) while its report fails another test of its group,
+every required collector passed, and the reports parse and name the test `PASS`. Otherwise
+it failed again (`FAIL`) or is `not-observed` (a rerun that printed passes and then timed out
+is not a pass), and both keep the entry red as before.
+
+Every test passed alone: the entry reads green, its drive's own gate kept on
+`entry.check.gating`. It names the tests in `entry.flaky`, `rerun.outcome: all-passed`; that
+lands in `cycle.json`, on `GET /api/verification/latest` and in `verification-ended` (per
+project `flaky` and `rerun`, `outcome.flaky`). Each flaky test leaves two lines in
+`issues/<project>/.selftest-history/<drive id>.jsonl`, the suite drive as a failure and the
+rerun as a pass on one tree, with no issue, so the unstable classification counts them
+(same-bytes). After the checkpoint chain (or the red issues), every entry that is not red
+and has flaky tests gets a note on its project's open flaky-test issue (`openedBy.from
+{via: 'full-verification', cycle, subject: 'flaky-tests'}`, still open, no disposition), else
+a new one. A red entry names them in its own issue instead: after a rerun its body and
+`failing-tests.md` list only the tests that failed twice or were not observed, and name the
+flaky ones apart. Coverage reads `suiteRan`, never the verdict, so a green-with-flaky entry
+is a whole suite that ran. In the next cycle a flaky test is not inherited from that green
+drive: failing again it is `flakyAgain`, gates, and is rerun.
 
 **The full check of a cycle run.** After its staging release completed, the engine drives
 the project's test-drive target in its full tier (`stagingTarget` + `tierTarget(…, 'full')`,

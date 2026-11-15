@@ -43,7 +43,8 @@ export const takesChanged = (run) => typeof run === 'string' && run.split(CHANGE
 /** Whether a command text names the instance. */
 export const namesInstance = (run) => typeof run === 'string' && PLACEHOLDER.test(run)
 
-const fill = (command, { name, root }) => ({ ...command, run: command.run.replaceAll('{{instanceName}}', name).replaceAll('{{instance}}', root) })
+/** A command with `{{instance}}` and `{{instanceName}}` filled for the instance `{ name, root }`. */
+export const fill = (command, { name, root }) => ({ ...command, run: command.run.replaceAll('{{instanceName}}', name).replaceAll('{{instance}}', root) })
 
 /**
  * A drive's target bound to its instance: every command names it, and

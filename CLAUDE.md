@@ -420,7 +420,18 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   was pending too), waits until no writing run or pending operation is left, then per stage, one at a time per staging
   host: on a host with dynamic instances (a project there declares `testDrive.modules.instance`) no run and no release —
   the checkout snapshotted (`gitWorktreeProvider`), `modules.instance.fullSuite` driven on an instance of the cycle's own
-  (`instanceCycleTarget` through `runChecks`, an instance slot waited for), destroyed however it ends, the outputs kept in
+  (`instanceCycleTarget` through `runChecks`, an instance slot waited for), and before the destroy, when the suite failed on
+  named tests alone, each failed test rerun alone on that instance (`runtime/full-verification-rerun.mjs`: on by default
+  but only with a command that selects named tests, `fullSuite.rerun.test` with `{{test}}`/`{{tests}}` or `rerun.namedTests`
+  for the tier's test command, else `cannot-select-named-tests`; `rerun: false` opts out; no rerun for a non-test failure
+  (instance down, suite timed out or unread, another command failed: `not-a-test-failure`) or more than `rerun.maxTests`
+  (default 10) reported failures on an entry the gate made red, inherited ones counted (`over-bound`; a passed gate, every
+  failure inherited, stays green); a pass only on a rerun that completed with its
+  collectors and a readable report; the reason on `entry.rerun`). All passed alone: green, `entry.flaky` in `cycle.json`,
+  the API and the event, two `.selftest-history` lines per test (a failure and a pass on one tree), a note on the project's
+  open flaky-test issue or a new one (`openedBy.from.subject: 'flaky-tests'`); a test that failed again keeps it red, its
+  issue listing only tests that failed twice and naming the flaky apart; next cycle a flaky test is never inherited
+  (`flakyAgain`). It is destroyed however it ends, the outputs kept in
   `issues/.verification/<date>/<cycle id>/<project>/`, the snapshot's covered deliveries recorded
   (`staging-coverage.mjs cycleSnapshotCoverage`), a release entry on that host refused `HOST_HAS_INSTANCES`, a missing
   suite `FULL_SUITE_UNDECLARED`, `modules.browser` without `fullSuite.browser` `incomplete`; elsewhere one Deployment run

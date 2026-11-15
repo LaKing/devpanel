@@ -219,6 +219,23 @@ function instanceErrors (modules, all) {
     const ids = [...all, ...own].map((c) => c.id)
     if (new Set(ids).size !== ids.length) errors.push('modules.instance.fullSuite: command ids must be unique beside the tier\'s own')
     if (![...all.filter((c) => !c.slot), ...own].some((c) => isSelftestReport(c.report))) errors.push('modules.instance.fullSuite: neither fullSuite.test nor a finalizer declares report: selftest, so nothing would show which tests ran')
+    // The rerun of failed tests alone (full-verification-rerun.mjs): its own template selects named tests on the cycle's instance.
+    const rerun = suite.rerun?.test
+    if (rerun) {
+      const label = 'modules.instance.fullSuite.rerun.test'
+      if (!namesInstance(rerun.run)) errors.push(`${label}.run must name the instance ({{instance}} or {{instanceName}}): the rerun runs on the cycle's instance`)
+      if (/\{\{(files|filters?)\}\}/.test(rerun.run)) errors.push(`${label}.run selects named tests: {{test}} or {{tests}}, not {{files}}, {{filter}} or {{filters}}`)
+      else {
+        const problem = templateProblem(rerun.run, rerun.run.includes('{{tests}}') ? 'tests' : 'test', { instance: true })
+        if (problem) errors.push(`${label}.run ${problem}`)
+      }
+      if (rerun.kind) errors.push(`${label}: modules.instance needs an unstructured tier (no command kinds)`)
+      if (rerun.required === false) errors.push(`${label}: the rerun decides the entry, so it is required`)
+      if ([...all, ...own].some((c) => c.id === rerun.id)) errors.push(`${label}: its id must be unique beside the tier's and the suite's own`)
+      // The rerun drive is that command and the collectors (the tier's and the suite's): one of them must show which tests passed.
+      const collectors = [...(modules.finallyCommands ?? []), ...(suite.finallyCommands ?? [])]
+      if (!isSelftestReport(rerun.report) && !collectors.some((c) => isSelftestReport(c.report))) errors.push(`${label}: neither it nor a collector declares report: selftest, so nothing would show whether a rerun test passed`)
+    }
   }
   return errors
 }

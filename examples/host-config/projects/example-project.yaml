@@ -116,6 +116,14 @@ infrastructure:
       #     browser: { id: full-browser, run: '/opt/stage-tools/browser-check.sh {{instance}}', timeoutSeconds: 1800 }
       #     finallyCommands:
       #       - { id: collect-log, run: 'cat {{instance}}/runtime/log/current/project.log' }
+      #     # A failed test reruns alone on the same instance before it is destroyed; one that
+      #     # passes alone is flaky, not red. It needs a command that selects named tests
+      #     # ({{test}} or {{tests}}), or namedTests: true for the tier's own test command;
+      #     # without either nothing is rerun. More than maxTests failed tests (inherited counted): no rerun.
+      #     # `rerun: false` opts out.
+      #     rerun:
+      #       test: { id: rerun-tests, run: '/opt/stage-tools/selftest-tests.sh {{instance}} {{tests}}', timeoutSeconds: 600 }
+      #       maxTests: 10
     # Under structured confinement (`kind` on every command) load, restart, ready,
     # test and the collector are `kind: privileged`: they act on the stage instance,
     # which a candidate command cannot see; lint may be `kind: candidate`.

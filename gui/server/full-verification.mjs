@@ -12,8 +12,11 @@ import { failureFingerprints, selftestReport } from './runtime/baseline-failures
 import { poolMembers } from './runtime/module-pool.mjs'
 import { startProjectAction } from './project-actions.mjs'
 import { projectPath, projectsRoot, resolveProjectPath } from './project-path.mjs'
-import { cycleRecords, driveFiles, DRIVE_DIR, fullTierRanOf, fullVerificationDrive, instanceCycleTarget, notOnInstanceOf, suiteRanOf } from './runtime/full-verification-drive.mjs'
-import { instanceName } from './runtime/instance-drive.mjs'
+import { cycleRecords, driveFiles, DRIVE_DIR, fullTierRanOf, fullVerificationDrive, instanceCycleTarget, notOnInstanceOf, readReports, suiteRanOf } from './runtime/full-verification-drive.mjs'
+import { flakyHistoryLines, judgeRerun, rerunCommands, rerunPlan, rerunSettings, RERUN_DIR } from './runtime/full-verification-rerun.mjs'
+import { fill, instanceName } from './runtime/instance-drive.mjs'
+import { runChecks } from './runtime/checks.mjs'
+import { recordDrive } from './runtime/selftest-history.mjs'
 import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
@@ -39,7 +42,10 @@ import { deliveryCounts } from './verification-trigger.mjs'
  *        checkout, drives `modules.instance.fullSuite` on an instance of its own (counted
  *        against testDrive.maxInstances, waited for), keeps what the instance produced
  *        under issues/.verification/<date>/<cycle id>/<project>/ and destroys it however
- *        the drive ends. Nothing is ever released to, loaded into or restarted on the base
+ *        the drive ends. When the suite failed on named tests alone, each failed test runs
+ *        again alone on that instance before it is destroyed (runtime/full-verification-rerun.mjs):
+ *        one that passes alone is flaky (recorded, in the selftest history, the event and an
+ *        issue) and does not make the entry red. Nothing is ever released to, loaded into or restarted on the base
  *        instance of such a host: a project there without an instance is refused
  *        (HOST_HAS_INSTANCES), one without a full suite too (FULL_SUITE_UNDECLARED);
  *      - elsewhere it starts one Deployment run (environment staging, `fullVerification`)
@@ -168,6 +174,8 @@ export function failingTestsOf (check, parsed = []) {
     else add(f, basis)
   }
   for (const f of check?.selftest?.newFailures ?? []) add(f, 'new')
+  // Failed here and passed only alone in the previous green cycle (full-verification-drive.mjs): never inherited.
+  for (const f of check?.flakyAgain ?? []) add(f, 'flaky-again')
   for (const f of check?.selftest?.unjudged ?? []) add(f, 'unjudged')
   for (const f of check?.failures?.newFailures ?? []) addNamedFirst(f, 'new')
   if (check?.result?.result === 'failed' && check.gating !== 'passed') {
@@ -237,10 +245,22 @@ const failureBlock = (f) => [`### \`${f.command}: ${f.test}\` (${f.basis})`, '',
 
 const plural = (n, one, many) => (n === 1 ? one : many)
 
+/** The flaky tests of an entry, apart from its failing ones: failed in the whole suite, passed when rerun alone. */
+const flakySection = (flaky) => ['## Flaky: failed in the whole suite, passed alone on the same instance', '',
+  'These do not make the stage red; each is recorded in the project\'s selftest history as a failure and a pass on one tree.', '',
+  ...flaky.map((f) => `- \`${f.command}: ${f.test}\` (rerun in \`${f.dir ?? 'unknown'}\`)`), ''].join('\n')
+
+/** Why an entry's failed tests were or were not rerun, in a line. */
+const rerunLine = (rerun) => !rerun ? null
+  : rerun.state === 'ran' ? `- Rerun of failed tests alone: ${rerun.tests.length} rerun, ${rerun.tests.filter((t) => t.rerun === 'passed').length} passed alone (flaky), ${rerun.tests.filter((t) => t.rerun !== 'passed').length} failed again or not observed`
+    : rerun.state === 'skipped' ? `- Rerun of failed tests alone: not done, ${rerun.reason}: ${rerun.message}`
+      : `- Rerun of failed tests alone: ${rerun.state}${rerun.error ? ` (${rerun.error})` : ''}`
+
 /** Every failing test with its excerpt, in parts of at most `maxBytes`, split only between tests. */
-export function failureAttachments ({ name, failures, unread = [], maxBytes }) {
+export function failureAttachments ({ name, failures, unread = [], flaky = [], maxBytes }) {
   const head = (i, n) => `# Failing tests: ${name}${n > 1 ? ` (part ${i} of ${n})` : ''}\n\nAll ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}.\n\n`
   const blocks = failures.map(failureBlock)
+  if (flaky.length) blocks.push(flakySection(flaky))
   if (unread.length) blocks.push(['## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), ''].join('\n'))
   const headroom = Buffer.byteLength(head(9999, 9999))
   const parts = []
@@ -257,7 +277,7 @@ export function failureAttachments ({ name, failures, unread = [], maxBytes }) {
 }
 
 /** The report of a red project's issue: the cycle, the run, why it is red, the first failing tests. */
-export function redIssueReport ({ record, entry, name, stage, failures, unread = [], parts = [] }) {
+export function redIssueReport ({ record, entry, name, stage, failures, unread = [], flaky = [], parts = [] }) {
   const lines = [`# ${name}`, '',
     `The daily full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
     `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
@@ -269,6 +289,7 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
     lines.push(`- Full check: ${entry.check.result ?? 'no result'}, gate ${entry.check.gating}${entry.check.baseline?.cycleId ? `, compared with cycle ${entry.check.baseline.cycleId}` : ', no previous green cycle to compare with'}`)
     if (entry.check.selftestVerdict) lines.push(`- Selftest comparison: ${entry.check.selftestVerdict}${entry.check.selftestReason ? ` (${entry.check.selftestReason})` : ''}`)
   }
+  if (rerunLine(entry.rerun)) lines.push(rerunLine(entry.rerun))
   lines.push('')
   if (failures.length) {
     lines.push(`## Failing tests (${failures.length})`, '')
@@ -276,6 +297,7 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
     for (const f of failures.slice(0, SHOWN_FAILURES)) lines.push(failureBlock(f))
   } else lines.push('## Failing tests', '', 'The check names no failing test; the run status above says why the stage is red.', '')
   if (unread.length) lines.push('## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), '')
+  if (flaky.length) lines.push(flakySection(flaky))
   if (parts.length) lines.push(`All ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}: ${parts.map((p) => `\`${p.name}\``).join(', ')} on the report step (000).`, '')
   return lines.join('\n')
 }
@@ -612,11 +634,13 @@ export function createFullVerification ({
       outcome: {
         bump: record.outcome?.bump ? { chain: record.outcome.bump.chain.map((s) => ({ project: s.project, args: s.args, status: s.status, versionAfter: s.versionAfter ?? null })), failed: record.outcome.bump.failed ?? null } : null,
         issues: (record.outcome?.issues ?? []).map((i) => ({ project: i.project, issueId: i.issueId, name: i.name })),
-        reason: record.outcome?.reason ?? null
+        reason: record.outcome?.reason ?? null,
+        flaky: (record.outcome?.flaky ?? []).map((i) => ({ project: i.project, issueId: i.issueId, noted: i.noted === true }))
       },
       projects: record.projects.map((e) => ({
         project: e.project, stage: e.stage ?? null, mode: e.mode ?? null, verdict: e.verdict ?? null, refusal: e.refusal?.code ?? null, incomplete: e.incomplete?.reason ?? null,
         instance: e.instance?.name ?? null, evidence: e.evidence?.dir ?? e.runDir ?? null, coverageEstablished: e.coverageEstablished === true,
+        flaky: (e.flaky ?? []).map((f) => ({ command: f.command, test: f.test })), rerun: e.rerun ? { state: e.rerun.state, reason: e.rerun.reason ?? e.rerun.outcome ?? null } : null,
         covered: e.coverageEstablished ? runIds(e.coverage?.covered) : [],
         stillCounting: [...(e.coverageEstablished ? [] : runIds(e.coverage?.covered)), ...runIds(e.coverage?.indeterminate), ...runIds(e.coverage?.notShipped)]
       })),
@@ -629,6 +653,7 @@ export function createFullVerification ({
     dir: check.result?.dir ?? null, result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline ?? null, baseCommit: check.baseCommit ?? null, files: check.files ?? {},
     newFailures: [...(check.selftest?.newFailures ?? []), ...(check.failures?.newFailures ?? [])].map((f) => ({ command: f.command, test: f.test })),
     failingTests: failingTestsOf(check, parsed),
+    ...(check.flakyAgain?.length ? { flakyAgain: check.flakyAgain } : {}),
     selftestVerdict: check.selftest?.verdict ?? null,
     selftestReason: check.selftest?.reason ?? null,
     unread: (check.selftest?.unread ?? []).map((u) => ({ command: u.command, reason: u.reason })),
@@ -701,6 +726,11 @@ export function createFullVerification ({
         ...(incomplete ? { incomplete } : {}),
         verdict: incomplete ? 'incomplete' : check.gating === 'passed' ? 'green' : 'red'
       })
+      // Before the finally below destroys the instance: each failed test alone on it (full-verification-rerun.mjs).
+      if (entry.verdict !== 'green') {
+        await rerunFailed(record, { entry, infra, check, target, home, driveId, workspace })
+        if (entry.rerun?.state === 'ran') await fs.writeFile(path.join(home, 'drive.json'), JSON.stringify({ driveId, cycleId: record.id, project: entry.project, fullVerification: { check, rerun: entry.rerun } }, null, 2))
+      }
     } catch (error) {
       Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
     } finally {
@@ -714,6 +744,49 @@ export function createFullVerification ({
     entry.endedAt ??= clock.iso()
     entry.durationMs = Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt))
     await write(record)
+  }
+
+  /**
+   * A red or incomplete instance entry: rerun each failed test alone on the instance the suite used, before it is
+   * destroyed, when rerunPlan allows it (full-verification-rerun.mjs); else record why not. One drive per command
+   * (`checks/full-verification-rerun-<n>/`), with no load or restart: the instance is still this process's, so the
+   * drive is not fresh and runs only the rerun and the collectors. Every test passed alone: the entry is green and
+   * names its flaky tests, which leave their lines in the project's selftest history. Never throws: a rerun that
+   * breaks leaves the entry as the suite left it.
+   */
+  async function rerunFailed (record, { entry, infra, check, target, home, driveId, workspace }) {
+    const settings = rerunSettings(infra)
+    try {
+      const reports = check.result ? await readReports({ runDir: home, check: check.result, target }) : []
+      const plan = rerunPlan({ settings, incomplete: Boolean(entry.incomplete), check, suiteRan: entry.suiteRan, suiteId: infra.testDrive.modules.instance.fullSuite.test.id,
+        reports, baseFailed: check.baseFailed ?? null, previousFlaky: check.baseline?.flaky ?? [] })
+      const bound = settings.maxTests ?? null
+      if (plan.skip) { entry.rerun = { state: 'skipped', ...plan.skip, bound, ...(plan.reported !== undefined ? { reported: plan.reported } : {}) }; return }
+      entry.rerun = { state: 'running', bound, reported: plan.reported, tests: [], drives: [] }
+      await write(record).catch(() => {})
+      for (const [i, group] of rerunCommands(plan.tests, settings).entries()) {
+        const rerunTarget = { ...target, commands: [fill(group.command, target.stageInstance)] }
+        const result = await (drive ?? runChecks)({ target: rerunTarget, revision: null, base: true, dirName: `${RERUN_DIR}-${i + 1}`, baseCommit: workspace.baseCommit, workspacePath: workspace.path, gitDir: workspace.gitDir ?? null, runDir: home, clock, runId: driveId })
+        const judged = judgeRerun({ drive: result, command: rerunTarget.commands[0], tests: group.tests, reports: await readReports({ runDir: home, check: result, target: rerunTarget }), target: rerunTarget })
+        entry.rerun.drives.push({ dir: result.dir ?? null, command: group.command.id, result: result.result ?? null, at: result.at ?? clock.iso(), tests: group.tests.map((t) => t.test) })
+        entry.rerun.tests.push(...judged.map((t) => ({ ...t, first: 'failed', dir: result.dir ?? null })))
+      }
+      const flaky = entry.rerun.tests.filter((t) => t.rerun === 'passed')
+      Object.assign(entry.rerun, { state: 'ran', outcome: flaky.length === entry.rerun.tests.length ? 'all-passed' : 'some-not-passed' })
+      if (flaky.length) {
+        entry.flaky = flaky.map(({ command, test, module, dir }) => ({ command, test, ...(module ? { module } : {}), dir }))
+        try {
+          const dir = path.join(issues.ISSUES_DIR, entry.project, '.selftest-history')
+          for (const line of flakyHistoryLines({ project: entry.project, driveId, flaky, suiteCheck: check.result, rerunAt: entry.rerun.drives.at(-1)?.at, baseCommit: workspace.baseCommit, at: clock.iso() })) await recordDrive(dir, line, { now: clock.now() })
+        } catch (error) {
+          entry.rerun.historyError = error.message
+        }
+      }
+      if (entry.rerun.outcome === 'all-passed') entry.verdict = 'green'
+    } catch (error) {
+      entry.rerun = { ...(entry.rerun ?? {}), state: 'failed', error: error.message }
+      delete entry.flaky
+    }
   }
 
   async function runStage (record, entry, hosts = new Map()) {
@@ -761,6 +834,7 @@ export function createFullVerification ({
       // The released snapshot was tested only when its full drive ran every required command to an answer of its own
       // (no skip, timeout, signal or unavailable) and a selftest report parsed out of a report command's output.
       entry.suiteRan = check?.result ? await fullTierRanOf({ runDir: entry.runDir, check: check.result, selftest: check.selftest }) : null
+      if (entry.verdict === 'red') entry.rerun = { state: 'skipped', reason: 'release-mode', message: 'a release-mode stage has no instance of the cycle\'s own to rerun a failed test on' }
       entry.coverageEstablished = Boolean(run.release?.status === 'completed' && entry.suiteRan)
     } catch (error) {
       Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message }, coverageEstablished: false })
@@ -783,6 +857,8 @@ export function createFullVerification ({
     } catch (error) {
       record.outcome.error = error.message
     }
+    // After the checkpoint chain or the red issues: the flaky tests of every entry not red, never silent.
+    await noteFlaky(record).catch((error) => { record.outcome.flakyError = error.message })
     record.outcome.endedAt = clock.iso()
     await write(record).catch(() => {})
   }
@@ -838,12 +914,19 @@ export function createFullVerification ({
       out.push(item)
       try {
         const failures = []
-        for (const f of entry.check?.failingTests ?? []) failures.push({ ...f, excerpt: await excerptOf({ runDir: entry.runDir, dir: entry.check.dir, command: f.command, test: f.test, commands: entry.check.failedCommands ?? [] }) })
+        // After a rerun only the tests that failed again (or whose rerun proved nothing) fail; the flaky ones are named apart.
+        const failing = entry.rerun?.state === 'ran'
+          ? entry.rerun.tests.filter((t) => t.rerun !== 'passed').map((t) => ({ command: t.command, test: t.test, basis: t.rerun === 'failed' ? 'failed-twice' : 'not-observed',
+            message: t.rerun === 'failed' ? `Failed in the whole suite and again alone on the same instance (rerun in ${t.dir}).` : `Failed in the whole suite; its rerun alone proved nothing: ${t.why} (rerun in ${t.dir}).` }))
+          : entry.check?.failingTests ?? []
+        for (const f of failing) failures.push({ ...f, excerpt: await excerptOf({ runDir: entry.runDir, dir: entry.check.dir, command: f.command, test: f.test, commands: entry.check.failedCommands ?? [] }) })
         const unread = entry.check?.unread ?? []
+        const flaky = entry.flaky ?? []
         item.failingCount = failures.length
-        const parts = failures.length || unread.length ? failureAttachments({ name, failures, unread, maxBytes: maxAttachmentBytes }) : []
+        if (flaky.length) item.flaky = flaky.map((f) => `${f.command}: ${f.test}`)
+        const parts = failures.length || unread.length || flaky.length ? failureAttachments({ name, failures, unread, flaky, maxBytes: maxAttachmentBytes }) : []
         const issue = await issues.createIssue(entry.project, {
-          input: redIssueReport({ record, entry, name, stage, failures, unread, parts }),
+          input: redIssueReport({ record, entry, name, stage, failures, unread, flaky, parts }),
           openedBy: { user: 'engine', from: { project: entry.project, runId: entry.runId ?? null, via: 'full-verification', cycle: record.id } }
         })
         item.issueId = issue?.id ?? null
@@ -857,6 +940,47 @@ export function createFullVerification ({
         }
       } catch (error) {
         item.error = `${item.error ? `${item.error}; ` : ''}${error.message}`
+      }
+      await write(record).catch(() => {})
+    }
+  }
+
+  /**
+   * The flaky tests of every entry that is not red (a red one names them in its issue): a note on the project's open
+   * flaky-test issue (openedBy.from.subject 'flaky-tests', open, no disposition), else a new one. Recorded as
+   * `record.outcome.flaky`.
+   */
+  async function noteFlaky (record) {
+    const entries = record.projects.filter((e) => !e.verifiedThrough && e.verdict !== 'red' && e.flaky?.length)
+    if (!entries.length) return
+    const out = []
+    record.outcome.flaky = out
+    const later = Number(record.id.split('.').pop()) > 1
+    for (const entry of entries) {
+      const name = `Full verification ${later ? record.id : record.date}: flaky tests in ${entry.project}`
+      const item = { project: entry.project, issueId: null, noted: false, tests: entry.flaky.map((f) => `${f.command}: ${f.test}`) }
+      out.push(item)
+      try {
+        const blocks = []
+        for (const f of entry.flaky) {
+          const excerpt = await excerptOf({ runDir: entry.runDir, dir: entry.check?.dir, command: f.command, test: f.test, commands: entry.check?.failedCommands ?? [] })
+          blocks.push(failureBlock({ ...f, basis: 'flaky', message: `Failed in the whole suite, passed when rerun alone on the same instance (rerun in ${f.dir}).`, excerpt }))
+        }
+        const text = [`# ${name}`, '',
+          `The full verification ${record.id} found ${entry.flaky.length} ${plural(entry.flaky.length, 'test', 'tests')} of ${entry.project} that failed in the whole suite on ${entry.stage} and passed when rerun alone on the same instance. They did not make the stage red (the entry reads ${entry.verdict}). Each is recorded in issues/${entry.project}/.selftest-history/ as a failure and a pass on one tree, so the unstable classification sees it.`, '',
+          `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
+          `- Drive: \`${entry.driveId}\` on stage instance \`${entry.instance?.name ?? 'none'}\`; evidence \`${entry.runDir}\``, '',
+          `## Flaky tests (${entry.flaky.length})`, '', ...blocks].join('\n')
+        const open = (await issues.listIssues(entry.project)).find((i) => i.openedBy?.from?.via === 'full-verification' && i.openedBy.from.subject === 'flaky-tests' && (i.status ?? 'open') === 'open' && !i.disposition && !i.archived)
+        if (open) {
+          await issues.createEngineNote(entry.project, open.id, { name: 'flaky-tests', text, invocationId: `full-verification:${record.id}:flaky` })
+          Object.assign(item, { issueId: open.id, noted: true })
+        } else {
+          const issue = await issues.createIssue(entry.project, { input: text, openedBy: { user: 'engine', from: { project: entry.project, runId: null, via: 'full-verification', cycle: record.id, subject: 'flaky-tests' } } })
+          Object.assign(item, { issueId: issue?.id ?? null, name })
+        }
+      } catch (error) {
+        item.error = error.message
       }
       await write(record).catch(() => {})
     }

@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { runChecks } from './checks.mjs'
-import { compareFailures, compareSelftestReports, isSelftestReport, selftestReport, skippedSelftests } from './baseline-failures.mjs'
+import { compareFailures, compareSelftestReports, failedSelftests, isSelftestReport, selftestReport, skippedSelftests } from './baseline-failures.mjs'
 import { withInstance } from './instance-drive.mjs'
 import { exitedOnItsOwn } from './modules-tier.mjs'
 import { modulesTarget } from '../infrastructure.mjs'
@@ -118,8 +118,18 @@ export async function fullVerificationDrive ({ target, workspace, runDir, runId,
   const baseCheck = base ? { ...base, sourceRevision } : null
   const selftest = await compareSelftestReports({ runDir, target, base: baseCheck, candidate: check, sourceRevision })
   const failures = check.result === 'failed' ? await compareFailures({ runDir, target, base: baseCheck, candidate: check, sourceRevision }) : null
-  const gating = cycleGate(check, { failures, selftest })
-  return { result: check, baseline, selftest, failures, gating, files: await driveFiles(runDir, check), baseCommit: workspace.baseCommit }
+  let gating = cycleGate(check, { failures, selftest })
+  // A test the previous green entry passed only on its rerun (full-verification-rerun.mjs) is in that drive's report as
+  // failed; inherited, it would never gate again. A failure of it here is not inherited: it gates and is rerun.
+  const flaky = new Set((previous?.flaky ?? []).map((f) => f.test))
+  const reports = flaky.size ? await readReports({ runDir, check, target }) : []
+  const flakyAgain = reports.flatMap((r) => r.report ? failedSelftests(r.report).filter((test) => flaky.has(test)).map((test) => ({ command: r.command, test })) : [])
+  if (flakyAgain.length && gating === 'passed') gating = 'failed'
+  // What the previous green drive's reports fail: inherited, never rerun (null when it cannot be read whole).
+  const baseReports = base ? await readReports({ runDir, check: base, target }) : null
+  const baseFailed = baseReports?.length && baseReports.every((r) => r.report) ? [...new Set(baseReports.flatMap((r) => failedSelftests(r.report)))] : null
+  if (baseline && previous?.flaky?.length) baseline.flaky = previous.flaky.map(({ command, test }) => ({ command, test }))
+  return { result: check, baseline, selftest, failures, gating, ...(flakyAgain.length ? { flakyAgain } : {}), baseFailed, files: await driveFiles(runDir, check), baseCommit: workspace.baseCommit }
 }
 
 /**
@@ -144,7 +154,7 @@ export function instanceCycleTarget (infra, name) {
 const reportCommands = (target) => [...(target?.commands ?? []), ...(target?.finallyCommands ?? [])].filter((c) => isSelftestReport(c.report))
 
 /** Each declared report command that ran, with the report its own output holds (parsed), or why none. */
-async function readReports ({ runDir, check, target }) {
+export async function readReports ({ runDir, check, target }) {
   const out = []
   for (const { id } of reportCommands(target)) {
     if (!(check?.commands ?? []).some((c) => c.id === id)) continue

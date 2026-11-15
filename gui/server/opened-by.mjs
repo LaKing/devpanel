@@ -27,7 +27,8 @@ export function openedBy ({ user, host = PANEL_HOST, from = null }) {
     if (!VIA.includes(from.via)) throw Object.assign(new Error(`openedBy.from.via must be one of ${VIA.join(', ')}`), { status: 400 })
     if (from.via === 'full-verification') {
       if (!clean(from.cycle, 200)) throw Object.assign(new Error('openedBy.from of a full verification needs the cycle it came from'), { status: 400 })
-      record.from = { project: clean(from.project, 200), issueId: null, runId: clean(from.runId, 200), via: from.via, cycle: clean(from.cycle, 200) }
+      // `subject: 'flaky-tests'` marks a cycle's flaky-test issue, which a later cycle notes on while it is open.
+      record.from = { project: clean(from.project, 200), issueId: null, runId: clean(from.runId, 200), via: from.via, cycle: clean(from.cycle, 200), ...(from.subject === 'flaky-tests' ? { subject: 'flaky-tests' } : {}) }
       return record
     }
     if (!clean(from.issueId, 200)) throw Object.assign(new Error('openedBy.from needs the issue it came from'), { status: 400 })

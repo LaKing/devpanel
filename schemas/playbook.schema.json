@@ -918,6 +918,31 @@
                     "finallyCommands": {
                       "$ref": "#/$defs/checkTarget/properties/commands",
                       "description": "Optional: further collectors (the instance's project log, a browser-check report), after the tier's own; each names the instance."
+                    },
+                    "rerun": {
+                      "description": "The rerun of failed tests alone (docs/project-infrastructure.md \"The full verification on a stage instance\"). On by default: when the whole suite failed on named tests only, each failed test is run again alone on the same instance before it is destroyed; one that passes alone is flaky and does not make the entry red. It needs a command that selects named tests: `test` here, or `namedTests: true` to reuse the tier's `test` command with test names in place of its filters. With neither the entry records cannot-select-named-tests and stays red as before. `false` opts out.",
+                      "oneOf": [
+                        { "const": false },
+                        {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "properties": {
+                            "maxTests": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "description": "More distinct failed tests than this in the suite's report (inherited ones included) and an entry the gate made red is not rerun. It never overrides a passed gate: an entry whose every reported failure is inherited stays green. Default 10."
+                            },
+                            "namedTests": {
+                              "type": "boolean",
+                              "description": "true: the tier's `test` command accepts a test name where it takes a filter. `{{filter}}` then reruns one test per command, `{{filters}}` the failed tests of one module per command."
+                            },
+                            "test": {
+                              "$ref": "#/$defs/checkTarget/properties/commands/items",
+                              "description": "Optional: the selftest CLI for named tests on the instance, naming {{instance}} or {{instanceName}} and holding {{test}} (one test per command) or {{tests}} (the failed tests of one module per command) as a word of its own."
+                            }
+                          }
+                        }
+                      ]
                     }
                   }
                 }
