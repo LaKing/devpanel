@@ -62,8 +62,11 @@ export default async function (t) {
     await agent.chat('A note')
     await wait(() => sent.length === 2 && agent.get().pending === null)
     // Read from disk, not inferred from an inode number: a rename-based write may reuse a freed one.
-    await wait(async () => (await fs.readFile(stateFile, 'utf8')).includes('A note'))
-    t.ok('a real change is written as before', (await fs.readFile(stateFile, 'utf8')).includes('A note'))
+    // The message is in the chat file beside the state (supervisor-chat.mjs), the call it caused in the state.
+    const chatFile = path.join(dir, JSON.parse(await fs.readFile(stateFile, 'utf8')).chatFile)
+    await wait(async () => (await fs.readFile(chatFile, 'utf8')).includes('A note') && JSON.parse(await fs.readFile(stateFile, 'utf8')).lastPrompt?.invocationId === sent[1].meta.invocationId)
+    // The content and the call it names, not an inode: an atomic replacement may reuse a freed one.
+    t.ok('a real change is written as before', (await fs.readFile(chatFile, 'utf8')).includes('A note') && JSON.parse(await fs.readFile(stateFile, 'utf8')).lastPrompt?.invocationId === sent[1].meta.invocationId)
     await agent.stop()
     await agent.shutdown()
 

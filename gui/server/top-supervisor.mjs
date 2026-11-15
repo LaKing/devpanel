@@ -15,6 +15,7 @@ import { createStartGate, migrateStartLimits, accumulateHistory, emptyHistory } 
 import { runlessFence } from '../../harness/fence.mjs'
 import { appendLiveFile, readLiveFile } from './runtime/store.mjs'
 import { CONTEXT_BLOCKS, RESEND_AFTER_CHARS, composeContext, countAttempt, recordSent } from './supervisor-context.mjs'
+import { chatFileName, createChat } from './supervisor-chat.mjs'
 
 const fail = (message, status = 400) => Object.assign(new Error(message), { status })
 /** The log keeps errors for errors: a refused action is a warning without a stack, anything else a fault. */
@@ -129,8 +130,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   let state
   try { state = JSON.parse(await fs.readFile(file, 'utf8')) } catch (e) {
     if (e.code !== 'ENOENT') throw e
-    state = { status: 'stopped', session: null, model: null, messages: [], queue: [], ownedRuns: [], previews: {}, calls: 0, starts: 0, costUsd: 0, unknownCostCalls: 0, history: emptyHistory() }
+    state = { status: 'stopped', session: null, model: null, queue: [], ownedRuns: [], previews: {}, calls: 0, starts: 0, costUsd: 0, unknownCostCalls: 0, history: emptyHistory() }
   }
+  // The conversation, beside the state (supervisor-chat.mjs): loaded, or migrated from a state that still holds it, below.
+  let chat = createChat({ dir, file: chatFileName(state.chatFile) })
   let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null, pollPending = false
   // The running activation is ending because of the supervisor itself, not on an operator's Stop (settleStop).
   let ownEnding = false
@@ -156,8 +159,12 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
    * stored, so a New session cannot make it stale either.
    */
   const costReading = () => ({ reportedUsd: state.costUsd ?? 0, estimatedUsd: toUsd(state.estimatedCostUsdMicros ?? 0), estimatedCalls: state.estimatedCostCalls ?? 0, unknownCalls: state.unknownCostCalls ?? 0 })
-  const view = () => ({
-    ...structuredClone(state),
+  // The state is small; of the chat a reader gets the newest messages, bounded, and pages the rest (messages(), message()).
+  const view = () => {
+    const shown = chat.tail()
+    return {
+    ...structuredClone({ ...state, messages: shown.entries }),
+    chat: { total: shown.total, from: shown.from, shown: shown.entries.length, usage: chat.usage(), ...(chat.recovered ? { recovered: chat.recovered } : {}) },
     cost: costReading(),
     asking: asking ? { ...asking } : null,
     spending: {
@@ -168,13 +175,14 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       policy: spending.policy ?? null,
       ledger: { file: ledger.file, entries: ledger.entryCount, recovered: ledger.recovered, usage: spending.active ? ledger.usage() : null }
     }
-  })
+  }
+  }
   /*
    * Where the supervisor stands, small enough to poll: the app bar reads this
-   * every few seconds, and view() clones the whole state, conversation included.
+   * every few seconds; view() carries the newest part of the conversation.
    */
   const brief = () => {
-    const last = (state.messages ?? []).findLast((m) => m.role === 'assistant' && !m.side)
+    const last = chat.entries.findLast((m) => m.role === 'assistant' && !m.side)
     return {
       status: state.status,
       finishing: Boolean(state.finishing),
@@ -189,11 +197,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       // What this session's model calls cost, as the panel reports cost: tokens
       // and time. Replies recorded before durations were kept add tokens only,
       // and are counted so the time is not mistaken for complete.
-      usage: (state.messages ?? []).filter((m) => m.role === 'assistant' && m.usage).reduce((u, m) => ({
-        tokens: u.tokens + (Number(m.usage.tokens) || 0),
-        durationMs: u.durationMs + (Number(m.durationMs) || 0),
-        untimed: u.untimed + (Number.isFinite(m.durationMs) ? 0 : 1)
-      }), { tokens: 0, durationMs: 0, untimed: 0 }),
+      // Kept by the chat as replies come (supervisor-chat.mjs), never recounted per reading.
+      usage: chat.briefUsage(),
       ownedRuns: (state.ownedRuns ?? []).length,
       // The last call's prompt size (characters), what the unchanging blocks are measured by.
       lastPromptChars: state.lastPrompt?.chars ?? null,
@@ -203,13 +208,20 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   let writes = Promise.resolve()
   // The state as it was last written: a save that would write the same bytes writes nothing and tells
   // nobody. The poll saves every few seconds whether or not anything moved, and an idle activation used
-  // to rewrite the whole file each time.
+  // to rewrite the whole file each time. New chat messages are appended to the chat file first, then the
+  // state (which holds no chat) is written.
   let written = null
   async function save () {
     const bytes = JSON.stringify(state, null, 2)
-    if (bytes === written) return writes
+    const owed = chat.pending > 0
+    if (bytes === written && !owed) return writes
     const event = { status: state.status, reason: state.reason ?? null, calls: state.calls, starts: state.starts, operation: state.pending?.kind ?? null, invocationId: state.pending?.invocationId ?? null }
-    const write = writes.then(async () => { await writeAtomic(file, bytes); written = bytes; emit(event) })
+    const into = chat
+    const write = writes.then(async () => {
+      if (owed) await into.flush()
+      if (bytes !== written) { await writeAtomic(file, bytes); written = bytes }
+      emit(event)
+    })
     writes = write.catch(() => {})
     await write
   }
@@ -232,17 +244,29 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       if ((await fs.stat(entry).catch(() => null))?.mtimeMs < before) await fs.rm(entry, { force: true })
     }
   }
-  // A state written before prompts moved out carries one on every reply and recorded failure: moved once, here.
+  /*
+   * A state written before the chat moved out holds it as `messages`, and one written before prompts moved
+   * out carries a prompt on every reply and recorded failure. Such a state is the authority, and is migrated
+   * in this order, so a crash anywhere leaves it to be migrated again at the next start: (1) every prompt to
+   * its file and out of the entry, in memory (a prompt that cannot be kept stops the load, nothing written
+   * yet); (2) the chat file written whole from those entries, so no prompt can reach it; (3) the state saved
+   * without the chat, which ends it.
+   */
   {
+    const legacy = Array.isArray(state.messages)
+    if (!legacy) await chat.load()
+    const messages = legacy ? state.messages : chat.entries
     let moved = 0
-    for (const entry of [...(state.messages ?? []), ...(state.failureHistory ?? []), ...(state.pending ? [state.pending] : [])]) {
-      if (typeof entry.prompt !== 'string') continue
-      if (entry.invocationId) await keepPrompt(entry.invocationId, entry.prompt).catch(() => {})
+    for (const entry of [...messages, ...(state.failureHistory ?? []), ...(state.pending ? [state.pending] : [])]) {
+      if (typeof entry?.prompt !== 'string') continue
+      if (entry.invocationId) await keepPrompt(entry.invocationId, entry.prompt)
       entry.promptBytes = entry.prompt.length
       delete entry.prompt
       moved++
     }
-    if (moved) await save()
+    if (legacy || moved) await chat.rewrite(messages)
+    if (legacy) delete state.messages
+    if (legacy || moved || state.chatFile !== chat.file) { state.chatFile = chat.file; await save() }
   }
   /*
    * One call's cost into this session's accounting: reported, else estimated from
@@ -259,7 +283,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     } else state.unknownCostCalls = (state.unknownCostCalls ?? 0) + 1
     return { costUsd, estimate, cost: { usd: costUsd ?? estimate?.usd ?? null, basis: costUsd !== null ? 'reported' : estimate ? 'estimated' : 'unknown' } }
   }
-  function message (role, text, extra = {}) { state.messages.push({ id: crypto.randomUUID(), at: new Date().toISOString(), role, text, ...extra }) }
+  function message (role, text, extra = {}) { chat.append({ id: crypto.randomUUID(), at: new Date().toISOString(), role, text, ...extra }) }
   /*
    * What the runtime streams during a call, kept under live/<invocationId>.jsonl
    * and announced as {type:'live'} only after it is written, as for issue runs:
@@ -302,7 +326,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   const legacySpawnError = `could not start "${legacyCommand}": spawn ${legacyCommand} ENOENT`
   if (state.status === 'recovery-required' && state.pending?.kind === 'model' &&
       ['claude','codex'].includes(legacyCommand) && state.reason === legacySpawnError &&
-      state.messages.at(-1)?.role === 'system' && state.messages.at(-1)?.text === legacySpawnError) {
+      chat.entries.at(-1)?.role === 'system' && chat.entries.at(-1)?.text === legacySpawnError) {
     state.failureHistory ??= []
     state.failureHistory.push({ ...state.pending, error: state.reason, code: 'ENOENT', started: false, migrated: true })
     state.pending = null
@@ -778,7 +802,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         const context = await contextForPrompt(remaining.history)
         const prompt = JSON.stringify({
           // A reply discarded because its call came back on another session was written without this context.
-          history: state.session ? undefined : state.messages.filter((m) => !m.side && !m.discarded).slice(-30).map(({role,text,action})=>({role,text,action})),
+          history: state.session ? undefined : chat.entries.filter((m) => !m.side && !m.discarded).slice(-30).map(({role,text,action})=>({role,text,action})),
           event,
           replyFormat: 'exactly one JSON object {"message": string, "action": object|null}; prose outside it is allowed, a reply without it is rejected and repaired once',
           projects: await tools.projects(),
@@ -940,15 +964,15 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         }
         // How long the call took, beside its tokens: what the panel reports a call cost.
         message('assistant', response.response, { usage: response.usage, cost: spent.cost, durationMs: Date.now() - callStarted, invocationId, promptBytes: prompt.length, rawResponse: response.response })
-        const assistantMessage = state.messages.at(-1)
+        const assistantMessage = chat.entries.at(-1)
         state.pending = null; await save()
         if (controller.signal.aborted) break
         let answer
         try {
           answer = parseSupervisorResponse(response.response)
-          assistantMessage.protocol = { valid: true, repairAttempt: event.type === 'protocol-repair' ? event.attempt : 0 }
+          chat.amend(assistantMessage, { protocol: { valid: true, repairAttempt: event.type === 'protocol-repair' ? event.attempt : 0 } })
         } catch (error) {
-          assistantMessage.protocol = { valid: false, error: error.message }
+          chat.amend(assistantMessage, { protocol: { valid: false, error: error.message } })
           if (event.type === 'protocol-repair') throw Object.assign(fail(`Supervisor format repair exhausted: ${error.message}; no action from the invalid replies was executed`), { carryOn: true })
           message('system', `Supervisor reply format needs repair: ${error.message}. No action from that reply was executed.`)
           state.queue.unshift({ type: 'protocol-repair', attempt: 1, error: error.message,
@@ -956,7 +980,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           state.status = 'active'; await save()
           continue
         }
-        assistantMessage.text = answer.message
+        chat.amend(assistantMessage, { text: answer.message })
         if (answer.action) {
           state.pending = { kind: 'action', action: answer.action, at: new Date().toISOString() }; await save()
           let result
@@ -1150,7 +1174,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   // What the operator asked for, verbatim, for the provider to read: the mission and
   // the latest instructions, never a side question or the answer to one.
   function missionText () {
-    const said = state.messages.filter((m) => m.role === 'user' && !m.side && !m.questionId).slice(-3).map((m) => m.text)
+    const said = chat.entries.filter((m) => m.role === 'user' && !m.side && !m.questionId).slice(-3).map((m) => m.text)
     const parts = [...new Set([state.mission, ...said].filter(Boolean))].map((text) => String(text).slice(0, 2000))
     return parts.length ? parts.join('\n\n') : null
   }
@@ -1387,7 +1411,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       try { await ledger.reserve({ id: invocationId, subject: 'model-call', meta: { side: true } }) }
       catch (error) { throw fail(`The spending ledger could not record this call, so it was not made: ${error.message}`, 503) }
       message('user', text.trim(), { side: 'question', invocationId })
-      const question = state.messages.at(-1)
+      const question = chat.entries.at(-1)
       asking = { questionId: question.id, invocationId }
       forkMarks++; state.ownUsageSession = null
       await save()
@@ -1440,6 +1464,15 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       await save(); emit({ type: 'question', questionId: q.id }); kick()
       return view()
     }),
+    /** Older chat messages, a bounded page ending before index `before` (the reading's `chat.from`), each bounded as in the reading. */
+    messages: ({ before, limit } = {}) => structuredClone(chat.page({ before, limit })),
+    /** One chat message whole, on request: what a bounded one left out. */
+    message: (id) => {
+      if (typeof id !== 'string' || !/^[A-Za-z0-9-]+$/.test(id)) throw fail('Invalid message id')
+      const entry = chat.entry(id)
+      if (!entry) throw fail('No such message', 404)
+      return structuredClone(entry)
+    },
     /** Open questions, for Needs attention and the issue page. */
     questions: () => structuredClone((state.questions ?? []).filter((q) => !q.answer)),
     /** What a call was sent, read from beside the state (keepPrompt); null when it was not kept or has been pruned. */
@@ -1492,8 +1525,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       clearInterval(timer)
       const archivedAt = new Date().toISOString()
       const archive = path.join(dir, `state.${archivedAt.replace(/[:.]/g, '-')}.json`)
-      const previous = { session: state.session, messages: state.messages.length, pending: state.pending ?? null, ownedRuns: state.ownedRuns.length, costUsd: state.costUsd, cost: costReading() }
-      await writeAtomic(archive, JSON.stringify(state, null, 2))
+      const previous = { session: state.session, messages: chat.total, pending: state.pending ?? null, ownedRuns: state.ownedRuns.length, costUsd: state.costUsd, cost: costReading() }
+      // The archive keeps its format: the whole previous chat inline, as `messages`.
+      await writeAtomic(archive, JSON.stringify({ ...state, messages: chat.entries }, null, 2))
       const { model, focus, campaign, deferred, limits, allowArchive, mission, launches: allLaunches, ownedRuns: allOwned, startBudgetVersion, startLimitMigration } = state
       // Session allowances end with the session. What was used is added to the
       // history, which is accounting: it is shown, never enforced.
@@ -1503,12 +1537,16 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       const ownedRuns = allOwned.filter((r) => OPEN_RUN.includes(r.status) || !r.status)
       const launches = allLaunches.filter((a) => a.status !== 'finished')
       const retired = { runs: allOwned.length - ownedRuns.length, launches: allLaunches.length - launches.length }
-      state = { status: 'stopped', session: null, model, focus, campaign, deferred, limits, allowArchive, mission, messages: [], queue: [], ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
+      // The new conversation gets a file of its own: until the state naming it is saved, the old state still names the old one.
+      const previousChat = chat
+      chat = createChat({ dir, file: `chat-${archivedAt.replace(/[:.]/g, '-')}.jsonl` })
+      state = { status: 'stopped', session: null, model, focus, campaign, deferred, limits, allowArchive, mission, chatFile: chat.file, queue: [], ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
         reset: { at: archivedAt, archive: path.basename(archive), previous, retired } }
       message('system', `Fresh session. The previous conversation (${previous.messages} messages${previous.pending ? ', one unreconciled operation' : ''}) is archived as ${path.basename(archive)}.` +
         (retired.runs ? ` ${retired.runs} settled run${retired.runs === 1 ? '' : 's'} moved into that archive; ${ownedRuns.length === 0 ? 'nothing is still open' : `${ownedRuns.length} still open`}.` : '') +
         ` Model calls, run starts, starts per issue and failed-launch guards begin again from zero; ${spending.active ? 'the daily and monthly spending windows continue, because they describe calendar spending' : 'no spending policy is configured, so the session limits are the only bound'}. The next Start opens a new native session.`)
       await save()
+      if (previousChat.file !== chat.file) await fs.rm(path.join(dir, previousChat.file), { force: true })
       return view()
     }),
     shutdown: () => {

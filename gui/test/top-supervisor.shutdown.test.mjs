@@ -41,7 +41,9 @@ export default async function (t) {
     const saved = JSON.parse(await fs.readFile(path.join(dir, 'state.json'), 'utf8'))
     t.eq('the session is kept, stopped', [saved.status, saved.session?.id], ['stopped', 's'])
     t.ok('and still owns the run', saved.ownedRuns.some((r) => r.runId === 'r1'))
-    t.ok('the chat says why nothing was stopped', saved.messages.some((m) => m.role === 'system' && /service is shutting down/.test(m.text)))
+    // The chat is the file beside the state that the state names (supervisor-chat.mjs).
+    const chat = (await fs.readFile(path.join(dir, saved.chatFile), 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
+    t.ok('the chat says why nothing was stopped', chat.some((m) => m.role === 'system' && /service is shutting down/.test(m.text)))
 
     const again = await h.open()
     t.eq('the next service start finds it stopped', again.get().status, 'stopped')

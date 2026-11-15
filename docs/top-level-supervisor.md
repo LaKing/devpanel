@@ -381,7 +381,38 @@ usage. What each call was sent is kept beside the state, not in it:
 status. A prompt once held the whole panel (infrastructure, models, playbooks) on every
 call, so a few hundred of them inside `state.json` made it tens of megabytes, serialised and
 rewritten at every save and cloned for every reader. A state written that way is
-converted once, at load; prompt files older than 14 days are removed. The poll
+converted once, at load; prompt files older than 14 days are removed.
+
+The chat (every message, tool result and side question of the session) is not in
+`state.json` either: it is `issues/.supervisor/chat.jsonl`, or the file `state.chatFile`
+names, one message per line, appended at each save before the state is written
+(`server/supervisor-chat.mjs`). A message changed after it was written (a reply's protocol
+verdict and its parsed text) is an amendment line `{amend: id, set}`, folded in at load; a
+torn final line is dropped and reported as `chat.recovered`. A 4 MB chat inside the state
+was serialised at every save and cloned and sent whole to every page on every state change,
+which kept the panel's process at half a core while the supervisor worked. The whole chat
+stays in the process's memory (the history for a new native session and the mission are
+read from it, so prompts are unchanged); readers get it bounded: `GET /api/supervisor`
+carries the newest messages (at most 200 and 256 kB) as `messages`, with
+`chat {total, from, shown, usage}`; `GET /api/supervisor/messages?before=<index>&limit=<n>`
+returns the older ones a page at a time (at most 500 messages and 512 kB, `entries`, `from`,
+`total`), which the Supervisor page's "Load earlier messages" reads; a message whose line is
+over 16 kB is given in a bounded form (texts cut to 8 000 characters, larger fields left out,
+`truncated {bytes, fields}`) and read whole only through `GET /api/supervisor/messages/:id`
+("Show in full"). The limits are UTF-8 bytes on the wire, envelope included. Each message's
+size and bounded form are worked out once, when it is added or changed (never at a reading), and the usage
+totals (the reading's `chat.usage`, the status's `usage`) are kept as replies come, so a
+reading touches only the messages it returns. A message line read twice at load (an append
+whose bytes reached the file but whose fsync failed, then retried) counts once, and a write
+after a failed one starts on a fresh line. Chat writes run one at a time and what a failed
+one left is written again before anything newer, so a restart reads every message and
+amendment in the order memory holds them. A migrated message without an id gets
+`m-legacy-<index>`, so it can be read whole too. The socket event `supervisor:changed` carries no chat. A state that still
+holds `messages` is migrated at load, in this order so a crash anywhere repeats it: every
+embedded prompt to its file and out of its entry (a prompt that cannot be kept stops the
+load), then the chat file written whole, then the state saved without it. New session
+archives `state.<ts>.json` with the whole previous chat inline, as before, starts the new
+conversation in `chat-<ts>.jsonl` and removes the old file once the new state is saved. The poll
 itself is never queued twice: a tick that finds a poll queued or running is skipped, so
 an operator action (a message, an answer, Stop) waits behind one poll at most.
 A session owns its settled runs until New session, and the poll reads every owned run:
@@ -399,13 +430,14 @@ action from an invalid reply executes. A second invalid reply stops the supervis
 with both raw responses and the validation errors retained in history.
 The API and socket use the existing authenticated channel:
 
-- `GET /api/supervisor` and `/api/supervisor/models`
+- `GET /api/supervisor` (the state, with the newest chat messages bounded) and `/api/supervisor/models`
+- `GET /api/supervisor/messages?before=&limit=` (older chat messages, a bounded page) and `GET /api/supervisor/messages/:id` (one message whole)
 - `POST /api/supervisor/start` — model, message, limits (`maxCalls`, `maxStartsPerIssue`, `maxRuns`, `maxConcurrent`), `allowArchive`, and an optional `focus` (project ids to attend to first; `projects` is still accepted as its old name)
 - `POST /api/supervisor/messages` — text
 - `POST /api/supervisor/campaign` — `campaign` (`{projects, leaveReporters}`, or null to clear), `actor`; any status
 - `POST /api/supervisor/stop`
 - `POST /api/supervisor/finish` and `POST /api/supervisor/reset`
-- `supervisor:changed` socket event triggers rereading durable state.
+- `supervisor:changed` socket event triggers rereading durable state; it carries no chat.
 
 What the supervisor is shown is a **summary**, never the panel's full view: a
 run lists its steps with roles, verdicts, validity and usage, plus closure,

@@ -20,10 +20,18 @@ const modelOptions=computed(()=>models.value.map(m=>({...m,title:m.launchReady==
 const active=computed(()=>['active','working','stopping'].includes(state.value?.status))
 const chatArea=ref(null), activationPanel=ref(null), following=ref(true)
 async function configure(){following.value=false;await nextTick();if(activationPanel.value)activationPanel.value.open=true;if(chatArea.value)chatArea.value.scrollTop=0}
-const hasMessages=computed(()=>Boolean(state.value?.messages?.length))
+// The chat lives beside the state: a reading carries its newest messages (chat.from onwards), older ones are
+// loaded a page at a time, and a message shown bounded (truncated) is read whole only when asked for.
+const loaded=ref(new Map()), full=ref({})
+function absorb(from,list){const next=new Map(loaded.value);list.forEach((m,i)=>next.set(from+i,m));loaded.value=next}
+const earlierFrom=computed(()=>{const c=state.value?.chat;if(!c)return 0;let first=c.from;while(loaded.value.has(first-1))first--;return first})
+const shownMessages=computed(()=>{const c=state.value?.chat;if(!c)return state.value?.messages??[];const out=[];for(let i=earlierFrom.value;i<c.total;i++){const m=loaded.value.get(i);if(m)out.push(full.value[m.id]??m)}return out})
+const loadEarlier=()=>run(async()=>{following.value=false;const page=await api.supervisorMessages(earlierFrom.value,200);absorb(page.from,page.entries)})
+const showFull=(m)=>run(async()=>{const whole=await api.supervisorMessage(m.id);full.value={...full.value,[m.id]:whole}})
+const hasMessages=computed(()=>Boolean(shownMessages.value.length))
 function trackScroll(){const el=chatArea.value;if(el)following.value=el.scrollHeight-el.scrollTop-el.clientHeight<80}
 async function latest(){following.value=true;await nextTick();const el=chatArea.value;if(el)el.scrollTop=hasMessages.value?el.scrollHeight:0}
-watch(()=>[state.value?.messages?.length,state.value?.messages?.at(-1)?.text,state.value?.status],async()=>{if(following.value)await latest()},{flush:'post'})
+watch(()=>[shownMessages.value.length,shownMessages.value.at(-1)?.text,state.value?.status],async()=>{if(following.value)await latest()},{flush:'post'})
 function readable(m){
  if(m.protocol?.valid===false)return 'Reply could not be used. See technical details for the original response.'
  if(m.role!=='assistant')return m.text
@@ -42,7 +50,7 @@ function actionSummary(m){
  return 'Response recorded'
 }
 let timer, sequence=0
-async function refresh(){const seq=++sequence;try{const next=await api.supervisor();if(seq===sequence){state.value=next;refreshError.value=''}}catch(e){if(seq===sequence)refreshError.value=e.message}}
+async function refresh(){const seq=++sequence;try{const next=await api.supervisor();if(seq===sequence){if(next.chat&&(next.reset?.at!==state.value?.reset?.at||next.chat.total<(state.value?.chat?.total??0))){loaded.value=new Map();full.value={}}if(next.chat)absorb(next.chat.from,next.messages);state.value=next;refreshError.value=''}}catch(e){if(seq===sequence)refreshError.value=e.message}}
 async function run(fn){busy.value=true;error.value='';try{await fn();await refresh()}catch(e){error.value=e.message}finally{busy.value=false}}
 const start=()=>run(()=>api.startSupervisor({model:model.value,focus:selected.value,message:mission.value,allowArchive:allowArchive.value,limits:{maxCalls:Number(maxCalls.value),maxRuns:Number(maxRuns.value),maxConcurrent:Number(maxConcurrent.value),maxStartsPerIssue:Number(maxStartsPerIssue.value)}}))
 const canReset=computed(()=>['stopped','recovery-required'].includes(state.value?.status)&&(hasMessages.value||!!state.value?.session||!!state.value?.pending))
@@ -60,7 +68,7 @@ const who=(m)=>m.side==='question'?'You · side question':m.side==='answer'?'Sup
 onMounted(async()=>{await run(async()=>{[models.value,projects.value]=await Promise.all([api.supervisorModels(),api.listProjects()]);await refresh();if(state.value?.model){model.value=state.value.model.id;selected.value=state.value.focus??[];mission.value=state.value.mission??state.value.messages.filter(m=>m.role==='user').at(-1)?.text??'Continue managing the panel.';allowArchive.value=state.value.allowArchive===true;if(state.value.limits){maxCalls.value=state.value.limits.maxCalls;maxRuns.value=state.value.limits.maxRuns;maxConcurrent.value=state.value.limits.maxConcurrent;if(state.value.limits.maxStartsPerIssue)maxStartsPerIssue.value=state.value.limits.maxStartsPerIssue}}});socket.on('supervisor:changed',refresh);socket.on('connect',refresh);timer=setInterval(refresh,5000)})
 onUnmounted(()=>{clearInterval(timer);socket.off('supervisor:changed',refresh);socket.off('connect',refresh)})
 // The session's model calls, as cost is reported: time and tokens.
-const callUsage=computed(()=>supervisorUsage(state.value?.messages??[]))
+const callUsage=computed(()=>state.value?.chat?.usage??supervisorUsage(state.value?.messages??[]))
 const callCost=computed(()=>supervisorCost(state.value?.cost))
 const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
 </script>
@@ -125,12 +133,14 @@ const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
   </details>
   <v-alert v-if="state?.status==='recovery-required'" type="warning" variant="tonal">The previous operation needs reconciliation. It will not be replayed automatically. Chat history and pending operation are retained. Investigate what it may have started, then use New session to begin afresh.<details v-if="state.pending"><summary>Pending operation</summary><pre>{{JSON.stringify(state.pending,null,2)}}</pre></details></v-alert>
   <section aria-label="Supervisor conversation" class="conversation">
-   <article v-for="m in state?.messages??[]" :key="m.id" :class="['message',m.role]">
+   <button v-if="earlierFrom>0" type="button" class="earlier" :disabled="busy" @click="loadEarlier">Load earlier messages ({{earlierFrom}})</button>
+   <article v-for="m in shownMessages" :key="m.id" :class="['message',m.role]">
     <div class="message__head"><strong>{{who(m)}}</strong><time>{{new Date(m.at).toLocaleString()}}</time></div>
     <template v-if="m.role==='tool'">
      <div class="action-summary"><strong>{{actionTitles[m.action?.type]??'Engine action'}}</strong><span v-if="m.action?.issueId"> · {{m.action.issueId}}</span><span v-else-if="m.action?.project"> · {{m.action.project}}</span><p>{{actionSummary(m)}}</p></div>
     </template>
     <MarkdownText v-else :text="readable(m)" compact />
+    <p v-if="m.truncated" class="truncated">Shown in part ({{Math.round(m.truncated.bytes/1024)}} kB). <button type="button" :disabled="busy" @click="showFull(m)">Show in full</button></p>
     <button v-if="m.role==='assistant'&&m.invocationId" type="button" class="reasoning-toggle" @click="toggleReasoning(m.invocationId)">{{reasoningOpen.has(m.invocationId)?'Hide reasoning':'Reasoning'}}</button>
     <LiveOutput v-if="m.role==='assistant'&&m.invocationId&&reasoningOpen.has(m.invocationId)" supervisor :invocation-id="m.invocationId" role="supervisor" />
     <details v-if="m.role==='tool'||m.rawResponse||m.protocol?.valid===false" class="technical" @toggle="onTechnical(m.id,$event)"><summary>Technical details</summary><div v-if="technicalOpen.has(m.id)" class="technical__body"><StructuredBody :text="m.rawResponse??m.text" /></div><details class="technical__raw"><summary>Exact text</summary><pre>{{m.rawResponse??m.text}}</pre></details></details>
@@ -173,7 +183,7 @@ const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
 @media(max-width:600px){.activation-heading{padding:18px;gap:12px}.activation-icon{width:40px;height:40px;border-radius:11px}.activation-title h2{font-size:1.15rem}.activation-eyebrow{font-size:.58rem}.activation-subtitle{font-size:.75rem}.activation-body{padding:18px}.settings{grid-template-columns:minmax(0,1fr);gap:14px}.activation-limits{padding:16px 12px 6px}.limits-heading>span{display:none}.activation-footer{flex-direction:column;align-items:stretch;gap:16px}.activation-start{width:100%}}
 .message{border-radius:10px;padding:10px 12px;margin:8px 0;overflow-wrap:anywhere;max-width:92%}.message.user{background:rgba(var(--v-theme-primary),.09);margin-left:auto;max-width:85%;width:fit-content}.message.assistant{background:rgb(var(--v-theme-surface))}.message.tool,.message.system{border-left:2px solid rgba(var(--v-theme-on-surface),.18);border-radius:0;font-size:.85rem}
 .message__head{display:flex;gap:12px;align-items:center;margin-bottom:4px;font-size:.8rem}time{opacity:.6;font-size:.7rem}.technical{margin-top:5px;font-size:.75rem}.technical>summary{opacity:.8}.technical__body{margin:6px 0;padding:8px 10px;border-radius:6px;max-height:420px;overflow:auto;background:rgba(var(--v-theme-on-surface),.04);font-size:.8125rem}.technical__raw{margin-top:4px;opacity:.8}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.75rem;max-height:320px;overflow:auto}code{overflow-wrap:anywhere}
-.composer{flex:none;display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:10px 0;border-top:1px solid rgba(var(--v-theme-on-surface),.12)}.composer small{grid-column:1/-1;font-size:.7rem;opacity:.65}.latest{position:absolute;bottom:115px;align-self:center;background:rgb(var(--v-theme-surface));border:1px solid rgba(var(--v-theme-on-surface),.2);border-radius:20px;padding:6px 14px;box-shadow:0 2px 8px #0002;font-size:.8rem}.owned-runs{font-size:.85rem;padding:10px}
+.composer{flex:none;display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:10px 0;border-top:1px solid rgba(var(--v-theme-on-surface),.12)}.composer small{grid-column:1/-1;font-size:.7rem;opacity:.65}.latest{position:absolute;bottom:115px;align-self:center;background:rgb(var(--v-theme-surface));border:1px solid rgba(var(--v-theme-on-surface),.2);border-radius:20px;padding:6px 14px;box-shadow:0 2px 8px #0002;font-size:.8rem}.owned-runs{font-size:.85rem;padding:10px}.earlier{align-self:center;font-size:.8rem;opacity:.8;padding:4px 10px;border:1px solid rgba(var(--v-theme-on-surface),.2);border-radius:14px}.truncated{font-size:.75rem;opacity:.75}.truncated button{text-decoration:underline}
 @media(max-width:600px){.supervisor{padding:0 10px}.status-heading{gap:8px}.status-meta{font-size:.7rem}.message{max-width:100%;padding:8px}.message.user{max-width:92%}.message__head{gap:8px}}
 .working{display:flex;flex-direction:column;gap:6px;margin:8px 0}.reasoning-toggle{font-size:.75rem;opacity:.7;text-decoration:underline;margin-top:4px}.questions{display:flex;flex-direction:column;gap:8px;padding:8px 0}
 </style>

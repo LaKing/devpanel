@@ -40,6 +40,9 @@ export const api = {
   stopProjectAction: (project, operationId) => request(`/api/projects/${enc(project)}/actions/operations/${enc(operationId)}/stop`, { method: 'POST' }),
   supervisor: () => request('/api/supervisor'),
   supervisorStatus: () => request('/api/supervisor/status'),
+  /** The supervisor's chat: older messages a page at a time (ending before index `before`), one message whole. */
+  supervisorMessages: (before, limit = 200) => request(`/api/supervisor/messages?before=${Number(before)}&limit=${Number(limit)}`),
+  supervisorMessage: (id) => request(`/api/supervisor/messages/${enc(id)}`),
   supervisorModels: () => request('/api/supervisor/models'),
   startSupervisor: (options) => request('/api/supervisor/start', { method: 'POST', body: JSON.stringify(options) }),
   askSupervisor: (text) => request('/api/supervisor/ask', { method: 'POST', body: JSON.stringify({ text }) }),

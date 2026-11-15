@@ -463,6 +463,13 @@ app.get('/api/supervisor/live/:invocationId', route(async (req, res) => {
 }))
 app.get('/api/supervisor/questions', route(async (_req, res) => res.json(topSupervisor.questions())))
 app.post('/api/supervisor/questions/:id/answer', route(async (req, res) => res.json(await topSupervisor.answerQuestion(req.params.id, req.body ?? {}))))
+// The chat beside the state (supervisor-chat.mjs): GET /api/supervisor carries only its newest messages, bounded.
+// Older ones a page at a time, ending before index `before`; one message whole only when asked for.
+app.get('/api/supervisor/messages', route(async (req, res) => {
+  const number = (v) => (v === undefined ? undefined : Number(v))
+  res.json(topSupervisor.messages({ before: number(req.query.before), limit: number(req.query.limit) }))
+}))
+app.get('/api/supervisor/messages/:id', route(async (req, res) => res.json(topSupervisor.message(req.params.id))))
 app.post('/api/supervisor/messages', route(async (req, res) => res.status(202).json(await topSupervisor.chat(req.body?.text))))
 app.post('/api/supervisor/stop', route(async (_req, res) => {
   const stopping = topSupervisor.stop()

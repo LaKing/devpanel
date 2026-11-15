@@ -40,7 +40,7 @@ onUnmounted(() => {
 })
 defineExpose({ load })
 /* The supervisor's model calls, as cost is reported: time and tokens. */
-const callUsage = computed(() => supervisorUsage(state.value?.messages ?? []))
+const callUsage = computed(() => state.value?.chat?.usage ?? supervisorUsage(state.value?.messages ?? []))
 </script>
 
 <template>

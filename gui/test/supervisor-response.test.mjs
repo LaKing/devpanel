@@ -25,7 +25,7 @@ export default async function(t){
   ['mark_landed without handChanges',{...landed.action,handChanges:undefined}],
   ['mark_landed with an unknown argument',{...landed.action,outcome:'resolved'}]
  ]){let refused=false;try{parseSupervisorResponse(JSON.stringify({message:'x',action}))}catch{refused=true}t.ok(label+' refused',refused)}
- const actual=JSON.parse(await fs.readFile(new URL('../../issues/.supervisor/state.json',import.meta.url),'utf8').catch(()=>'{"messages":[]}')).messages.findLast(m=>m.rawResponse?.startsWith('Five open issues, and my limits'))
+ const actual=JSON.parse(await fs.readFile(new URL('../../issues/.supervisor/state.json',import.meta.url),'utf8').catch(()=>'{"messages":[]}')).messages?.findLast(m=>m.rawResponse?.startsWith('Five open issues, and my limits'))
  if(actual)t.eq('recorded live failure now parses',parseSupervisorResponse(actual.rawResponse).action.type,'get_issue')
  async function scenario(replies,maxCalls=5){
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'supervisor-response-'));const calls=[],actions=[]
