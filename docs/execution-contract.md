@@ -1843,6 +1843,40 @@ The tool-free coordinator sees them as bounded excerpts beside the report and
 notes; the seats read the full files. The option is snapshotted with the other
 run options; a fresh evidence window keeps the inputs of the first.
 
+**Full verification evidence.** When the issue was opened by a full
+verification (`openedBy.from.via: 'full-verification'` with its `cycle`: a red
+issue or a flaky-test issue), or is an inquiry whose `inquiry.relatedIssue` is
+such an issue, the window also freezes that cycle's evidence under
+`cycle-evidence/` (`runtime/cycle-evidence.mjs`): `cycle.json`, the cycle's
+record filtered to the exposed projects, and each exposed entry's `checks/`
+(selftest report, project log, browser-check report, flaky reruns) from
+`issues/.verification/<date>/<cycle id>/<project>/checks/`, or from the
+project's run home `issues/<project>/.verification-<date>/runs/<runId>/checks/`
+for a stage driven by a Deployment run. The exposed projects are the issue's
+own and the members of a pool the record itself names with it under
+`outcome.bump` (`withheld[].members`, or `chain`/`notRun` steps of one
+framework); every other project's entry and every nested mention of one is
+left out of the copy, which says so in its `windowFilter` (projects, how many
+entries were left out, the original file and its sha256). No other cycle's
+record or directory is read, the evidence directories are computed from the
+cycle's layout rather than taken from the record, an evidence directory reached
+through a link anywhere below `issues/` is refused (the entry reads `refused`
+and nothing of it is copied), and links and special files inside are skipped. It is a copy under the window's evidence directory, which every
+seat fence binds read-only; seats never reach `issues/.verification` itself.
+Its caps are its own, beside the input budget: `windowLimits.maxCycleEvidenceFiles`
+(200), `maxCycleEvidenceBytes` (16 MiB) and `maxCycleEvidenceFileBytes` (1 MiB).
+A file over the per-file cap keeps its tail and its entry says `truncated` with
+a note; a file beyond the file or total cap is not copied and is listed under
+`omitted` with the cap that left it out, and a file or directory that cannot
+be read is listed there with its reason while the capture goes on; the capture's
+`note` sums these up. A capture that fails as a whole removes what it copied
+and reads `unreadable`, so nothing under the window is left unlisted.
+`window.cycleEvidence` lists every copied file (`file`, `source`, `sha256`,
+`bytes`, `totalBytes`) and the window summary in every prompt names it. When
+the cycle's record is gone the window says so (`state: 'pruned'`, with a note
+naming the cycle) and holds nothing of it; an unreadable record reads
+`unreadable`. A fresh evidence window keeps the first capture.
+
 **Symlinks.** A fingerprint records a symlink by its identity (its target
 string, mode `link`), never by what it reaches: following it would fingerprint
 content outside the candidate, and a write *through* it would change a live

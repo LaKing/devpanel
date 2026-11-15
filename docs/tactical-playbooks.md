@@ -208,7 +208,10 @@ folders and other unclassified `response.md` files are excluded. Published findi
 external reports retain their provenance and remain inputs to the issue they create. Default aggregate limits are
 100 files and 25 MiB, with a 25 MiB per-file limit; the manifest records copied bytes,
 files, exclusions and omissions. Configure `windowLimits.maxInputFiles`,
-`maxInputBytes`, and `maxInputFileBytes` in project YAML.
+`maxInputBytes`, and `maxInputFileBytes` in project YAML. A full verification issue's
+run (or an inquiry about one) also gets that cycle's evidence under its own caps,
+`maxCycleEvidenceFiles`, `maxCycleEvidenceBytes` and `maxCycleEvidenceFileBytes`
+(execution-contract.md "Full verification evidence").
 
 Prompts include the window summary and manifest path, plus the latest report from
 each seat/phase/step. Worker views retain up to 24 reports;

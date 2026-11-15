@@ -7,6 +7,7 @@ import { constants } from 'node:fs'
 import { writeJson, writeAtomic } from './persistence.mjs'
 import { priorRunSources } from './prior-runs.mjs'
 import { readIssueSizing } from './triage-sizing.mjs'
+import { captureCycleEvidence } from './cycle-evidence.mjs'
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 
 export async function captureWindow ({ issuePath, runId, workspace, evidence = [], previous = null, reason = 'run start', limits = {}, accumulate = false }) {
@@ -106,7 +107,16 @@ export async function captureWindow ({ issuePath, runId, workspace, evidence = [
   }
   // The issue's triage sizing as it stood when the run began (triage-sizing.mjs); a refresh keeps it.
   const sizing=previous?(previous.sizing??null):await readIssueSizing(issuePath)
-  const window={id,manifest:path.join(dir,'window.json'),sizing,inputBudget:previous?.inputBudget??inputBudget,previous:previous?.id??null,reason,startedAt,capturedAt:new Date().toISOString(),source:{path:workspace.path,baseCommit:workspace.baseCommit,base:workspace.base},files,inputs:previous?.inputs??inputs,accumulated:previous?previous.accumulated??null:accumulated,issues,coverage:'Source is the recorded snapshot; logs are bounded captures at the recorded times, not a continuous live view.'}
+  // The full verification evidence of a red issue, or of an inquiry's related one (cycle-evidence.mjs); a refresh keeps
+  // the first capture. It never stops a run from starting: a failure is recorded and stated.
+  let cycleEvidence=null
+  if(previous)cycleEvidence=previous.cycleEvidence??null
+  else try{cycleEvidence=await captureCycleEvidence({issuePath,dir,limits})}catch(e){
+    // Nothing half-copied stays under the seat-readable evidence root without being listed.
+    await fs.rm(path.join(dir,'cycle-evidence'),{recursive:true,force:true})
+    cycleEvidence={state:'unreadable',files:[],note:`The full verification evidence could not be captured, and what was copied of it was removed: ${e.message}`}
+  }
+  const window={id,manifest:path.join(dir,'window.json'),sizing,inputBudget:previous?.inputBudget??inputBudget,previous:previous?.id??null,reason,startedAt,capturedAt:new Date().toISOString(),source:{path:workspace.path,baseCommit:workspace.baseCommit,base:workspace.base},files,inputs:previous?.inputs??inputs,accumulated:previous?previous.accumulated??null:accumulated,cycleEvidence,issues,coverage:'Source is the recorded snapshot; logs are bounded captures at the recorded times, not a continuous live view.'}
   await writeJson(path.join(dir,'window.json'),window)
   return window
 }

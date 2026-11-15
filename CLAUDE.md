@@ -455,6 +455,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   (the top-level version fields located in the parsed document, nothing else changed), and changed paths no
   view holds, are `step.afterCommit` and `outcome.bump.untestedCommitted`, reported and never reverted; any red: no action, one issue
   per red project with its failing tests, excerpts and `failing-tests.md`, `openedBy.from {via: 'full-verification', cycle}`);
+  a run of such an issue, or an inquiry naming one as `relatedIssue`, gets that cycle's evidence frozen read-only into its window
+  (`runtime/cycle-evidence.mjs`, `window.cycleEvidence`: `cycle.json` filtered to the issue's project and a pool the record names
+  with it, each exposed entry's `checks/`, own caps `windowLimits.maxCycleEvidence*` with truncation and omission notes, `pruned`
+  when the record is gone; execution-contract.md "Full verification evidence");
   then thaws, resumes what it paused, keeps `issues/.verification/<date>/cycle.json` (`outcome`) and tells the top-level
   supervisor (`verification-ended`, always waking: outcome, record, evidence); it resolves no issue. execution-contract.md "Full verification freeze".
 - `runtime/path-overlap.mjs` — would this candidate write files another live run, of its project or another, is touching? Compared at the real destination, through links (`related` plays no part): expected paths from the issue's earlier runs (retained worktree, patch, plan text; none reads `unknown`, never `none`), a live run's from its worktree now and its plan. On readiness and preview as `pathOverlap`, an information prerequisite; every start reads it again and records `run.startOverlap`. It refuses nothing, for operator and supervisor alike. docs/top-level-supervisor.md "Readiness".

@@ -203,6 +203,21 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 200000
+        },
+        "maxCycleEvidenceFiles": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "maxCycleEvidenceBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 104857600
+        },
+        "maxCycleEvidenceFileBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 26214400
         }
       }
     }
