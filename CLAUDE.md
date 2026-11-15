@@ -769,7 +769,9 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   reserves its destination with `mkdir`; every generated id walks past an archived one (`-2`, `-3`; `publishFindings`
   reuses its own). A folder beside a bundle of one id, from before this, reads as the folder with `archivedTwin` on it
   and can be neither archived nor restored until someone decides. A report's `repeats` (a fingerprint match) and
-  `repeatLookup` (not known yet, rerun on read, kept in `<id>.repeat-lookup.json`) are `server/report-identity.mjs`.
+  `repeatLookup` (not known yet, rerun on read, kept in `<id>.repeat-lookup.json`) are `server/report-identity.mjs`. A fault report whose
+  fingerprint an open issue states opens nothing: it is recorded on that issue (`occurrences`, bounded) and answered 409, or 503
+  when the match cannot be read or is busy (`server/report-occurrences.mjs`, gui/README.md).
 
 ## Front-end conventions (`gui/src/`)
 

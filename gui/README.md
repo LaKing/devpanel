@@ -178,9 +178,30 @@ The key is `chmod 600` and `cert/` is git-ignored — it must never be committed
 > resubmitting. The panel logs that at info, not as a warning. An id an archived issue holds
 > is never taken (`-2`, `-3`, …, the record's `sameTitleAs` naming it), and two reports of one
 > title whose fingerprints differ are two issues. A fingerprint comes from the optional
-> `fingerprint` field or a labelled line of the report's text; a match with an earlier issue, on
-> any date, live or archived, is the record's `repeats` and a link on the issue page, never told
-> to the reporter. A lookup that could not finish says so (`repeatLookup`) and is rerun on read;
+> `fingerprint` field or a labelled line of the report's text.
+> **A fault that is already open is not opened again** (`server/report-occurrences.mjs`): a `fault`
+> report whose fingerprint an open issue of the project states (a folder with no archive marker, no
+> disposition, status open or unset) opens nothing. The occurrence is recorded on that issue and
+> answered like a resubmission, 409 `{error, project, id}`, so the reporter stops resending it. The
+> issue keeps `occurrences {count, firstAt, lastAt, recent}` (`occurrences.json` in its folder,
+> on the issue API and under the family links on the issue page) and each kept occurrence's report
+> text whole in `occurrences/<seq>.md`: when, the framework and application version, the release
+> receipt, the reporter's own count and the threads are read from that text, since the panel has no
+> format for them. The record is bounded: `count`, `firstAt` and `lastAt` count every occurrence,
+> only the newest 10 are kept, each text is at most 256 KiB (the route's body limit, so a reported
+> text is never cut) and the metadata is capped (name 200 characters, reporter 64, host 255), with
+> `occurrences.json` refused past 64 KiB; at most 2.5625 MiB per issue however long the fault recurs.
+> List rows carry only the counters. A match that may be open but whose record cannot be read, or
+> whose lock stays held, is answered 503 `{error, project, id, retryable: true}` with
+> `Retry-After: 60` and nothing is recorded or opened (whether the framework's reporter sends the
+> record again after a 503 is not confirmed). The **top-level supervisor is not woken** by an
+> occurrence: its issue poll compares id, status and name, which an occurrence leaves alone; it sees
+> `occurrences {count, lastAt}` on the issue's row and `{count, firstAt, lastAt}` in its summary the
+> next time it lists or reads the issue. Browsers get `issues:changed {reason: 'issue-occurrence'}`.
+> A match with an archived or decided issue, or one with a closed status, is news: a new issue
+> whose record names the earlier one as `repeats` (on any date, live or archived) and a link on the
+> issue page, never told to the reporter; so are `request` reports and reports without a readable
+> fingerprint, as before. A lookup that could not finish says so (`repeatLookup`) and is rerun on read;
 > its outcome is kept beside the bundle in `<id>.repeat-lookup.json`, so it survives archiving.
 > Allowed peers have a private address (10/8, 172.16/12, 192.168/16, fc00::/7) and no
 > `X-Forwarded-For` header, i.e. a sibling container reaching `https://<panel ip>/` directly;
@@ -338,7 +359,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `GET /api/projects` | re-scans `/srv` — every `*-project`, each with its issue count |
 | `GET /api/projects/:project/issues` | that project's issues, newest first; each with `family` (`server/issue-family.mjs`): `parent` (`openedBy.from`, `known: false` when it is in no folder and no bundle), `children`, `openChildren`, `waitingOn` (unsettled prerequisites; one in another project is `unknown`) and `blocks`. The list page nests children under their parent (`src/issue-tree.js`) while no column sort is set |
 | `POST /api/projects/:project/issues` | open one — `{ name }` |
-| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), optional `fingerprint`, answers `{ project, id, trust }` only, or 409 `{ error, project, id }` naming the issue already opened today; see the notes under "HTTPS" |
+| `POST /api/report/:project` | **no token**, private network only: open one from a project's container — `{ input }` (Markdown, always text), optional `fingerprint`, answers `{ project, id, trust }` only, or 409 `{ error, project, id }` naming the issue already opened today or the open issue a fault's occurrence was recorded on, or 503 `{ error, project, id, retryable }` (`Retry-After: 60`) when that open issue cannot be read or is busy; see the notes under "HTTPS" |
 | `GET /api/projects/:project/issues/:id` | one issue with its steps and files |
 | `GET /api/projects/:project/issues/:id/family` | `{parent, children, dependsOn, dependsOnReason, blocks}`, each member `{project, id, name, disposition, archived, packed, settled, run}` (packed issues included; an unreadable one `missing: true`). Provenance and order stay separate: a parent is not a prerequisite |
 | `POST /api/projects/:project/issues/:id/steps` | add the next step — `{ name }` |

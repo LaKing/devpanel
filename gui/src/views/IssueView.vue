@@ -18,6 +18,7 @@ import SupervisorQuestion from '@/components/SupervisorQuestion.vue'
 import CopyPath from '@/components/CopyPath.vue'
 import IssueStats from '@/components/IssueStats.vue'
 import IssueFamily from '@/components/IssueFamily.vue'
+import IssueOccurrences from '@/components/IssueOccurrences.vue'
 import PatchCheck from '@/components/PatchCheck.vue'
 import ContinueRun from '@/components/ContinueRun.vue'
 import { api } from '@/api'
@@ -917,6 +918,7 @@ watch(() => route.query.run, (runId) => {
             </button>
           </div>
           <IssueFamily :project="String(project)" :issue-id="issue.id" />
+          <IssueOccurrences v-if="issue.occurrences?.count" :occurrences="issue.occurrences" :packed="Boolean(issue.packed)" />
           <!-- An older issue archived under this id: restoring it is refused while this folder stands. -->
           <section v-if="issue.archivedTwin" class="head__twin" aria-label="An archived issue with this id">
             <p class="head__twin-title">

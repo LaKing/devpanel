@@ -31,6 +31,8 @@ export function issueRow (i) {
         priority: i.priority?.value ?? i.priority ?? null, disposition: i.disposition?.value ?? i.disposition ?? null,
         ...(i.report ? { report: { kind: i.report.kind ?? null, trust: i.report.trust ?? null, reporter: i.report.reporter ?? null } } : {}),
         ...(i.dependsOn?.length ? { dependsOn: i.dependsOn.map((d) => d.id ?? d) } : {}),
+        // Later occurrences of a reported fault: counted here, never a wake of their own (report-occurrences.mjs).
+        ...(i.occurrences?.count ? { occurrences: { count: i.occurrences.count, lastAt: i.occurrences.lastAt ?? null } } : {}),
         openedOn: i.openedOn ?? null,
         latestRun: i.latestRun ? { runId: i.latestRun.runId, status: i.latestRun.status, outcome: i.latestRun.outcome ?? null, blockedReason: i.latestRun.blockedReason ?? null } : null
     }

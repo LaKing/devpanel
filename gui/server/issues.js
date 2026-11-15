@@ -14,9 +14,10 @@ import { reconcilePending } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
 import { withLock } from './runtime/lock.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
-import { ARCHIVE_FILE, archiveState, requireUnarchived } from './issue-archive.mjs'
+import { ARCHIVE_FILE, archiveState, issueStatus, requireUnarchived } from './issue-archive.mjs'
 import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
 import { completePendingLookup, findRepeat, folderFingerprint, repeatOutcome, reportFingerprint } from './report-identity.mjs'
+import { findOpenMatch, occurrenceSummary, occurrenceTexts, readOccurrences, recordOccurrence } from './report-occurrences.mjs'
 import { openedBy as openedByRecord, derivedOpenedBy } from './opened-by.mjs'
 import { brief, families } from './issue-family.mjs'
 
@@ -178,9 +179,12 @@ async function readIssue (project, dirName) {
     // archived issue that only shares its title (report-identity.mjs).
     ...await repeatOutcome(ISSUES_DIR, project, dirName, meta),
     sameTitleAs: meta.sameTitleAs ?? null,
+    // Later occurrences of the fault this report opened, recorded here instead of new issues (report-occurrences.mjs);
+    // getIssue adds each kept entry's text.
+    occurrences: await readOccurrences(dir),
     // Distinct from any run's status: an issue stays open while a run is paused,
     // blocked, failed or cancelled.
-    status: ['open', 'resolved', 'abandoned'].includes(meta.status) ? meta.status : 'open',
+    status: issueStatus(meta),
     openedOn,
     openedAt: meta.openedAt ?? null,
     path: dir,
@@ -334,12 +338,13 @@ export async function listIssues (project, { archived = false } = {}) {
     if (!packed) continue
     for (const f of family.values()) if (f.parent?.id === parent && f.parent.project === project) Object.assign(f.parent, { known: true, name: packed.issue?.name ?? null, packed: true })
   }
-  const listed = issues.filter(Boolean).filter((issue) => issue.archived === archived).map((issue) => ({ ...issue, family: family.get(`${project}/${issue.id}`) }))
+  // Rows carry the occurrence counters only; the issue itself has the kept entries.
+  const listed = issues.filter(Boolean).filter((issue) => issue.archived === archived).map((issue) => ({ ...issue, occurrences: occurrenceSummary(issue.occurrences), family: family.get(`${project}/${issue.id}`) }))
   if (archived) {
     // Packed issues are no longer folders here; their summaries stand in.
     const present = new Set(listed.map((i) => i.id))
     for (const summary of await packedSummaries(ISSUES_DIR, project)) {
-      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, ...await repeatOutcome(ISSUES_DIR, project, summary.issue.id, summary.issue), archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null, stagingOperations: summary.operations?.length ?? 0 })
+      if (!present.has(summary.issue.id)) listed.push({ ...summary.issue, occurrences: occurrenceSummary(summary.issue.occurrences), ...await repeatOutcome(ISSUES_DIR, project, summary.issue.id, summary.issue), archived: true, packed: true, location: bundleFiles(ISSUES_DIR, project, summary.issue.id).bundle, bundle: summary.bundle ?? null, stagingOperations: summary.operations?.length ?? 0 })
     }
   }
   return listed.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
@@ -543,7 +548,20 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
   if (!fingerprint) return open(null)
   // A resubmission is answered here, ahead of any other report's lookup.
   await freeIssueId(project, base, slug, fingerprint, seams.lookup)
-  return inReportTurn(project, async () => open(await findRepeat({ issuesDir: ISSUES_DIR, project, fingerprint, seams: seams.lookup, movesWaitMs: seams.movesWaitMs })))
+  return inReportTurn(project, async () => {
+    // A fault an open issue already reports is recorded on it, not opened again (report-occurrences.mjs).
+    if ((reportOrigin.kind ?? 'fault') === 'fault') {
+      const proved = new Set()
+      for (let match; (match = await findOpenMatch({ issuesDir: ISSUES_DIR, project, fingerprint, exclude: proved }));) {
+        const entry = { at: openedAt.toISOString(), name: finalName, reporter: reportOrigin.reporter ?? null, trust: reportOrigin.trust ?? null, category: reportOrigin.category ?? null, host: opener?.host ?? null }
+        const outcome = match.state === 'open' ? await recordOccurrence({ issuesDir: ISSUES_DIR, project, id: match.id, entry, text: report ?? '', seams }) : { state: 'unknown' }
+        if (outcome.state === 'recorded') throw Object.assign(new IssueError(`"${slug}" is already open as ${match.id}; this occurrence was recorded on it`, 409), { existingId: match.id, occurrence: true })
+        if (outcome.state !== 'closed') throw Object.assign(new IssueError(`${match.id} may be open but could not be read or was busy; this occurrence was not recorded, send it again later`, 503), { existingId: match.id, retryable: true })
+        proved.add(match.id)
+      }
+    }
+    return open(await findRepeat({ issuesDir: ISSUES_DIR, project, fingerprint, seams: seams.lookup, movesWaitMs: seams.movesWaitMs }))
+  })
 }
 
 /*
@@ -822,7 +840,7 @@ export async function getIssue (project, id) {
   const issue = await readIssue(project, id)
   if (!issue) throw new IssueError('no such issue', 404)
   const twin = await packedSummary(ISSUES_DIR, project, id)
-  return settleRepeatLookup(project, { ...issue, steps: await listSteps(project, id), ...(twin ? { archivedTwin: describeTwin(twin, project, id) } : {}) })
+  return settleRepeatLookup(project, { ...issue, occurrences: await occurrenceTexts(issue.path, issue.occurrences), steps: await listSteps(project, id), ...(twin ? { archivedTwin: describeTwin(twin, project, id) } : {}) })
 }
 
 /** A pending repeat lookup is rerun on read, in whatever state the issue is; its outcome is read back. */

@@ -13,8 +13,11 @@ import { reporterForKey } from './reporters.mjs'
  * A report already opened today is answered 409 {error, project, id}, naming that issue so the reporter
  * can stop resubmitting; only its id, which the report's own title and the date determine. An id an archived
  * issue holds is never taken, and two reports of one title whose fingerprints differ are two issues
- * (issues.js createIssue). A fingerprint comes from `fingerprint` or from the report's own text; a match with
- * an earlier issue is recorded on the new one, never told to the reporter (report-identity.mjs).
+ * (issues.js createIssue). A fingerprint comes from `fingerprint` or from the report's own text. A fault report
+ * whose fingerprint an OPEN issue states opens nothing: the occurrence is recorded on that issue and answered
+ * the same 409 (report-occurrences.mjs); one that may be open but cannot be read or stays locked is answered 503
+ * {error, project, id, retryable} with Retry-After and nothing is recorded. A match with an archived or decided
+ * issue is recorded on the new one as `repeats`, never told to the reporter (report-identity.mjs).
  * Mounted in index.js BEFORE the token gate, with its own small body parser.
  *
  * Who may: a peer whose address is private (RFC 1918, IPv6 ULA) and that did not come through the
@@ -103,6 +106,8 @@ export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refu
       // A resubmission is routine, not a failure: info here, because the app's error handler warns.
       if (!error.existingId) return next(error)
       console.info(`${req.method} ${req.path}: ${error.message}`)
+      if (error.retryable) return res.set('Retry-After', '60').status(503).json({ error: error.message, project: req.params.project, id: error.existingId, retryable: true })
+      if (error.occurrence) emit({ reason: 'issue-occurrence', project: req.params.project, id: error.existingId })
       res.status(409).json({ error: error.message, project: req.params.project, id: error.existingId })
     }
   })

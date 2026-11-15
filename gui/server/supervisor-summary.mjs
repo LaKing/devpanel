@@ -310,6 +310,8 @@ export function summariseIssue ({ issue, reports, runs }) {
       // The latest triage's sizing: size, each seat's sentence, the modules and the recommended playbook.
       sizing: issue.sizing ?? null,
       ...(issue.repeats ? { repeats: issue.repeats } : {}), ...(issue.repeatLookup ? { repeatLookup: issue.repeatLookup } : {}), ...(issue.sameTitleAs ? { sameTitleAs: issue.sameTitleAs } : {}),
+      // How often the fault was reported again while this issue was open (report-occurrences.mjs); texts are on the issue page.
+      ...(issue.occurrences?.count ? { occurrences: { count: issue.occurrences.count, firstAt: issue.occurrences.firstAt ?? null, lastAt: issue.occurrences.lastAt ?? null } } : {}),
       // Never clipped: a risk's text, like its id, names it in acceptRisks.
       unacceptedRisks: issue.unacceptedRisks ?? null, acceptedRisks: issue.acceptedRisks ?? [],
       steps: (issue.steps ?? []).map((s) => ({ number: s.number, slug: s.slug, files: (s.files ?? []).map((f) => f.name) })),

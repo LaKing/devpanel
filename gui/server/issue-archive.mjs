@@ -15,6 +15,9 @@ export async function archiveState (dir) {
   }
 }
 
+// An issue's status as every reader takes it: missing or unrecognised reads as open.
+export const issueStatus = (meta) => ['open', 'resolved', 'abandoned'].includes(meta?.status) ? meta.status : 'open'
+
 export async function requireUnarchived (dir) {
   if (await archiveState(dir)) {
     throw Object.assign(new Error('This issue is archived. Restore it before making changes.'), { status: 409 })

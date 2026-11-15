@@ -11,6 +11,7 @@ import express from 'express'
 import { bundleFiles, unpackIssue } from '../server/issue-bundle.mjs'
 import { lookupRetry, reportFingerprint, validFingerprint } from '../server/report-identity.mjs'
 import { privateAddress, refusal, reportRouter, reportText } from '../server/report.mjs'
+import { issueRow } from '../server/supervisor-payload.mjs'
 import { withLock } from '../server/runtime/lock.mjs'
 import { listen } from './helpers.mjs'
 
@@ -24,7 +25,7 @@ async function serve (options, onError = null) {
   await listen(server, 0, '127.0.0.1')
   const post = async (project, body, headers = {}) => {
     const res = await fetch(`http://127.0.0.1:${server.address().port}/api/report/${project}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(body) })
-    return { status: res.status, body: await res.json().catch(() => null) }
+    return { status: res.status, headers: res.headers, body: await res.json().catch(() => null) }
   }
   return { post, close: () => new Promise((resolve) => server.close(resolve)) }
 }
@@ -55,6 +56,9 @@ async function identity (t) {
   const origin = { kind: 'fault', category: 'error', reporter: 'r', trust: 'fault' }
   const report = (title, fingerprint, seams) => issues.createIssue(P, { input: `# ${title}\n\nFingerprint: ${fingerprint}\n`, reportOrigin: { ...origin }, openedBy: { user: 'r' } }, seams)
   const archive = (id) => issues.setIssueArchived(P, id, true, { overrideReason: 'fixture' })
+  // A decided issue is not open: a repeat of its fault is news again. Fixtures that test the lookup of an earlier
+  // issue (rather than an occurrence on an open one) decide it first.
+  const decide = (id) => issues.setIssueDisposition(P, id, { value: 'declined', evidence: 'fixture: decided, so a repeat is news' })
   const folder = (id) => path.join(issuesDir, P, id)
   const record = async (id) => JSON.parse(await fs.readFile(path.join(folder(id), 'issue.json'), 'utf8'))
   // A bundle from before reports recorded a fingerprint: only its text has it.
@@ -158,7 +162,8 @@ async function identity (t) {
       await fs.mkdir(path.join(folder('2026-01-02-live-old-fault'), '000-report'), { recursive: true })
       await fs.writeFile(path.join(folder('2026-01-02-live-old-fault'), 'issue.json'), JSON.stringify({ name: 'Live old fault', project: P, report: origin, openedAt: '2026-01-02T10:00:00.000Z' }))
       await fs.writeFile(path.join(folder('2026-01-02-live-old-fault'), '000-report', 'response.md'), '# Live old fault\n\nFingerprint: cccc0000\n')
-      t.eq('a live issue of another day, under another title, by its text', (await report('Other words', 'cccc0000')).repeats?.id, '2026-01-02-live-old-fault')
+      // Open, of another day and under another title: an occurrence on it now, not a new issue (section I).
+      t.eq('a live issue of another day, under another title, by its text: the report is recorded on it', await report('Other words', 'cccc0000').then(() => null, (e) => [e.status, e.existingId, e.occurrence]), [409, '2026-01-02-live-old-fault', true])
       await oldBundle('2026-01-03-old-bundle', '# Old bundle\n\nFingerprint: cccc1111\n')
       t.eq('an old bundle, from the text inside it', (await report('Other words again', 'cccc1111')).repeats?.id, '2026-01-03-old-bundle')
       for (let i = 0; i < 12; i++) await oldBundle(`2026-02-${String(i + 1).padStart(2, '0')}-noise-${i}`, `# Noise\n\nFingerprint: noise${i}000\n`)
@@ -186,6 +191,7 @@ async function identity (t) {
       t.eq('then the restore finishes', await exists(folder(a.id)), true)
 
       const b = await report('Ordering packed', 'dddd0002')
+      await decide(b.id)
       let packing = null
       let stillFolder = null
       const reportedB = await report('Ordering packed later', 'dddd0002', { lookup: { betweenListings: async () => {
@@ -203,6 +209,7 @@ async function identity (t) {
       t.eq('restored after the listing: found in its folder', reportedC.repeats?.id, c.id)
 
       const d = await report('Packed after listing', 'dddd0004')
+      await decide(d.id)
       const reportedD = await report('Packed after listing, later', 'dddd0004', { lookup: { afterSnapshot: () => archive(d.id) } })
       t.eq('packed after the listing: found in its bundle', reportedD.repeats?.id, d.id)
 
@@ -279,6 +286,7 @@ async function identity (t) {
       t.eq('an operator deleting the bundle clears it, with no claim', [cleared.repeats, cleared.repeatLookup], [null, null])
 
       const moving = await report('Keeps moving', 'eeee0004')
+      await decide(moving.id)
       const exhausted = await report('Waits for a moving issue', 'eeee0004', { lookup: { failRead: (entry) => entry.id === moving.id } })
       t.eq('relocations exhausted: named as unread', (await record(exhausted.id)).repeatLookup?.unread, [moving.id])
       t.eq('the next read completes it', (await issues.getIssue(P, exhausted.id)).repeats?.id, moving.id)
@@ -288,6 +296,7 @@ async function identity (t) {
     {
       const movesLock = path.join(issuesDir, '.archive', P, '.moves.lock')
       const earlier = await report('Rerun earlier', 'ffff0001')
+      await decide(earlier.id)
       const pending = await withLock(movesLock, { purpose: 'test' }, () => report('Rerun report', 'ffff0001', { movesWaitMs: 20 }))
       const before = await fs.readFile(path.join(folder(pending.id), 'issue.json'), 'utf8')
       let runs = 0
@@ -298,6 +307,8 @@ async function identity (t) {
       t.eq('both read its outcome', [one.repeats?.id, two.repeats?.id], [earlier.id, earlier.id])
       t.eq('issue.json is byte for byte what it was', await fs.readFile(path.join(folder(pending.id), 'issue.json'), 'utf8'), before)
 
+      // Decided after the reads above (a disposition reads the issue, which would spend this minute's rerun).
+      await decide(pending.id)
       const other = await withLock(movesLock, { purpose: 'test' }, () => report('Rerun beside a decision', 'ffff0001', { movesWaitMs: 20 }))
       // Not awaited inside the rerun: the disposition's own read of the issue waits for that very rerun.
       let decided = null
@@ -312,6 +323,7 @@ async function identity (t) {
     {
       const movesLock = path.join(issuesDir, '.archive', P, '.moves.lock')
       const earlier = await report('Corrupt outcome earlier', 'cdcd0001')
+      await decide(earlier.id)
       const pending = await withLock(movesLock, { purpose: 'test' }, () => report('Corrupt outcome report', 'cdcd0001', { movesWaitMs: 20 }))
       const before = await fs.readFile(path.join(folder(pending.id), 'issue.json'), 'utf8')
       const outcome = bundleFiles(issuesDir, P, pending.id).repeatLookup
@@ -337,7 +349,8 @@ async function identity (t) {
       // A report from before fingerprints were recorded: its record has none, so its text is read.
       const textOnly = async (id, name, fingerprint) => {
         await fs.mkdir(path.join(folder(id), '000-report'), { recursive: true })
-        await fs.writeFile(path.join(folder(id), 'issue.json'), JSON.stringify({ name, project: P, report: origin, openedAt: '2026-01-06T10:00:00.000Z' }))
+        // Decided, so its fault returning is news and goes to the lookup these cases follow.
+        await fs.writeFile(path.join(folder(id), 'issue.json'), JSON.stringify({ name, project: P, report: origin, openedAt: '2026-01-06T10:00:00.000Z', disposition: { value: 'declined' } }))
         await fs.writeFile(path.join(folder(id), '000-report', 'response.md'), `# ${name}\n\nFingerprint: ${fingerprint}\n`)
       }
       await textOnly('2026-01-06-text-only', 'Text only', 'hhhh0001')
@@ -440,6 +453,115 @@ async function identity (t) {
       t.eq('answered 409 at once, naming the issue', answer, [409, live.id])
       release()
       t.ok('and the slow one still opens', (await slow).id.endsWith('a-slow-lookup'))
+    }
+
+    t.section('I. a fault an open issue already reports is recorded on it, not opened again')
+    {
+      // An open report of an earlier day, its fingerprint only in its text and no status: open, as readIssue reads it.
+      const openFixture = async (id, fingerprint, extra = {}) => {
+        await fs.mkdir(path.join(folder(id), '000-report'), { recursive: true })
+        await fs.writeFile(path.join(folder(id), 'issue.json'), JSON.stringify({ name: id.slice(11), project: P, report: origin, openedAt: `${id.slice(0, 10)}T10:00:00.000Z`, ...extra }))
+        await fs.writeFile(path.join(folder(id), '000-report', 'response.md'), `# ${id.slice(11)}\n\nFingerprint: ${fingerprint}\n`)
+        return id
+      }
+      const fields = ['Framework version: 4.2.1', 'Application version: 1.9.0', 'Release receipt: rel-2026-01-05', 'Occurrences: 3', 'Threads: App.worker, App.tester']
+      const again = (title, fingerprint, { body = '', kind = 'fault', seams } = {}) => issues.createIssue(P, { input: `# ${title}\n\nFingerprint: ${fingerprint}\n${body}`, reportOrigin: { ...origin, kind }, openedBy: { user: 'r', host: 'deploy-1' } }, seams)
+      const outcome = (p) => p.then((issue) => ({ created: issue.id, repeats: issue.repeats?.id ?? null }), (e) => [e.status, e.existingId, Boolean(e.occurrence), Boolean(e.retryable)])
+      const folders = () => fs.readdir(path.join(issuesDir, P)).then((names) => names.sort())
+      const projection = async () => (await issues.listIssues(P)).map((i) => ({ id: i.id, status: i.status, name: i.name }))
+
+      // AC1, AC2, AC6
+      const first = await openFixture('2026-01-08-open-fault', 'iiii0001')
+      const [before, rows] = [await folders(), await projection()]
+      t.eq('a second report of the fault, another day, first still open: 409 naming it, an occurrence', await outcome(again('Open fault again', 'iiii0001', { body: fields.join('\n') + '\n' })), [409, first, true, false])
+      t.eq('no new issue folder', await folders(), before)
+      const read = await issues.getIssue(P, first)
+      const one = read.occurrences?.recent?.[0]
+      t.eq('the issue API counts it', [read.occurrences?.count, read.occurrences?.recent?.length], [1, 1])
+      t.eq('when it happened, from whom and where', [typeof one?.at, one?.reporter, one?.host, one?.trust, one?.category, one?.seq], ['string', 'r', 'deploy-1', 'fault', 'error', 1])
+      t.eq('the versions, release receipt, occurrence count and threads are readable in its text', fields.filter((f) => !one?.text?.includes(f)), [])
+      t.eq('the supervisor\'s poll reads the same id, status and name: no wake', await projection(), rows)
+      const row = (await issues.listIssues(P)).find((i) => i.id === first)
+      t.eq('a list row carries the counters only', [row.occurrences?.count, 'recent' in (row.occurrences ?? {})], [1, false])
+      t.eq('and so does the supervisor\'s row', issueRow(row).occurrences?.count, 1)
+
+      // AC1: the fields survive behind a long diagnostic section
+      const filler = 'diagnostic line of a long stack, kept whole\n'.repeat(Math.ceil(200 * 1024 / 44))
+      t.eq('a 200 KiB report is recorded too', (await outcome(again('Open fault again', 'iiii0001', { body: filler + fields.join('\n') + '\n' })))[0], 409)
+      const long = (await issues.getIssue(P, first)).occurrences.recent.at(-1)
+      t.eq('its fields after the diagnostics are all there, nothing cut', [fields.filter((f) => !long.text.includes(f)), long.truncated, long.bytes > 200 * 1024], [[], false, true])
+
+      // AC5: the bound
+      for (let n = 3; n <= 25; n++) await again('Open fault again', 'iiii0001').catch(() => {})
+      await again('x'.repeat(100000), 'iiii0001').catch(() => {})
+      await again(`A${'\u0001'.repeat(100000)}`, 'iiii0001').catch(() => {})
+      const bounded = await issues.getIssue(P, first)
+      const texts = await fs.readdir(path.join(folder(first), 'occurrences'))
+      const sizes = await Promise.all(texts.map((n) => fs.stat(path.join(folder(first), 'occurrences', n)).then((s) => s.size)))
+      t.eq('27 occurrences: every one counted, the newest 10 kept', [bounded.occurrences.count, bounded.occurrences.recent.length, bounded.occurrences.recent.at(-1).seq, texts.length], [27, 10, 27, 10])
+      t.ok('each kept text is at most 256 KiB', sizes.every((n) => n <= 256 * 1024), sizes.join(','))
+      t.ok('a 100 000-character heading is capped in the record', bounded.occurrences.recent.at(-2).name.length <= 200, String(bounded.occurrences.recent.at(-2).name.length))
+      t.ok('and control characters in one keep occurrences.json under 64 KiB', (await fs.stat(path.join(folder(first), 'occurrences.json'))).size <= 64 * 1024 && bounded.occurrences.recent.at(-1).name.startsWith('A\u0001'))
+
+      // Status as readIssue reads it
+      const weird = await openFixture('2026-01-09-weird-status', 'iiii0002', { status: 'weird' })
+      t.eq('an unrecognised status reads as open', (await outcome(again('Weird status again', 'iiii0002')))[1], weird)
+      const resolved = await openFixture('2026-01-09-resolved-status', 'iiii0003', { status: 'resolved' })
+      t.eq('a resolved status is closed: a new issue that repeats it', (await outcome(again('Resolved status again', 'iiii0003'))).repeats, resolved)
+
+      // AC3: closed is news
+      const archivedFirst = await report('Archived fault', 'jjjj0001')
+      await archive(archivedFirst.id)
+      t.eq('archived: a new issue with repeats', (await outcome(again('Archived fault, another title', 'jjjj0001'))).repeats, archivedFirst.id)
+      const decided = await openFixture('2026-01-09-decided', 'jjjj0002', { disposition: { value: 'not-reproducible' } })
+      t.eq('decided: a new issue with repeats', (await outcome(again('Decided again', 'jjjj0002'))).repeats, decided)
+
+      // AC4: requests and reports without a fingerprint
+      const forRequests = await openFixture('2026-01-09-for-requests', 'kkkk0001')
+      t.eq('a request with the same fingerprint opens its own issue, as before', (await outcome(again('A person asks', 'kkkk0001', { kind: 'request' }))).repeats, forRequests)
+      const plain = await issues.createIssue(P, { input: '# No fingerprint here\n\nwords\n', reportOrigin: { ...origin } })
+      t.eq('no fingerprint: a new issue, nothing recorded anywhere', [plain.occurrences, (await issues.getIssue(P, forRequests)).occurrences], [null, null])
+
+      // Uncertain is never closed: 503, nothing opened
+      const corrupt = await openFixture('2026-01-10-corrupt-record', 'llll0001')
+      await fs.writeFile(path.join(folder(corrupt), 'issue.json'), '{')
+      const beforeCorrupt = await folders()
+      t.eq('an unreadable record of the matching issue: 503, retryable', await outcome(again('Corrupt again', 'llll0001')), [503, corrupt, false, true])
+      t.eq('no new folder, nothing recorded', [await folders(), await exists(path.join(folder(corrupt), 'occurrences.json'))], [beforeCorrupt, false])
+      // At scan time, a record missing beside the fault's own report is not proof of anything: 503, never a duplicate.
+      const noRecord = await openFixture('2026-01-10-no-record', 'llll0005')
+      await fs.rm(path.join(folder(noRecord), 'issue.json'))
+      const [foldersNoRecord, openNoRecord] = [await folders(), (await issues.listIssues(P)).filter((i) => i.status === 'open').map((i) => i.id).sort()]
+      t.eq('scan: a folder with its report but no issue.json is unknown: 503 naming it', await outcome(again('No record again', 'llll0005')), [503, noRecord, false, true])
+      t.eq('scan: no new folder, the open issues listed are the same', [await folders(), (await issues.listIssues(P)).filter((i) => i.status === 'open').map((i) => i.id).sort()], [foldersNoRecord, openNoRecord])
+      // An archive marker is positive evidence even when the record beside it cannot be read: news, not 503. The
+      // lookup cannot read that record either, so it names it as unread rather than claiming a repeat (report-identity.mjs).
+      const markedCorrupt = await openFixture('2026-01-10-marked-corrupt', 'llll0006')
+      await fs.writeFile(path.join(folder(markedCorrupt), 'issue.json'), '{')
+      await fs.writeFile(path.join(folder(markedCorrupt), '.archive.json'), JSON.stringify({ archivedAt: new Date().toISOString() }))
+      const afterMarked = await outcome(again('Marked corrupt again', 'llll0006'))
+      t.eq('scan: corrupt record beside an archive marker is closed: a new issue, not 503', Array.isArray(afterMarked) ? afterMarked : typeof afterMarked.created, 'string')
+      t.eq('and its lookup names the archived issue (unread record, so pending rather than a claim)', (await record(afterMarked.created)).repeatLookup?.unread?.includes(markedCorrupt), true)
+      const corruptInside = await openFixture('2026-01-10-corrupt-inside', 'llll0002')
+      t.eq('corrupted under the locks: 503', await outcome(again('Corrupt inside', 'llll0002', { seams: { insideOccurrence: () => fs.writeFile(path.join(folder(corruptInside), 'issue.json'), '{') } })), [503, corruptInside, false, true])
+      const recordGone = await openFixture('2026-01-10-record-gone', 'llll0003')
+      t.eq('a folder that lost its record under the locks: 503', await outcome(again('Record gone', 'llll0003', { seams: { insideOccurrence: () => fs.rename(path.join(folder(recordGone), 'issue.json'), path.join(folder(recordGone), 'issue.json.away')) } })), [503, recordGone, false, true])
+      const packedAway = await openFixture('2026-01-10-packed-away', 'llll0004')
+      t.eq('packed away before the locks: proved gone, a new issue that repeats it', await outcome(again('Packed away', 'llll0004', { seams: { beforeOccurrence: () => archive(packedAway) } })), { created: `${issues.today()}-packed-away`, repeats: packedAway })
+
+      // A held lock is not closure
+      const busy = await openFixture('2026-01-11-busy', 'mmmm0001')
+      const stepLock = path.join(folder(busy), '.step-alloc.lock')
+      const fast = { occurrenceWaitMs: 20, occurrenceRetryMs: 10 }
+      t.eq('its step lock held: 503 after one retry, nothing opened', await withLock(stepLock, { purpose: 'test' }, () => outcome(again('Busy again', 'mmmm0001', { seams: fast }))), [503, busy, false, true])
+      t.eq('nothing was recorded', await exists(path.join(folder(busy), 'occurrences.json')), false)
+      t.eq('released, the same report is recorded', await outcome(again('Busy again', 'mmmm0001', { seams: fast })), [409, busy, true, false])
+      const busyDecided = await openFixture('2026-01-11-busy-decided', 'mmmm0002')
+      const decidedWhileHeld = await withLock(path.join(folder(busyDecided), '.step-alloc.lock'), { purpose: 'test' }, async () => {
+        await decide(busyDecided)
+        return outcome(again('Busy and decided', 'mmmm0002', { seams: fast }))
+      })
+      t.eq('held, but decided meanwhile: proved closed, a new issue that repeats it', decidedWhileHeld.repeats, busyDecided)
     }
   } finally {
     lookupRetry.now = clockWas
@@ -588,6 +710,25 @@ export default async function (t) {
         await s.post('app-project', { input: '# Odd\n\nThe fingerprint is written some other way\n' })
         t.ok('a fingerprint mentioned but not read is logged', logged.some((m) => m.includes('none could be read')), logged.join(' | '))
       } finally { await s.close() }
+
+      // Section 6: an occurrence over the route. The reporter is told only what a resubmission tells it.
+      const events = []
+      const r = await serve({ createIssue, emit: (e) => events.push(e), refuse: () => null })
+      try {
+        const openId = '2026-01-12-route-open-fault'
+        const dir = path.join(root, 'issues', 'app-project', openId)
+        await fs.mkdir(path.join(dir, '000-report'), { recursive: true })
+        await fs.writeFile(path.join(dir, 'issue.json'), JSON.stringify({ name: 'Route open fault', project: 'app-project', report: { kind: 'fault', trust: 'anonymous' }, openedAt: '2026-01-12T10:00:00.000Z' }))
+        await fs.writeFile(path.join(dir, '000-report', 'response.md'), '# Route open fault\n\nFingerprint: route-open-1\n')
+        logged.length = 0
+        const occurred = await r.post('app-project', { input: '# Route open fault, again\n\nFingerprint: route-open-1\n' })
+        t.eq('6. an occurrence is answered 409 with error, project and id only', [occurred.status, Object.keys(occurred.body).sort(), occurred.body.id], [409, ['error', 'id', 'project'], openId])
+        t.eq('the panel is told the issue changed', events, [{ reason: 'issue-occurrence', project: 'app-project', id: openId }])
+        t.ok('logged at info', logged.some((m) => m.includes('this occurrence was recorded on it')), logged.join(' | '))
+        await fs.writeFile(path.join(dir, 'issue.json'), '{')
+        const unsure = await r.post('app-project', { input: '# Route open fault, once more\n\nFingerprint: route-open-1\n' })
+        t.eq('an open match that cannot be read: 503 with Retry-After, retryable, naming it', [unsure.status, unsure.headers.get('retry-after'), unsure.body], [503, '60', { error: unsure.body?.error, project: 'app-project', id: openId, retryable: true }])
+      } finally { await r.close() }
     } finally {
       console.info = saved.info
       for (const [key, value] of [['DEVPANEL_ISSUES_DIR', saved.issues], ['DEVPANEL_PROJECTS_DIR', saved.projects]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
