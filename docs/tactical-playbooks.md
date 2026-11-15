@@ -666,7 +666,10 @@ cycle acts on its verdict:
   action runs, and the record names the failure and what was not run. A cycle whose
   projects name no framework bumps nothing and says so. An instance is in the chain only
   when its project file names its framework (`framework: <id>`); see
-  project-infrastructure.md "Project actions: checkpoint.sh".
+  project-infrastructure.md "Project actions: checkpoint.sh". Before the chain every green
+  entry's checkouts are snapshotted again: a pool any of whose checkouts moved since its
+  snapshot runs no checkpoint at all, and every commit a checkpoint makes is compared with the
+  tested bytes (execution-contract.md "A green cycle commits only what it tested").
 - **Any stage red: no action runs, and one issue opens per red project**, named
   `Full verification <date>: <project> red on <stage>` (`configuration` when its
   configuration could not be read). Its report names the cycle, the stage run and its run

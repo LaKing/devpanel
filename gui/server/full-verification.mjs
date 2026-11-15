@@ -22,6 +22,7 @@ import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
 import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries } from './staging-coverage.mjs'
 import { deliveryCounts } from './verification-trigger.mjs'
+import { checkoutsOf, committedBeyond, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews } from './runtime/full-verification-snapshot.mjs'
 
 /*
  * The full verification (docs/tactical-playbooks.md "The daily full
@@ -54,11 +55,17 @@ import { deliveryCounts } from './verification-trigger.mjs'
  *      a project with no infrastructure, or whose staging declares
  *      `fullVerification: instances`, is recorded as verified through its instances.
  *      Each entry records the delivered runs its snapshot covered;
+ *      Each entry records whether its checkouts were moving around the snapshot
+ *      (snapshotMotion, snapshotDuringEdits; information, no verdict reads it);
  *   4. waits until those runs settle and handles the outcome while admission is still
- *      closed: every stage green, each framework's `checkpoint` runs with --minor and
- *      then each instance's `checkpoint` (runtime/module-pool.mjs poolMembers order),
- *      stopping at the first that fails; any stage red, no action runs and one issue
- *      opens per red project with its failing tests and their excerpts;
+ *      closed: every stage green, each green entry's checkouts are snapshotted again and
+ *      compared with what it tested; a pool any of whose checkouts moved runs no
+ *      checkpoint (outcome.bump.withheld, outcome.committed false). Otherwise each
+ *      framework's `checkpoint` runs with --minor and then each instance's `checkpoint`
+ *      (runtime/module-pool.mjs poolMembers order), stopping at the first that fails, and
+ *      every attempt's commit is compared with the tested bytes (step.afterCommit,
+ *      outcome.bump.untestedCommitted; reported, never reverted); any stage red, no action
+ *      runs and one issue opens per red project with its failing tests and their excerpts;
  *   5. opens admission and resumes the runs it paused;
  *   6. writes issues/.verification/<date>/cycle.json at every step, and tells the
  *      top-level supervisor (`onEnded`) the outcome and where the evidence is. The cycle
@@ -290,7 +297,13 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
     if (entry.check.selftestVerdict) lines.push(`- Selftest comparison: ${entry.check.selftestVerdict}${entry.check.selftestReason ? ` (${entry.check.selftestReason})` : ''}`)
   }
   if (rerunLine(entry.rerun)) lines.push(rerunLine(entry.rerun))
+  const moving = entry.snapshotDuringEdits ? movingPaths(entry.snapshotMotion) : []
+  if (entry.snapshotDuringEdits) {
+    const m = entry.snapshotMotion
+    lines.push(`- Snapshot taken during edits: ${m.during?.total ?? 0} ${plural(m.during?.total ?? 0, 'path', 'paths')} changed while it was read, ${m.recent?.total ?? 0} within ${Math.round((m.windowMs ?? 0) / 60000)} minutes before it (newest change ${m.newest?.at ?? 'unknown'}${m.newest ? ` in \`${m.newest.path}\`` : ''}). The failures may come from a half-done change; the verdict was not changed.`)
+  }
   lines.push('')
+  if (moving.length) lines.push('## Moving paths at snapshot time', '', ...moving.map((p) => `- \`${p.checkout}\`: \`${p.path}\``), ...(moving.length >= SHOWN_PATHS ? ['', `The first ${moving.length} are shown; the cycle record's \`snapshotMotion\` has the totals.`] : []), '')
   if (failures.length) {
     lines.push(`## Failing tests (${failures.length})`, '')
     if (failures.length > SHOWN_FAILURES) lines.push(`The first ${SHOWN_FAILURES} are shown here; every one is in the attachment named below.`, '')
@@ -358,7 +371,16 @@ export function createFullVerification ({
   deliveriesOf = async (project) => projectDeliveries({ project, projectPath: await projectPathOf(project).catch(() => null), listIssues: (p, o) => issues.listIssues(p, o), listHomes: (p) => issues.listRunHomes?.(p) ?? [] }),
   deliveryPollMs = 15 * 60 * 1000,
   /** Told when a cycle ended (the top-level supervisor's verification-ended event); never throws into the cycle. */
-  onEnded = null
+  onEnded = null,
+  // What the cycle knows of the bytes it tested (runtime/full-verification-snapshot.mjs): a reading of the checkouts a
+  // snapshot of `projectDir` reads (plus `extra`), the window before a snapshot in which a change means it was moving,
+  // where a snapshot lives, a checkout's HEAD, and a commit compared with the tested views of its checkout.
+  readMotion = async ({ projectDir, policy = {}, extra = [] }) => readCheckouts([projectDir, ...await snapshotCheckouts(projectDir, policy), ...extra]),
+  motionWindowMs = MOTION_WINDOW_MS,
+  recordSnapshot = (args) => snapshotRecord(args),
+  compareSnapshots = (args) => snapshotDiff(args),
+  headOf = async (checkout) => (await readGit(['-C', checkout, 'rev-parse', 'HEAD'])).trim(),
+  compareCommit = (args) => committedBeyond(args)
 } = {}) {
   let cancel = null
   let cancelDeliveries = null
@@ -367,6 +389,8 @@ export function createFullVerification ({
   let current = null
   let running = null
   let stopped = false
+  // Per project, how its entry's snapshot was taken (checkout, policy, where): the recheck before the chain takes it again.
+  const snapshotInputs = new Map()
 
   const wait = (ms) => new Promise((resolve) => clock.after(ms, resolve))
   const changed = (record) => emit?.({ type: 'verification:changed', id: record.id, state: record.state })
@@ -527,6 +551,7 @@ export function createFullVerification ({
   }
 
   async function cycle (record) {
+    snapshotInputs.clear()
     try {
       // No run of an issue left in this process: no seat turn is running.
       for (;;) {
@@ -632,7 +657,11 @@ export function createFullVerification ({
       cycleId: record.id, date: record.date, trigger: record.trigger, by: record.by, state: record.state, verdict: record.verdict, error: record.error ?? null,
       record: file ?? path.join(verificationDir, record.date, 'cycle.json'),
       outcome: {
-        bump: record.outcome?.bump ? { chain: record.outcome.bump.chain.map((s) => ({ project: s.project, args: s.args, status: s.status, versionAfter: s.versionAfter ?? null })), failed: record.outcome.bump.failed ?? null } : null,
+        bump: record.outcome?.bump ? { chain: record.outcome.bump.chain.map((s) => ({ project: s.project, args: s.args, status: s.status, versionAfter: s.versionAfter ?? null, afterCommit: s.afterCommit?.state ?? null })), failed: record.outcome.bump.failed ?? null } : null,
+        // A green cycle commits only what it tested: false when a pool's checkpoints were withheld, a step failed or none ran.
+        committed: record.outcome?.committed === true,
+        withheld: (record.outcome?.bump?.withheld ?? []).map((w) => ({ framework: w.framework, members: w.members, moved: w.moved })),
+        untestedCommitted: record.outcome?.bump?.untestedCommitted ?? [],
         issues: (record.outcome?.issues ?? []).map((i) => ({ project: i.project, issueId: i.issueId, name: i.name })),
         reason: record.outcome?.reason ?? null,
         flaky: (record.outcome?.flaky ?? []).map((i) => ({ project: i.project, issueId: i.issueId, noted: i.noted === true }))
@@ -641,6 +670,10 @@ export function createFullVerification ({
         project: e.project, stage: e.stage ?? null, mode: e.mode ?? null, verdict: e.verdict ?? null, refusal: e.refusal?.code ?? null, incomplete: e.incomplete?.reason ?? null,
         instance: e.instance?.name ?? null, evidence: e.evidence?.dir ?? e.runDir ?? null, coverageEstablished: e.coverageEstablished === true,
         flaky: (e.flaky ?? []).map((f) => ({ command: f.command, test: f.test })), rerun: e.rerun ? { state: e.rerun.state, reason: e.rerun.reason ?? e.rerun.outcome ?? null } : null,
+        snapshotDuringEdits: e.snapshotDuringEdits ?? null,
+        ...(e.snapshotDuringEdits ? { movingPaths: movingPaths(e.snapshotMotion), newestChangeAt: e.snapshotMotion?.newest?.at ?? null } : {}),
+        recheck: e.recheck?.state ?? null,
+        commitWithheld: Boolean(e.commitWithheld),
         covered: e.coverageEstablished ? runIds(e.coverage?.covered) : [],
         stillCounting: [...(e.coverageEstablished ? [] : runIds(e.coverage?.covered)), ...runIds(e.coverage?.indeterminate), ...runIds(e.coverage?.notShipped)]
       })),
@@ -665,6 +698,27 @@ export function createFullVerification ({
   const parsedFailures = (runDir, check) => check?.result?.result === 'failed'
     ? failureFingerprints({ runDir, check: check.result, target: { commands: (check.result.commands ?? []).map((c) => ({ id: c.id, required: c.required })) } }).catch(() => [])
     : []
+
+  /**
+   * Whether the checkouts were moving around the snapshot (AC: snapshotDuringEdits): the newest change among the
+   * changed paths, those changed within the window before it, those that differ between the two readings. A reading
+   * that failed leaves it unknown (null). No verdict reads it.
+   */
+  function noteMotion (entry, before, after, extra = {}) {
+    if (!before || before.error || !after || after.error) {
+      entry.snapshotMotion = { error: before?.error ?? after?.error ?? 'no reading after the snapshot', ...extra }
+      entry.snapshotDuringEdits = null
+      return
+    }
+    entry.snapshotMotion = { ...motionOf({ before, after, windowMs: motionWindowMs }), ...extra }
+    entry.snapshotDuringEdits = entry.snapshotMotion.moving
+  }
+
+  /** An entry's snapshot as the record keeps it, with where it lives so a later comparison needs nothing from memory. */
+  const snapshotOf = async ({ workspace, policy, projectDir }) => ({
+    baseCommit: workspace.baseCommit ?? null, base: workspace.base ?? null,
+    ...(workspace.baseCommit ? await Promise.resolve().then(() => recordSnapshot({ workspace, policy, projectDir })).catch((error) => ({ recordError: error.message })) : {})
+  })
 
   const pick = (coverage) => coverage && !coverage.error
     ? { basis: coverage.basis ?? null, covered: coverage.covered ?? [], indeterminate: coverage.indeterminate ?? [], notShipped: coverage.notShipped ?? [] }
@@ -692,11 +746,16 @@ export function createFullVerification ({
       if (!resolution.ok) throw Object.assign(new Error(resolution.errors.map((e) => `${e.field}: ${e.message}`).join('; ')), { code: 'CONFIGURATION_INVALID' })
       const resolved = resolution.resolved
       projectDir = await projectPathOf(entry.project)
+      // Always the tree as it stands, uncommitted deliveries included, whatever base the project's runs take (`head`, a commit).
+      const policy = { ...(resolved.workspace ?? {}), base: 'working-tree', requireCleanBase: false, selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, store: gitStoreDir(entry.project), nested: hostSettings().nestedRepositories }
+      // A reading of the checkouts the snapshot reads, just before and just after it: was somebody editing them?
+      const before = await readMotion({ projectDir, policy }).catch((error) => ({ error: error.message }))
       // The candidate: the development checkout as it stands now, as a run's working-tree base takes it.
-      workspace = await provision({ projectPath: projectDir, runId: driveId, root: home, clock,
-        // Always the tree as it stands, uncommitted deliveries included, whatever base the project's runs take (`head`, a commit).
-        policy: { ...(resolved.workspace ?? {}), base: 'working-tree', requireCleanBase: false, selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, store: gitStoreDir(entry.project), nested: hostSettings().nestedRepositories } })
-      Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: { baseCommit: workspace.baseCommit ?? null, base: workspace.base ?? null }, snapshotAt: clock.iso(), state: 'running' })
+      workspace = await provision({ projectPath: projectDir, runId: driveId, root: home, clock, policy })
+      const after = await readMotion({ projectDir, policy, extra: (workspace.symlinks?.owners ?? []).map((o) => o.owner?.path).filter(Boolean) }).catch((error) => ({ error: error.message }))
+      noteMotion(entry, before, after)
+      Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: await snapshotOf({ workspace, policy, projectDir }), snapshotAt: clock.iso(), state: 'running' })
+      snapshotInputs.set(entry.project, { projectDir, policy, root: home, runId: driveId })
       await write(record)
       const records = await cycleRecords(verificationDir)
       const counting = (await deliveryCounts({ stages: [{ host: entry.host, stage: entry.stage, projects: [entry.project] }], deliveriesOf, records, threshold: 0 }).catch(() => [{ runs: null }]))[0].runs
@@ -808,14 +867,27 @@ export function createFullVerification ({
       if (!resolution.ok) throw Object.assign(new Error(resolution.errors.map((e) => `${e.field}: ${e.message}`).join('; ')), { code: 'CONFIGURATION_INVALID' })
       const blockers = resolution.resolved.liveExecution?.blockers ?? []
       if (blockers.length) throw Object.assign(new Error(blockers.map((b) => b.reason).join('; ')), { code: blockers.some((b) => b.reason === TARGET_MISSING) ? 'TARGET_MISSING' : 'NOT_LAUNCHABLE' })
+      // The run takes its snapshot as it provisions: the readings go around that (before the start, and at the first
+      // poll that shows its workspace), with the policy the run's provisioning uses (launch.mjs provisionRun).
+      const resolved = resolution.resolved
+      const policy = { ...(resolved.workspace ?? {}), selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, store: gitStoreDir(entry.project), nested: hostSettings().nestedRepositories }
+      const projectDir = await Promise.resolve().then(() => projectPathOf(entry.project)).catch(() => null)
+      const before = projectDir ? await readMotion({ projectDir, policy }).catch((error) => ({ error: error.message })) : { error: 'the project checkout could not be named' }
+      let after = null
       const started = await supervisor.start({ project: entry.project, issueId: home.id, playbookId: 'deployment', expectConfigHash: resolution.resolved.configHash, runOptions, configRoot, cycle: record.id })
       Object.assign(entry, { runId: started.runId, runDir: path.join(home.path, 'runs', started.runId), state: 'running', startedAt: clock.iso() })
       await write(record)
       let run = null
       for (;;) {
         run = await readRun(home.path, started.runId).catch(() => null)
+        if (run?.workspace && !after && projectDir && !before.error) after = await readMotion({ projectDir, policy, extra: (run.workspace.symlinks?.owners ?? []).map((o) => o.owner?.path).filter(Boolean) }).catch((error) => ({ error: error.message }))
         if (run && !LIVE.includes(run.status) && !supervisor.isActive(entry.project, home.id)) break
         await wait(pollMs)
+      }
+      noteMotion(entry, before, after ?? { error: 'the run recorded no workspace, so there is no reading after its snapshot' }, { basis: 'around-run-provisioning' })
+      if (run.workspace?.baseCommit && projectDir) {
+        entry.snapshot = await snapshotOf({ workspace: run.workspace, policy, projectDir })
+        snapshotInputs.set(entry.project, { projectDir, policy, root: path.join(verificationDir, record.date, record.id, entry.project), runId: driveIdOf(record.id, entry.project) })
       }
       const check = run.fullVerification?.check ?? null
       // The failures each failed command's own output names (the parser the baseline comparison uses),
@@ -848,7 +920,7 @@ export function createFullVerification ({
   /** Bump or open issues, by the verdict; recorded as `record.outcome`. Never throws. */
   async function outcome (record) {
     record.state = 'outcome'
-    record.outcome = { verdict: record.verdict, startedAt: clock.iso(), endedAt: null }
+    record.outcome = { verdict: record.verdict, committed: false, startedAt: clock.iso(), endedAt: null }
     await write(record).catch(() => {})
     try {
       if (record.verdict === 'green') await bump(record)
@@ -869,14 +941,40 @@ export function createFullVerification ({
    * step that does not complete stops every later one.
    */
   async function bump (record) {
-    const result = { chain: [], failed: null, notRun: [], versions: {} }
+    const result = { chain: [], failed: null, notRun: [], versions: {}, withheld: [], untestedCommitted: [] }
     record.outcome.bump = result
     const projects = await projectsConfig()
     const frameworks = [...new Set([...projects.values()].map((p) => p.framework).filter((id) => id && projects.has(id)))].sort()
-    const steps = frameworks.flatMap((framework) => poolMembers(framework, projects).map((project, i) => ({ project, framework, args: i === 0 ? ['--minor'] : [] })))
-    if (!steps.length) { result.reason = 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
+    const allSteps = frameworks.flatMap((framework) => poolMembers(framework, projects).map((project, i) => ({ project, framework, args: i === 0 ? ['--minor'] : [] })))
+    if (!allSteps.length) { result.reason = 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
+    // Before any checkpoint: every green entry's checkouts snapshotted again and compared with what it tested.
+    const green = record.projects.filter((e) => !e.verifiedThrough && e.verdict === 'green')
+    for (const entry of green) await recheck(record, entry)
+    await write(record).catch(() => {})
+    const checkoutOf = async (project) => {
+      const dir = await Promise.resolve().then(() => projectPathOf(project)).catch(() => null)
+      return dir ? fs.realpath(dir).catch(() => dir) : null
+    }
+    const moved = green.filter((e) => ['moved', 'failed'].includes(e.recheck?.state))
+    const withheld = new Set()
+    for (const framework of frameworks) {
+      const members = poolMembers(framework, projects)
+      const memberCheckouts = (await Promise.all(members.map(checkoutOf))).filter(Boolean)
+      // An entry concerns the pool when it is a member's, or its snapshot read a member's checkout (a framework linked in).
+      const concerned = moved.filter((e) => members.includes(e.project) || (e.recheck.checkouts ?? []).some((c) => memberCheckouts.includes(c)))
+      if (!concerned.length) continue
+      withheld.add(framework)
+      result.withheld.push({ framework, members, moved: concerned.map((e) => ({ project: e.project, state: e.recheck.state, ...(e.recheck.error ? { error: e.recheck.error } : {}), checkouts: e.recheck.moved ?? [] })) })
+      for (const e of record.projects.filter((x) => members.includes(x.project) && !x.verifiedThrough)) {
+        e.commitWithheld = { framework, at: clock.iso() }
+        // AC3: a withheld cycle retires only the deliveries whose bytes the tested snapshot held (staging-coverage.mjs covered).
+        if (e.coverage) e.coverage.retires = { rule: 'covered-only', reason: 'commit withheld: only the deliveries whose bytes the tested snapshot held are retired; the indeterminate ones keep counting', runIds: (e.coverage.covered ?? []).map((c) => c.runId) }
+      }
+    }
+    const steps = allSteps.filter((s) => !withheld.has(s.framework))
     for (const [i, s] of steps.entries()) {
-      const step = { project: s.project, framework: s.framework, action: 'checkpoint', args: s.args, status: 'running', versionBefore: await versionOf(s.project).catch(() => null), startedAt: clock.iso() }
+      const checkout = await checkoutOf(s.project)
+      const step = { project: s.project, framework: s.framework, action: 'checkpoint', args: s.args, status: 'running', versionBefore: await versionOf(s.project).catch(() => null), headBefore: checkout ? await headOf(checkout).catch(() => null) : null, startedAt: clock.iso() }
       result.chain.push(step)
       await write(record).catch(() => {})
       try {
@@ -885,8 +983,11 @@ export function createFullVerification ({
         if (step.status !== 'completed') step.reason = operation?.error ?? (operation?.timedOut ? 'the action reached its deadline' : `the action ended ${step.status}${step.exitCode != null ? ` with exit code ${step.exitCode}` : ''}`)
       } catch (error) {
         Object.assign(step, { status: 'refused', reason: error.message, code: error.status ?? null })
+      } finally {
+        step.versionAfter = await versionOf(s.project).catch(() => null)
+        // However the attempt ended: what it committed, against what was tested (approach (a)); reported, never reverted.
+        await afterCommit(record, step, checkout)
       }
-      step.versionAfter = await versionOf(s.project).catch(() => null)
       step.endedAt = clock.iso()
       if (step.status !== 'completed') {
         result.failed = { project: s.project, reason: step.reason }
@@ -895,6 +996,62 @@ export function createFullVerification ({
       }
       if (step.versionAfter === step.versionBefore) step.unchanged = true
       result.versions[s.project] = step.versionAfter
+    }
+    record.outcome.committed = !withheld.size && result.chain.length > 0 && result.chain.length === steps.length && result.chain.every((s) => s.status === 'completed')
+    if (withheld.size) record.outcome.commitWithheld = true
+  }
+
+  /**
+   * The entry's checkouts snapshotted again with the policy that took its snapshot (a ref of its own, removed after)
+   * and compared: the same commit, else the same tree, else the changed paths by the checkout owning them. A recheck
+   * that cannot be made counts as moved (failed). An entry that took no snapshot has nothing to compare (no-snapshot).
+   */
+  async function recheck (record, entry) {
+    const input = snapshotInputs.get(entry.project)
+    const at = clock.iso()
+    if (!entry.snapshot?.baseCommit) { entry.recheck = { at, state: 'no-snapshot', reason: 'the entry recorded no snapshot of its own; its commits are still compared with every tested view' }; return }
+    if (!input) { entry.recheck = { at, state: 'failed', error: 'how the snapshot was taken is not known in this process' }; return }
+    const checkouts = await Promise.all(checkoutsOf(input.projectDir, entry.snapshot).map((c) => fs.realpath(c).catch(() => c)))
+    let workspace = null
+    const runId = `${input.runId}-recheck`
+    try {
+      await fs.mkdir(input.root, { recursive: true })
+      workspace = await provision({ projectPath: input.projectDir, runId, root: input.root, clock, policy: input.policy })
+      if (workspace.baseCommit === entry.snapshot.baseCommit) entry.recheck = { at, state: 'unchanged', commit: workspace.baseCommit, checkouts }
+      else {
+        const diff = await compareSnapshots({ repository: entry.snapshot.repository, from: entry.snapshot.baseCommit, to: workspace.baseCommit, projectDir: input.projectDir, links: entry.snapshot.links ?? [] })
+        entry.recheck = diff.sameTree ? { at, state: 'unchanged', headMoved: true, commit: workspace.baseCommit, checkouts } : { at, state: 'moved', commit: workspace.baseCommit, checkouts, moved: diff.moved }
+      }
+    } catch (error) {
+      entry.recheck = { at, state: 'failed', error: error.message, checkouts }
+    } finally {
+      if (workspace) await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: input.projectDir })).catch(() => {})
+      if (workspace && entry.snapshot.repository) await forgetRef(entry.snapshot.repository, `refs/devpanel/base/${runId}`)
+    }
+  }
+
+  /**
+   * A checkpoint attempt's commit compared with every tested view of its checkout (runtime/full-verification-snapshot.mjs
+   * committedBeyond): untested paths are recorded on the step and in outcome.bump.untestedCommitted. A HEAD that cannot
+   * be read is recorded as such and counted, never taken as clean.
+   */
+  async function afterCommit (record, step, checkout, { observedBy = null } = {}) {
+    const by = observedBy ? { observedBy } : {}
+    try {
+      if (!checkout) throw new Error('the project checkout could not be named')
+      const head = await headOf(checkout)
+      if (step.headBefore && head === step.headBefore) { step.afterCommit = { state: 'no-commit', ...by }; return }
+      step.afterCommit = { ...await compareCommit({ checkout, commit: head, headBefore: step.headBefore ?? null, views: testedViews(checkout, step.project, record.projects), versionBefore: step.versionBefore ?? null, versionAfter: step.versionAfter ?? null }), ...by }
+    } catch (error) {
+      step.afterCommit = { state: 'unreadable', error: error.message, ...by }
+    }
+    const a = step.afterCommit
+    if (a.state === 'unreadable' || a.state === 'incomparable' || (a.state === 'compared' && a.untested.total)) {
+      const bumpRecord = record.outcome?.bump
+      if (bumpRecord) {
+        bumpRecord.untestedCommitted = [...(bumpRecord.untestedCommitted ?? []).filter((u) => u.project !== step.project),
+          { project: step.project, state: a.state, commit: a.commit ?? null, paths: a.untested?.paths ?? [], total: a.untested?.total ?? null, ...(a.error ? { error: a.error } : {}) }]
+      }
     }
   }
 
@@ -1053,6 +1210,13 @@ export function createFullVerification ({
             const projectDir = await projectPathOf(entry.project).catch(() => null)
             await Promise.resolve().then(() => releaseWorkspace({ ...entry.workspace, projectPath: projectDir })).then(() => { entry.workspace.released = true }, (error) => { entry.workspace.retained = error.message })
           }
+        }
+        // A checkpoint the stop interrupted may have committed: what it committed is compared now, as after any attempt.
+        for (const step of (record.outcome?.bump?.chain ?? []).filter((s) => s.status === 'running')) {
+          Object.assign(step, { status: 'interrupted', reason: 'the service stopped while the action ran', versionAfter: await versionOf(step.project).catch(() => null), endedAt: clock.iso() })
+          const dir = await Promise.resolve().then(() => projectPathOf(step.project)).catch(() => null)
+          await afterCommit(record, step, dir ? await fs.realpath(dir).catch(() => dir) : null, { observedBy: 'recovery' })
+          record.outcome.committed = false
         }
         await write(record)
       }

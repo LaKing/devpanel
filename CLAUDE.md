@@ -437,9 +437,23 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   suite `FULL_SUITE_UNDECLARED`, `modules.browser` without `fullSuite.browser` `incomplete`; elsewhere one Deployment run
   (environment staging, `runOptions.fullVerification`) per `infrastructure.staging` in the run home
   `issues/<project>/.verification-<date>/` (`issues.getRunHolder`, never an issue); each drive against the previous green
-  cycle of its mode (`runtime/full-verification-drive.mjs`); still frozen, handles the
-  outcome (all green: each framework's `checkpoint --minor`, then its instances' `checkpoint` in `poolMembers` order,
-  stopping at the first failure, through the engine-only `args` of `startProjectAction`; any red: no action, one issue
+  cycle of its mode (`runtime/full-verification-drive.mjs`); each entry records where its snapshot lives (`entry.snapshot`:
+  repository, own commit, excludes, materialized links with their owning checkouts) and whether its checkouts were moving
+  around it (`runtime/full-verification-snapshot.mjs`: a `git status` reading with modification times just before and just
+  after the snapshot; `snapshotMotion` names the newest change, the paths changed within 5 minutes before it and those that
+  differ between the readings; `snapshotDuringEdits` true/false, null when any checkout's reading failed; information only, no verdict changes; a red entry
+  shows it in `cycle.json`, its issue text and the event's `movingPaths`); still frozen, handles the
+  outcome (all green: every green entry snapshotted again first (`entry.recheck`); a pool whose checkouts moved since,
+  a framework's seen through an instance's link included, runs no checkpoint (`outcome.bump.withheld` with the moved
+  checkouts and paths, `outcome.committed: false`, `entry.commitWithheld`; entries stay green; such an entry retires only
+  its `covered` deliveries, `coverage.retires`, its indeterminate ones keep counting and an automatic cycle like it holds
+  its stage back, verification-trigger.mjs); otherwise each framework's `checkpoint --minor`, then its instances' `checkpoint`
+  in `poolMembers` order, stopping at the first failure, through the engine-only `args` of `startProjectAction`, and after
+  every attempt (failed or interrupted included, `recover()` for the latter) approach (a): the commit's tree listed in its
+  checkout and each tested view (own snapshot, instances' materialized copies) listed in its own repository, compared by blob
+  id (a tested path missing from the commit counts too); differences beyond a version-only change of the root `version`/`package.json`/`package-lock.json`
+  (the top-level version fields located in the parsed document, nothing else changed), and changed paths no
+  view holds, are `step.afterCommit` and `outcome.bump.untestedCommitted`, reported and never reverted; any red: no action, one issue
   per red project with its failing tests, excerpts and `failing-tests.md`, `openedBy.from {via: 'full-verification', cycle}`);
   then thaws, resumes what it paused, keeps `issues/.verification/<date>/cycle.json` (`outcome`) and tells the top-level
   supervisor (`verification-ended`, always waking: outcome, record, evidence); it resolves no issue. execution-contract.md "Full verification freeze".

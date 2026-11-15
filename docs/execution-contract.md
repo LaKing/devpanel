@@ -3257,6 +3257,76 @@ next start, before `resumeInterrupted`, `recover()` marks an unfinished cycle re
 `interrupted` and resumes the runs paused as `full-verification`; the cycle's own runs
 are not resumed automatically (their homes are not issues, so `resumeInterrupted` never
 lists them; `reconcile` does, so a crash leaves them `recovery-required` like any run).
+A checkpoint step the stop left `running` is marked `interrupted` and its commit compared
+as below (`afterCommit.observedBy: recovery`).
+
+**A green cycle commits only what it tested.** People's own sessions keep editing the
+checkouts while a cycle runs; the freeze stops writing runs, not people. So a green
+cycle's checkpoint is bound to the bytes it tested
+(`runtime/full-verification-snapshot.mjs`):
+
+- **Each entry keeps where its snapshot lives** (`entry.snapshot`: `repository`, the
+  project's Git store or else its checkout's common dir; `ownCommit`, the project's own
+  tree; `excludes`; and `links`, each materialized link with the checkout owning it and the
+  owner-relative path it copied, so an instance's snapshot holds its framework's tested
+  bytes).
+- **Before the chain, every green entry is snapshotted again** with the policy that took its
+  snapshot (`entry.recheck`): the same commit, or the same tree, is `unchanged`; otherwise
+  `moved`, with the changed paths grouped by the checkout owning them, the framework's for a
+  path under an instance's link. A recheck that cannot be made is `failed` and counts as
+  moved. An entry that recorded no snapshot of its own is `no-snapshot`.
+- **A pool with a moved checkout runs no checkpoint.** A framework's pool (the framework and
+  its instances) is withheld when any member's entry moved, or any entry whose snapshot read
+  a member's checkout through a link: an edit in the framework withholds its instances'
+  checkpoints too. The cycle never reverts, stashes or commits a subset; it does not commit.
+  `outcome.bump.withheld` names each pool, the entries that moved and the checkouts with
+  their changed paths (20 shown, with the total); `outcome.committed` is false (it is true
+  only when every step of the chain ran and completed and nothing was withheld) and
+  `outcome.commitWithheld` true; each member entry carries `commitWithheld`. The entries stay
+  green: their test results are what they were.
+- **Every commit is compared with the tested bytes (approach (a)).** Each step reads its
+  checkout's HEAD before the action (`step.headBefore`) and, however the action ended
+  (completed, failed, refused, thrown, or interrupted and found by `recover()`), the HEAD
+  after it. A new commit is compared with every tested view of that checkout: the project's
+  own snapshot and each instance's materialized copy of it. Each side is listed in the
+  repository that holds it (`git ls-tree`: the view's repository, the committing checkout)
+  and compared by mode and blob id, so an instance's snapshot vouches for a framework
+  commit its repository cannot resolve; different object formats make the step
+  `incomparable`. A path a view holds that the commit holds differently
+  (`differs-from-tested`) or not at all (`absent-from-commit`: deleted, or an untracked file
+  the snapshot held that went away), or that the commit holds and the view does not, is
+  untested, unless it is the root `version`, `package.json` or `package-lock.json` whose
+  committed bytes are exactly the tested bytes with only the version changed (`bumped`:
+  `version`'s first line; `package.json`'s top-level `version`; `package-lock.json`'s
+  top-level `version` and `packages[""].version`, located in the parsed document, the bytes
+  differing nowhere else, so a nested version or any other edit is untested); a
+  path the commit changed that no view holds is untested as `outside-every-snapshot`. The
+  step records `afterCommit` (`compared`, `no-commit`, `incomparable` or `unreadable`), and
+  every step with untested paths or no reading is in `outcome.bump.untestedCommitted`. Only
+  read commands run; a difference is reported, never reverted by the engine.
+- **Pending deliveries.** A withheld entry's `coverage.retires` says which deliveries it
+  retires: only those whose bytes the tested snapshot held (`covered`, staging-coverage.mjs:
+  its own bytes or those of a later delivery built on them). Its `indeterminate` deliveries
+  keep counting toward the next cycle (verification-trigger.mjs), and an automatic cycle that
+  withheld its commit holds its stage back like one that established nothing, so someone
+  editing through every cycle does not start one after another.
+- The `verification-ended` event carries `outcome.committed`, `outcome.withheld` and
+  `outcome.untestedCommitted`, and per project `recheck` and `commitWithheld`.
+
+**A snapshot taken during edits.** Each entry reads the checkouts its snapshot reads (the
+project's and those of the repositories the snapshot locks, a framework's included) just
+before and just after the snapshot (an instance entry around its own snapshot; a release
+entry before its run starts and at the first poll that shows its workspace, `basis:
+around-run-provisioning`): every path `git status` lists with its modification time. It
+records `entry.snapshotMotion` (`newest` change among the changed paths, the paths changed
+within `windowMs` before the snapshot began, 5 minutes by default, and those that differ
+between the two readings, 20 of each shown with the total) and `entry.snapshotDuringEdits`
+(true when either list is not empty; null, never false, when a reading failed, the whole reading or
+any one checkout's, named in `snapshotMotion.unread`). It is information beside
+the verdict, which it never changes. A red entry with `snapshotDuringEdits` says so in
+`cycle.json`, in its red issue (a line and "Moving paths at snapshot time") and in the
+`verification-ended` event (`snapshotDuringEdits`, `movingPaths`, `newestChangeAt`); a green
+entry records it the same way.
 
 **The rerun of failed tests.** One test failing once in a suite of thousands does not decide
 a cycle. When an instance entry's drive is not green, `rerunPlan` decides, before the instance

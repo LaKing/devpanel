@@ -21,6 +21,13 @@
  * cycle also needs `afterDeliveries` deliveries made after that cycle began (`suppressed`).
  * A later cycle of any trigger that establishes coverage for the stage clears it. A hand start
  * is never held.
+ *
+ * A green cycle whose commit was withheld (a checkout moved after its snapshot, full-verification.mjs
+ * `commitWithheld` on the entry) retires only the deliveries its snapshot held the bytes of
+ * (`coverage.covered`, staging-coverage.mjs: its own bytes or those of a later delivery built on
+ * them), as the entry's `coverage.retires` says; its indeterminate deliveries keep counting. Such a
+ * cycle holds the stage back like one that established nothing, and clears nothing, so somebody
+ * editing the checkout through every cycle does not start one after another.
  */
 
 const time = (iso) => { const t = Date.parse(iso ?? ''); return Number.isFinite(t) ? t : null }
@@ -40,7 +47,7 @@ export async function deliveryCounts ({ stages, deliveriesOf, records, threshold
     for (const entry of record.projects ?? []) {
       if (!establishes(entry)) continue
       const set = accounted.get(entry.project) ?? new Set()
-      for (const c of [...(entry.coverage?.covered ?? []), ...(entry.coverage?.indeterminate ?? [])]) set.add(c.runId)
+      for (const c of [...(entry.coverage?.covered ?? []), ...(entry.commitWithheld ? [] : entry.coverage?.indeterminate ?? [])]) set.add(c.runId)
       accounted.set(entry.project, set)
     }
   }
@@ -52,13 +59,14 @@ export async function deliveryCounts ({ stages, deliveriesOf, records, threshold
     }
     const ofStage = (record) => (record.projects ?? []).filter((e) => projects.includes(e.project) && (e.host ?? null) === host)
     // Newest first: the latest cycle that established coverage here, and the latest automatic one that did not.
-    const cleared = records.find((r) => ofStage(r).some(establishes))
-    const failed = records.find((r) => r.trigger === 'deliveries' && r.deliveries?.host === host && !ofStage(r).some(establishes))
+    const withheld = (record) => ofStage(record).some((e) => e.commitWithheld)
+    const cleared = records.find((r) => ofStage(r).some(establishes) && !withheld(r))
+    const failed = records.find((r) => r.trigger === 'deliveries' && r.deliveries?.host === host && (!ofStage(r).some(establishes) || withheld(r)))
     let suppressed = null
     if (failed && (!cleared || (time(failed.startedAt ?? failed.frozenAt) ?? 0) > (time(cleared.startedAt ?? cleared.frozenAt) ?? 0))) {
       const since = time(failed.startedAt ?? failed.frozenAt) ?? 0
       const fresh = runs.filter((r) => (time(r.at) ?? 0) > since).length
-      if (fresh < threshold) suppressed = { sinceCycle: failed.id, needs: threshold - fresh, reason: 'the stage\'s latest automatic cycle established no coverage; the next needs as many deliveries again' }
+      if (fresh < threshold) suppressed = { sinceCycle: failed.id, needs: threshold - fresh, reason: withheld(failed) ? 'the stage\'s latest automatic cycle withheld its commit (a checkout moved after its snapshot); the next needs as many deliveries again' : 'the stage\'s latest automatic cycle established no coverage; the next needs as many deliveries again' }
     }
     out.push({ host, stage, projects, count: runs.length, runs, threshold, suppressed, due: threshold > 0 && runs.length >= threshold && !suppressed })
   }

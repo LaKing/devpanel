@@ -6,6 +6,7 @@ import { createFullVerification, driveIdOf } from '../server/full-verification.m
 import { manualClock } from '../server/runtime/clock.mjs'
 import { driveCommands, instanceName } from '../server/runtime/instance-drive.mjs'
 import { writesCheckout } from '../server/run-exclusivity.mjs'
+import { deliveryCounts } from '../server/verification-trigger.mjs'
 import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
 import { readVerificationFile, VERIFICATION_PAGE_CHARS } from '../server/runtime/check-log.mjs'
 import { engineFixture } from './fakes/fixture.mjs'
@@ -428,6 +429,152 @@ export default async function (t) {
           else process.env[env] = saved[key]
         }
       }
+    }
+
+    // A framework and an instance naming it, both on dynamic instances. The instance's snapshot materializes the
+    // framework's lib/ as fw/. Each scenario says what the recheck finds, how the checkouts read around the snapshot,
+    // and what each checkpoint commits; the git seams are fakes, so nothing here touches a repository.
+    const T0 = Date.parse('2026-11-14T08:59:00.000Z')
+    const FRAMEWORK = '/fixture/framework-project'
+    const SITE = '/fixture/site-project'
+    const pool = ({ suiteFails = [], recheckOf = () => null, movingIn = [], unreadIn = [], failAction = null, commitUntested = {}, covered = () => ({}) } = {}) => {
+      const s = seams({ issuesDir: null, infra: { 'framework-project': instanceInfra(), 'site-project': instanceInfra() }, outcome: async (target, { runId }) => passing(suiteFails.some((p) => runId.endsWith(p.replace(/[^a-z0-9]+/g, '-'))) ? 1 : 0)(target), covered })
+      const heads = { [FRAMEWORK]: 'f0', [SITE]: 's0' }
+      Object.assign(s.calls, { rechecks: [], compared: [], readings: [] })
+      Object.assign(s.options, {
+        projectsConfig: async () => new Map([['framework-project', { id: 'framework-project' }], ['site-project', { id: 'site-project', framework: 'framework-project' }]]),
+        provision: async (args) => {
+          s.calls.provisions.push(args)
+          const p = path.join(args.root, `worktree-${args.runId}`)
+          await fs.mkdir(p, { recursive: true })
+          const project = args.projectPath.split('/').pop()
+          const again = args.runId.endsWith('-recheck')
+          if (again) s.calls.rechecks.push(project)
+          return { path: p, baseCommit: again ? (recheckOf(project) ? `moved-${project}` : `snap-${project}`) : `snap-${project}`, isolation: 'git-worktree' }
+        },
+        recordSnapshot: async ({ projectDir }) => ({ repository: `${projectDir}/.git`, ownCommit: 'own', excludes: [], links: projectDir === SITE ? [{ path: 'fw', owner: FRAMEWORK, prefix: 'lib', consumerExcludes: [], skipped: [] }] : [] }),
+        compareSnapshots: async ({ to }) => ({ sameTree: false, moved: recheckOf(to.replace('moved-', '')) }),
+        readMotion: async ({ projectDir, extra = [] }) => {
+          const after = s.calls.readings.filter((r) => r === projectDir).length % 2 === 1
+          s.calls.readings.push(projectDir)
+          const project = projectDir.split('/').pop()
+          const paths = movingIn.includes(project) ? { 'lib/thread.js': { mtimeMs: after ? T0 + 30000 : T0 - 60000, size: after ? 120 : 80 } } : { 'notes.txt': { mtimeMs: T0 - 3 * 60 * 60 * 1000, size: 5 } }
+          return { at: after ? T0 + 60000 : T0, checkouts: [unreadIn.includes(project) && after ? { checkout: projectDir, error: 'git status: not a git repository' } : { checkout: projectDir, paths }, ...extra.map((c) => ({ checkout: c, paths: {} }))] }
+        },
+        headOf: async (checkout) => heads[checkout],
+        runAction: async (a) => {
+          s.calls.actions.push(a)
+          const checkout = `/fixture/${a.project}`
+          heads[checkout] = `${heads[checkout]}+1`
+          return a.project === failAction ? { id: 'op-fail', status: 'failed', exitCode: 2 } : { status: 'completed' }
+        },
+        compareCommit: async (args) => {
+          s.calls.compared.push({ checkout: args.checkout, commit: args.commit, headBefore: args.headBefore, views: args.views.map((v) => [v.repository, v.at, v.prefix]) })
+          const untested = commitUntested[args.checkout] ?? []
+          return { state: 'compared', commit: args.commit, untested: { paths: untested.map((p) => ({ path: p, reason: 'differs-from-tested' })), total: untested.length }, bumped: [], views: args.views.length }
+        }
+      })
+      return s
+    }
+    const poolCycle = async (s, prefix) => {
+      const issuesDir = await temp(prefix)
+      s.options.issues.ISSUES_DIR = issuesDir
+      return (await cycle(s, path.join(issuesDir, '.verification'), manualClock(Date.parse('2026-11-14T09:00:00.000Z')))).run()
+    }
+
+    t.section('12. a green cycle compares every checkout it snapshotted before the chain: unchanged, the chain runs and every commit is compared with the tested views')
+    {
+      const s = pool()
+      const record = await poolCycle(s, 'devpanel-fvi-unchanged-')
+      const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
+      t.eq('every green entry was snapshotted again before any checkpoint', [s.calls.rechecks.sort(), by['framework-project'].recheck.state, by['site-project'].recheck.state], [['framework-project', 'site-project'], 'unchanged', 'unchanged'])
+      t.eq('the instance\'s recheck covers the framework checkout it read through its link', by['site-project'].recheck.checkouts, [SITE, FRAMEWORK])
+      t.eq('nothing moved: the chain ran as before', s.calls.actions.map((a) => [a.project, a.args]), [['framework-project', ['--minor']], ['site-project', []]])
+      t.eq('the cycle committed', [record.outcome.committed, record.outcome.bump.withheld, record.outcome.commitWithheld], [true, [], undefined])
+      t.eq('each commit compared with every tested view of its checkout: the framework\'s own and the instance\'s copy of lib', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [
+        [FRAMEWORK, 'f0', 'f0+1', [[`${FRAMEWORK}/.git`, '', ''], [`${SITE}/.git`, 'fw', 'lib']]],
+        [SITE, 's0', 's0+1', [[`${SITE}/.git`, '', '']]]
+      ])
+      t.eq('nothing untested was committed', [record.outcome.bump.chain.map((c) => c.afterCommit.state), record.outcome.bump.untestedCommitted], [['compared', 'compared'], []])
+      t.eq('the event says the cycle committed', [s.calls.ended[0].outcome.committed, s.calls.ended[0].outcome.withheld, s.calls.ended[0].projects.map((p) => [p.project, p.recheck, p.commitWithheld])], [true, [], [['framework-project', 'unchanged', false], ['site-project', 'unchanged', false]]])
+    }
+
+    t.section('13. a file edited after the snapshot withholds its pool\'s checkpoints and is named; the entries stay green; only the deliveries the snapshot held retire')
+    {
+      const s = pool({ recheckOf: (project) => project === 'site-project' ? [{ checkout: SITE, paths: ['src/cart.js'], total: 1 }] : null, covered: (project) => project === 'site-project' ? { covered: ['r1'], indeterminate: ['r2'] } : {} })
+      s.options.deliveriesOf = async (project) => project === 'site-project' ? [{ issueId: 'i1', runId: 'r1', at: '2026-11-14T08:00:00.000Z' }, { issueId: 'i2', runId: 'r2', at: '2026-11-14T08:10:00.000Z' }] : []
+      const record = await poolCycle(s, 'devpanel-fvi-moved-')
+      const site = record.projects.find((p) => p.project === 'site-project')
+      t.eq('no checkpoint ran for the pool', s.calls.actions, [])
+      t.eq('the entries stay green as test results', [record.verdict, record.projects.map((p) => p.verdict)], ['green', ['green', 'green']])
+      t.eq('the outcome names the checkout that moved and its path; the cycle did not commit', [record.outcome.committed, record.outcome.commitWithheld, record.outcome.bump.withheld], [false, true, [{ framework: 'framework-project', members: ['framework-project', 'site-project'], moved: [{ project: 'site-project', state: 'moved', checkouts: [{ checkout: SITE, paths: ['src/cart.js'], total: 1 }] }] }]])
+      t.eq('every member entry says its commit was withheld', record.projects.map((p) => [p.project, p.commitWithheld?.framework]), [['framework-project', 'framework-project'], ['site-project', 'framework-project']])
+      t.eq('the record says which deliveries it retires: only those whose bytes the snapshot held', site.coverage.retires, { rule: 'covered-only', reason: 'commit withheld: only the deliveries whose bytes the tested snapshot held are retired; the indeterminate ones keep counting', runIds: ['r1'] })
+      const notice = s.calls.ended[0]
+      t.eq('the verification-ended event carries it', [notice.verdict, notice.outcome.committed, notice.outcome.withheld[0].moved[0].checkouts[0].paths, notice.projects.find((p) => p.project === 'site-project').commitWithheld], ['green', false, ['src/cart.js'], true])
+      const counts = await deliveryCounts({ stages: [{ host: HOST, stage: 'stage', projects: ['site-project'] }], deliveriesOf: s.options.deliveriesOf, records: [record], threshold: 1 })
+      t.eq('the indeterminate delivery keeps counting, the covered one retired', counts[0].runs.map((r) => r.runId), ['r2'])
+      const automatic = { ...record, trigger: 'deliveries', deliveries: { host: HOST } }
+      const held = await deliveryCounts({ stages: [{ host: HOST, stage: 'stage', projects: ['site-project'] }], deliveriesOf: s.options.deliveriesOf, records: [automatic], threshold: 1 })
+      t.eq('an automatic cycle that withheld its commit holds the stage back like one that tested nothing', [held[0].due, held[0].suppressed?.sinceCycle, /withheld its commit/.test(held[0].suppressed?.reason ?? '')], [false, record.id, true])
+    }
+
+    t.section('14. a framework edit seen through an instance\'s link withholds the whole pool, the framework\'s own checkpoint and its instances\'')
+    {
+      const s = pool({ recheckOf: (project) => project === 'site-project' ? [{ checkout: FRAMEWORK, paths: ['lib/thread.js'], total: 1 }] : null })
+      const record = await poolCycle(s, 'devpanel-fvi-framework-')
+      t.eq('the framework\'s own snapshot did not move, the instance\'s copy of it did', record.projects.map((p) => [p.project, p.recheck.state]), [['framework-project', 'unchanged'], ['site-project', 'moved']])
+      t.eq('no checkpoint ran: neither the framework\'s nor its instance\'s', [s.calls.actions, record.outcome.committed], [[], false])
+      t.eq('the outcome names the framework checkout and its path', record.outcome.bump.withheld[0].moved[0].checkouts, [{ checkout: FRAMEWORK, paths: ['lib/thread.js'], total: 1 }])
+    }
+
+    t.section('15. a checkout moving at snapshot time is recorded on a red and on a green entry, and shown in cycle.json, the red issue and the event; no verdict changes')
+    {
+      const s = pool({ movingIn: ['framework-project', 'site-project'], suiteFails: ['site-project'] })
+      const record = await poolCycle(s, 'devpanel-fvi-moving-')
+      const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
+      t.eq('both entries were moving at snapshot time; the verdicts are the suite\'s', record.projects.map((p) => [p.project, p.verdict, p.snapshotDuringEdits]), [['framework-project', 'green', true], ['site-project', 'red', true]])
+      const m = by['site-project'].snapshotMotion
+      t.eq('the newest change, the paths changed within the window and between the readings', [m.newest, m.recent.paths.map((p) => p.path), m.during.paths, m.windowMs], [{ checkout: SITE, path: 'lib/thread.js', at: new Date(T0 + 30000).toISOString() }, ['lib/thread.js'], [{ checkout: SITE, path: 'lib/thread.js' }], 5 * 60 * 1000])
+      const issue = s.calls.issues.find((i) => i.project === 'site-project')
+      t.ok('the red issue says the snapshot was taken during edits, with the moving path', issue.input.includes('Snapshot taken during edits') && issue.input.includes('## Moving paths at snapshot time') && issue.input.includes('`lib/thread.js`'), issue.input)
+      const notice = s.calls.ended[0].projects
+      t.eq('the event carries it for both, with the moving paths', notice.map((p) => [p.project, p.snapshotDuringEdits, p.movingPaths]), [['framework-project', true, [{ checkout: FRAMEWORK, path: 'lib/thread.js' }]], ['site-project', true, [{ checkout: SITE, path: 'lib/thread.js' }]]])
+      const still = await poolCycle(pool(), 'devpanel-fvi-still-')
+      t.eq('a checkout last changed hours before, unchanged between the readings: not moving', still.projects.map((p) => p.snapshotDuringEdits), [false, false])
+      const blind = pool({ unreadIn: ['site-project'] })
+      const unknown = await poolCycle(blind, 'devpanel-fvi-unread-')
+      const site = unknown.projects.find((p) => p.project === 'site-project')
+      t.eq('a checkout whose reading failed: unknown (null), never false, the failure named; the verdict unchanged', [site.snapshotDuringEdits, site.snapshotMotion.unread, site.verdict, blind.calls.ended[0].projects.find((p) => p.project === 'site-project').snapshotDuringEdits], [null, [{ checkout: SITE, error: 'git status: not a git repository' }], 'green', null])
+    }
+
+    t.section('16. every checkpoint attempt is compared, a failed one that committed included; a difference is reported, never reverted')
+    {
+      const s = pool({ failAction: 'framework-project', commitUntested: { [FRAMEWORK]: ['lib/slipped.js'] } })
+      const record = await poolCycle(s, 'devpanel-fvi-failed-')
+      const step = record.outcome.bump.chain[0]
+      t.eq('the framework\'s checkpoint failed after committing; its commit was compared all the same', [step.status, step.headBefore, step.afterCommit.state, step.afterCommit.untested.paths], ['failed', 'f0', 'compared', [{ path: 'lib/slipped.js', reason: 'differs-from-tested' }]])
+      t.eq('the committed-but-untested difference is in the outcome and the event', [record.outcome.bump.untestedCommitted, s.calls.ended[0].outcome.untestedCommitted.map((u) => u.paths)], [[{ project: 'framework-project', state: 'compared', commit: 'f0+1', paths: [{ path: 'lib/slipped.js', reason: 'differs-from-tested' }], total: 1 }], [[{ path: 'lib/slipped.js', reason: 'differs-from-tested' }]]])
+      t.eq('no further action ran: nothing was reverted, the chain stopped as before', [s.calls.actions.map((a) => [a.project, a.actionId]), record.outcome.committed], [[['framework-project', 'checkpoint']], false])
+    }
+
+    t.section('17. a checkpoint the service stop interrupted is compared at the next start')
+    {
+      const dir = await temp('devpanel-fvi-recover-')
+      const verificationDir = path.join(dir, '.verification')
+      const step = { project: 'framework-project', framework: 'framework-project', action: 'checkpoint', args: ['--minor'], status: 'running', headBefore: 'f0', startedAt: '2026-11-14T09:30:00.000Z' }
+      const entry = { project: 'framework-project', stage: 'stage', verdict: 'green', snapshot: { baseCommit: 'snap', repository: `${FRAMEWORK}/.git`, ownCommit: 'own', excludes: [], links: [] } }
+      await fs.mkdir(path.join(verificationDir, '2026-11-14'), { recursive: true })
+      await fs.writeFile(path.join(verificationDir, '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', date: '2026-11-14', state: 'outcome', projects: [entry], outcome: { verdict: 'green', committed: false, bump: { chain: [step], untestedCommitted: [] } } }))
+      const s = pool({ commitUntested: { [FRAMEWORK]: ['lib/half.js'] } })
+      s.options.headOf = async () => 'f0+1'
+      const fv = createFullVerification({ ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
+      await fv.recover()
+      const after = await readJson(path.join(verificationDir, '2026-11-14', 'cycle.json'))
+      const recovered = after.outcome.bump.chain[0]
+      t.eq('the step reads interrupted and its commit was compared by the recovery', [after.state, recovered.status, recovered.afterCommit.observedBy, recovered.afterCommit.untested.paths.map((p) => p.path)], ['interrupted', 'interrupted', 'recovery', ['lib/half.js']])
+      t.eq('against the views the record kept', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [[FRAMEWORK, 'f0', 'f0+1', [[`${FRAMEWORK}/.git`, '', '']]]])
+      t.eq('and it is in the outcome', after.outcome.bump.untestedCommitted.map((u) => [u.project, u.total]), [['framework-project', 1]])
     }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
