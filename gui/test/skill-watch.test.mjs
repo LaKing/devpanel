@@ -32,7 +32,8 @@ export default async function (t) {
 
   // The two routes the watch reads, from the real issue code over real run records; the events are the test's.
   // `failReads` answers that many readings of an issue with a 503; `failing` answers all of them so.
-  const api = { failReads: 0, failed: 0, failing: false }
+  // `answered` counts the readings of each issue answered with its record, so a test can tell what the watch was told.
+  const api = { failReads: 0, failed: 0, failing: false, answered: {} }
   const server = http.createServer(async (req, res) => {
     try {
       const m = /^\/api\/projects\/([^/]+)\/issues(?:\/([^/?]+))?/.exec(req.url)
@@ -46,6 +47,7 @@ export default async function (t) {
       const body = m[2] ? await issues.getIssue(project, decodeURIComponent(m[2])) : await issues.listIssues(project)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(body))
+      if (m[2]) { const id = decodeURIComponent(m[2]); api.answered[id] = (api.answered[id] ?? 0) + 1 }
     } catch (error) {
       res.writeHead(error.status ?? 500, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: error.message }))
@@ -185,6 +187,10 @@ export default async function (t) {
       const issue = await newIssue('Failing on reconnect', { [NEWER]: pending(NEWER) })
       const w = watch(issue.id)
       await w.connected()
+      // The watch reads the record at its start and again on connect, after printing "watching ". The decision is
+      // written only once both readings were answered undecided: written earlier, a slow connect reading would see it
+      // and settle the watch before the transport drops, and it would never reconnect.
+      await until(() => (api.answered[issue.id] ?? 0) >= 2, 'the start and connect readings to be answered')
       await issue.write(NEWER, completed(NEWER))
       api.failing = true
       api.failed = 0

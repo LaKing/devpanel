@@ -39,7 +39,8 @@ export default async function (t) {
   const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline })
 
   // The SSH shim: `-G` answers from map-<destination> (else the destination), fail-<destination>
-  // makes it fail, slow-<destination> makes the next one outlast its attempt. Every other call is
+  // makes it fail (leaving failed-<destination> behind, so a test can see that a read failed), each
+  // answer adds a line to answered-<destination>, and slow-<destination> makes the next one outlast its attempt. Every other call is
   // a connection: it logs "<pinned hostname>|<destination>" and runs the remote command.
   const shimDir = await temp('ds-shim-')
   const managerEnv = await installRemoteManager(shimDir)
@@ -54,7 +55,8 @@ export default async function (t) {
     'if [ "$1" = -G ]; then',
     '  name=${last#*@}',
     '  if [ -e "$D/slow-$name" ]; then rm -f "$D/slow-$name"; sleep 20; fi',
-    '  if [ -e "$D/fail-$name" ]; then echo "no config for $name" >&2; exit 255; fi',
+    '  if [ -e "$D/fail-$name" ]; then touch "$D/failed-$name"; echo "no config for $name" >&2; exit 255; fi',
+    '  echo ok >> "$D/answered-$name"',
     '  h=$(cat "$D/map-$name" 2>/dev/null || echo "$name")',
     '  echo "host $name"; echo "hostname $h"; echo "user u"',
     '  case " $* " in *" HostName="*) if [ -e "$D/differ-$name" ]; then echo "port 22"; else echo "port 4444"; fi;; *) echo "port 4444";; esac',
@@ -175,10 +177,14 @@ export default async function (t) {
       const a = drive('ssh-config:host-m', 'm1'), b = drive('ssh-config:host-m', 'm2')
       await until('both resolved drives', async () => await exists(started('m1')) && await exists(started('m2')))
       const flaky = drive('ssh-config:alias-flaky', 'm3', { driveTiming: { ...timing(), windowMs: 30000 } })
-      await settle()
+      // The drive rebuilds its candidate before its first -G, which under a loaded host can take longer than any fixed
+      // pause: the failure is removed only once a read has failed, so the drive has waited and counted it, however slow.
+      await until('a -G read of the alias to fail', () => exists(path.join(state, 'failed-alias-flaky')))
       const flakyLines = async () => (await log()).filter((line) => line.endsWith('|alias-flaky'))
       t.eq('while its -G fails it connects to nothing', await flakyLines(), [])
       await fs.rm(path.join(state, 'fail-alias-flaky'))
+      const answered = async () => (await fs.readFile(path.join(state, 'answered-alias-flaky'), 'utf8').catch(() => '')).split(NL).filter(Boolean).length
+      await until('the alias to resolve: its plain and its pinned read answered', async () => (await answered()) >= 2)
       await settle()
       t.eq('resolved to the same host, it still connects to nothing while the slots are held', await flakyLines(), [])
       await go('m1')
@@ -455,13 +461,13 @@ export default async function (t) {
       const say = (word) => `echo ${word} {{instanceName}} >> '${instanceLog}'`
       const lines = async () => (await fs.readFile(instanceLog, 'utf8').catch(() => '')).split(NL).filter(Boolean)
       // The ready command is the gate: the drive holds its instance while the test looks.
-      const instanced = async (instanceName, runId, gateName, max = 2) => {
+      const instanced = async (instanceName, runId, gateName, max = 2, extra = {}) => {
         const tier = { kind: 'ssh', ssh: { hostRef: 'ssh-config:host-i', workdir: await temp('ds-remote-') }, modules: { collections: ['@*'],
           lint: { id: 'lint', run: 'true {{files}}' }, load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') },
           ready: { id: 'ready', run: `${held(gateName)[0].run}; ${say('ready')}` }, test: { id: 'selftest', run: 'true {{instance}} {{filter}}' },
           instance: { root, max, create: { run: `${say('create')} && mkdir {{instance}}` }, start: { run: say('start') }, destroy: { run: `${say('destroy')} && rmdir {{instance}}` } } } }
         const { target } = modulesDrive(tier, { affected: { modules: ['@c/a'], core: null }, files: [], instanceName })
-        return runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp, target, runId, runDir: await temp('ds-run-'), driveTiming: timing() })
+        return runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp, target, runId, runDir: await temp('ds-run-'), driveTiming: timing(), ...extra })
       }
       const whole = runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp,
         target: { kind: 'ssh', tier: 'modules', ssh: { hostRef: 'ssh-config:host-i', workdir: await temp('ds-remote-') }, commands: held('ib') }, runDir: await temp('ds-run-'), driveTiming: timing() })
@@ -484,7 +490,11 @@ export default async function (t) {
       t.eq('load, restart, ready', (await lines()).slice(3), ['load dp-one', 'restart dp-one', 'ready dp-one'])
 
       // A host that keeps one instance: another run waits until the first one's is destroyed.
-      const other = instanced('dp-two', 'run-two', 'i3', 1)
+      // The first instance is destroyed only once this drive is waiting for the host's one instance slot: it rebuilds
+      // its candidate first, which under a loaded host can outlast any fixed pause, and then it would find the slot free.
+      const waits = []
+      const other = instanced('dp-two', 'run-two', 'i3', 1, { onDriveWait: async (event) => { waits.push(event) } })
+      await until('the second run to wait for an instance slot', () => waits.some((w) => w.phase === 'start' && w.reason === 'instances-full'))
       await settle()
       t.eq('a second instance over the cap is not created', (await lines()).filter((l) => l.endsWith('dp-two')), [])
       const before = (await log()).length
