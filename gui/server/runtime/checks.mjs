@@ -14,7 +14,8 @@ import { hostPlatform } from './platform.mjs'
 import { exitedOnItsOwn } from './modules-tier.mjs'
 import { driveCommands, instanceTimings, instanceVerdict } from './instance-drive.mjs'
 import { instanceStep, manifestsKey, syncOf } from './dependency-sync.mjs'
-import { destroyInstance, holdInstance, liveManifests, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
+import { destroyInstance, holdInstance, liveManifests, liveStageMark, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
+import { foreignEvents, holdsSync, revertOwnSync, stageEvents, stageMark } from './sync-records.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
 import { discardReconstruction, reconstructInto, worktreeDiffDelivery } from './launch.mjs'
 import { applyFence, PANEL_ROOT } from '../../../harness/fence.mjs'
@@ -85,7 +86,8 @@ export async function runChecks ({
   prepared = null,
   // Told as a wait for a test-drive slot begins and ends (drive-slots.mjs).
   onDriveWait = null,
-  // Injected by tests: the slot directory and how long resolving and polling take.
+  // Injected by tests: the slot directory and how long resolving and polling take, and
+  // `afterStageRead`, awaited between a held instance's journal reading and its use.
   driveTiming = {}
 }) {
   const startedAt = clock.now()
@@ -199,32 +201,76 @@ export async function runChecks ({
  * loading into it. What the drive leaves decides its fate (instanceVerdict): up, it
  * stays for the run's next drive; in doubt, it is destroyed here, so a retry of the
  * drive starts from a new one. `result.stageInstance` records all of it.
+ *
+ * The stage's dependency set is shared (sync-records.mjs). A drive that installed its
+ * revision's dependencies destroys its instance and reverts them as it ends, whatever
+ * its outcome. A held instance whose stage another run synced or reverted since its last
+ * drive began is not loaded into: it is replaced (`replaced.by`). A drive that failed
+ * while another run synced or reverted the stage under it is `unavailable` and
+ * environmental (`result.environmental`): the failure is the stage's, not the candidate's.
  */
-async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming, entries = [] }, run) {
+export async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming, entries = [] }, run) {
   const instance = target.stageInstance
   if (!instance) return run(target)
+  const slotsDir = driveTiming.slotsDir ?? null
   const hold = () => holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
-    ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir: driveTiming.slotsDir ?? null })
+    ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir })
   let slot = await hold()
+  // The drive's journal mark is taken before the instance's history is read, so the two readings overlap: an event
+  // either reaches the replacement below or lies at or after the mark and so in `disturbedBy`, never neither.
+  let mark = await stageMark(host, slotsDir)
   // A revision whose changed dependency manifests are not the ones the instance was made with is not loaded into it.
   const manifests = manifestsKey(instance, entries)
   let replaced = null
-  if (!slot.fresh && manifests !== null && liveManifests(instance.name) !== manifests) {
-    replaced = await destroyInstance(instance.name, { reason: 'dependencies-changed', clock })
-    slot = await hold()
+  if (!slot.fresh) {
+    // Nor an instance whose stage another run's sync or revert stopped since its last drive began.
+    const since = liveStageMark(instance.name)
+    const by = Number.isInteger(since) ? foreignEvents(await stageEvents(host, { from: since, slotsDir }), instance.name) : []
+    await driveTiming.afterStageRead?.()
+    if (by.length) replaced = { ...await destroyInstance(instance.name, { reason: 'stage-dependencies-replaced', clock }), by }
+    else if (manifests !== null && liveManifests(instance.name) !== manifests) replaced = await destroyInstance(instance.name, { reason: 'dependencies-changed', clock })
+    // A replaced instance is created by this drive, after everything the journal holds now.
+    if (replaced) { slot = await hold(); mark = await stageMark(host, slotsDir) }
   }
-  const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}), ...(replaced ? { replaced: { reason: replaced.reason, at: replaced.at, durationMs: replaced.durationMs, passed: replaced.passed, ...(replaced.error ? { error: replaced.error } : {}) } } : {}) }
+  const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}), ...(replaced ? { replaced: { reason: replaced.reason, at: replaced.at, durationMs: replaced.durationMs, passed: replaced.passed, ...(replaced.error ? { error: replaced.error } : {}), ...(replaced.by ? { by: replaced.by } : {}) } } : {}) }
   try {
-    const holder = { kind: target.kind, ssh: target.ssh ?? null, runId, runDir, dir: result.dir, slotsDir: driveTiming.slotsDir ?? null }
+    const foreignWait = { ...(driveTiming.foreignSyncWaitMs ? { timeoutMs: driveTiming.foreignSyncWaitMs } : {}), ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}) }
+    const holder = { kind: target.kind, ssh: target.ssh ?? null, runId, runDir, dir: result.dir, slotsDir, foreignWait, stageMark: mark }
     await run({ ...target, commands: driveCommands(target, slot.fresh), stageInstance: { ...instance, sync: syncOf(instance, entries), holder } })
   } finally {
     Object.assign(record, instanceTimings(target, slot.fresh, result))
+    const disturbedBy = foreignEvents(await stageEvents(host, { from: mark, slotsDir }), instance.name)
+    if (disturbedBy.length) record.disturbedBy = disturbedBy
+    const synced = holdsSync(instance.name)
     const verdict = instanceVerdict(target, slot.fresh, result)
-    if (verdict === 'live') await markLive(instance.name, { revision: result.revision ?? result.ofRevision ?? null, manifests, clock })
+    if (verdict === 'live' && !synced) await markLive(instance.name, { revision: result.revision ?? result.ofRevision ?? null, manifests, stageMark: mark, clock })
     else if (verdict === 'doubt') record.destroyed = await destroyInstance(instance.name, { reason: slot.fresh ? 'did-not-come-up' : 'reload-failed', clock })
+    // It runs on the dependencies this drive installed, which are reverted next.
+    else if (verdict === 'live') record.destroyed = await destroyInstance(instance.name, { reason: 'dependencies-reverted', clock })
     else if (slot.fresh) await releaseInstance(instance.name)
-    record.state = verdict === 'doubt' ? 'destroyed' : verdict === 'untouched' && slot.fresh ? 'not-created' : 'live'
+    record.state = record.destroyed ? 'destroyed' : verdict === 'untouched' && slot.fresh ? 'not-created' : 'live'
+    if (synced) await revertDriveSync({ record, instance, host, clock, onWait, slotsDir, dir: result.dir })
+    if (record.environmental && result.result !== 'passed') result.environmental = record.environmental
+    if (result.result === 'failed' && disturbedBy.length) {
+      result.result = 'unavailable'
+      result.environmental = { cause: 'dependency-sync', by: disturbedBy }
+      const who = disturbedBy.map((d) => `${d.event} by run ${d.runId ?? 'unknown'} (${d.owner}${d.files.length ? `: ${d.files.join(', ')}` : ''})`).join(', ')
+      result.error = `another run's dependency ${who} stopped every instance on ${host} during this drive, so its failure says nothing about the candidate${result.error ? ` (the drive said: ${result.error})` : ''}`
+    }
   }
+}
+
+/** The drive that installed dependencies on the whole stage puts the deployed set back as it ends: a wait the wall clock excuses, recorded on `dependencySync.reverted`. */
+async function revertDriveSync ({ record, instance, host, clock, onWait, slotsDir, dir }) {
+  const wait = { id: crypto.randomUUID(), from: clock.iso() }
+  await onWait?.({ phase: 'start', id: wait.id, host, reason: 'dependency-revert', from: wait.from, dir })
+  let reverted
+  try { reverted = await revertOwnSync(instance.name, { host, reason: 'drive-ended', clock, slotsDir }) } finally {
+    await onWait?.({ phase: 'end', id: wait.id, host, from: wait.from, to: clock.iso(), dir })
+  }
+  if (!reverted) return
+  const said = { reason: reverted.reason, at: reverted.at, durationMs: reverted.durationMs, passed: reverted.passed, ...(reverted.error ? { error: reverted.error } : {}) }
+  record.dependencySync = { ...(record.dependencySync ?? { files: reverted.files, outcome: 'earlier' }), reverted: said }
 }
 
 /**
@@ -431,7 +477,7 @@ async function runCommandsLocally ({ target, cwd, dir, result, clock, signal, pl
   const env = { ...childEnvironment('none'), HOME: os.homedir(), ...(wrap ? { TMPDIR: '/tmp' } : {}), ...(runId ? { DEVPANEL_RUN_ID: runId } : {}) }
   const spawn = c => ({ ...(wrap ? wrap('/bin/sh', ['-c', c.run]) : { command: '/bin/sh', args: ['-c', c.run] }), env })
   try {
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd, dir, clock, signal, spawn }), { clock, signal, onWait: onDriveWait, host: LOCAL_HOST, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host: LOCAL_HOST }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd, dir, clock, signal, spawn }), { clock, signal, onWait: onDriveWait, host: LOCAL_HOST, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host: LOCAL_HOST, signal }) })
   } finally {
     for (const command of target.finallyCommands ?? []) result.commands.push(await runOne({ command, cwd, dir, clock, spawn }))
   }
@@ -630,7 +676,7 @@ async function runCommandsOverSsh ({ connection, host, target, rebuilt, dir, run
     // and only does not execute what the smoke ran, so comparison and gating
     // read the records a fresh drive with these outcomes would leave: a smoke
     // command a fresh drive would have skipped reads as not run.
-    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd: null, dir, clock, signal, spawn: remoteSpawn }), { clock, signal, onWait: onDriveWait, host, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host }) })
+    await runCommandSet({ commands: target.commands, result, signal, run: (command) => carried?.get(command.id) ?? instanceStep(command, (c) => runBusy(c, () => runOne({ command: c, cwd: null, dir, clock, signal, spawn: remoteSpawn }), { clock, signal, onWait: onDriveWait, host, dir: result.dir }), { target, result, clock, onWait: onDriveWait, host, signal }) })
   } finally {
     if (carried) {
       const { instance, smoke, plan } = continueFrom

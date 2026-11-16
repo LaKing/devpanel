@@ -59,7 +59,7 @@ export function harnessUnavailable (harnesses, id) {
 
 /** One check attempt as kept on the check that replaced or outlived it (check-log.mjs reads its logs). */
 const attemptRecord = (c) => ({ dir: c.dir, result: c.result, at: c.at, durationMs: c.durationMs, error: c.error ?? null,
-  ...(c.driveSlot ? { driveSlot: c.driveSlot } : {}), ...(c.stageInstance ? { stageInstance: c.stageInstance } : {}),
+  ...(c.driveSlot ? { driveSlot: c.driveSlot } : {}), ...(c.stageInstance ? { stageInstance: c.stageInstance } : {}), ...(c.environmental ? { environmental: c.environmental } : {}),
   failed: (c.commands ?? []).filter((x) => x.passed === false && x.required !== false).map((x) => x.id),
   commands: (c.commands ?? []).map((x) => ({ id: x.id, required: x.required, passed: x.passed, exitCode: x.exitCode, log: x.log, ...(x.fromSmoke ? { fromSmoke: x.fromSmoke } : {}) })),
   ...(c.continuedFrom ? { continuedFrom: c.continuedFrom } : {}), ...(c.continuation ? { continuation: c.continuation } : {}) })
@@ -2005,14 +2005,31 @@ export class Engine {
    * times, how many drives it served and how it ended. The run's end adds the destroy
    * (the supervisor, stage-instances.mjs), so the record names every instance the run
    * ever had on a staging host.
+   *
+   * Returns what other runs' dependency syncs did to the run's instances in these drives
+   * (`run.stageDisturbances`), for the caller to announce.
    */
   noteStageInstance (check) {
+    const disturbances = []
     for (const drive of [...(check?.attempts ?? []), check]) {
       const used = drive?.stageInstance
       if (!used) continue
-      // A sync that ran is the run's to answer for: the supervisor reverts it when the run ends undelivered (sync-records.mjs).
+      // A sync that ran is the run's to answer for: the drive reverts it as it ends (`settled`), and the
+      // supervisor tries again at the run's end when that failed (sync-records.mjs).
       const sync = used.dependencySync
-      if (sync && sync.outcome !== 'not-changed') (this.run.dependencySyncs ??= []).push({ name: used.name, host: used.host, at: drive.at ?? this.clock.iso(), dir: drive.dir ?? null, files: sync.files, durationMs: sync.durationMs, outcome: sync.outcome, reason: sync.reason })
+      const settled = sync?.reverted ? { settled: sync.reverted } : {}
+      if (sync?.outcome === 'earlier') {
+        const earlier = (this.run.dependencySyncs ?? []).findLast((d) => d.name === used.name && !d.settled?.passed)
+        if (earlier) Object.assign(earlier, settled)
+      } else if (sync && sync.outcome !== 'not-changed') (this.run.dependencySyncs ??= []).push({ name: used.name, host: used.host, at: drive.at ?? this.clock.iso(), dir: drive.dir ?? null, files: sync.files, durationMs: sync.durationMs, outcome: sync.outcome, reason: sync.reason, ...settled })
+      // Told: another run's sync or revert stopped this run's instance during the drive, or since its last one.
+      const by = [...(used.replaced?.by ?? []).map((d) => ({ ...d, when: 'before-drive' })), ...(used.disturbedBy ?? []).map((d) => ({ ...d, when: 'during-drive' })),
+        ...(used.foreignSync?.by ?? []).map((d) => ({ ...d, event: 'standing', when: 'at-create' }))]
+      if (by.length) {
+        const disturbance = { name: used.name, host: used.host, at: drive.at ?? this.clock.iso(), dir: drive.dir ?? null, result: drive.result, environmental: Boolean(drive.environmental), by }
+        ;(this.run.stageDisturbances ??= []).push(disturbance)
+        disturbances.push(disturbance)
+      }
       const list = (this.run.stageInstances ??= [])
       let entry = list.findLast((i) => i.name === used.name && !i.destroyed)
       if (used.fresh && used.state !== 'not-created' && used.created !== false) {
@@ -2027,6 +2044,7 @@ export class Engine {
       entry.drives++
       if (used.destroyed) entry.destroyed = used.destroyed
     }
+    return disturbances
   }
 
   /**
@@ -2137,7 +2155,7 @@ export class Engine {
       const { failures, unreadable } = await modulesSelftestFailures({ runDir: common.runDir, target, check: result })
       // Tagged before any caller gates it (maybeRunChecks, reconcile): gatingResult reads the tier.
       Object.assign(result, { tier: 'modules', modules: { selftestFailures: failures, ...(unreadable.length ? { reportUnreadable: unreadable } : {}) } })
-      this.noteStageInstance(result)
+      for (const d of this.noteStageInstance(result)) await this.persist({ type: 'stage-instance-disturbed', revision: current, ...d })
       await this.subscriberChecks(result, { revision: current, common })
       return result
     }
@@ -2279,9 +2297,18 @@ export class Engine {
    * command records, so its logs stay readable (check-log.mjs). No rerun when an
    * earlier revision already failed the same way (sameFailureEarlier): `base` is
    * what is known of the base now, and no base is driven just to decide this.
+   *
+   * A first drive another run's dependency sync disturbed (`environmental`, checks.mjs) is
+   * no failure; it is driven once more whatever `retryFailed` says, and that drive's
+   * answer stands (a pass is `recoveredFrom: 'environmental'`, never `flaky`).
    */
   async retryFailedCheck (first, { common, revision, fingerprint: fp, target, earlier, base }) {
     const attempts = []
+    if (first.environmental && !this.controller.signal.aborted) {
+      await this.persist({ type: 'checks-retry', revision, attempt: 2, failedDir: first.dir, environmental: true })
+      const retry = await runChecks({ ...common, revision, fingerprint: fp })
+      return { ...retry, attempts: [attemptRecord(first)], ...(retry.result === 'passed' ? { recoveredFrom: 'environmental' } : {}) }
+    }
     const limit = Number.isInteger(target.retryFailed) ? target.retryFailed : 1
     if (first.result === 'failed' && limit > 0 && earlier.length && !this.controller.signal.aborted) {
       const commands = sameFailureEarlier({ failures: await failureIdentities({ runDir: common.runDir, check: first }), earlier, base })

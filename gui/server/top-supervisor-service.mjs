@@ -24,6 +24,7 @@ import { deployStaging, deploymentReport } from './staging-deployment.mjs'
 import { deploymentCoverage, stagingPendingReport, writeDeploymentNotes } from './staging-coverage.mjs'
 import { settledRunCache } from './settled-run-cache.mjs'
 import { bundleFiles } from './issue-bundle.mjs'
+import { standingSyncs } from './runtime/sync-records.mjs'
 
 // pollMs: only a test passes it (top-supervisor.idle-reads.test.mjs); the service polls at createTopSupervisor's default.
 export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null, pollMs }) {
@@ -151,7 +152,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
      resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState,
      pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue?.path??null,...args}),
      moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId??null}),
-     modulesCoverage:target=>supervisor.modulesCoverage({project:a.project,projectPath:projectPath(a.project),issueId:a.issueId??null,issuePath:issue?.path??null,target})})
+     modulesCoverage:target=>supervisor.modulesCoverage({project:a.project,projectPath:projectPath(a.project),issueId:a.issueId??null,issuePath:issue?.path??null,target}),
+     stagingSyncs:()=>standingSyncs()})
    },
    infrastructure:project=>projectInfrastructure(project,{root:configRoot}),
    inspectEnvironment:a=>inspectEnvironment(a,{root:configRoot}),

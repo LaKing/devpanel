@@ -1368,19 +1368,18 @@ export function createSupervisor ({
    * the run's next drive after a resume creates it again from the revision it then checks.
    * The destroy is written to the run's record (`stageInstances[].destroyed`).
    *
-   * Dependencies the run had installed on the stage (sync-records.mjs) are another matter:
-   * a paused run, and one a shutdown stopped that the next start resumes, keeps them, since
-   * a revert and a second sync would restart the stage's base instance twice more. Every
-   * other end without a delivery to the source reverts them here, after the instance is
-   * gone; a delivered run leaves them for the next release (`dependencySyncs[].settled`).
+   * Dependencies the run installed on the stage (sync-records.mjs) are reverted by the
+   * drive that installed them as it ends. One still standing here (that revert failed, or
+   * the drive was cut short) is reverted now, after the instance is gone, at every end and
+   * at a pause, delivered or not: the stage stays on its deployed set
+   * (`dependencySyncs[].settled`).
    */
   async function destroyStageInstances (run, issuePath) {
     if (!run?.runId) return
     try {
       const reason = run.status === 'paused' ? 'run-paused' : `run-${run.status ?? 'ended'}`
       const destroyed = await destroyRunInstances(run.runId, { reason })
-      const how = syncDisposition(run)
-      const settled = ['revert', 'drop'].includes(how) ? await settleRunSyncs(run.runId, { how, reason }) : []
+      const settled = syncDisposition(run) === 'revert' ? await settleRunSyncs(run.runId, { how: 'revert', reason }) : []
       for (const s of settled) {
         const entry = (run.dependencySyncs ?? []).findLast((d) => d.name === s.owner && d.outcome === 'synced' && !d.settled?.passed)
         const { owner, host, runId, files, ...rest } = s
@@ -1706,7 +1705,7 @@ export function createSupervisor ({
         await removeRunWorkspace(run, await resolveProjectPath(project, { projectsDir }).catch(() => null))
         // Its end destroyed its stage instances; one that could not be removed then is tried once more.
         await destroyRunInstances(runId, { reason: 'run-deleted' }).catch(() => [])
-        // So is a dependency sync its end could not revert; a delivered run's record went at its end.
+        // So is a dependency sync neither its drive nor its end could revert.
         if (syncDisposition(run) === 'revert') await settleRunSyncs(runId, { how: 'revert', reason: 'run-deleted' }).catch(() => [])
         let reservations = []
         try { reservations = JSON.parse(await fs.readFile(path.join(issue.path, '.step-reservations.json'), 'utf8')) } catch (e) { if (e.code !== 'ENOENT') throw e }

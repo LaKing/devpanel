@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises'
+import { appendFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
@@ -11,9 +12,11 @@ import { slotDirectory } from '../server/runtime/drive-slots.mjs'
 import { modulesDrive } from '../server/runtime/modules-tier.mjs'
 import { CREATE_ID, DESTROY_ID, instanceName, instanceWords, START_ID, SYNC_ID } from '../server/runtime/instance-drive.mjs'
 import { changedManifests, syncOf } from '../server/runtime/dependency-sync.mjs'
-import { noteSync, settleRunSyncs, sweepSyncs, syncDisposition } from '../server/runtime/sync-records.mjs'
+import { holdsSync, noteSync, settleRunSyncs, settleSync, stageEvents, standingSyncs, sweepSyncs, syncDisposition } from '../server/runtime/sync-records.mjs'
+import { withStageInstance } from '../server/runtime/checks.mjs'
 import { destroyRunInstances, holdsInstance, LOCAL_HOST } from '../server/runtime/stage-instances.mjs'
 import { createSupervisor } from '../server/supervisor.mjs'
+import { launchReadiness } from '../server/supervisor-readiness.mjs'
 
 export const name = 'dependency sync — a run that changes dependency manifests gets them installed on the stage: create\'s refusal, the sync and the second create, a revision that changed none, the stage\'s refusals, a stale instance, a start held by a sync, and the revert at every undelivered end and for a dead owner'
 
@@ -63,7 +66,7 @@ export default async function (t) {
   const MANIFESTS = { '@c/a/package.json': '{"dependencies":{"is-number":"7.0.0"}}\n', '@c/a/npm.sh': 'npm install is-number@7.0.0\n' }
   // A stage that refuses a create until `synced` exists, as one whose manifests differ from the candidate's does.
   // Every command appends "<word> <instance name>" to a log; `sync` (shell text) is what the sync command does.
-  const tier = async ({ sync = null, start = null, declare = true, test = 'ok' } = {}) => {
+  const tier = async ({ sync = null, start = null, ready = null, revert = null, declare = true, test = 'ok' } = {}) => {
     const dir = await temp('devpanel-sync-')
     const log = path.join(dir, 'log')
     const say = (word) => `echo ${word} {{instanceName}} >> '${log}'`
@@ -72,7 +75,7 @@ export default async function (t) {
     const modules = {
       collections: ['@*'],
       lint: { id: 'lint', run: `${dir}/ok {{instance}} {{files}}` },
-      load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') }, ready: { id: 'ready', run: say('ready') },
+      load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') }, ready: { id: 'ready', run: ready ? ready({ dir, say }) : say('ready') },
       test: { id: 'module-selftest', run: `${dir}/${test} {{instance}} {{filter}}` }, finallyCommands: [REPORT],
       instance: {
         root: path.join(dir, 'instances'),
@@ -81,7 +84,7 @@ export default async function (t) {
         destroy: { run: `${say('destroy')} && rm -rf {{instance}}` },
         ...(declare ? { syncDependencies: {
           run: `${say('sync')}; printf '%s\\n' {{changed}} > '${dir}/changed'; ${sync ?? `touch '${dir}/synced'`}`, unavailableExitCodes: [3, 7], unavailableReason: 'the stage refused to install this candidate\'s dependencies',
-          revert: { run: `echo revert {{instanceName}} >> '${log}'; rm -f '${dir}/synced'` }
+          revert: { run: `echo revert {{instanceName}} >> '${log}'; ${revert ?? `rm -f '${dir}/synced'`}` }
         } } : {})
       }
     }
@@ -89,6 +92,40 @@ export default async function (t) {
     return { dir, target: { kind: 'local', modules }, lines }
   }
   const records = async () => (await fs.readdir(slotDirectory(LOCAL_HOST)).catch(() => [])).filter((n) => n.startsWith('sync-') && n.endsWith('.json')).sort()
+  // Another run's sync, as its noteSync leaves it in the host journal (sync-records.mjs).
+  const journalFile = () => path.join(slotDirectory(LOCAL_HOST), 'syncs.jsonl')
+  const OTHER = { event: 'sync', owner: 'dp-other', runId: 'run-other', files: ['@c/b/npm.sh'] }
+  // One stage two runs share: create refuses whenever the candidate's manifest (`@c/a/npm.sh`, which only the
+  // manifest-changing run has) and the stage's (`synced`) differ, as the real one compares them; a sync and a
+  // revert stop every instance on it (their `up` goes). `before*`, `sync` and `ready` add barriers for an order.
+  const shared = async (barriers = () => ({})) => {
+    const dir = await temp('devpanel-shared-stage-')
+    const log = path.join(dir, 'log')
+    const inst = path.join(dir, 'instances')
+    const say = (word) => `echo ${word} {{instanceName}} >> '${log}'`
+    const wait = (file) => `i=0; while [ ! -f '${dir}/${file}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; `
+    const { beforeCreate = '', sync = '', ready = '', revert = null } = barriers({ dir, wait })
+    await fs.writeFile(path.join(dir, 'ok'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    const modules = {
+      collections: ['@*'],
+      lint: { id: 'lint', run: `${dir}/ok {{instance}} {{files}}` },
+      load: { id: 'load', run: say('load') }, restart: { id: 'restart', run: say('restart') },
+      ready: { id: 'ready', run: `${ready}test -f {{instance}}/up` },
+      test: { id: 'module-selftest', run: `${dir}/ok {{instance}} {{filter}}` }, finallyCommands: [REPORT],
+      instance: {
+        root: inst,
+        create: { run: `${beforeCreate}${say('create')}; if test -f @c/a/npm.sh; then want=1; else want=0; fi; if [ -f '${dir}/synced' ]; then on=1; else on=0; fi; if [ $want != $on ]; then echo "the candidate's manifests differ from the base instance's" >&2; exit 3; fi; mkdir -p {{instance}}`, unavailableExitCodes: [3] },
+        start: { run: `${say('start')}; touch {{instance}}/up`, staleExitCodes: [6] },
+        destroy: { run: `${say('destroy')} && rm -rf {{instance}}` },
+        syncDependencies: {
+          run: `${say('sync')}; : {{changed}} ; touch '${dir}/synced'; rm -f '${inst}'/*/up; ${sync}`, unavailableExitCodes: [3, 7],
+          revert: { run: `echo revert {{instanceName}} >> '${log}'; ${revert ?? `rm -f '${dir}/synced' '${inst}'/*/up`}` }
+        }
+      }
+    }
+    const lines = async () => (await fs.readFile(log, 'utf8').catch(() => '')).split(NL).filter(Boolean)
+    return { dir, target: { kind: 'local', modules }, lines }
+  }
   const end = async (engine) => { await destroyRunInstances(engine.runId, { reason: 'test' }); await settleRunSyncs(engine.runId, { how: 'revert', reason: 'test' }); await releaseWorkspace(engine) }
 
   try {
@@ -126,20 +163,19 @@ export default async function (t) {
       const name = instanceName(engine.runId)
       const check = engine.run.checkResults.at(-1)
       t.eq('the run completes on its one revision', [engine.run.status, engine.run.revisions.length, check.result], ['completed', 1, 'passed'], check.error ?? engine.run.blockedReason)
-      t.eq('create, sync, create again, then the drive as ever', await lines(), ['create', 'sync', 'create', 'start', 'ready'])
+      t.eq('create, sync, create again, the drive as ever; as it ends its instance goes and the sync is reverted', await lines(), ['create', 'sync', 'create', 'start', 'ready', 'destroy', 'revert'])
       t.eq('the records in the order they ran, the refused create not among them', check.commands.map((c) => [c.id, c.passed]).slice(0, 4), [[SYNC_ID, true], [CREATE_ID, true], ['lint', true], [START_ID, true]])
       t.eq('the script got exactly the revision\'s changed manifests', (await fs.readFile(path.join(dir, 'changed'), 'utf8')).trim().split(NL), ['@c/a/npm.sh', '@c/a/package.json'])
       const sync = check.stageInstance.dependencySync
       t.eq('on the check: files, outcome, and what create had said', [sync.files, sync.outcome, Number.isInteger(sync.durationMs), sync.createSaid.includes('package.json differs')], [['@c/a/npm.sh', '@c/a/package.json'], 'synced', true, true])
-      t.eq('on the run, so the supervisor knows a revert may be owed', engine.run.dependencySyncs.map((d) => [d.name, d.outcome, d.files.length, d.settled]), [[name, 'synced', 2, undefined]])
-      t.eq('the instance was created by this drive', [check.stageInstance.created, check.stageInstance.state], [true, 'live'])
-      t.ok('said in words for reviewers', instanceWords(check).includes('were installed on the whole stage') && instanceWords(check).includes('@c/a/package.json'), instanceWords(check))
-      t.eq('the sync is a wait, begun and ended, which the wall clock excuses', [events.filter((e) => e.type === 'checks-waiting').map((e) => e.reason), (engine.run.driveSlotWaits ?? []).length], [['dependency-sync'], 1])
-      t.eq('a record on the host\'s slots names the run and how to revert', [(await records()).includes(`sync-${name}.json`), JSON.parse(await fs.readFile(path.join(slotDirectory(LOCAL_HOST), `sync-${name}.json`), 'utf8')).runId], [true, engine.runId])
-      await destroyRunInstances(engine.runId, { reason: 'test' })
-      const reverted = await settleRunSyncs(engine.runId, { how: 'revert', reason: 'run-blocked' })
-      t.eq('the revert runs once, after the instance is gone, and the record goes', [reverted.map((r) => [r.owner, r.passed, r.reason]), (await lines()).slice(-2), await exists(path.join(dir, 'synced')), (await records()).includes(`sync-${name}.json`)], [[[name, true, 'run-blocked']], ['destroy', 'revert'], false, false])
-      t.eq('a second call finds nothing to revert', await settleRunSyncs(engine.runId, { how: 'revert', reason: 'again' }), [])
+      t.eq('on the run, reverted by the drive', engine.run.dependencySyncs.map((d) => [d.name, d.outcome, d.files.length, d.settled?.passed, d.settled?.reason]), [[name, 'synced', 2, true, 'drive-ended']])
+      t.eq('the instance was created by this drive and destroyed as it ended', [check.stageInstance.created, check.stageInstance.state, check.stageInstance.destroyed?.reason], [true, 'destroyed', 'dependencies-reverted'])
+      t.ok('said in words for reviewers', instanceWords(check).includes('were installed on the whole stage') && instanceWords(check).includes('@c/a/package.json') && instanceWords(check).includes('were reverted'), instanceWords(check))
+      t.eq('the sync and the revert are waits, begun and ended, which the wall clock excuses', [events.filter((e) => e.type === 'checks-waiting').map((e) => e.reason), (engine.run.driveSlotWaits ?? []).length], [['dependency-sync', 'dependency-revert'], 2])
+      t.eq('the stage is back on its deployed set: no marker, no record', [await exists(path.join(dir, 'synced')), (await records()).includes(`sync-${name}.json`)], [false, false])
+      const journal = await stageEvents(LOCAL_HOST)
+      t.eq('the host journal names each step of it, with the run', journal.filter((e) => e.owner === name).map((e) => [e.event, e.runId]), [['sync', engine.runId], ['synced', engine.runId], ['revert', engine.runId], ['reverted', engine.runId]])
+      t.eq('the run\'s end finds nothing left to revert', await settleRunSyncs(engine.runId, { how: 'revert', reason: 'again' }), [])
       await releaseWorkspace(engine)
     }
 
@@ -256,6 +292,7 @@ export default async function (t) {
       t.eq('the run completes on its second revision', [engine.run.status, engine.run.revisions.length], ['completed', 2], check.error ?? engine.run.blockedReason)
       t.eq('no load: the instance is destroyed and made again from the candidate', await lines(), ['create', 'start', 'ready', 'destroy', 'create', 'start', 'ready'])
       t.eq('on the check and on the run', [check.stageInstance.fresh, check.stageInstance.replaced?.reason, engine.run.stageInstances.map((i) => i.destroyed?.reason)], [true, 'dependencies-changed', ['dependencies-changed', undefined]])
+      t.eq('no sync ran: the stage already had these manifests', engine.run.dependencySyncs, undefined)
       await end(engine)
 
       // The same two revisions without a manifest: loaded into the one instance, as ever.
@@ -277,16 +314,197 @@ export default async function (t) {
       await end(engine)
     }
 
+    // One drive straight through the check runner's instance step (checks.mjs withStageInstance): `commands` are
+    // the records the drive leaves, `before` runs as the drive starts, `driveTiming` is the test injection.
+    const directDrive = async ({ bound, runId, runDir, commands, outcome, before = null, driveTiming = {} }) => {
+      const result = { dir: 'checks/direct', commands: [], result: 'unavailable', error: null }
+      let thrown = null
+      try {
+        await withStageInstance({ target: bound, host: LOCAL_HOST, result, runId, runDir, clock: { now: () => Date.now(), iso: () => new Date().toISOString() }, signal: null, onWait: null, driveTiming, entries: [] }, async () => {
+          if (before) await before()
+          result.commands.push(...commands)
+          result.result = outcome
+        })
+      } catch (error) { thrown = error }
+      return { result, thrown }
+    }
+    const up = [{ id: CREATE_ID, passed: true }, { id: START_ID, passed: true }, { id: 'ready', passed: true }]
+
+    t.section('AC3: another run\'s sync lands between a held instance\'s journal reading and the drive\'s use of it: it reaches the drive\'s classification, so a failure is environmental, never failed')
+    {
+      const { dir, target } = await tier()
+      const runDir = await temp('devpanel-direct-run-')
+      const runId = `direct-gap-${Date.now()}`
+      const { target: bound } = modulesDrive(target, { affected: { modules: ['@c/a'], core: null }, files: [], instanceName: instanceName(runId) })
+      const first = await directDrive({ bound, runId, runDir, commands: up, outcome: 'passed' })
+      t.eq('the first drive leaves a live instance', [first.result.result, first.result.stageInstance.state, holdsInstance(instanceName(runId))], ['passed', 'live', true])
+      // The interleaving that escaped both readings: the event lands after the history was read, before the drive ran.
+      const gap = await directDrive({ bound, runId, runDir, commands: [{ id: 'load', passed: true }, { id: 'restart', passed: false }], outcome: 'failed',
+        driveTiming: { afterStageRead: () => appendFileSync(journalFile(), JSON.stringify({ ...OTHER, at: 'in-the-gap' }) + NL) } })
+      const used = gap.result.stageInstance
+      t.eq('not replaced (the reading saw nothing), so the reload failed', [used.fresh, used.replaced, used.destroyed?.reason], [false, undefined, 'reload-failed'])
+      t.eq('the failure is unavailable and environmental, naming the other run', [gap.result.result, gap.result.environmental?.cause, used.disturbedBy?.map((d) => d.runId)], ['unavailable', 'dependency-sync', ['run-other']])
+      // The same event before the drive begins: the reading sees it and the instance is replaced instead.
+      await directDrive({ bound, runId, runDir, commands: up, outcome: 'passed' })
+      appendFileSync(journalFile(), JSON.stringify({ ...OTHER, at: 'before-the-drive' }) + NL)
+      const before = await directDrive({ bound, runId, runDir, commands: up, outcome: 'passed' })
+      t.eq('an event before the reading: replaced, not counted again as a disturbance', [before.result.stageInstance.replaced?.reason, before.result.stageInstance.fresh, before.result.stageInstance.disturbedBy, before.result.result], ['stage-dependencies-replaced', true, undefined, 'passed'])
+      await destroyRunInstances(runId, { reason: 'test' })
+      await fs.rm(path.join(dir, 'instances'), { recursive: true, force: true })
+    }
+
+    t.section('AC1: a cancelled drive that synced reverts the sync as it ends')
+    {
+      const { dir, target } = await tier()
+      const runDir = await temp('devpanel-direct-run-')
+      const runId = `direct-cancel-${Date.now()}`
+      const owner = instanceName(runId)
+      const { target: bound } = modulesDrive(target, { affected: { modules: ['@c/a'], core: null }, files: [], instanceName: owner })
+      const cancelled = await directDrive({ bound, runId, runDir, commands: [{ id: CREATE_ID, passed: true }], outcome: 'passed',
+        before: async () => {
+          // As createStep leaves it: the sync noted and installed, then the drive is stopped mid-way.
+          await noteSync({ owner, host: LOCAL_HOST, kind: 'local', runId, runDir, revert: { run: `echo cancelled-revert >> '${dir}/log'` }, files: ['@c/a/package.json'] })
+          await settleSync(owner, { host: LOCAL_HOST, installed: true, prior: false })
+          throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
+        } })
+      t.eq('the cancellation still reaches the caller', cancelled.thrown?.name, 'AbortError')
+      t.eq('reverted as the drive ended, the record gone, nothing held', [cancelled.result.stageInstance.dependencySync?.reverted?.passed, cancelled.result.stageInstance.dependencySync?.reverted?.reason, (await fs.readFile(path.join(dir, 'log'), 'utf8')).includes('cancelled-revert'), (await records()).includes(`sync-${owner}.json`), holdsSync(owner)], [true, 'drive-ended', true, false, false])
+      await destroyRunInstances(runId, { reason: 'test' })
+    }
+
+    t.section('AC2: a sync record rewritten while other runs read it: every reading is whole and names the run and its manifests')
+    {
+      const owner = 'dp-read-write'
+      const dir = await temp('devpanel-sync-rw-')
+      // A large record, so a write in place would take long enough to be caught half done.
+      const files = Array.from({ length: 4000 }, (_, i) => `@c/m${String(i).padStart(4, '0')}/package.json`)
+      await noteSync({ owner, host: LOCAL_HOST, kind: 'local', runId: 'run-rw', revert: { run: `echo rw >> '${dir}/log'` }, files })
+      let writing = true
+      let readings = 0
+      const errors = []
+      const missing = []
+      const writer = (async () => {
+        for (let i = 0; i < 100; i++) await settleSync(owner, { host: LOCAL_HOST, installed: true, prior: true })
+        writing = false
+      })()
+      const reader = async () => {
+        while (writing) {
+          try {
+            const mine = (await standingSyncs()).find((s) => s.owner === owner)
+            readings++
+            if (!mine || mine.runId !== 'run-rw' || mine.files.length !== files.length) missing.push(readings)
+          } catch (error) { errors.push(error.message) }
+        }
+      }
+      await Promise.all([writer, reader(), reader(), reader()])
+      t.ok('100 rewrites beside continuous readings: no parse error, the record whole each time', readings > 0 && errors.length === 0 && missing.length === 0, JSON.stringify({ readings, errors: errors.slice(0, 3), errorCount: errors.length, missing: missing.length }))
+      t.eq('no temporary file is left beside it', (await fs.readdir(slotDirectory(LOCAL_HOST))).filter((n) => n.endsWith('.tmp')), [])
+      t.eq('reverted at the end', (await settleRunSyncs('run-rw', { how: 'revert', reason: 'test' })).map((r) => r.passed), [true])
+    }
+
+    t.section('AC1: a sync whose answer never came (a timeout) may have installed: the drive reverts it as it ends all the same')
+    {
+      const { target, lines } = await tier({ sync: 'sleep 5' })
+      target.modules.instance.syncDependencies.timeoutSeconds = 1
+      const { engine } = await scenario({ target, files: MANIFESTS })
+      const log = await lines()
+      const syncs = engine.run.dependencySyncs ?? []
+      t.ok('every sync is followed by its revert', log.filter((l) => l === 'sync').length > 0 && log.filter((l) => l === 'sync').length === log.filter((l) => l === 'revert').length && log.indexOf('revert') > log.indexOf('sync'), log.join(','))
+      t.eq('each recorded as reverted by its drive; nothing left on record', [syncs.length > 0 && syncs.every((d) => d.outcome === 'failed' && d.settled?.passed === true && d.settled.reason === 'drive-ended'), (await records()).length], [true, 0], JSON.stringify(syncs))
+      await end(engine)
+    }
+
+    t.section('AC3: another run\'s sync since the instance\'s last drive: it is not loaded into but replaced, and the run is told')
+    {
+      const { dir, target, lines } = await tier({ test: 'later' })
+      await fs.writeFile(path.join(dir, 'synced'), '')
+      // Between the first drive and the second, another run syncs the stage (its line in the host journal).
+      const { engine, events } = await scenario({ target, files: (round) => { if (round) { appendFileSync(journalFile(), JSON.stringify({ ...OTHER, at: 'between' }) + NL); return { 'round-1.txt': 'work\n' } } return {} } })
+      const check = engine.run.checkResults.at(-1)
+      t.eq('the run completes on its second revision', [engine.run.status, engine.run.revisions.length, check.result], ['completed', 2, 'passed'], check.error ?? engine.run.blockedReason)
+      t.eq('no load into the stopped instance: destroyed and created again', await lines(), ['create', 'start', 'ready', 'destroy', 'create', 'start', 'ready'])
+      t.eq('the replacement names the other run', [check.stageInstance.replaced?.reason, check.stageInstance.replaced?.by?.map((d) => [d.event, d.runId])], ['stage-dependencies-replaced', [['sync', 'run-other']]])
+      t.eq('told on the run and as an event', [engine.run.stageDisturbances?.map((d) => d.by.map((b) => [b.when, b.runId])), events.filter((e) => e.type === 'stage-instance-disturbed').length], [[[['before-drive', 'run-other']]], 1])
+      t.ok('and in words', instanceWords(check).includes('another run\'s dependency sync (run run-other'), instanceWords(check))
+      await end(engine)
+    }
+
+    t.section('AC3: another run\'s sync stops the instance during the drive: unavailable and environmental, not failed; one more drive, whose pass stands; no author round')
+    {
+      const { dir, target } = await tier({ ready: ({ dir: d, say }) => `if [ ! -f '${d}/ready-once' ]; then touch '${d}/ready-once'; echo '${JSON.stringify(OTHER)}' >> '${journalFile()}'; echo "the instance is not running" >&2; exit 1; fi; ${say('ready')}` })
+      await fs.writeFile(path.join(dir, 'synced'), '')
+      const { engine, events } = await scenario({ target })
+      const check = engine.run.checkResults.at(-1)
+      const first = check.attempts?.[0]
+      t.eq('the run completes on its one revision, with no author round', [engine.run.status, engine.run.revisions.length, engine.run.steps.filter((s) => s.stepId === 'implement').length], ['completed', 1, 1], check.error ?? engine.run.blockedReason)
+      t.eq('the disturbed drive: unavailable, environmental, naming the other run', [first?.result, first?.environmental?.cause, first?.environmental?.by?.map((d) => d.runId)], ['unavailable', 'dependency-sync', ['run-other']])
+      t.ok('with why', first?.error?.includes('run run-other') && first.error.includes('says nothing about the candidate'), first?.error)
+      t.eq('the second drive passed, recovered from the environment, not flaky', [check.result, check.recoveredFrom, check.flaky], ['passed', 'environmental', undefined])
+      t.eq('one retry, the run told', [events.filter((e) => e.type === 'checks-retry').length, engine.run.stageDisturbances?.map((d) => [d.environmental, d.by[0].when])], [1, [[true, 'during-drive']]])
+      await end(engine)
+    }
+
+    t.section('AC1 and AC2: a revert that fails as the drive ends stays on record; the supervisor and other runs read it, and another run\'s create is environmental')
+    {
+      const { dir, target } = await shared(() => ({ revert: 'echo "the deployed set could not be installed" >&2; exit 1' }))
+      const a = await scenario({ target, files: MANIFESTS })
+      const aCheck = a.engine.run.checkResults.at(-1)
+      const owner = instanceName(a.engine.runId)
+      t.eq('the manifest-changing run passes; its revert as the drive ended failed', [aCheck.result, aCheck.stageInstance.dependencySync.reverted?.passed], ['passed', false], aCheck.error)
+      t.ok('said in words', instanceWords(aCheck).includes('their revert failed'), instanceWords(aCheck))
+      const standing = (await standingSyncs()).find((s) => s.owner === owner)
+      t.eq('the record names the run, the deviating manifests and the state, and nobody answers for it now', [standing?.runId, standing?.files, standing?.state, standing?.held, Boolean(standing?.revertFailed)], [a.engine.runId, ['@c/a/npm.sh', '@c/a/package.json'], 'revert-failed', false, true])
+      const readiness = await launchReadiness({ project: P, projectPath: dir, inspect: async () => null, stagingSyncs: () => standingSyncs() })
+      t.eq('the supervisor\'s readiness lists it', readiness.stagingSyncs?.filter((s) => s.owner === owner).map((s) => [s.runId, s.state]), [[a.engine.runId, 'revert-failed']])
+      const b = await scenario({ target })
+      const bCheck = b.engine.run.checkResults.at(-1)
+      t.eq('the other run: unavailable and environmental, no author round', [bCheck.result, bCheck.environmental?.cause, bCheck.environmental?.by?.map((s) => s.runId), b.engine.run.steps.filter((s) => s.stepId === 'implement').length], ['unavailable', 'dependency-sync', [a.engine.runId], 1])
+      t.ok('its reason names the run whose dependencies stand', bCheck.error.includes(a.engine.runId) && bCheck.error.includes('could not revert'), bCheck.error)
+      t.eq('told on the run', b.engine.run.stageDisturbances?.at(-1)?.by.map((d) => [d.when, d.runId]), [['at-create', a.engine.runId]])
+      await fs.rm(path.join(slotDirectory(LOCAL_HOST), `sync-${owner}.json`), { force: true })
+      await end(a.engine)
+      await end(b.engine)
+    }
+
+    t.section('AC4: two concurrent runs on one stage, one changing a manifest and the other not: both drives complete, and the stage is left on its deployed set')
+    for (const [order, barriers] of [
+      // (i) The manifest-changing run's sync stands when the other run creates: that create waits for the revert (or, when the revert came first, sees it in the journal) and asks again.
+      ['its sync stands when the other run creates', ({ dir, wait }) => ({
+        beforeCreate: `if ! test -f @c/a/npm.sh && [ ! -f '${dir}/b-go' ]; then ${wait('synced')}touch '${dir}/b-go'; fi; `,
+        sync: wait('b-go')
+      })],
+      // (ii) The other run's instance is up and in its drive when the sync stops it: that drive is environmental, the next one passes.
+      ['the other run is mid-drive when it syncs', ({ dir, wait }) => ({
+        beforeCreate: `if test -f @c/a/npm.sh && [ ! -f '${dir}/a-go' ]; then ${wait('b-at-ready')}touch '${dir}/a-go'; fi; `,
+        sync: `touch '${dir}/a-synced'`,
+        ready: `if ! test -f @c/a/npm.sh && [ ! -f '${dir}/b-ready-once' ]; then touch '${dir}/b-at-ready'; ${wait('a-synced')}touch '${dir}/b-ready-once'; fi; `
+      })]
+    ]) {
+      const { dir, target, lines } = await shared(barriers)
+      const [a, b] = await Promise.all([scenario({ target, files: MANIFESTS }), scenario({ target })])
+      const [aCheck, bCheck] = [a.engine.run.checkResults.at(-1), b.engine.run.checkResults.at(-1)]
+      t.eq(`${order}: both runs complete on their one revision, both drives passed`, [a.engine.run.status, b.engine.run.status, aCheck.result, bCheck.result, a.engine.run.revisions.length, b.engine.run.revisions.length], ['completed', 'completed', 'passed', 'passed', 1, 1], `${aCheck.error ?? a.engine.run.blockedReason} | ${bCheck.error ?? b.engine.run.blockedReason} | ${(await lines()).join(',')}`)
+      t.eq(`${order}: the manifest-changing run synced and reverted as its drive ended`, [a.engine.run.dependencySyncs?.map((d) => [d.outcome, d.settled?.passed])], [[['synced', true]]])
+      t.eq(`${order}: the stage is back on its deployed set, no sync on record`, [await exists(path.join(dir, 'synced')), (await standingSyncs()).length], [false, 0])
+      const told = b.engine.run.stageDisturbances ?? []
+      t.ok(`${order}: the other run was told, naming the manifest-changing run`, told.some((d) => d.by.some((x) => x.runId === a.engine.runId)), JSON.stringify(told))
+      if (order.startsWith('the other run is mid-drive')) {
+        t.eq(`${order}: its disturbed drive was environmental, the next one passed`, [bCheck.attempts?.[0]?.result, bCheck.attempts?.[0]?.environmental?.cause, bCheck.recoveredFrom], ['unavailable', 'dependency-sync', 'environmental'])
+      } else t.eq(`${order}: its create waited for, or saw, the sync and asked again`, [bCheck.stageInstance.foreignSync?.by?.[0]?.runId, bCheck.attempts], [a.engine.runId, undefined])
+      await end(a.engine)
+      await end(b.engine)
+    }
+
     t.section('what becomes of a sync, read off its run')
     {
       const delivered = { status: 'completed', outcome: 'resolved', delivery: { action: 'apply-to-source', completedAt: 'now' }, revisions: [{}] }
-      t.eq('paused keeps; a shutdown\'s stop keeps while the next start resumes it; delivered drops; every other end reverts; gone reverts',
-        [syncDisposition({ status: 'paused' }), syncDisposition({ status: 'cancelled', stoppedBy: 'service-shutdown' }, { resume: true }), syncDisposition({ status: 'cancelled', stoppedBy: 'service-shutdown' }, { resume: false }), syncDisposition(delivered),
-          syncDisposition({ ...delivered, delivery: { action: 'worktree-diff', completedAt: 'now' } }), syncDisposition({ status: 'blocked' }), syncDisposition({ status: 'failed' }), syncDisposition({ status: 'cancelled' }), syncDisposition(null), syncDisposition({ status: 'running' })],
-        ['keep', 'keep', 'revert', 'drop', 'revert', 'revert', 'revert', 'revert', 'revert', 'live'])
+      t.eq('only a run still driving keeps a standing sync; a pause, a shutdown, a delivery and every other end revert it; so does a run that is gone',
+        [syncDisposition({ status: 'paused' }), syncDisposition({ status: 'cancelled', stoppedBy: 'service-shutdown' }), syncDisposition(delivered),
+          syncDisposition({ status: 'blocked' }), syncDisposition({ status: 'failed' }), syncDisposition({ status: 'cancelled' }), syncDisposition(null), syncDisposition({ status: 'running' })],
+        ['revert', 'revert', 'revert', 'revert', 'revert', 'revert', 'revert', 'live'])
     }
 
-    t.section('the supervisor: reverts where it destroys the instance of a run that ended undelivered; a pause and a shutdown keep the sync; a deleted run is tried again')
+    t.section('the supervisor: a sync still standing at a run\'s end, its pause or a shutdown is reverted where the instance is destroyed; a deleted run is tried again')
     {
       const f = await engineFixture()
       const saved = { projects: process.env.DEVPANEL_PROJECTS_DIR, control: process.env.DEVPANEL_FAKE_CONTROL }
@@ -320,16 +538,13 @@ export default async function (t) {
         const paused = await live('paused')
         await paused.supervisor.pause(paused.named)
         await paused.supervisor.settle()
-        t.eq('a paused run keeps its claim: no revert, the record stays', [(await read(paused.issue, paused.runId)).status, (await logged()).includes('paused'), await exists(paused.file)], ['paused', false, true])
+        t.eq('a paused run: reverted, the record gone (its next drive syncs again)', [(await read(paused.issue, paused.runId)).status, (await logged()).includes('paused'), await exists(paused.file)], ['paused', true, false])
         await paused.supervisor.stop(paused.named).catch(() => {})
         await paused.supervisor.settle()
-        const afterPause = await read(paused.issue, paused.runId)
-        if (afterPause.status === 'paused') await settleRunSyncs(paused.runId, { how: 'revert', reason: 'test' })
-        t.eq('and is reverted once the run ends', await exists(paused.file), false)
 
         const shut = await live('shutdown')
         await shut.supervisor.shutdown({ graceMs: 15000 })
-        t.eq('a service shutdown keeps it for the resume at the next start', [(await read(shut.issue, shut.runId)).stoppedBy, (await logged()).includes('shutdown'), await exists(shut.file)], ['service-shutdown', false, true])
+        t.eq('a service shutdown reverts it too: the resumed run syncs again', [(await read(shut.issue, shut.runId)).stoppedBy, (await logged()).includes('shutdown'), await exists(shut.file)], ['service-shutdown', true, false])
 
         t.section('the sweep at the panel\'s start: a dead owner\'s sync is judged by its run; a live or unknown owner\'s is never touched')
         const me = await currentOwner()
@@ -355,13 +570,12 @@ export default async function (t) {
         await plant('dp-live', await fakeRun('live', { status: 'blocked' }), me)
         await plant('dp-unknown', await fakeRun('unknown', { status: 'blocked' }), { ...me, host: 'another-machine' })
         const swept = await sweepSyncs()
-        const by = Object.fromEntries(swept.map((s) => [s.owner, s.kept ?? s.passed]))
-        t.eq('reverted: the ended run\'s, the vanished run\'s, the crashed run\'s; forgotten: the delivered run\'s', [by['dp-ended'], by['dp-gone'], by['dp-crashed'], by['dp-delivered'], by[shut.owner]], [true, true, true, 'delivered', undefined], JSON.stringify(swept))
-        const left = (await records()).map((n) => n.slice(5, -5)).filter((n) => n.startsWith('dp-') && n !== shut.owner).sort()
-        t.eq('kept: a paused run\'s, a run that drives again in this process, a live owner\'s, an unknown owner\'s', left, ['dp-live', 'dp-paused', 'dp-resumed', 'dp-unknown'])
-        t.eq('the shutdown\'s run keeps its record too: it awaits the resume', await exists(shut.file), true)
-        t.eq('each revert ran once', (await logged()).filter((l) => l.startsWith('swept-')).sort(), ['swept-dp-crashed', 'swept-dp-ended', 'swept-dp-gone'])
-        for (const owner of ['dp-live', 'dp-paused', 'dp-resumed', 'dp-unknown', shut.owner]) await fs.rm(path.join(hostDir, `sync-${owner}.json`), { force: true })
+        const by = Object.fromEntries(swept.map((s) => [s.owner, s.passed]))
+        t.eq('reverted: the ended, vanished, crashed, paused and delivered runs\' syncs', [by['dp-ended'], by['dp-gone'], by['dp-crashed'], by['dp-paused'], by['dp-delivered']], [true, true, true, true, true], JSON.stringify(swept))
+        const left = (await records()).map((n) => n.slice(5, -5)).filter((n) => n.startsWith('dp-')).sort()
+        t.eq('kept: a run that drives again in this process, a live owner\'s, an unknown owner\'s', left, ['dp-live', 'dp-resumed', 'dp-unknown'])
+        t.eq('each revert ran once', (await logged()).filter((l) => l.startsWith('swept-')).sort(), ['swept-dp-crashed', 'swept-dp-delivered', 'swept-dp-ended', 'swept-dp-gone', 'swept-dp-paused'])
+        for (const owner of ['dp-live', 'dp-resumed', 'dp-unknown']) await fs.rm(path.join(hostDir, `sync-${owner}.json`), { force: true })
         for (const owner of ['dp-live', 'dp-unknown']) await fs.rm(path.join(hostDir, `sync-${owner}.lock`), { force: true })
 
         // A revert that fails at the run's end leaves the record; deleting the run tries again.

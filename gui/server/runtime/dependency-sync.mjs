@@ -2,15 +2,20 @@ import crypto from 'node:crypto'
 
 import { CHANGED, CREATE_ID, DESTROY_ID, START_ID, SYNC_ID } from './instance-drive.mjs'
 import { shellQuote } from './ssh.mjs'
-import { noteSync, settleSync } from './sync-records.mjs'
+import { awaitForeignSyncs, foreignEvents, noteSync, settleSync, stageEvents, syncWords } from './sync-records.mjs'
 
 /*
  * A run that changes dependencies (docs/project-infrastructure.md "A run that changes
  * dependencies"): an instance runs on the stage's installed dependencies and cannot
  * install, so `create` refuses a candidate whose manifests differ. When the revision
  * itself changed a manifest, `modules.instance.syncDependencies` installs them on the
- * whole stage and `create` runs again; the stage keeps them until the run delivers (the
- * next release carries them) or ends otherwise (sync-records.mjs reverts them).
+ * whole stage and `create` runs again; the drive that synced reverts them as it ends
+ * (checks.mjs, sync-records.mjs), so the stage is back on its deployed set before another
+ * run creates an instance.
+ *
+ * A create refused while another run's sync stands on the host waits for that sync's
+ * revert and asks again; a sync nobody answers for any more is named in the refusal, which
+ * is then environmental (`stageInstance.environmental`), not the candidate's.
  *
  * This file is the part inside a drive: the two instance commands whose answer the
  * engine acts on instead of recording it. Both run through `step`, the drive's own way
@@ -57,12 +62,29 @@ const said = (record) => (record.stderr || record.stdout || '').trim().split('\n
  * reason rather than create's. The refused first create is kept only as
  * `dependencySync.createSaid`; its log is overwritten by the second.
  */
-async function createStep (command, step, { instance, used, clock, onWait, host, holder }) {
-  const first = await step(command)
+async function createStep (command, step, { instance, used, clock, onWait, host, holder, signal }) {
+  let first = await step(command)
+  if (!first.unavailable || !command.unavailableExitCodes?.includes(first.exitCode)) return first
+  // Another run's dependencies on the stage: its drive reverts them as it ends, so the create waits for that and asks again.
+  const foreign = await awaitForeignSyncs({ host, owner: instance.name, clock, signal, onWait, dir: holder.dir, slotsDir: holder.slotsDir, ...(holder.foreignWait ?? {}) })
+  // A sync reverted between the refusal and that reading left only its lines in the host journal since the drive began.
+  const since = Number.isInteger(holder.stageMark) ? foreignEvents(await stageEvents(host, { from: holder.stageMark, slotsDir: holder.slotsDir }), instance.name) : []
+  if (foreign.by.length || since.length) {
+    const by = foreign.by.length ? foreign.by.map(({ owner, runId, host: on, files, state }) => ({ owner, runId, host: on, files, state })) : since.map(({ owner, runId, files, event }) => ({ owner, runId, host, files, state: event }))
+    used.foreignSync = { by, waitedMs: foreign.waitedMs, ...(foreign.timedOut ? { timedOut: true } : {}) }
+    if ((foreign.waited || since.length) && !foreign.timedOut) first = await step(command)
+    if (first.unavailable && command.unavailableExitCodes?.includes(first.exitCode) && foreign.unanswered.length) {
+      const words = foreign.unanswered.map(syncWords).join('; ')
+      used.environmental = { cause: 'dependency-sync', by: foreign.unanswered.map(({ owner, runId, host: on, files, state }) => ({ owner, runId, host: on, files, state })) }
+      first.unavailable = `${first.unavailable}. Another run's dependencies stand on the stage${foreign.timedOut ? ' longer than this drive waits for them' : ''}: ${words}`
+      return first
+    }
+    if (!first.unavailable || !command.unavailableExitCodes?.includes(first.exitCode)) return first
+  }
   const sync = instance.sync
-  if (!sync || !first.unavailable || !command.unavailableExitCodes?.includes(first.exitCode)) return first
+  if (!sync) return first
   if (!sync.files.length) {
-    const reason = 'This revision changed no dependency manifest, so nothing was installed on the stage: its base instance moved ahead of the run\'s base commit, or another run\'s dependencies are installed there. Start the run again from the current base.'
+    const reason = 'This revision changed no dependency manifest, so nothing was installed on the stage: its base instance moved ahead of the run\'s base commit. Start the run again from the current base.'
     used.dependencySync = { files: [], durationMs: 0, outcome: 'not-changed', reason }
     first.unavailable = `${first.unavailable}. ${reason}`
     return first
@@ -80,7 +102,7 @@ async function createStep (command, step, { instance, used, clock, onWait, host,
   const outcome = synced.passed ? 'synced' : synced.unavailable ? 'unavailable' : 'failed'
   used.dependencySync = { files: sync.files, durationMs: clock.now() - wait.startedAt, outcome, exitCode: synced.exitCode, reason: synced.unavailable ?? (synced.passed ? (synced.stdout ?? '').trim().split('\n').at(-1).slice(-600) : said(synced)), createSaid: first.unavailable }
   // An exit the stage chose says nothing new stands there; anything else (a timeout, a lost connection) may have installed.
-  await settleSync(instance.name, { host, installed: synced.passed || !chose(synced), prior, slotsDir: holder.slotsDir })
+  await settleSync(instance.name, { host, installed: synced.passed || !chose(synced), prior, clock, slotsDir: holder.slotsDir })
   if (!synced.passed) return synced
   return { again: await step(command), before: [synced] }
 }
@@ -122,10 +144,10 @@ async function startStep (command, step, ctx) {
  * returns its record; `ctx.result.commands` receives the records of what the engine ran
  * besides (the sync, the destroy of a stale instance), in the order they ran.
  */
-export async function instanceStep (command, step, { target, result, clock, onWait = null, host = null }) {
+export async function instanceStep (command, step, { target, result, clock, onWait = null, host = null, signal = null }) {
   const instance = target.stageInstance
   if (!instance || ![CREATE_ID, START_ID].includes(command.id)) return step(command)
-  const ctx = { instance, used: result.stageInstance, result, clock, onWait, host, holder: instance.holder }
+  const ctx = { instance, used: result.stageInstance, result, clock, onWait, host, signal, holder: instance.holder }
   if (command.id === START_ID) return startStep(command, step, ctx)
   const created = await createStep(command, step, ctx)
   result.commands.push(...(created.before ?? []))

@@ -49,10 +49,11 @@ function ownershipOf (fault) {
  * @param pathOverlap  ({ deliveryAction }) => the reading of runtime/path-overlap.mjs
  * @param moduleLocks  () => supervisor.moduleLockReading: the project's module pool and its locks
  * @param modulesCoverage  (target) => supervisor.modulesCoverage: what the named playbook's modules tier would test
+ * @param stagingSyncs  () => sync-records.mjs standingSyncs: dependency syncs standing on staging hosts
  */
 export async function launchReadiness ({
   project, issueId = null, projectPath, budget = null, perIssueLeft = null,
-  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null, modulesCoverage = null,
+  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null, modulesCoverage = null, stagingSyncs = null,
   now = Date.now(), inspect = inspectSourceRepository
 }) {
   const fault = await inspect({ projectPath })
@@ -101,6 +102,10 @@ export async function launchReadiness ({
     configuration.ready = false
   }
 
+  // Dependencies a run installed on a staging host's whole stage, standing now (sync-records.mjs):
+  // the stage deviates from its deployed set, and other runs' instance creates wait or are refused.
+  const syncs = stagingSyncs ? await Promise.resolve().then(stagingSyncs).catch((error) => ({ unavailable: error.message })) : null
+
   return {
     project,
     issueId,
@@ -117,7 +122,8 @@ export async function launchReadiness ({
     configuration,
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
-    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
+    ...(Array.isArray(syncs) ? (syncs.length ? { stagingSyncs: syncs } : {}) : syncs ? { stagingSyncs: syncs } : {}),
+    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. stagingSyncs, when present, is information too: dependency syncs standing on a staging host now, each naming the run that installed them, the manifests the stage deviates by, its state and whether a live process answers for it (held: its drive reverts it as it ends). configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
 }

@@ -373,13 +373,16 @@ tier must name the instance, and without `instance` neither placeholder is accep
 |---|---|
 | the run's first modules drive | `create` (in the drive's candidate directory), lint, `start`, `ready`, the tests. No load and no restart: the instance is made from the candidate |
 | each later drive of the run (a new revision, a retry, a diagnostic drive, a reconciled candidate) | lint, `load`, `restart`, `ready`, the tests, as in base-instance mode, on the same instance |
+| `create` refuses the candidate's manifests while another run's sync stands on the host | a wait for that sync's revert (`foreign-dependency-sync`), then `create` again |
 | `create` refuses the candidate's manifests and the revision changed one (with `syncDependencies`) | `syncDependencies`, then `create` again |
+| a drive that ran `syncDependencies` ends (passed, failed, cut short, cancelled) | `destroy`, then `syncDependencies.revert` (`dependency-revert`): the stage is back on its deployed set before another run creates an instance |
 | a later drive whose revision's changed manifests are not the ones the instance was made with (with `syncDependencies`) | `destroy`, then a first drive |
+| a later drive after another run's sync or revert on the host (since this instance's last drive began) | `destroy` (`stage-dependencies-replaced`), then a first drive |
 | `start` answers a stale exit | `destroy`, `create`, `start` again, once in that drive |
 | a drive that leaves the instance in doubt (a failed, cut or skipped create, start, load, restart or ready) | `destroy` at once; the next drive, a retry included, is a first drive again |
-| the run ends (completed, blocked, failed, cancelled, service shutdown) or is deleted | `destroy`; then `syncDependencies.revert` when the run synced and did not deliver to the source (a shutdown the next start resumes keeps the sync) |
-| the run pauses | `destroy`; the first drive after the resume creates a new one. A sync stays: the paused run keeps its claim |
-| the panel starts | `destroy` for every instance whose owning process is proved dead, `syncDependencies.revert` for every sync whose run ended undelivered or died, then `gc` once per staging host |
+| the run ends (completed, blocked, failed, cancelled, service shutdown) or is deleted | `destroy`; then `syncDependencies.revert` for a sync of the run still standing (its drive's revert failed, or the drive was cut short) |
+| the run pauses | `destroy`, and the revert of a sync still standing; the first drive after the resume creates a new instance and syncs again |
+| the panel starts | `destroy` for every instance whose owning process is proved dead, `syncDependencies.revert` for every sync whose run is no longer driving or whose owner died, then `gc` once per staging host |
 
 A paused run gives its instance back because an idle instance holds gigabytes of the host
 and one of its few slots for a wait nobody can bound, while a new one costs a few minutes
@@ -435,20 +438,26 @@ inside an instance and no fallback to another tier.
 |---|---|
 | when | `create` answered one of its `unavailableExitCodes` and the revision's changed paths hold a manifest: a file named `package.json`, `package-lock.json`, `npm.sh`, `dnf.sh` or `node-version`, or one of `syncDependencies.manifests` |
 | what runs | `syncDependencies.run` in the candidate directory, `{{instanceName}}` naming the owner and `{{changed}}` replaced by those paths, each shell-quoted as one word (so `printf '%s\n' {{changed}} > "$list"` makes the list a script wants); then `create` again |
-| the stage refuses (`unavailableExitCodes`) | the check is `unavailable` with what the script said: a differing manifest this revision did not change (the stage moved ahead of the run's base: start the run again from the current base), a change that needs a release, or another run's dependencies standing. A second run is refused, not queued: one installation holds one dependency set, and the wait could last as long as the first run. `busyExitCodes` on the sync would make an exit a wait instead |
+| another run's sync stands | `create`, refused, waits while a live process answers for that sync (its drive reverts it as it ends; bound 3600 s, a wait excused from the wall clock), then asks again; a sync reverted between the refusal and that reading is seen in the host journal and `create` asks again too. A sync nobody answers for (its revert failed, its process died) is not waited on: the check is `unavailable` and environmental (`environmental: {cause: 'dependency-sync', by}`), naming the run, its manifests and its state |
+| the stage refuses (`unavailableExitCodes`) | the check is `unavailable` with what the script said: a differing manifest this revision did not change (the stage moved ahead of the run's base: start the run again from the current base), a change that needs a release, or another run's dependencies standing (two syncs that begin together). `busyExitCodes` on the sync would make an exit a wait instead |
 | the install fails | a failed check, with the script's words: the author's round |
-| a revision that changed no manifest | `syncDependencies` is not run; the check is `unavailable` as without it, saying that the stage moved ahead or holds another run's dependencies |
+| a revision that changed no manifest | `syncDependencies` is not run; with no other run's sync on record the check is `unavailable` as without it, saying that the stage moved ahead of the run's base |
 | time | the whole step is a wait (`dependency-sync`), not charged to the wall clock |
-| the revert | `syncDependencies.revert.run`, by the engine outside any drive (default bound 1800 s), where it destroys the instance of a run that ends without delivering to the source: blocked, failed, cancelled, completed with a patch only, deleted. It must succeed when nothing of this owner is installed |
-| not reverted | a run that delivered to the source: the stage keeps the dependencies until the next release carries them. A paused run, and a run a service shutdown stopped that the next start resumes: it keeps its claim, since a revert and a second sync would restart the base instance twice more |
-| the panel's start | a sync whose record no live or unknown process holds is judged by its run: ended undelivered, gone, or still marked live with a run lock whose owner is proved dead, it is reverted |
+| the revert | `syncDependencies.revert.run` (default bound 1800 s), by the drive that synced as it ends, after it destroyed its own instance (which runs on the synced set): `dependencySync.reverted` on the check, `settled` on `run.dependencySyncs[]`, a wait (`dependency-revert`) excused from the wall clock. Every drive of a manifest-changing run therefore syncs and reverts, two base restarts. It must succeed when nothing of this owner is installed |
+| a revert that fails | the record stays (`state: revert-failed`, `revertFailed`); the run's end or pause, its deletion and the panel's start try again, delivered or not: the stage must stay on its deployed set |
+| the panel's start | a sync whose record no live or unknown process holds is judged by its run: no longer driving, gone, or still marked live with a run lock whose owner is proved dead, it is reverted |
+| another run's instance | a sync and a revert stop every instance on the stage. The host journal (`syncs.jsonl` beside the slots: `sync`, `synced`, `sync-not-installed`, `revert`, `reverted`, `revert-failed`, each with owner, run and manifests) tells the other runs: a drive that failed while another run's sync or revert happened is `unavailable` and environmental (`result.environmental`), driven once more whatever `retryFailed` says, the second answer standing (a pass is `recoveredFrom: environmental`); a held instance such an event stopped since its last drive is replaced. The run records each case on `run.stageDisturbances[]` with a `stage-instance-disturbed` event |
+| who reads the record | other runs (above) and the supervisor: readiness lists `stagingSyncs`, every sync standing now with its run, manifests, state, the instances it stopped and whether a live process answers for it (`sync-records.mjs` `standingSyncs`) |
 
 The record of a sync is `sync-<owner>.json` beside the instance slots, written before the
-command runs and removed when the revert succeeded or the run delivered; a revert that
-fails keeps it for the run's deletion or the next start. A sync stops the other runs'
-instances on that stage and marks them stale (the stage's own behaviour): such a run's
-next drive fails in its load or restart, its instance is destroyed, and the retry's
-`create` is refused until the syncing run delivered or was reverted.
+command runs, rewritten whole (written beside and renamed over, so a reader sees one complete
+record or the next) and removed when the revert succeeded; a revert that fails keeps it for the
+run's end, its deletion or the next start. A sync, and its revert, stop the other runs'
+instances on that stage and mark them stale (the stage's own behaviour): the journal tells
+those runs, so a drive it cut is environmental rather than failed, a held instance it
+stopped is replaced before the next drive, and a `create` refused meanwhile waits for the
+revert. The stage-wide install itself is the stage tooling's; a per-instance install
+would spare the other runs both restarts.
 
 **Who may destroy what.** The panel keeps one slot per instance beside the drive slots
 (`instance-<n>.lock` and `.json` under `issues/.drive-slots/<host>/`). The lock carries the

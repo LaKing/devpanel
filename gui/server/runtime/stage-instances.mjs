@@ -184,15 +184,18 @@ export async function holdInstance ({ instance, host, kind, ssh = null, connecti
 }
 
 /** The instance came up: its record says since when, for whoever reads the slots. */
-export async function markLive (name, { revision = null, manifests = null, clock = systemClock } = {}) {
+export async function markLive (name, { revision = null, manifests = null, stageMark = null, clock = systemClock } = {}) {
   const mine = held.get(name)
   if (!mine) return
-  mine.record = { ...mine.record, liveSince: mine.record.liveSince ?? clock.iso(), revision, manifests }
+  mine.record = { ...mine.record, liveSince: mine.record.liveSince ?? clock.iso(), revision, manifests, stageMark }
   await fs.writeFile(mine.file, JSON.stringify(mine.record, null, 2)).catch(() => {})
 }
 
 /** The changed-manifests state (dependency-sync.mjs manifestsKey) the held instance was last driven with; undefined when none is held. */
 export const liveManifests = (name) => held.get(name)?.record.manifests
+
+/** The host journal's length (sync-records.mjs stageMark) when the held instance's last drive began; undefined when none is held. */
+export const liveStageMark = (name) => held.get(name)?.record.stageMark
 
 /** Give a slot back for an instance that was never created: nothing is on the host. */
 export async function releaseInstance (name) {

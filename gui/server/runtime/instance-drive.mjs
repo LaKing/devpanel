@@ -125,17 +125,26 @@ export function instanceWords (check) {
   if (!used) return ''
   const waited = (used.slotWaitMs ?? 0) + (used.startWaitMs ?? 0)
   const sync = used.dependencySync
+  const reverted = sync?.reverted ? (sync.reverted.passed ? ` As the drive ended they were reverted, so the stage is back on its deployed dependencies (${seconds(sync.reverted.durationMs)}).` : ` As the drive ended their revert failed (${sync.reverted.error}): the stage still runs them, the record on the host says so, and the run's end tries again.`) : ''
   const synced = !sync ? ''
-    : sync.outcome === 'synced' ? ` Before that the revision's changed dependency manifests (${sync.files.join(', ')}) were installed on the whole stage of ${used.host} (${seconds(sync.durationMs)}); they are reverted there when the run ends without delivering.`
+    : sync.outcome === 'synced' ? ` Before that the revision's changed dependency manifests (${sync.files.join(', ')}) were installed on the whole stage of ${used.host} (${seconds(sync.durationMs)}).${reverted}`
       : sync.outcome === 'not-changed' ? ` ${sync.reason}`
-        : ` Installing the revision's changed dependency manifests (${sync.files.join(', ')}) on the stage of ${used.host} ${sync.outcome === 'unavailable' ? 'was refused' : 'failed'} (${seconds(sync.durationMs)}): ${sync.reason}`
+        : sync.outcome === 'earlier' ? ` The dependencies an earlier drive of the run installed (${sync.files.join(', ')}) were still on the stage.${reverted}`
+          : ` Installing the revision's changed dependency manifests (${sync.files.join(', ')}) on the stage of ${used.host} ${sync.outcome === 'unavailable' ? 'was refused' : 'failed'} (${seconds(sync.durationMs)}): ${sync.reason}${reverted}`
+  const runs = (list) => list.map((d) => `run ${d.runId ?? 'unknown'} (${d.owner})`).join(', ')
+  const foreign = !used.foreignSync ? '' : used.foreignSync.timedOut ? ` Create was refused while another run's dependencies stood on the stage (${runs(used.foreignSync.by)}), longer than a drive waits.`
+    : ` Create was refused while another run's dependencies stood on the stage (${runs(used.foreignSync.by)})${used.foreignSync.waitedMs ? `; the drive waited ${seconds(used.foreignSync.waitedMs)} for their revert and asked again` : ''}.`
+  const disturbed = used.disturbedBy?.length ? ` During this drive another run's dependency ${used.disturbedBy.map((d) => `${d.event} (${runs([d])})`).join(', ')} stopped every instance on ${used.host}.` : ''
   const stale = used.recreated ? ` The instance had gone stale between its creation and its start (${used.recreated.said}), so it was destroyed and created again in this drive.` : ''
   const how = used.state === 'not-created' ? `The drive ended before stage instance ${used.name} was created on ${used.host}.`
     : used.fresh && used.created === false ? `Stage instance ${used.name} could not be created on ${used.host} from this candidate (create ${seconds(used.createMs)}); nothing was started or tested.`
     : used.fresh ? `This drive created stage instance ${used.name} on ${used.host} for the run (create ${seconds(used.createMs)}, start ${seconds(used.startMs)}, ready ${seconds(used.readyMs)}${waited ? `, after waiting ${seconds(waited)} for room on the host` : ''}).`
       : `This drive loaded the candidate into the run's stage instance ${used.name} on ${used.host} (load ${seconds(used.loadMs)}, restart ${seconds(used.restartMs)}, ready ${seconds(used.readyMs)}).`
+  const why = used.destroyed?.reason === 'dependencies-reverted' ? 'ran on the dependencies this drive installed' : used.fresh ? 'did not come up' : 'did not come back after the load'
   const gone = !used.destroyed || used.created === false ? ''
-    : ` The instance ${used.fresh ? 'did not come up' : 'did not come back after the load'}, so it was ${used.destroyed.passed ? 'destroyed' : `to be destroyed, which failed (${used.destroyed.error}); it keeps its slot until that succeeds`}: the next drive creates a new one.`
-  const replaced = used.replaced ? ` The run's earlier instance was destroyed first: this revision's dependency manifests are not the ones it was created with.` : ''
-  return replaced + how + stale + synced + gone
+    : ` The instance ${why}, so it was ${used.destroyed.passed ? 'destroyed' : `to be destroyed, which failed (${used.destroyed.error}); it keeps its slot until that succeeds`}: the next drive creates a new one.`
+  const replaced = !used.replaced ? ''
+    : used.replaced.reason === 'stage-dependencies-replaced' ? ` The run's earlier instance was destroyed first: another run's dependency ${used.replaced.by.map((d) => `${d.event} (${runs([d])})`).join(', ')} stopped it since its last drive.`
+      : ` The run's earlier instance was destroyed first: this revision's dependency manifests are not the ones it was created with.`
+  return replaced + how + stale + foreign + synced + disturbed + gone
 }

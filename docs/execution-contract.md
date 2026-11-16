@@ -611,9 +611,15 @@ stage instance per run") is driven on an instance that belongs to the run
   `package-lock.json`, `npm.sh`, `dnf.sh`, `node-version` by file name, or the declared
   `manifests`), the check is `unavailable` with the declared reason and the command's
   own words; with the declaration it also says that the stage moved ahead of the run's
-  base, or holds another run's dependencies, and that the run is to start again from
-  the current base. The candidate is tested nowhere else. No retry, no author round;
-  closure under `required` is unmet and names the reason.
+  base, and that the run is to start again from the current base. When another run's
+  sync stands on the host, a refused `create` first waits while a live process answers
+  for it (`foreign-dependency-sync`, excused from the wall clock; the drive that synced
+  reverts it as it ends) and asks again, as it does when the host journal shows such a
+  sync or revert since the drive began; a sync nobody answers for any more makes the
+  check `unavailable` and environmental (`environmental: {cause: 'dependency-sync', by}`,
+  `stageInstance.foreignSync`), naming the run, its manifests and its state. The
+  candidate is tested nowhere else. No author round; closure under `required` is unmet
+  and names the reason.
 - **Dependency sync.** When the revision did change a manifest, the check runner runs
   `syncDependencies` in the candidate directory (`instance-sync-deps`; `{{changed}}` is
   those paths, each one shell word; the owner is the instance name), then `create`
@@ -636,22 +642,36 @@ stage instance per run") is driven on an instance that belongs to the run
   whose revision has another state is not loaded into it: the instance is destroyed
   (`dependencies-changed`, `stageInstance.replaced`) and the drive is a first drive, so
   `create` and the sync decide. Only with `syncDependencies` declared.
-- **The sync outlives the instance.** A record per owner (`sync-<owner>.json` beside
+- **The sync ends with its drive.** A record per owner (`sync-<owner>.json` beside
   the instance slots, written before the sync command runs, `runtime/sync-records.mjs`)
-  says which run installed what and how to revert it. What becomes of it is read off
-  the run (`syncDisposition`): a paused run keeps it, and so does a run a service
-  shutdown stopped while `resumeAfterShutdown` will resume it (a revert and a second
-  sync would restart the base instance twice more); a run that delivered to the source
-  (`runResult` `delivered`) has its record dropped without a revert, the stage keeping
-  the dependencies until the next release carries them; every other end (blocked,
-  failed, cancelled, completed with a patch only), and the run's deletion, runs
-  `syncDependencies.revert` where the supervisor destroys the instance, after the
-  destroy. At the panel's start a record whose lock no live or unknown owner holds is
-  judged the same way, and a run whose status is still live counts as ended only when
-  its run lock's owner is proved dead. A revert that fails keeps the record
-  (`revertFailed`) for the next attempt. `run.dependencySyncs[]` holds each sync
-  (`name`, `host`, `files`, `durationMs`, `outcome` `synced | unavailable | failed`,
-  `reason`) and `settled` once it was reverted or left for the release.
+  says which run installed which manifests (`files`, the stage's deviation from its
+  deployed set), its `state` (`syncing | installed | revert-failed`), the instances on
+  the host it stopped and how to revert it. The drive that synced destroys its own
+  instance and runs `syncDependencies.revert` as it ends, whatever its outcome
+  (`dependency-revert`, excused from the wall clock; `dependencySync.reverted`), so the
+  stage is back on its deployed set before another run creates an instance. A sync still
+  standing afterwards (its revert failed, or its drive was cut short) is read off the
+  run (`syncDisposition`): only a run still driving keeps it; every end and a pause,
+  delivered or not, and the run's deletion run the revert where the supervisor
+  destroys the instance. At the panel's start a record whose lock no live or unknown
+  owner holds is judged the same way, and a run whose status is still live counts as
+  ended only when its run lock's owner is proved dead. A revert that fails keeps the
+  record (`revert-failed`, `revertFailed`) for the next attempt. `run.dependencySyncs[]`
+  holds each sync (`name`, `host`, `files`, `durationMs`, `outcome` `synced |
+  unavailable | failed`, `reason`) and `settled` once it was reverted. The supervisor
+  reads the standing records as readiness `stagingSyncs` (`standingSyncs`).
+- **Another run's sync.** A sync and a revert stop every instance on the stage. Each is
+  a line of the host's journal (`syncs.jsonl` beside the slots), and a drive notes the
+  journal's length as it begins. A drive that failed while another run's sync or revert
+  happened is `unavailable` and environmental (`result.environmental`, naming the run),
+  never `failed`: it is driven once more whatever `retryFailed` says, and that second
+  answer stands (a pass is `recoveredFrom: 'environmental'`, not `flaky`). A failed drive
+  that nothing disturbed keeps the rule above: an unavailable retry leaves its failure
+  standing. A held instance such an event stopped since its last drive began is not
+  loaded into: it is destroyed (`stage-dependencies-replaced`, `replaced.by`) and the
+  drive is a first drive. The run is told: each case is on `run.stageDisturbances[]`
+  (`when`: `before-drive | during-drive | at-create`) with a `stage-instance-disturbed`
+  event.
 - **The run's id, and a pinned snapshot.** Every instance command the check runner
   runs inside a drive (create, sync, start, the stale path's destroy, the tier's own) is
   a command of that drive and gets `DEVPANEL_RUN_ID` like any other
