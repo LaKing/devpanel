@@ -77,6 +77,58 @@ export default async function (t) {
     packed = false
     const gone = settledRunCache({ locate: async () => ({ path: issuePath, packed: false }), read: async () => { throw Object.assign(new Error('no such run'), { status: 404 }) } })
     t.eq('a run that is gone still answers 404', (await gone('p', 'issue-a', 'r1').catch((e) => e)).status, 404)
+
+    t.section('a monitoring read keeps a settled summary past the limit; a plain read (get_run) still refreshes it')
+    await write(runFile, { runId: 'r1', status: 'completed', outcome: 'resolved' })
+    await get(); before = reads
+    clock += 120_000
+    for (let i = 0; i < 5; i++) await detail('p', 'issue-a', 'r1', { monitoring: true })
+    t.eq('monitoring, twice the limit later: nothing read', reads - before, 0)
+    await get()
+    t.eq('a plain read past the limit reads it again', reads - before, 1)
+
+    t.section('a same-size edit that puts the modification time back is still seen')
+    const stamp = new Date('2023-11-14T22:13:20Z')
+    await write(runFile, { runId: 'r1', status: 'completed', outcome: 'resolved' })
+    await fs.utimes(runFile, stamp, stamp)
+    t.eq('read and kept', (await detail('p', 'issue-a', 'r1', { monitoring: true })).status, 'completed')
+    before = reads
+    await detail('p', 'issue-a', 'r1', { monitoring: true })
+    t.eq('kept', reads - before, 0)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await write(runFile, { runId: 'r1', status: 'cancelled', outcome: 'resolved' })
+    await fs.utimes(runFile, stamp, stamp)
+    const sameSize = await detail('p', 'issue-a', 'r1', { monitoring: true })
+    t.eq('the next monitoring read sees the new status (the change time moved)', [sameSize.status, reads - before], ['cancelled', 1])
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await write(runFile, { runId: 'r1', status: 'completed', outcome: 'resolved' })
+    await fs.utimes(runFile, stamp, stamp)
+    t.eq('and a plain read within the limit as well', (await get()).status, 'completed')
+
+    t.section('a packed issue kept by the files filesOf names')
+    const bundleDir = path.join(dir, 'archive')
+    const runsRecord = path.join(bundleDir, 'issue-b.runs.json'), summaryRecord = path.join(bundleDir, 'issue-b.json')
+    await write(runsRecord, [{ runId: 'r1', status: 'completed' }])
+    await write(summaryRecord, { issue: { id: 'issue-b' } })
+    let packedReads = 0
+    const packedDetail = settledRunCache({
+      locate: async () => ({ path: path.join(dir, 'issue-b'), packed: true }),
+      read: async (issue, project, issueId, runId) => { packedReads++; return { runId, packed: true, ...JSON.parse(await fs.readFile(runsRecord, 'utf8'))[0] } },
+      filesOf: (issue) => issue.packed ? [runsRecord, summaryRecord] : null
+    })
+    const getPacked = () => packedDetail('p', 'issue-b', 'r1', { monitoring: true })
+    await getPacked(); await getPacked(); await getPacked()
+    t.eq('read once, then kept', packedReads, 1)
+    await fs.utimes(runsRecord, stamp, stamp)
+    await getPacked()
+    const settledAt = packedReads
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await write(runsRecord, [{ runId: 'r1', status: 'cancelled' }])
+    await fs.utimes(runsRecord, stamp, stamp)
+    t.eq('a bundle record rewritten in place with its time put back is read again', [(await getPacked()).status, packedReads - settledAt], ['cancelled', 1])
+    await fs.rm(summaryRecord)
+    await getPacked()
+    t.eq('a bundle file removed (a restore) drops the entry', packedReads - settledAt, 2)
   } finally {
     await fs.rm(dir, { recursive: true, force: true })
   }

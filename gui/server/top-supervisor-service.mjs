@@ -23,8 +23,10 @@ import { createAvailabilityStore } from './runtime/failure.mjs'
 import { deployStaging, deploymentReport } from './staging-deployment.mjs'
 import { deploymentCoverage, stagingPendingReport, writeDeploymentNotes } from './staging-coverage.mjs'
 import { settledRunCache } from './settled-run-cache.mjs'
+import { bundleFiles } from './issue-bundle.mjs'
 
-export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null }) {
+// pollMs: only a test passes it (top-supervisor.idle-reads.test.mjs); the service polls at createTopSupervisor's default.
+export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null, pollMs }) {
  const configRoot=process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
  const models=async()=>[...(await loadConfig({root:configRoot})).roster.values()].filter(m=>['claude','codex'].includes(m.harness))
  // Which models a run's SEATS may be filled with — a different question from
@@ -83,12 +85,19 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
   return summarisePackedRun({runId,project,issueId,record})
  }
  // Monitoring reads every owned run every few seconds: a settled run's summary is kept until its record changes.
- const detail=settledRunCache({locate:(project,issueId)=>issues.getIssue(project,issueId),read,isActive:(project,issueId)=>supervisor.isActive(project,issueId)})
+ // A packed issue's run summary is read off its bundle's run records, so it is kept until those (or the summary) change;
+ // a restore deletes both, which drops the entry.
+ const filesOf=(issue,project,issueId,runId)=>{
+  if(!issue.packed)return [path.join(issue.path,'runs',runId,'run.json'),path.join(issue.path,'issue.json')]
+  const files=bundleFiles(issues.ISSUES_DIR,project,issueId)
+  return [files.runs,files.summary]
+ }
+ const detail=settledRunCache({locate:(project,issueId)=>issues.getIssue(project,issueId),read,filesOf,isActive:(project,issueId)=>supervisor.isActive(project,issueId)})
  const mutate=async fn=>{const value=await fn();changed();return value}
  const dir=process.env.DEVPANEL_SUPERVISOR_DIR ?? path.join(issues.ISSUES_DIR,'.supervisor')
  const lock=await acquire(path.join(dir,'.owner.lock'),{purpose:'top-level-supervisor'})
  let service
- try { service=await createTopSupervisor({dir,models,adapter,emit,decisions,
+ try { service=await createTopSupervisor({dir,models,adapter,emit,decisions,...(pollMs?{pollMs}:{}),
   tools:{
    // The consult panel for the supervisor's own questions (consult/consult.mjs): it reads the project, the
    // issue's folder and, when a run is named, that run's worktree; recorded under the supervisor's directory.
@@ -106,7 +115,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
    }}:{}),
    retryInput:a=>supervisor.retryInput(a), recover:a=>supervisor.recover(a), refreshChecks:a=>supervisor.refreshChecks(a), acceptCheckResult:a=>supervisor.acceptCheckResult(a), reconcileDelivery:a=>supervisor.reconcileDelivery(a), continueRun:a=>supervisor.continueRun(a),
    availability:supervisor.availability,recordExhausted:a=>supervisor.availability.recordExhausted(a),
-   projects:()=>issues.listProjects(),playbooks:()=>listPlaybooks({root:configRoot}),seatModels,
+   projects:()=>issues.listProjects(),projectIds:()=>issues.listProjectIds(),playbooks:()=>listPlaybooks({root:configRoot}),seatModels,
    // Every project on the panel, never a selection: a management reading that
    // omits a project is how the supervisor came to report work as non-existent.
    overview:async({focus=[]}={})=>{let config=null;return buildOverview({projects:(await issues.listProjects()).map(p=>p.id),focus,listIssues:(p,o)=>issues.listIssues(p,o),openDependencies,

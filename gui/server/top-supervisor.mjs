@@ -1191,7 +1191,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     try {
       for (const r of [...state.ownedRuns]) {
         let current
-        try { current = await tools.getRun(r.project, r.issueId, r.runId) } catch (e) {
+        try { current = await tools.getRun(r.project, r.issueId, r.runId, { monitoring: true }) } catch (e) {
           // A run that is gone is terminal whatever it was last seen doing: its issue was packed (an answered
           // inquiry packs itself; an issue can be archived between two polls) or the run was deleted. It
           // can report nothing more, so it leaves monitoring. Seen live last, its ending was never observed,
@@ -1239,7 +1239,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       // A start gate that cannot read one launch keeps that slot occupied; it must not stop issue observation.
       try { await startGate.refresh(); monitoringFaults.delete('start-gate') } catch (e) { monitoringFault('start-gate', e.message) }
       const listed = {}
-      for (const { id: project } of await tools.projects()) {
+      // Only the ids: listing the projects counts every issue in them, which the listings below read anyway.
+      for (const project of tools.projectIds ? await tools.projectIds() : (await tools.projects()).map((p) => p.id)) {
         const issues = await tools.listIssues(project)
         listed[project] = issues
         const fingerprint = JSON.stringify(issues.map(i=>({id:i.id,status:i.status,name:i.name})))

@@ -85,17 +85,19 @@ async function projectDirNames () {
   return (await listProjectDirs(PROJECTS_DIR)).map(({ id }) => id)
 }
 
+/** The project ids alone, without counting their issues (the supervisor's poll lists each project's issues anyway). */
+export const listProjectIds = () => projectDirNames()
+
 async function countIssues (project) {
   try {
     const entries = await fs.readdir(path.join(ISSUES_DIR, project), { withFileTypes: true })
     const active = await Promise.all(entries
       .filter((entry) => entry.isDirectory() && ISSUE_PATTERN.test(entry.name))
       .map(async (entry) => {
-        const dir = path.join(ISSUES_DIR, project, entry.name)
-        if (await archiveState(dir)) return false
+        const issue = await listedIssue(project, entry.name)
         // Inquiries stay out of the issue lists (docs/top-level-supervisor.md "Inquiries"),
         // so the count beside the project must leave them out too.
-        try { return JSON.parse(await fs.readFile(path.join(dir, META_FILE), 'utf8')).kind !== 'inquiry' } catch { return true }
+        return Boolean(issue) && !issue.archived && issue.kind !== 'inquiry'
       }))
     return active.filter(Boolean).length
   } catch {
@@ -313,6 +315,95 @@ async function runSummaries (dir, unreadable = []) {
   return out.sort((a, b) => ((a.startedAt ?? '') < (b.startedAt ?? '') ? 1 : -1))
 }
 
+/*
+ * Each folder's listed reading (readIssue), reused while nothing it was read from changed. The top-level
+ * supervisor's poll lists every project's issues every few seconds, and counts them too: reading every
+ * issue.json, archive marker and occurrence record of every issue each time kept the panel's process busy
+ * with nothing to learn.
+ *
+ * The signature is taken BEFORE the read (a write during it shows at the next call), and the reading is kept only
+ * if the same paths, found again after it, still sign the same (a run folder created while the paths were being
+ * found would otherwise be in the reading without its run.json being signed). It is each path's
+ * modification time, change time, size and inode, or '-' when it does not exist: the folder (a new step, run
+ * folder, archive marker or occurrence record, and any file written by rename, change its time), issue.json,
+ * runs/ (a new run folder), run.json of EVERY run folder in it (one whose record is not written yet is '-' until
+ * it is), occurrences.json and the archive marker when present (an edit in place), and the two files outside the
+ * folder that readIssue reads: an archived folder's notes and a pending repeat lookup's outcome (both beside the
+ * bundles, issue-bundle.mjs). A read readIssue gains outside the folder must join it here. A run summary's own
+ * reuse is summaryCache's, keyed on run.json as before; the clock plays no part in a listed reading.
+ *
+ * Only lists and counts use it; getIssue and every writer read the folder afresh.
+ */
+const listedCache = new Map()
+
+async function listedIssue (project, dirName) {
+  if (!ISSUE_PATTERN.test(dirName)) return null
+  const dir = path.join(ISSUES_DIR, project, dirName)
+  const kept = listedCache.get(dir)
+  if (kept) {
+    const now = await signatureOf(kept.files).catch(() => null)
+    if (now === kept.signature) return { ...kept.issue }
+    listedCache.delete(dir)
+  }
+  const files = await listedFiles(project, dirName).catch(() => null)
+  const before = files ? await signatureOf(files).catch(() => null) : null
+  const issue = await readIssue(project, dirName)
+  // Kept only when the paths found again after the read are the same and still read as before: a run folder (or any
+  // other signed file) that appeared between finding the paths and the read is in the reading but not in `files`.
+  const after = before ? await listedFiles(project, dirName).catch(() => null) : null
+  const settled = after && after.join('\0') === files.join('\0') && await signatureOf(after).catch(() => null) === before
+  if (issue && settled) {
+    if (listedCache.size >= SUMMARY_CACHE_LIMIT) listedCache.delete(listedCache.keys().next().value)
+    listedCache.set(dir, { files, signature: before, issue })
+  }
+  return issue && { ...issue }
+}
+
+/** The paths a folder's listed reading is signed by (see listedCache), found by reading the folder and its runs/. */
+async function listedFiles (project, dirName) {
+  const dir = path.join(ISSUES_DIR, project, dirName)
+  const absent = (error) => { if (error.code === 'ENOENT') return null; throw error }
+  const [entries, runs] = await Promise.all([
+    fs.readdir(dir),
+    fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }).catch((error) => absent(error) ?? [])
+  ])
+  const files = [dir, path.join(dir, META_FILE), path.join(dir, 'runs')]
+  for (const e of runs) if (e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-')) files.push(path.join(dir, 'runs', e.name, 'run.json'))
+  if (entries.includes('occurrences.json')) files.push(path.join(dir, 'occurrences.json'))
+  if (entries.includes(ARCHIVE_FILE)) {
+    files.push(path.join(dir, ARCHIVE_FILE))
+    files.push(bundleFiles(ISSUES_DIR, project, dirName).notes)
+  }
+  // A malformed record is listed from readIssue's fallback and kept like any other (it names no repeat lookup).
+  const meta = await fs.readFile(path.join(dir, META_FILE), 'utf8').then((text) => { try { return JSON.parse(text) } catch { return null } }, () => null)
+  if (meta?.repeatLookup) files.push(bundleFiles(ISSUES_DIR, project, dirName).repeatLookup)
+  return files
+}
+
+async function signatureOf (files) {
+  const stamps = await Promise.all(files.map((file) => fs.stat(file).then((s) => `${s.mtimeMs}:${s.ctimeMs}:${s.size}:${s.ino}`, (error) => {
+    if (error.code === 'ENOENT') return '-'
+    throw error
+  })))
+  return stamps.join('|')
+}
+
+// A packed parent's summary as a list names it, reused while its summary file is the same (a restore deletes it).
+const packedParents = new Map()
+async function listedPackedSummary (project, id) {
+  const file = bundleFiles(ISSUES_DIR, project, id).summary
+  const signature = await signatureOf([file]).catch(() => null)
+  const kept = packedParents.get(file)
+  if (signature === '-') { packedParents.delete(file); return null }
+  if (kept && signature && kept.signature === signature) return kept.summary
+  const summary = await packedSummary(ISSUES_DIR, project, id).catch(() => null)
+  if (signature) {
+    if (packedParents.size >= SUMMARY_CACHE_LIMIT) packedParents.delete(packedParents.keys().next().value)
+    packedParents.set(file, { signature, summary })
+  } else packedParents.delete(file)
+  return summary
+}
+
 /** One project's issues, newest first. */
 export async function listIssues (project, { archived = false } = {}) {
   await requireProject(project)
@@ -326,7 +417,7 @@ export async function listIssues (project, { archived = false } = {}) {
   }
 
   const issues = await Promise.all(
-    entries.filter((entry) => entry.isDirectory()).map((entry) => readIssue(project, entry.name))
+    entries.filter((entry) => entry.isDirectory()).map((entry) => listedIssue(project, entry.name))
   )
 
   // Family links are read across both tabs, so an active child still names its archived parent.
@@ -334,7 +425,7 @@ export async function listIssues (project, { archived = false } = {}) {
   // Archiving packs an issue out of the folders: a parent missing here is looked up on its own, so a child can
   // still name it. Only missing parents are read; the whole archive is not.
   for (const parent of new Set([...family.values()].filter((f) => f.parent && !f.parent.known && f.parent.project === project).map((f) => f.parent.id))) {
-    const packed = ISSUE_PATTERN.test(parent) ? await packedSummary(ISSUES_DIR, project, parent).catch(() => null) : null
+    const packed = ISSUE_PATTERN.test(parent) ? await listedPackedSummary(project, parent) : null
     if (!packed) continue
     for (const f of family.values()) if (f.parent?.id === parent && f.parent.project === project) Object.assign(f.parent, { known: true, name: packed.issue?.name ?? null, packed: true })
   }

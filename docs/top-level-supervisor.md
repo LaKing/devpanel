@@ -415,12 +415,39 @@ archives `state.<ts>.json` with the whole previous chat inline, as before, start
 conversation in `chat-<ts>.jsonl` and removes the old file once the new state is saved. The poll
 itself is never queued twice: a tick that finds a poll queued or running is skipped, so
 an operator action (a message, an answer, Stop) waits behind one poll at most.
-A session owns its settled runs until New session, and the poll reads every owned run:
-a settled run's summary is therefore kept and read again only when its `run.json` or
-its issue's `issue.json` was written (their time and size, taken before the read), or
-after five minutes at the latest (`server/settled-run-cache.mjs`). A live or paused
-run, one under an automatic reconcile, one the run supervisor holds active and a
-packed issue are read every time, as before.
+
+**What an idle poll reads.** A session owns its settled runs until New session, and an active supervisor polls every
+few seconds whether or not anything moved. A poll that finds nothing changed opens no
+record it has already read: it compares file metadata (`stat`: modification time, change
+time, size and inode, each taken before the read it vouches for) and reads a file again
+only when that moved.
+
+- **Each owned run**, once by monitoring and once by the start gate's refresh: the stats
+  of its `run.json` and its issue's `issue.json`, or, for a packed issue, of the bundle's
+  `<id>.runs.json` and `<id>.json` (`server/settled-run-cache.mjs`). The summary is read
+  again when one of them changed, or a file is gone (a run deleted, an issue packed or
+  restored). Monitoring compares only what `run.json` holds, so it keeps a summary
+  whatever its age; `get_run` still reads a kept summary again after five minutes, for
+  what is derived from the clock.
+- **Each issue folder of every project** (the issue listing, `server/issues.js`): the
+  stats of the folder, `issue.json`, `runs/` and the `run.json` of every run folder in it
+  (a folder whose record is not written yet counts until it is), `occurrences.json` and
+  the archive marker when present, and the two files outside the folder an issue's
+  reading takes: an archived folder's notes and a pending repeat lookup's outcome, beside
+  the bundles. A new step, run or file in the folder moves the folder's time; an edit in
+  place moves the file's; an edit that puts the modification time back still moves the
+  change time.
+- **The project directories**, listed for their ids only.
+- **Once per `queueIdleMs`** (ten polls), or when the listings or the session's counters
+  moved, the ready queue's reading: the configuration, each project's checkout holder,
+  module pools and run homes ("The ready queue").
+
+Always read: a live or paused run, one under an automatic reconcile and one the run
+supervisor holds active. A pending repeat lookup is rerun only when the issue itself is
+opened (at most once a minute), never by the poll. The metrics tick of a connected
+browser (every two seconds) reads no record: one filesystem statistic, and a walk of
+`server/`'s file times once per ten seconds for the staleness banner.
+
 
 Replies may contain a single JSON response object surrounded by prose or a code
 fence. Its envelope and action arguments are validated before execution; multiple

@@ -156,7 +156,7 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
     if (!['started', 'finished'].includes(attempt.status)) return
     // An unreadable run is not evidence that a concurrent slot is free.
     let run
-    try { run = await tools.getRun(attempt.project, attempt.issueId, attempt.runId) } catch (error) {
+    try { run = await tools.getRun(attempt.project, attempt.issueId, attempt.runId, { monitoring: true }) } catch (error) {
       if (attempt.status === 'finished') return
       if (error.status === 404 || error.code === 'ENOENT') {
         if (await tools.wasDeleted?.(attempt)) {
