@@ -5,7 +5,7 @@ import { riskStatement } from './residual-risks.mjs'
 import { ignoredSelftests, ignoredWords } from './selftest-history.mjs'
 import { describeConflict } from './source-merge.mjs'
 import { countsForClosure } from './modules-tier.mjs'
-import { gateReason, unreadableReportOnly } from './baseline-failures.mjs'
+import { gateReason, testedNothing, unreadableReportOnly } from './baseline-failures.mjs'
 import { instanceWords } from './instance-drive.mjs'
 
 // Where a run stands, in words a person reads once and acts on.
@@ -770,6 +770,12 @@ function blocked (run, outputs, kept) {
         next: 'Recover picks up where it stopped. Abandon keeps the work and lets you start fresh.' }
     case 'checks-inconclusive': {
       const check = (run.checkResults ?? []).filter((c) => c.revision === run.revisions?.at(-1)?.fingerprint).at(-1)
+      // Nothing was tested at all: not a failed test, not a report the drive failed to show.
+      if (testedNothing(check)) {
+        return { ...base, headline: 'Stopped: the reviewers approved, but the modules tier tested nothing',
+          detail: `${modulesWords(check, run)}Nothing failed, and nothing was tested. No author round was spent on it.`,
+          next: 'Refresh checks and Continue would drive the same paths and test nothing again. Verify this change another way and record the outcome yourself, or start a new run whose change the modules tier can test.' }
+      }
       if (unreadableReportOnly(check)) {
         return { ...base, headline: 'Stopped: the reviewers approved and every check command passed, but a selftest report could not be read',
           detail: `${modulesWords(check, run)}No test is known to have failed. No author round was spent on it, since no source change answers a report the drive did not show.`,
@@ -844,8 +850,12 @@ function blocked (run, outputs, kept) {
         detail: [`The full check of the released snapshot ${c?.result?.result === 'passed' ? 'passed but its selftest report' : 'did not pass and'} could not be judged inherited from the previous green cycle${c?.baseline?.cycleId ? ` (${c.baseline.cycleId})` : ' (there is none)'}.`, fresh.length ? `New: ${fresh.slice(0, 10).join('; ')}` : null].filter(Boolean).join(' '),
         next: 'The stage keeps what was released. The next cycle verifies again.' }
     }
-    case 'refreshed-checks-failed':
-      return { ...base, headline: 'Stopped: checks failed after the evidence was refreshed', next: 'Start a new run against the current project.' }
+    case 'refreshed-checks-failed': {
+      // A modules gate says in its own words what failed: a failed test, an unread report, or a drive that tested nothing.
+      const check = (run.checkResults ?? []).filter((c) => c.revision === run.revisions?.at(-1)?.fingerprint).at(-1)
+      const detail = check?.tier === 'modules' ? modulesWords(check, run).trim() : ''
+      return { ...base, headline: testedNothing(check) ? 'Stopped: after the evidence was refreshed, the modules tier tested nothing' : 'Stopped: checks failed after the evidence was refreshed', ...(detail ? { detail } : {}), next: 'Start a new run against the current project.' }
+    }
     case 'coordinator-requested-source-refresh':
       return { ...base, headline: 'Stopped: the coordinator needs a fresh copy of the project', detail: 'The project changed in ways this run cannot account for.', next: 'Start a new run to work against the current project.' }
     case 'integrity-abandoned':

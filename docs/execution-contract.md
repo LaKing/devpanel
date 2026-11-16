@@ -455,6 +455,18 @@ explanation naming the unreadable report and that no test is known to have
 failed. A drive with a named failed test, or a failed command, is an ordinary
 failed check.
 
+A drive that tested nothing is that case with its own name (`testedNothing`,
+baseline-failures.mjs): no module or core directory was affected, so the drive ran
+no test command, no selftest ran and no report was read (`modulesSelftestFailures`
+marks its unread entry `testedNothing`; an older record is read through its empty
+`modules.tests`). It gates and stops the same way, but the gate's reason, the
+closure's `checks.gate` (with `checks.testedNothing`), `checks.latest.modules`
+(`testedNothing`) and the run explanation say that nothing was tested, worded apart
+from a failed test, an unread report and an unfinished base. A revision whose change
+set is empty is recorded like any other (engine.recordRevision), and with no triage
+module it is this case; preview and readiness say so before a start
+(top-level-supervisor.md "Readiness", `modulesCoverage`).
+
 ### The modules tier
 
 On a Boilerplate project (one with `infrastructure`) every playbook that records

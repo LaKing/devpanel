@@ -543,6 +543,16 @@ export function inconclusiveBase (check, run) {
 export const unreadableReportOnly = (check) => check?.tier === 'modules' && check.result === 'passed' && !check.modules?.selftestFailures?.length && Boolean(check.modules?.reportUnreadable?.length)
 
 /**
+ * A modules drive that tested nothing: it passed, but no module or core directory was affected, so no
+ * selftest ran and no report was read (modulesSelftestFailures marks it `testedNothing`; a record from
+ * before that is read through its empty plan, `modules.tests: []`). The gate still fails it, and it is a
+ * case of unreadableReportOnly, but it is said apart from a failed test and from a report that was not
+ * shown or a base that did not finish: nothing was tested at all.
+ */
+export const testedNothing = (check) => unreadableReportOnly(check) &&
+  (check.modules.reportUnreadable.some((r) => r.testedNothing) || (Array.isArray(check.modules.tests) && check.modules.tests.length === 0))
+
+/**
  * Every test and browser command of a modules drive that did not pass, as the
  * module or core directory it tested, and those that never ran (`notRun`): what
  * prompts and explanations list, so one round names every failing module. Null
@@ -623,7 +633,8 @@ export function gateReason (check, run) {
     const modules = failedModulesWords(check)
     if (modules) parts.push(modules)
     if (check.modules?.selftestFailures?.length) parts.push(`the selftest report names failed tests: ${named(check.modules.selftestFailures)}`)
-    if (check.modules?.reportUnreadable?.length) parts.push(`selftest report unreadable: ${check.modules.reportUnreadable.map((r) => `${r.command} (${r.error})`).join(', ')}`)
+    if (testedNothing(check)) parts.push('the drive tested nothing: no module or core directory was affected, so no selftest ran and no report was read')
+    else if (check.modules?.reportUnreadable?.length) parts.push(`selftest report unreadable: ${check.modules.reportUnreadable.map((r) => `${r.command} (${r.error})`).join(', ')}`)
     return parts.join('; ') + ' (the modules tier has no base: every failure blocks)'
   }
   const parts = []

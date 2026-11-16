@@ -141,7 +141,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     return launchReadiness({...a,projectPath:projectPath(a.project),
      resolve:(id,opts)=>resolvePlaybook(id,{...opts,root:configRoot}),inspectLaunch:inspectLaunchState,
      pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue?.path??null,...args}),
-     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId??null})})
+     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId??null}),
+     modulesCoverage:target=>supervisor.modulesCoverage({project:a.project,projectPath:projectPath(a.project),issueId:a.issueId??null,issuePath:issue?.path??null,target})})
    },
    infrastructure:project=>projectInfrastructure(project,{root:configRoot}),
    inspectEnvironment:a=>inspectEnvironment(a,{root:configRoot}),
@@ -190,7 +191,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     return summarisePreview(await preview(a.playbook,{configRoot,issue,project:{id:a.project,path:projectPath(a.project)},runOptions:a.runOptions??{},deliveryActions:supervisor.deliveryActions,
      selectRelease:()=>selectStagedRelease({project:a.project,projectPath:projectPath(a.project),listIssues:(p,o)=>issues.listIssues(p,o)}),
      pathOverlap:args=>supervisor.pathOverlap({project:a.project,projectPath:projectPath(a.project),issuePath:issue.path,...args}),
-     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId})}))
+     moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId}),
+     modulesCoverage:target=>supervisor.modulesCoverage({project:a.project,projectPath:projectPath(a.project),issueId:a.issueId,issuePath:issue.path,target})}))
    },
    launchState:async p=>{
     const resolved=await resolveWithRelease(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project},()=>selectStagedRelease({project:p.project,projectPath:projectPath(p.project),listIssues:(q,o)=>issues.listIssues(q,o)}))

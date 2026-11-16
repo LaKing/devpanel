@@ -1015,6 +1015,21 @@ or a live run that could not be compared. Every path is compared; only the file
 lists shown stop at 30 (`more`). `unknown` is not an all-clear, and `possible` names the live runs whose files the candidate's
 links can reach.
 
+On a project with a modules tier, a preview, and a reading that names a playbook (under
+`configuration`), also carry `modulesCoverage` (`runtime/modules-coverage.mjs`): what that
+tier would test, through the drive's own filter mapping (`driveFilters`). The evidence is
+the issue's ended runs newest first, and in each the first that answers of its latest
+revision's recorded `affectedModules` (under the collections in force; it may be known and
+empty), its revision's paths, and the paths its plan names; the issue's triage modules are
+always added. `state` is `tests` (with `filters`), `nothing` (no module and no core directory
+gives a filter: a drive of that change set runs no selftest, reads no report, and its gate
+will be inconclusive; the reading names the run and revision and says it describes that
+change set, not what the next author will change), `unknown` (no run gives evidence, even
+when the triage names modules, which are listed as `triageFilters`; never a claim of
+nothing) or `unavailable`. In a preview, `nothing`, `unknown` and `unavailable` are also an
+information prerequisite (`modules-coverage`); `tests` adds none. It refuses nothing: on
+`nothing`, choose another verification route or criterion before spending a start.
+
 It is not a prerequisite and refuses nothing: `baselineReady` and
 `configurationReady` do not hear of it, and it is no admission rule. Every start reads it again, and a start with `overlap` or `unknown`
 goes ahead with the reading on `run.startOverlap` (with `by`: `operator` or

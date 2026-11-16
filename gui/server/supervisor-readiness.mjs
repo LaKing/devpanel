@@ -48,10 +48,11 @@ function ownershipOf (fault) {
  * @param inspectLaunch  inspectLaunchState, likewise
  * @param pathOverlap  ({ deliveryAction }) => the reading of runtime/path-overlap.mjs
  * @param moduleLocks  () => supervisor.moduleLockReading: the project's module pool and its locks
+ * @param modulesCoverage  (target) => supervisor.modulesCoverage: what the named playbook's modules tier would test
  */
 export async function launchReadiness ({
   project, issueId = null, projectPath, budget = null, perIssueLeft = null,
-  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null,
+  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null, modulesCoverage = null,
   now = Date.now(), inspect = inspectSourceRepository
 }) {
   const fault = await inspect({ projectPath })
@@ -85,7 +86,7 @@ export async function launchReadiness ({
   // is not a question with an answer.
   let configuration = null
   if (playbook) {
-    configuration = await inspectConfiguration({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, now })
+    configuration = await inspectConfiguration({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage, now })
   }
 
   // Not a prerequisite: nothing here refuses a start, so baselineReady does not hear of it.
@@ -116,13 +117,13 @@ export async function launchReadiness ({
     configuration,
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
-    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing.',
+    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
 }
 
 /** The selected configuration's own source policy, under the hash it belongs to. */
-async function inspectConfiguration ({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, now }) {
+async function inspectConfiguration ({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage = null, now }) {
   const observedAt = new Date(now).toISOString()
   if (!resolve || !inspectLaunch) return { playbook, ready: false, prerequisites: [{ condition: 'configuration', state: 'this service cannot resolve a configuration', needs: 'ask for the baseline reading only' }], observedAt }
 
@@ -139,6 +140,9 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
   const identity = { playbook, intent: resolved.intent?.id ?? null, configHash: resolved.configHash, base: resolved.workspace?.base ?? 'head', locksModules: locksModules(resolved),
     delivery: { action: action ?? null, destination: writesSource ? projectPath : null, writesSource,
       authority: writesSource ? 'Starting this playbook authorizes engine-owned source writes at this destination and the bound Git-owner checkouts behind its materialized symlinks.' : 'This delivery does not update the project checkout.' } }
+  // What its modules tier would test (modules-coverage.mjs): information only, never a prerequisite.
+  const coverage = modulesCoverage ? await Promise.resolve().then(() => modulesCoverage(resolved.checks?.target)).catch((error) => ({ state: 'unavailable', detail: error.message })) : null
+  if (coverage) identity.modulesCoverage = coverage
 
   // A base policy over a checkout git cannot read is not a question with an
   // answer; saying "unevaluated" is honest, inventing a verdict is not.

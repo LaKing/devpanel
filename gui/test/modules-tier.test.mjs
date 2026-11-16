@@ -9,10 +9,10 @@ import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readEvents, runDir } from '../server/runtime/store.mjs'
 import { modulesErrors, modulesTarget } from '../server/infrastructure.mjs'
-import { failedModuleTests, failedModulesWords, gateReason, gatingResult, inconclusiveBase } from '../server/runtime/baseline-failures.mjs'
+import { failedModuleTests, failedModulesWords, gateReason, gatingResult, inconclusiveBase, testedNothing } from '../server/runtime/baseline-failures.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { checkSummary } from '../server/runtime/check-summary.mjs'
-import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, exitedOnItsOwn, failedFilters, failedInTests, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
+import { affectedModules, affectedModulesNotice, changedModules, countsForClosure, driveFilters, exitedOnItsOwn, failedFilters, failedInTests, isTestCommand, lintFiles, moduleChecksums, moduleOf, modulesDrive, modulesSelftestFailures, revisionFiles } from '../server/runtime/modules-tier.mjs'
 import { fingerprint, workspaceProjection } from '../server/runtime/fingerprint.mjs'
 
 export const name = 'modules tier — module mapping, the union with the triage list, unlisted, checksums and changed modules, the drive\'s order, its recording, no base drive, and the coding playbooks\' default'
@@ -37,7 +37,7 @@ const declared = (extra = {}) => ({
  * (the engine expands it the same way whatever the kind). The worker adds a
  * module file and a core file each round; `onAudit` sees each auditor prompt.
  */
-async function scenario ({ target, sizing = null, onAudit = null, extra = null }) {
+async function scenario ({ target, sizing = null, onAudit = null, extra = null, noChange = false }) {
   const state = { engine: null, prompts: [], authorPrompts: [] }
   const script = async (turn) => {
     const { stepId, role, round, prompt } = turn
@@ -45,6 +45,8 @@ async function scenario ({ target, sizing = null, onAudit = null, extra = null }
     if (stepId === 'implement') {
       state.authorPrompts.push({ round, prompt })
       const ws = state.engine.run.workspace.path
+      // A turn that changes nothing still records a revision (engine.recordRevision): the drive then tests nothing.
+      if (noChange) return fence({ summary: 'Nothing to change in the source', basedOnRevision: revision(prompt) })
       await fs.mkdir(path.join(ws, '@c/a'), { recursive: true })
       await fs.mkdir(path.join(ws, 'lib'), { recursive: true })
       await fs.writeFile(path.join(ws, '@c/a/x.mjs'), `export const round = ${round}\n`)
@@ -436,6 +438,50 @@ export default async function (t) {
       t.eq('no rerun either', events.filter((e) => e.type === 'checks-retry').length, 0)
       const said = explainRun(engine.run)
       t.ok('the explanation names the unreadable report and that no test failed', /selftest report could not be read/.test(said.headline) && /selftest report unreadable: collect/i.test(said.detail) && /No test is known to have failed/.test(said.detail), JSON.stringify(said))
+      await releaseWorkspace(engine)
+    }
+
+    t.section('a drive that tested nothing: its own cause at the gate, at closure and in the explanation (AC3)')
+    {
+      const declared = { collections: ['@*'], rootFilter: 'core', test: { id: 'module-selftest', run: 'x {{filter}}' } }
+      t.eq('driveFilters: modules, hook subscribers in the tree, then core with rootFilter', driveFilters(declared, { modules: ['@c/a'], viaHooks: [{ module: '@c/h', inTree: true }, { module: '@c/o', inTree: false }], core: { dirs: ['.', 'lib'] } }).map((f) => f.filter), ['@c/a', '@c/h', 'core', 'lib'])
+      t.eq('nothing affected gives no filter', driveFilters(declared, { modules: [], core: null }), [])
+      t.ok('isTestCommand knows the numbered test commands only', isTestCommand({ modules: declared }, 'module-selftest-2') && !isTestCommand({ modules: declared }, 'module-selftest') && !isTestCommand({ modules: declared }, 'ready'))
+      const collect = { id: 'collect', report: 'selftest', required: false }
+      const none = await modulesSelftestFailures({ runDir: os.tmpdir(), target: { modules: declared, commands: [{ id: 'ready' }], finallyCommands: [collect] }, check: { result: 'passed', dir: 'x', commands: [{ id: 'ready', passed: true }, { id: 'collect', passed: false, required: false }] } })
+      t.eq('a declared tier whose drive held no test command is marked testedNothing', none.unreadable.map((u) => [u.testedNothing, u.error]), [[true, 'no module or core directory was tested, so no selftest ran and no report was read']])
+      const ran = await modulesSelftestFailures({ runDir: os.tmpdir(), target: { modules: declared, commands: [{ id: 'module-selftest-1' }], finallyCommands: [collect] }, check: { result: 'passed', dir: 'x', commands: [{ id: 'module-selftest-1', passed: true }, { id: 'collect', passed: false, required: false }] } })
+      t.eq('a drive whose tests ran keeps the old words', ran.unreadable.map((u) => [u.testedNothing ?? false, u.error]), [[false, 'no selftest report was read']])
+      const run = { workspace: { baseCommit: 'b' } }
+      const nothing = { tier: 'modules', result: 'passed', commands: [{ id: 'ready', passed: true }], modules: { tests: [], selftestFailures: [], reportUnreadable: none.unreadable } }
+      const legacy = { tier: 'modules', result: 'passed', commands: [], modules: { tests: [], selftestFailures: [], reportUnreadable: [{ command: 'collect', error: 'no selftest report was read' }] } }
+      const unread = { tier: 'modules', result: 'passed', commands: [{ id: 'module-selftest-1', passed: true }], modules: { tests: [{ id: 'module-selftest-1', slot: 'test', module: '@c/a', filter: '@c/a' }], selftestFailures: [], reportUnreadable: [{ command: 'collect', error: 'x' }] } }
+      const failing = { tier: 'modules', result: 'passed', commands: [{ id: 'module-selftest-1', passed: true }], modules: { tests: [{ id: 'module-selftest-1', slot: 'test', module: '@c/a', filter: '@c/a' }], selftestFailures: [{ command: 'collect', test: '@c/a: works' }] } }
+      t.ok('testedNothing: the marked record and a legacy one with an empty plan; not an unread report or a failed test', testedNothing(nothing) && testedNothing(legacy) && !testedNothing(unread) && !testedNothing(failing))
+      t.eq('it still gates failed and stops as inconclusive', [gatingResult(nothing, run), inconclusiveBase(nothing, run)], ['failed', true])
+      const words = gateReason(nothing, run)
+      t.ok('the gate names it', /the drive tested nothing: no module or core directory was affected/.test(words), words)
+      t.ok('worded apart from an unread report and a failed test', !/unreadable/.test(words) && /selftest report unreadable/.test(gateReason(unread, run)) && /names failed tests/.test(gateReason(failing, run)) && !/tested nothing/.test(gateReason(unread, run)))
+      t.ok('a legacy record is named the same', /the drive tested nothing/.test(gateReason(legacy, run)))
+      const atClosure = explainRun({ status: 'blocked', blockedReason: 'closure-conditions-unmet', revisions: [], closure: { conditions: { checksSatisfied: false }, checks: { result: 'passed', gating: 'failed', gate: words, testedNothing: true } } })
+      t.ok('at closure the explanation quotes the gate: tested nothing', /tested nothing/.test(atClosure.detail ?? ''), JSON.stringify(atClosure))
+      const refreshed = explainRun({ status: 'blocked', blockedReason: 'refreshed-checks-failed', revisions: [{ fingerprint: 'r' }], checkResults: [{ ...nothing, revision: 'r' }] })
+      t.ok('after Refresh checks it says the tier tested nothing, with the gate\'s words', /modules tier tested nothing/.test(refreshed.headline) && /tested nothing/.test(refreshed.detail), JSON.stringify(refreshed))
+      t.eq('a plain refreshed failure keeps its headline', explainRun({ status: 'blocked', blockedReason: 'refreshed-checks-failed', revisions: [{ fingerprint: 'r' }], checkResults: [{ ...failing, revision: 'r' }] }).headline, 'Stopped: checks failed after the evidence was refreshed')
+
+      // The reported case, through the engine: an author turn that changed nothing, with no triage list.
+      const ok = path.join(await temp('devpanel-modules-nothing-'), 'ok')
+      await fs.writeFile(ok, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      const target = { kind: 'local', modules: { collections: ['@*'], lint: { id: 'lint', run: `${ok} {{files}}` }, load: { id: 'load', run: 'true' }, restart: { id: 'restart', run: 'true' }, ready: { id: 'ready', run: 'true' },
+        test: { id: 'module-selftest', run: `${ok} {{filter}}`, report: 'selftest' } } }
+      const { engine } = await scenario({ target, noChange: true })
+      t.eq('the revision recorded an empty change set', [engine.run.revisions.at(-1).affectedModules.fromPaths, engine.run.revisions.at(-1).affectedModules.core], [[], null])
+      t.eq('stopped as inconclusive with no test in the drive', [`${engine.run.status} ${engine.run.blockedReason}`, engine.run.checkHistory.at(-1).modules.tests], ['blocked checks-inconclusive', 0])
+      const said = explainRun(engine.run)
+      t.ok('the explanation says the modules tier tested nothing', /modules tier tested nothing/.test(said.headline) && /the drive tested nothing/i.test(said.detail) && !/could not be read/.test(said.headline), JSON.stringify(said))
+      t.ok('apart from the unread-report and unfinished-base headlines', !/selftest report could not be read|did not finish its tests/.test(said.headline))
+      const latest = engine.run.checkResults.at(-1)
+      t.eq('seats read testedNothing in checks.latest', checkSummary(latest)?.modules?.testedNothing, true)
       await releaseWorkspace(engine)
     }
 

@@ -282,7 +282,10 @@ of affected modules (900 + n per filter when `timeoutSeconds` is left out). Its 
 the engine reads the failed modules off the selftest report the command prints (a
 `module` beside a failed test, else the first segment of the test's name), which is
 one more reason to declare `report: selftest` on it. A drive with nothing affected
-runs no test command in either form.
+runs no test command in either form: it tested nothing, its gate is inconclusive and
+says so (`testedNothing`), and preview and readiness warn of it before a start when
+the issue's newest recorded change set or expected paths give no filter
+(`modulesCoverage`, docs/top-level-supervisor.md "Readiness").
 
 `examples/host-config/projects/example-project.yaml` shows a whole declaration and how
 its commands are composed from `quick-deploy.sh`, the starter and the `selftest` CLI where

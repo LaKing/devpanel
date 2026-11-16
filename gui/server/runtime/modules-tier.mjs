@@ -102,6 +102,21 @@ export const exitedOnItsOwn = (c) => !c.timedOut && !c.signal && !c.unavailable 
 export const takesAllFilters = (command) => typeof command?.run === 'string' && command.run.includes('{{filters}}')
 
 /**
+ * The selftest filters a drive runs for what a revision affects, in order: each
+ * affected module (with the hook subscribers in this tree, affectedModules.viaHooks,
+ * once each), then each core directory (the root gets `rootFilter`, default '.').
+ * Empty means the drive runs no test command. modules-coverage.mjs reads coverage
+ * before a start through the same function, so the two cannot disagree.
+ */
+export function driveFilters (m, affected) {
+  const modules = [...new Set([...(affected?.modules ?? []), ...(affected?.viaHooks ?? []).filter((v) => v.inTree).map((v) => v.module)])].sort()
+  return [
+    ...modules.map((module) => ({ module, filter: module })),
+    ...(affected?.core?.dirs ?? []).map((dir) => ({ core: dir, filter: dir === '.' ? (m.rootFilter ?? '.') : dir }))
+  ]
+}
+
+/**
  * One drive of the tier for a revision: lint (left out with no files), load,
  * restart, ready, a test per affected module then per core directory (the root
  * gets `rootFilter`, default '.'), a browser run per affected module when the
@@ -127,12 +142,7 @@ export function modulesDrive (target, { affected, files = [], failedFirst = [], 
   const commands = []
   if (files.length) commands.push(fill(m.lint, 'files', files))
   commands.push(m.load, m.restart, m.ready)
-  // Hook subscribers in this tree (affectedModules.viaHooks, module-hooks.mjs) are tested here too, once each.
-  const modules = [...new Set([...(affected?.modules ?? []), ...(affected?.viaHooks ?? []).filter((v) => v.inTree).map((v) => v.module)])].sort()
-  const declared = [
-    ...modules.map((module) => ({ module, filter: module })),
-    ...(affected?.core?.dirs ?? []).map((dir) => ({ core: dir, filter: dir === '.' ? (m.rootFilter ?? '.') : dir }))
-  ]
+  const declared = driveFilters(m, affected)
   const first = new Set(failedFirst ?? [])
   const filters = [...declared.filter((f) => first.has(f.filter)), ...declared.filter((f) => !first.has(f.filter))]
   const tests = []
@@ -204,10 +214,14 @@ export function affectedModulesNotice (revision) {
  * is not the tests' answer and keeps the retry (`retryFailed`).
  */
 export function failedInTests (target, check) {
-  const prefixes = [target?.modules?.test?.id, target?.modules?.browser?.id].filter(Boolean)
-  const isTest = (id) => prefixes.some((p) => typeof id === 'string' && id.startsWith(`${p}-`) && /^\d+$/.test(id.slice(p.length + 1)))
   const failed = (check?.commands ?? []).filter((c) => c.required !== false && !c.passed)
-  return check?.result === 'failed' && failed.length > 0 && failed.every((c) => isTest(c.id) && exitedOnItsOwn(c))
+  return check?.result === 'failed' && failed.length > 0 && failed.every((c) => isTestCommand(target, c.id) && exitedOnItsOwn(c))
+}
+
+/** Whether a command id is one of a modules drive's test or browser commands (modulesDrive's `<id>-<n>`). */
+export function isTestCommand (target, id) {
+  const prefixes = [target?.modules?.test?.id, target?.modules?.browser?.id].filter(Boolean)
+  return prefixes.some((p) => typeof id === 'string' && id.startsWith(`${p}-`) && /^\d+$/.test(id.slice(p.length + 1)))
 }
 
 /** Check records that count for closure: the full drive, or the modules tier where it is the target. */
@@ -252,6 +266,13 @@ export async function modulesSelftestFailures ({ runDir, target, check }) {
   }
   // A passing drive must have shown a report: one that ran none, or only failed or skipped
   // collectors, proved no test (the declaration requires a collector, modulesErrors).
-  if (!read && !unreadable.length && check?.result === 'passed') unreadable.push({ command: declared.map((c) => c.id).join(', ') || null, error: 'no selftest report was read' })
+  // A declared tier whose drive held no test command tested nothing: no module or core directory was
+  // affected (modulesDrive, driveFilters). Said apart from a report the tests did not show (testedNothing).
+  if (!read && !unreadable.length && check?.result === 'passed') {
+    const tested = !target.modules?.test || [...(target.commands ?? [])].some((c) => isTestCommand(target, c.id))
+    unreadable.push(tested
+      ? { command: declared.map((c) => c.id).join(', ') || null, error: 'no selftest report was read' }
+      : { command: declared.map((c) => c.id).join(', ') || null, error: 'no module or core directory was tested, so no selftest ran and no report was read', testedNothing: true })
+  }
   return { failures, unreadable }
 }

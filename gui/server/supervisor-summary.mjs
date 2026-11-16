@@ -296,6 +296,7 @@ export function summarisePreview (preview) {
     prerequisites: preview.prerequisites ?? [],
     ...(preview.pathOverlap ? { pathOverlap: preview.pathOverlap } : {}),
     ...(preview.moduleLocks ? { moduleLocks: preview.moduleLocks } : {}),
+    ...(preview.modulesCoverage ? { modulesCoverage: preview.modulesCoverage } : {}),
     configurationReady: preview.configurationReady,
     liveEligible: preview.liveEligible
   }

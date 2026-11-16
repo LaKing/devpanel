@@ -1,5 +1,5 @@
 import { ignoredWords } from './selftest-history.mjs'
-import { failedModuleTests } from './baseline-failures.mjs'
+import { failedModuleTests, testedNothing } from './baseline-failures.mjs'
 import { instanceWords } from './instance-drive.mjs'
 
 /** Model-facing evidence summary. Full manifests/logs stay in the retained check artifact. */
@@ -79,6 +79,8 @@ function modulesSummary (check) {
     failed: read.failed, notRun: read.notRun,
     selftestFailures: named.slice(0, 60), ...(named.length > 60 ? { selftestFailuresTotal: named.length } : {}),
     ...(check.modules.reportUnreadable?.length ? { reportUnreadable: check.modules.reportUnreadable } : {}),
+    // No module or core directory was affected: no selftest ran, so the gate cannot pass (baseline-failures testedNothing).
+    ...(testedNothing(check) ? { testedNothing: true } : {}),
     note: `Modules tier: a test or browser command that fails on its own exit does not stop the others, so \`failed\` lists EVERY failing module of this drive${read.failed.length ? ' — answer all of them in one revision, not only the first' : ''}. \`notRun\` holds commands that did not run because an earlier one timed out, was killed or could not be reached: their outcome is unknown, not a pass.${read.failed.some((f) => f.undetermined) ? ' An `undetermined` entry is one command that tested several filters: read `selftestFailures` and its log for which.' : ''}`
   } }
 }

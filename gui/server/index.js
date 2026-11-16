@@ -637,7 +637,8 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
   const result = await preview(req.params.id, { issue, project: projectRef, deliveryActions: supervisor.deliveryActions, runOptions,
     selectRelease: projectRef ? () => selectStagedRelease({ project, projectPath: projectRef.path, listIssues: (p, o) => listIssues(p, o) }) : null,
     pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null,
-    moduleLocks: projectRef ? () => supervisor.moduleLockReading({ project, issueId }) : null })
+    moduleLocks: projectRef ? () => supervisor.moduleLockReading({ project, issueId }) : null,
+    modulesCoverage: projectRef ? (target) => supervisor.modulesCoverage({ project, projectPath: projectRef.path, issueId, issuePath: issue.path, target }) : null })
   res.status(result.ok ? 200 : 422).json(result)
 }))
 

@@ -138,7 +138,7 @@ const readWorktree = async (workspace) => {
 }
 
 /** The paths an earlier run's candidate changes: retained worktree, delivered patch, then its latest check's patch. */
-async function revisionPaths (issuePath, run, gaps) {
+export async function revisionPaths (issuePath, run, gaps) {
   if (!run.revisions?.length) return []
   const ws = run.workspace ?? {}
   if (ws.isolation === 'in-place') return run.delivery?.changedPaths ?? []
@@ -161,7 +161,7 @@ async function revisionPaths (issuePath, run, gaps) {
 }
 
 /** The tokens of a run's plan, the approved one first. The step folder holds the full text. */
-async function planPaths (issuePath, run, gaps) {
+export async function planPaths (issuePath, run, gaps) {
   try {
     const outputs = await store.readOutputs(issuePath, run.runId)
     const snapshot = await store.readSnapshot(issuePath, run.runId).catch(() => ({}))

@@ -82,8 +82,9 @@ function indexSteps (phases) {
  * @param issue    optional issue descriptor, so issue-scoped placeholders resolve
  * @param project  optional { id, path }
  * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
+ * @param modulesCoverage  optional (target) => the reading of runtime/modules-coverage.mjs: what the modules tier would test
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null } = {}) {
   // A production release with no named releaseId is filled from the issues
   // (release-selection.mjs selectStagedRelease), the same way the start fills it.
   const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
@@ -219,6 +220,12 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   if (overlap?.state === 'overlap' || overlap?.state === 'unknown') {
     prerequisites.push({ kind: 'path-overlap', category: 'information', status: overlap.state === 'overlap' || overlap.possible.length ? 'warning' : 'unknown', detail: overlap.detail })
   }
+  // What the modules tier would test (modules-coverage.mjs): information, like path-overlap. A drive that tests
+  // nothing gates inconclusive, so the warning comes before the start; `tests` adds nothing.
+  const coverage = modulesCoverage ? await Promise.resolve().then(() => modulesCoverage(r.checks.target)).catch((error) => ({ state: 'unavailable', detail: error.message })) : null
+  if (['nothing', 'unknown', 'unavailable'].includes(coverage?.state)) {
+    prerequisites.push({ kind: 'modules-coverage', category: 'information', status: coverage.state === 'nothing' ? 'warning' : 'unknown', detail: coverage.detail })
+  }
   // The module pool (module-locks.mjs): a module the issue's triage named that another live run
   // holds refuses a coding playbook's start until that run ends; the preview names the holder.
   const locks = moduleLocks && locksModules(r) ? await Promise.resolve().then(moduleLocks).catch((error) => ({ unavailable: error.message })) : null
@@ -258,6 +265,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     prerequisites,
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
+    ...(coverage ? { modulesCoverage: coverage } : {}),
     configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
     liveEligible: r.liveExecution.eligible
   }

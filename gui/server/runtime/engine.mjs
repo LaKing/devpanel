@@ -33,7 +33,7 @@ import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, fre
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
 import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
-import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, unfinishedSuites } from './baseline-failures.mjs'
+import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, testedNothing, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
 import { instanceName, SYNC_ID } from './instance-drive.mjs'
@@ -5327,7 +5327,7 @@ export class Engine {
         // The checks as closure counted them, with the inherited-failure comparison.
         ...(check.revision ? { checks: { result: check.result, gating, ...(check.carriedFrom ? { carriedFrom: check.carriedFrom } : {}),
           // The modules tier has no comparison to explain its gate: the gate's own words.
-          ...(check.tier === 'modules' && gating !== 'passed' ? { gate: gateReason(check, gateRun) } : {}),
+          ...(check.tier === 'modules' && gating !== 'passed' ? { gate: gateReason(check, gateRun), ...(testedNothing(check) ? { testedNothing: true } : {}) } : {}),
           ...(inherited ? { comparison: inherited.verdict, reason: inherited.reason, baselineKnown: inherited.baselineKnown, newFailures: inherited.newFailures, notRun: inherited.notRun } : {}),
           ...(check.baselineComparison?.selftest ? { selftest: (({ verdict, reason, newFailures, baselineKnown, unstable, flakyFailures }) => ({ verdict, reason, newFailures, baselineKnown, ...(unstable ? { unstable } : {}), ...(flakyFailures ? { flakyFailures } : {}) }))(check.baselineComparison.selftest) } : {}) } } : {}),
         // What the seat said stopped it, kept where closure explains itself.

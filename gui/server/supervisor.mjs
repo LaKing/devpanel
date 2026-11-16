@@ -5,6 +5,7 @@ import { launchPreconditions } from './launch-preconditions.mjs'
 import { createPathOverlap, deliveryActionOf, worthRecording } from './runtime/path-overlap.mjs'
 import { modulesTarget, projectInfrastructure, stagingTarget } from './infrastructure.mjs'
 import { isModulesTarget } from './runtime/modules-tier.mjs'
+import { coverageInput, modulesCoverage as coverageReading } from './runtime/modules-coverage.mjs'
 import { projectPath as projectDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
@@ -582,6 +583,22 @@ export function createSupervisor ({
       held,
       ...(issueId ? { expected: { modules: expected, source: issue?.sizing ? 'sizing' : 'none' }, conflicts: conflictsWith(held, expected, { project, issueId }) } : {}),
       ...(playbook ? { locks: playbook } : {})
+    }
+  }
+
+  /**
+   * `modulesCoverage` for preview and readiness (runtime/modules-coverage.mjs): what the modules
+   * tier would test for the issue's newest recorded change set or expected paths, `unknown` when
+   * there are none. Null for a target that is not a declared modules tier. Read-only, never throws.
+   */
+  async function modulesCoverage ({ project, projectPath = null, issueId = null, issuePath = null, target }) {
+    if (!isModulesTarget(target) || !target?.modules) return null
+    try {
+      const issue = issueId ? await issues.getIssue(project, issueId).catch(() => null) : null
+      const input = await coverageInput({ issuePath: issuePath ?? issue?.path ?? null, target, projectPath })
+      return coverageReading({ target, triage: issue?.sizing?.affectedModules ?? [], input })
+    } catch (error) {
+      return { state: 'unavailable', detail: `What the modules tier would test could not be read: ${error.message}` }
     }
   }
 
@@ -2195,7 +2212,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading }
+  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading, modulesCoverage }
 }
 
 /**
