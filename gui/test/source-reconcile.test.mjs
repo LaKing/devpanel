@@ -164,9 +164,15 @@ export default async function (t) {
       // must be run in a work tree", so a reconcile failed whenever anything had been deleted at the destination since the base.
       const { f, engine } = await blockedRun({ tracked: { 'obsolete.txt': 'no longer needed\n' }, worktree: { ...CHANGELOG_ONLY.worktree }, source: { ...CHANGELOG_ONLY.source, 'obsolete.txt': null } })
       t.eq('delivery was refused for the changelog conflict', `${engine.run.blockedReason} ${engine.run.delivery?.application?.state}`, 'source-delivery-blocked source-drift')
+      // The shape of the report: the delivery names the source by its .git directory, the merge runs in a private engine directory.
+      const checkout = await fs.realpath(f.projectPath)
+      t.eq('the delivery records the source as its .git directory', [engine.run.delivery.repository, engine.run.delivery.application.path], [path.join(checkout, '.git'), f.projectPath])
+      t.eq('the run merges in its private, bare engine Git directory', [engine.run.workspace.repository?.kind, (await exec('git', ['--git-dir', engine.run.workspace.gitDir, 'rev-parse', '--is-bare-repository'])).stdout.trim()], ['private', 'true'])
       await engine.reconcileDelivery({ policy: PREPEND })
       const attempt = engine.run.reconciliations?.at(-1)
       t.eq('the reconcile went through and delivered', `${engine.run.status} ${engine.run.outcome} ${attempt?.state}`, 'completed resolved accepted', `${engine.run.blockedReason} ${attempt?.error}`)
+      t.eq('with no error recorded', attempt?.error ?? null, null)
+      t.eq('B′ was written: a commit over the snapshot', attempt?.sourceBase ? (await exec('git', ['--git-dir', engine.run.workspace.gitDir, 'rev-parse', `${attempt.sourceBase}^`])).stdout.trim() : null, engine.run.workspace.baseCommit)
       t.eq('the source has the fix and both changelog entries', [await read(f, 'server.mjs'), await read(f, 'changelog.txt')], [lines(10, { 9: 'line 9 fixed' }), 'candidate: fixed line 9\nother: landed first\nv1 released\n'])
       t.eq('and the deleted file stays deleted', await fs.access(path.join(f.projectPath, 'obsolete.txt')).then(() => 'present', () => 'absent'), 'absent')
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
@@ -636,6 +642,23 @@ export default async function (t) {
       t.ok('no revision or approval was added', !engine.run.revisions.some((r) => r.reconciledFrom) && !engine.run.approvals.some((a) => a.reconciledFrom))
       t.eq('the next run still starts from the approved patch', (await undeliveredApproval(f.issuePath, 'next'))?.runId, engine.runId)
       t.ok('journaled', (await readEvents(f.issuePath, engine.runId)).events.some((e) => e.type === 'reconcile-refused' && e.state === 'conflicts'))
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('3b. a conflicting code path beside a deletion at the destination reports the conflict, not a git error')
+    {
+      // The deletion makes step 3 take a path out of the bare engine directory's index; before dropFromIndex that died
+      // with "this operation must be run in a work tree" and the conflict was never reached.
+      const { f, engine } = await blockedRun({ tracked: { 'obsolete.txt': 'no longer needed\n' }, worktree: { 'server.mjs': lines(10, { 5: 'line 5 by the candidate' }) },
+        source: { 'server.mjs': lines(10, { 5: 'line 5 by someone else' }), 'obsolete.txt': null } })
+      await engine.reconcileDelivery({ policy: { '**/changelog.txt': 'append' } })
+      const attempt = engine.run.reconciliations.at(-1)
+      t.eq('refused for the conflict, naming the path', [attempt.state, attempt.conflicts], ['conflicts', ['server.mjs']], attempt.error)
+      t.ok('B′ was written and no git error recorded', Boolean(attempt.sourceBase) && !/work tree/.test(attempt.error ?? ''), `${attempt.sourceBase} ${attempt.error}`)
+      t.eq('still blocked as before', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked source-delivery-blocked')
+      const detail = explainRun(engine.run).detail ?? ''
+      t.ok('the explanation names the file and its conflicting line', detail.includes('server.mjs line 5'), detail)
+      t.eq('the source is untouched', await read(f, 'server.mjs'), lines(10, { 5: 'line 5 by someone else' }))
       await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
     }
 
