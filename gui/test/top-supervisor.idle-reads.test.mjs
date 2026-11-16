@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -188,7 +189,11 @@ export default async function (t) {
 
     t.section('each outside change reaches the next listing')
     counting = false
-    const row = async (id, opts) => (await issues.listIssues('p-project', opts)).find((i) => i.id === id)
+    // The service goes on polling (every 50 ms) beside the listings below, and its monitoring rightly reads an owned
+    // run's issue again once that issue's record changed (the settled-run cache is signed by it). What a section counts
+    // or injects concerns the test's own listing, so it is told apart from the poll's reads by its async context.
+    const mine = new AsyncLocalStorage()
+    const row = (id, opts) => mine.run(true, async () => (await issues.listIssues('p-project', opts)).find((i) => i.id === id))
     const plain = '2026-11-11-issue-p-10'
     const stepsBefore = (await row(plain)).stepCount
     await fs.mkdir(path.join(issuesDir, 'p-project', plain, '001-note'))
@@ -225,7 +230,7 @@ export default async function (t) {
       const readdirBefore = fs.readdir
       fs.readdir = async function (dir, ...rest) {
         const out = await readdirBefore.call(this, dir, ...rest)
-        if (!injected && String(dir) === racedRuns) {
+        if (!injected && mine.getStore() && String(dir) === racedRuns) {
           injected = true
           await fs.mkdir(path.join(racedRuns, lateId), { recursive: true })
           await fs.writeFile(path.join(racedRuns, lateId, 'run.json'), JSON.stringify({ ...JSON.parse(record(lateId, 'completed')), startedAt: '2026-11-09T00:00:00.000Z' }))
@@ -249,7 +254,7 @@ export default async function (t) {
       let opens = 0
       const readFileBefore = fs.readFile
       fs.readFile = function (file, ...rest) {
-        if (String(file?.path ?? file) === brokenFile) opens++
+        if (mine.getStore() && String(file?.path ?? file) === brokenFile) opens++
         return readFileBefore.call(this, file, ...rest)
       }
       patched.push(['readFile', readFileBefore])
