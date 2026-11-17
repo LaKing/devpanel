@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { createFullVerification, driveIdOf } from '../server/full-verification.mjs'
+import { createFullVerification, derivedVerdict, driveIdOf } from '../server/full-verification.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { driveCommands, instanceName } from '../server/runtime/instance-drive.mjs'
 import { writesCheckout } from '../server/run-exclusivity.mjs'
@@ -437,7 +437,7 @@ export default async function (t) {
     const T0 = Date.parse('2026-11-14T08:59:00.000Z')
     const FRAMEWORK = '/fixture/framework-project'
     const SITE = '/fixture/site-project'
-    const pool = ({ suiteFails = [], recheckOf = () => null, movingIn = [], unreadIn = [], failAction = null, commitUntested = {}, covered = () => ({}) } = {}) => {
+    const pool = ({ suiteFails = [], recheckOf = () => null, movingIn = [], unreadIn = [], failAction = null, commitUntested = {}, covered = () => ({}), linked = true } = {}) => {
       const s = seams({ issuesDir: null, infra: { 'framework-project': instanceInfra(), 'site-project': instanceInfra() }, outcome: async (target, { runId }) => passing(suiteFails.some((p) => runId.endsWith(p.replace(/[^a-z0-9]+/g, '-'))) ? 1 : 0)(target), covered })
       const heads = { [FRAMEWORK]: 'f0', [SITE]: 's0' }
       Object.assign(s.calls, { rechecks: [], compared: [], readings: [] })
@@ -452,7 +452,7 @@ export default async function (t) {
           if (again) s.calls.rechecks.push(project)
           return { path: p, baseCommit: again ? (recheckOf(project) ? `moved-${project}` : `snap-${project}`) : `snap-${project}`, isolation: 'git-worktree' }
         },
-        recordSnapshot: async ({ projectDir }) => ({ repository: `${projectDir}/.git`, ownCommit: 'own', excludes: [], links: projectDir === SITE ? [{ path: 'fw', owner: FRAMEWORK, prefix: 'lib', consumerExcludes: [], skipped: [] }] : [] }),
+        recordSnapshot: async ({ projectDir }) => ({ repository: `${projectDir}/.git`, ownCommit: 'own', excludes: [], links: projectDir === SITE && linked ? [{ path: 'fw', owner: FRAMEWORK, prefix: 'lib', consumerExcludes: [], skipped: [] }] : [] }),
         compareSnapshots: async ({ to }) => ({ sameTree: false, moved: recheckOf(to.replace('moved-', '')) }),
         readMotion: async ({ projectDir, extra = [] }) => {
           const after = s.calls.readings.filter((r) => r === projectDir).length % 2 === 1
@@ -482,21 +482,36 @@ export default async function (t) {
       return (await cycle(s, path.join(issuesDir, '.verification'), manualClock(Date.parse('2026-11-14T09:00:00.000Z')))).run()
     }
 
-    t.section('12. a green cycle compares every checkout it snapshotted before the chain: unchanged, the chain runs and every commit is compared with the tested views')
+    t.section('12. a green cycle compares every checkout it snapshotted before the chain: unchanged, the chain runs and every commit is compared with the tested views (the framework derived from its instance)')
     {
       const s = pool()
       const record = await poolCycle(s, 'devpanel-fvi-unchanged-')
       const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
-      t.eq('every green entry was snapshotted again before any checkpoint', [s.calls.rechecks.sort(), by['framework-project'].recheck.state, by['site-project'].recheck.state], [['framework-project', 'site-project'], 'unchanged', 'unchanged'])
+      t.eq('every green entry was rechecked before any checkpoint: the instance snapshotted again, the derived framework has no snapshot of its own', [s.calls.rechecks.sort(), by['framework-project'].recheck.state, by['site-project'].recheck.state], [['site-project'], 'no-snapshot', 'unchanged'])
       t.eq('the instance\'s recheck covers the framework checkout it read through its link', by['site-project'].recheck.checkouts, [SITE, FRAMEWORK])
       t.eq('nothing moved: the chain ran as before', s.calls.actions.map((a) => [a.project, a.args]), [['framework-project', ['--minor']], ['site-project', []]])
       t.eq('the cycle committed', [record.outcome.committed, record.outcome.bump.withheld, record.outcome.commitWithheld], [true, [], undefined])
-      t.eq('each commit compared with every tested view of its checkout: the framework\'s own and the instance\'s copy of lib', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [
-        [FRAMEWORK, 'f0', 'f0+1', [[`${FRAMEWORK}/.git`, '', ''], [`${SITE}/.git`, 'fw', 'lib']]],
+      t.eq('each commit compared with every tested view of its checkout: the framework\'s only through the instance\'s copy of lib', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [
+        [FRAMEWORK, 'f0', 'f0+1', [[`${SITE}/.git`, 'fw', 'lib']]],
         [SITE, 's0', 's0+1', [[`${SITE}/.git`, '', '']]]
       ])
       t.eq('nothing untested was committed', [record.outcome.bump.chain.map((c) => c.afterCommit.state), record.outcome.bump.untestedCommitted], [['compared', 'compared'], []])
-      t.eq('the event says the cycle committed', [s.calls.ended[0].outcome.committed, s.calls.ended[0].outcome.withheld, s.calls.ended[0].projects.map((p) => [p.project, p.recheck, p.commitWithheld])], [true, [], [['framework-project', 'unchanged', false], ['site-project', 'unchanged', false]]])
+      t.eq('the event says the cycle committed', [s.calls.ended[0].outcome.committed, s.calls.ended[0].outcome.withheld, s.calls.ended[0].projects.map((p) => [p.project, p.recheck, p.commitWithheld])], [true, [], [['framework-project', 'no-snapshot', false], ['site-project', 'unchanged', false]]])
+    }
+
+    t.section('12b. an instance whose snapshot materializes nothing of the framework: the framework is driven after it, as before, and says why')
+    {
+      const s = pool({ linked: false })
+      const record = await poolCycle(s, 'devpanel-fvi-unlinked-')
+      const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
+      t.eq('both entries were driven, the framework after its instance', s.calls.provisions.filter((a) => !a.runId.endsWith('-recheck')).map((a) => a.projectPath), [SITE, FRAMEWORK])
+      t.eq('the framework entry says it was not derived, and is a driven instance entry', [by['framework-project'].derivation?.state, by['framework-project'].mode, by['framework-project'].derived], ['not-derived', 'instance', undefined])
+      t.eq('every green entry was snapshotted again before any checkpoint', [s.calls.rechecks.sort(), by['framework-project'].recheck.state, by['site-project'].recheck.state], [['framework-project', 'site-project'], 'unchanged', 'unchanged'])
+      t.eq('each commit compared with every tested view of its checkout: the framework\'s own', s.calls.compared.map((c) => [c.checkout, c.views]), [
+        [FRAMEWORK, [[`${FRAMEWORK}/.git`, '', '']]],
+        [SITE, [[`${SITE}/.git`, '', '']]]
+      ])
+      t.eq('the chain ran and committed', [s.calls.actions.map((a) => [a.project, a.args]), record.outcome.committed], [[['framework-project', ['--minor']], ['site-project', []]], true])
     }
 
     t.section('13. a file edited after the snapshot withholds its pool\'s checkpoints and is named; the entries stay green; only the deliveries the snapshot held retire')
@@ -523,14 +538,15 @@ export default async function (t) {
     {
       const s = pool({ recheckOf: (project) => project === 'site-project' ? [{ checkout: FRAMEWORK, paths: ['lib/thread.js'], total: 1 }] : null })
       const record = await poolCycle(s, 'devpanel-fvi-framework-')
-      t.eq('the framework\'s own snapshot did not move, the instance\'s copy of it did', record.projects.map((p) => [p.project, p.recheck.state]), [['framework-project', 'unchanged'], ['site-project', 'moved']])
+      t.eq('the derived framework has no snapshot of its own; the instance\'s copy of it moved', record.projects.map((p) => [p.project, p.recheck.state]), [['framework-project', 'no-snapshot'], ['site-project', 'moved']])
       t.eq('no checkpoint ran: neither the framework\'s nor its instance\'s', [s.calls.actions, record.outcome.committed], [[], false])
       t.eq('the outcome names the framework checkout and its path', record.outcome.bump.withheld[0].moved[0].checkouts, [{ checkout: FRAMEWORK, paths: ['lib/thread.js'], total: 1 }])
     }
 
     t.section('15. a checkout moving at snapshot time is recorded on a red and on a green entry, and shown in cycle.json, the red issue and the event; no verdict changes')
     {
-      const s = pool({ movingIn: ['framework-project', 'site-project'], suiteFails: ['site-project'] })
+      // Unlinked, so the framework is driven and takes a snapshot of its own.
+      const s = pool({ movingIn: ['framework-project', 'site-project'], suiteFails: ['site-project'], linked: false })
       const record = await poolCycle(s, 'devpanel-fvi-moving-')
       const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
       t.eq('both entries were moving at snapshot time; the verdicts are the suite\'s', record.projects.map((p) => [p.project, p.verdict, p.snapshotDuringEdits]), [['framework-project', 'green', true], ['site-project', 'red', true]])
@@ -540,7 +556,7 @@ export default async function (t) {
       t.ok('the red issue says the snapshot was taken during edits, with the moving path', issue.input.includes('Snapshot taken during edits') && issue.input.includes('## Moving paths at snapshot time') && issue.input.includes('`lib/thread.js`'), issue.input)
       const notice = s.calls.ended[0].projects
       t.eq('the event carries it for both, with the moving paths', notice.map((p) => [p.project, p.snapshotDuringEdits, p.movingPaths]), [['framework-project', true, [{ checkout: FRAMEWORK, path: 'lib/thread.js' }]], ['site-project', true, [{ checkout: SITE, path: 'lib/thread.js' }]]])
-      const still = await poolCycle(pool(), 'devpanel-fvi-still-')
+      const still = await poolCycle(pool({ linked: false }), 'devpanel-fvi-still-')
       t.eq('a checkout last changed hours before, unchanged between the readings: not moving', still.projects.map((p) => p.snapshotDuringEdits), [false, false])
       const blind = pool({ unreadIn: ['site-project'] })
       const unknown = await poolCycle(blind, 'devpanel-fvi-unread-')
@@ -575,6 +591,120 @@ export default async function (t) {
       t.eq('the step reads interrupted and its commit was compared by the recovery', [after.state, recovered.status, recovered.afterCommit.observedBy, recovered.afterCommit.untested.paths.map((p) => p.path)], ['interrupted', 'interrupted', 'recovery', ['lib/half.js']])
       t.eq('against the views the record kept', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [[FRAMEWORK, 'f0', 'f0+1', [[`${FRAMEWORK}/.git`, '', '']]]])
       t.eq('and it is in the outcome', after.outcome.bump.untestedCommitted.map((u) => [u.project, u.total]), [['framework-project', 1]])
+    }
+
+    t.section('18. a cycle shaped like 2026-11-17.2: the instance green, the framework\'s own drive would fail on the application deployed on the base; the framework is derived, green, and the chain commits')
+    {
+      // Driven, the framework's suite would fail; derived, it is never driven.
+      const s = pool({ suiteFails: ['framework-project'] })
+      const issuesDir = await temp('devpanel-fvi-derived-')
+      s.options.issues.ISSUES_DIR = issuesDir
+      const { fv, run } = await cycle(s, path.join(issuesDir, '.verification'))
+      const record = await run()
+      const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
+      const frameworkDrive = driveIdOf(record.id, 'framework-project')
+      t.eq('no instance, resolve, snapshot or suite for the framework', [s.calls.resolves, s.calls.provisions.filter((a) => a.runId === frameworkDrive).length, s.calls.targets.filter((tg) => tg.stageInstance.name === instanceName(frameworkDrive)).length, s.calls.destroys.includes(frameworkDrive)], [['site-project'], 0, 0, false])
+      const fw = by['framework-project']
+      t.eq('its entry is derived from the instance entry, and green', [fw.mode, fw.state, fw.verdict, fw.derived.from.map((f) => [f.project, f.verdict, f.state, f.suiteRan, f.coverageEstablished, f.links]), fw.derived.red, fw.driveId, fw.instance, fw.snapshot], ['derived', 'settled', 'green', [['site-project', 'green', 'settled', true, true, [{ path: 'fw', prefix: 'lib' }]]], [], undefined, undefined, undefined])
+      t.eq('it establishes coverage like the entries it comes from; it is not a static verified-through entry', [fw.coverageEstablished, fw.suiteRan, fw.verifiedThrough], [true, true, undefined])
+      t.eq('the cycle is green and the chain ran in the usual order, committing', [record.verdict, s.calls.actions.map((a) => [a.project, a.args]), record.outcome.committed], ['green', [['framework-project', ['--minor']], ['site-project', []]], true])
+      const notice = s.calls.ended[0].projects
+      t.eq('the verification-ended event names the derived entry and its instance entry', notice.map((p) => [p.project, p.mode, p.verdict, p.derived]), [['framework-project', 'derived', 'green', { from: ['site-project'], red: [], unmaterialized: 0 }], ['site-project', 'instance', 'green', null]])
+      const latest = (await fv.latest()).cycle
+      t.eq('the API (latest) carries the derived entry beside its instance entry', latest.projects.map((p) => [p.project, p.mode, p.derived?.from.map((f) => f.project) ?? null]), [['framework-project', 'derived', ['site-project']], ['site-project', 'instance', null]])
+    }
+
+    t.section('19. an instance entry red on a test makes the derived framework red; its issue names the instance entry and its failing tests')
+    {
+      const s = pool({ suiteFails: ['site-project'] })
+      const record = await poolCycle(s, 'devpanel-fvi-derived-red-')
+      const fw = record.projects.find((p) => p.project === 'framework-project')
+      t.eq('the derived entry is red and names the instance entry', [fw.mode, fw.verdict, fw.derived.red.map((r) => [r.project, r.reason.startsWith('red')])], ['derived', 'red', [['site-project', true]]])
+      t.eq('one issue per red project: the instance\'s own and the framework\'s', s.calls.issues.map((i) => i.project).sort(), ['framework-project', 'site-project'])
+      const issue = s.calls.issues.find((i) => i.project === 'framework-project').input
+      t.ok('the framework\'s issue says it is derived, from which entry, with that entry\'s failing test', issue.includes('No drive of its own') && issue.includes('- Derived from:') && issue.includes('`site-project`') && issue.includes('b: breaks') && issue.includes('From the instance entry of `site-project`') && issue.includes('## Failing tests of the instance entries it is derived from'), issue)
+      t.ok('and never presents a drive of its own', !issue.includes(driveIdOf(record.id, 'framework-project')) && !issue.includes('- Drive:'), issue)
+      t.eq('the event says which entry made it red', s.calls.ended[0].projects.find((p) => p.project === 'framework-project').derived.red.map((r) => r.project), ['site-project'])
+    }
+
+    t.section('20. a derived entry is never green on an instance entry that is refused, interrupted, incomplete, without its suite or without established coverage')
+    {
+      const ok = { project: 'site-project', state: 'settled', verdict: 'green', suiteRan: true, coverageEstablished: true }
+      t.eq('every instance entry green, settled, suite run, coverage established: green', derivedVerdict([ok, { ...ok, project: 'shop-project' }]), { verdict: 'green', red: [] })
+      const cases = [
+        [{ state: 'refused', verdict: 'red', refusal: { code: 'X', message: 'no' }, coverageEstablished: false }, /^refused: X: no$/],
+        [{ state: 'interrupted', verdict: 'red', coverageEstablished: false }, /^interrupted$/],
+        [{ verdict: 'incomplete', incomplete: { reason: 'BROWSER_CHECKS_UNBOUND' }, coverageEstablished: false }, /^incomplete: BROWSER_CHECKS_UNBOUND$/],
+        [{ verdict: 'red' }, /^red/],
+        [{ suiteRan: false }, /whole suite did not run/],
+        [{ coverageEstablished: false }, /coverage is not established/]
+      ]
+      for (const [patch, reason] of cases) {
+        const got = derivedVerdict([{ ...ok, project: 'shop-project' }, { ...ok, ...patch }])
+        t.ok(`${JSON.stringify(patch)}: red, naming site-project with why`, got.verdict === 'red' && got.red.length === 1 && got.red[0].project === 'site-project' && reason.test(got.red[0].reason), JSON.stringify(got))
+      }
+      t.eq('no instance entry at all: never green', derivedVerdict([]).verdict, 'red')
+      const refused = pool()
+      refused.options.drive = async () => { throw new Error('the stage host is gone') }
+      const r = await poolCycle(refused, 'devpanel-fvi-derived-refused-')
+      t.eq('an instance entry refused after its snapshot: the framework is derived and red', r.projects.map((p) => [p.project, p.mode, p.verdict, p.state]), [['framework-project', 'derived', 'red', 'settled'], ['site-project', 'instance', 'red', 'refused']])
+      const incomplete = pool()
+      const infra = { 'framework-project': instanceInfra(), 'site-project': instanceInfra({ browser: true }) }
+      incomplete.options.infrastructureOf = async (project) => infra[project]
+      const i = await poolCycle(incomplete, 'devpanel-fvi-derived-incomplete-')
+      t.eq('an incomplete instance entry: the framework is derived and red', i.projects.map((p) => [p.project, p.verdict]), [['framework-project', 'red'], ['site-project', 'incomplete']])
+    }
+
+    t.section('21. the framework\'s deliveries are read through the instances\' copies; a delivery on a path no copy held is not retired and is listed')
+    {
+      const s = pool()
+      const asked = []
+      s.options.deliveriesOf = async (project) => project === 'framework-project' ? [{ issueId: 'i8', runId: 'r8', at: '2026-11-14T08:00:00.000Z' }, { issueId: 'i9', runId: 'r9', at: '2026-11-14T08:10:00.000Z' }] : []
+      s.options.coverageOf = async (args) => {
+        asked.push(args)
+        return args.project === 'framework-project'
+          ? { basis: 'instance-views', covered: [{ runId: 'r8' }], indeterminate: [{ runId: 'r9', reason: 'not-materialized', paths: ['version'] }], notShipped: [] }
+          : { basis: 'cycle-snapshot', covered: [], indeterminate: [], notShipped: [] }
+      }
+      const record = await poolCycle(s, 'devpanel-fvi-derived-coverage-')
+      const fw = record.projects.find((p) => p.project === 'framework-project')
+      const q = asked.find((a) => a.project === 'framework-project')
+      t.eq('the framework\'s coverage is asked through the instance\'s copy of it, for its deliveries still counting', [q.views.map((v) => [v.repository, v.commit, v.at, v.prefix]), q.candidates, q.snapshotPath, q.snapshotAt], [[[`${SITE}/.git`, 'snap-site-project', 'fw', 'lib']], ['r8', 'r9'], undefined, record.projects.find((p) => p.project === 'site-project').snapshotAt])
+      t.eq('the entry keeps it and lists the path no copy held', [fw.coverage.basis, fw.coverage.covered.map((c) => c.runId), fw.coverage.indeterminate.map((c) => [c.runId, c.reason, c.paths]), fw.derived.unmaterialized], ['instance-views', ['r8'], [['r9', 'not-materialized', ['version']]], { paths: ['version'], total: 1 }])
+      const counts = await deliveryCounts({ stages: [{ host: HOST, stage: 'stage', projects: ['framework-project'] }], deliveriesOf: s.options.deliveriesOf, records: [record], threshold: 1 })
+      t.eq('the covered delivery retires; the one on a path no instance materializes keeps counting', counts[0].runs.map((r) => r.runId), ['r9'])
+      t.eq('the event counts the untested paths', s.calls.ended[0].projects.find((p) => p.project === 'framework-project').derived.unmaterialized, 1)
+    }
+
+    t.section('22. a framework alone in a cycle (its instance is configured but has no entry) is driven exactly as before')
+    {
+      const s = seams({ issuesDir: null, infra: { 'framework-project': instanceInfra() }, outcome: passing() })
+      s.options.projectsConfig = async () => new Map([['framework-project', { id: 'framework-project' }], ['site-project', { id: 'site-project', framework: 'framework-project' }]])
+      const issuesDir = await temp('devpanel-fvi-alone-')
+      s.options.issues.ISSUES_DIR = issuesDir
+      const record = await (await cycle(s, path.join(issuesDir, '.verification'))).run()
+      const fw = record.projects[0]
+      const driveId = driveIdOf(record.id, 'framework-project')
+      t.eq('one snapshot, one drive, one destroy of its own instance', [s.calls.provisions.filter((a) => !a.runId.endsWith('-recheck')).map((a) => a.runId), s.calls.targets.length, s.calls.destroys], [[driveId], 1, [driveId]])
+      t.eq('a driven instance entry, neither derived nor deferred', [fw.mode, fw.state, fw.verdict, fw.derived, fw.derivation], ['instance', 'settled', 'green', undefined, undefined])
+    }
+
+    t.section('23. recover() after an interrupted cycle: a derived or deferred framework entry has no instance to destroy, no workspace and no run home')
+    {
+      const dir = await temp('devpanel-fvi-recover-derived-')
+      const verificationDir = path.join(dir, '.verification')
+      const site = { project: 'site-project', stage: 'stage', host: HOST, mode: 'instance', state: 'running', driveId: 'fv-x-site-project', instance: { name: instanceName('fv-x-site-project') } }
+      const deriving = { project: 'framework-project', stage: 'stage', host: HOST, mode: 'derived', state: 'deriving', startedAt: '2026-11-14T09:20:00.000Z' }
+      const deferred = { project: 'other-framework-project', stage: 'stage', host: HOST, mode: 'instance', state: 'deferred', derivation: { state: 'pending', instances: ['site-project'] } }
+      await fs.mkdir(path.join(verificationDir, '2026-11-14'), { recursive: true })
+      await fs.writeFile(path.join(verificationDir, '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', date: '2026-11-14', state: 'running', projects: [deriving, deferred, site] }))
+      const s = pool()
+      const fv = createFullVerification({ ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
+      await fv.recover()
+      const after = await readJson(path.join(verificationDir, '2026-11-14', 'cycle.json'))
+      t.eq('only the instance entry\'s drive is destroyed; nothing is released; no run home is asked for', [s.calls.destroys, s.calls.releases], [['fv-x-site-project'], []])
+      t.eq('the derived and the deferred entries read interrupted, red, establishing nothing', after.projects.map((p) => [p.project, p.state, p.verdict, p.coverageEstablished, p.instance ?? null]), [
+        ['framework-project', 'interrupted', 'red', false, null], ['other-framework-project', 'interrupted', 'red', false, null], ['site-project', 'interrupted', 'red', false, { name: instanceName('fv-x-site-project'), destroyed: { passed: true, at: '2026-11-14T10:00:00.000Z' } }]])
     }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))

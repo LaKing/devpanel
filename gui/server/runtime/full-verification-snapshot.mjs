@@ -234,9 +234,11 @@ function jsonVersionsOnly (tested, committed, before, after, holders) {
  * changed (`bumped`). A path the commit changed since `headBefore` that no view holds is
  * untested as `outside-every-snapshot`. Different object formats make the comparison `incomparable`.
  */
+/** Whether a view never held a path below its prefix: excluded, skipped by the owner's selection, or under a link of its own. */
+const dropOf = (view) => (rel) => matches(view.at ? `${view.at}/${rel}`.replace(/\/$/, '') : rel, view.consumerExcludes ?? []) || matches(rel, view.excludes ?? []) || (view.skipped ?? []).some((s) => inside(rel, s)) || (view.links ?? []).some((l) => inside(rel, l))
+
 export async function committedBeyond ({ checkout, commit, headBefore = null, views = [], versionBefore = null, versionAfter = null, git = readGit }) {
   const here = ['-C', checkout]
-  const dropOf = (view) => (rel) => matches(view.at ? `${view.at}/${rel}`.replace(/\/$/, '') : rel, view.consumerExcludes ?? []) || matches(rel, view.excludes ?? []) || (view.skipped ?? []).some((s) => inside(rel, s)) || (view.links ?? []).some((l) => inside(rel, l))
   const covered = (p) => views.some((v) => inside(p, v.prefix) && !dropOf(v)(below(p, v.prefix)))
   const format = await objectFormat(here, git)
   for (const view of views) {
@@ -294,4 +296,32 @@ export function testedViews (checkout, project, entries) {
     for (const l of s.links ?? []) if (l.owner === checkout) views.push({ repository: s.repository, commit: s.baseCommit, at: l.path, prefix: l.prefix, consumerExcludes: l.consumerExcludes ?? [], skipped: l.skipped ?? [] })
   }
   return views
+}
+
+/**
+ * A framework checkout's paths read through instance snapshots' copies of it (the link views testedViews gives for
+ * the framework's checkout): `materialized(rel)` says whether any view held the owner-relative path, `read(rel)` what
+ * the views held there, as staging-coverage.mjs `holds` reads it ({mode, sha1|sha256}, null when absent). Views that
+ * disagree on a path read as `{ other: true }`, which matches no delivered state. Each view's tree is listed once.
+ */
+export function viewReader (views, { git = readGit } = {}) {
+  const linked = views.filter((v) => v.at)
+  const trees = new Map()
+  const treeOf = (view) => {
+    if (!trees.has(view)) trees.set(view, listTree(['--git-dir', view.repository], view.commit, view.at, git))
+    return trees.get(view)
+  }
+  const holding = (rel) => linked.filter((v) => inside(rel, v.prefix) && !dropOf(v)(below(rel, v.prefix)))
+  return {
+    materialized: (rel) => holding(rel).length > 0,
+    async read (rel) {
+      const seen = []
+      for (const view of holding(rel)) {
+        const e = (await treeOf(view)).get(below(rel, view.prefix))
+        seen.push(e ? { mode: e.mode, [e.oid.length === 64 ? 'sha256' : 'sha1']: e.oid } : null)
+      }
+      if (!seen.length) return null
+      return seen.every((s) => JSON.stringify(s) === JSON.stringify(seen[0])) ? seen[0] : { other: true }
+    }
+  }
 }

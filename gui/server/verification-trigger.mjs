@@ -28,7 +28,12 @@
  * them), as the entry's `coverage.retires` says; its indeterminate deliveries keep counting. Such a
  * cycle holds the stage back like one that established nothing, and clears nothing, so somebody
  * editing the checkout through every cycle does not start one after another.
+ *
+ * A framework entry derived from its pool instances (full-verification.mjs) names a delivery touching a framework
+ * path no instance's snapshot held as indeterminate with reason `not-materialized`: nothing tested those bytes, so
+ * it keeps counting whatever the entry established.
  */
+const NOT_MATERIALIZED = 'not-materialized'
 
 const time = (iso) => { const t = Date.parse(iso ?? ''); return Number.isFinite(t) ? t : null }
 
@@ -47,7 +52,7 @@ export async function deliveryCounts ({ stages, deliveriesOf, records, threshold
     for (const entry of record.projects ?? []) {
       if (!establishes(entry)) continue
       const set = accounted.get(entry.project) ?? new Set()
-      for (const c of [...(entry.coverage?.covered ?? []), ...(entry.commitWithheld ? [] : entry.coverage?.indeterminate ?? [])]) set.add(c.runId)
+      for (const c of [...(entry.coverage?.covered ?? []), ...(entry.commitWithheld ? [] : (entry.coverage?.indeterminate ?? []).filter((c) => c.reason !== NOT_MATERIALIZED))]) set.add(c.runId)
       accounted.set(entry.project, set)
     }
   }

@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
-import { committedBeyond, motionOf, ownerOf, readCheckouts, readGit, snapshotDiff, snapshotRecord, testedViews } from '../server/runtime/full-verification-snapshot.mjs'
+import { committedBeyond, motionOf, ownerOf, readCheckouts, readGit, snapshotDiff, snapshotRecord, testedViews, viewReader } from '../server/runtime/full-verification-snapshot.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 
 export const name = 'full verification snapshot — the recheck of a checkout, a commit compared with the tested bytes across independent repositories, the version rule, and the readings around a snapshot (real git)'
@@ -81,6 +81,22 @@ export default async function (t) {
       const sha256 = (args) => args.includes('--show-object-format') && args.includes('--git-dir') ? Promise.resolve('sha256\n') : readGit(args)
       const odd = await committedBeyond({ checkout: two.framework, commit: git(two.framework, 'rev-parse', 'HEAD'), headBefore: before2, views: testedViews(two.framework, 'framework-project', [two.entry]), git: sha256 })
       t.eq('different object formats: incomparable, every committed path untested, never clean', [odd.state, odd.untested.total > 0, odd.untested.paths.every((p) => p.reason === 'incomparable')], ['incomparable', true, true])
+    }
+
+    t.section('3b. a framework read through an instance snapshot\'s copy of it (a derived entry\'s coverage): what the copy held, what it never held, and copies that disagree')
+    {
+      const three = await pair('three')
+      const views = testedViews(three.framework, 'framework-project', [three.entry])
+      const reader = viewReader(views)
+      const blob = git(three.framework, 'rev-parse', 'HEAD:lib/a.js')
+      t.eq('a path under the link is materialized and reads as the framework\'s own blob', [reader.materialized('lib/a.js'), await reader.read('lib/a.js')], [true, { mode: '100644', sha1: blob }])
+      t.eq('the root version no copy held is not materialized and reads as nothing', [reader.materialized('version'), await reader.read('version')], [false, null])
+      t.eq('a path under the link the copy lacks reads as absent', await reader.read('lib/gone.js'), null)
+      await fs.writeFile(path.join(three.framework, 'lib/a.js'), 'a, edited between two instances\' snapshots\n')
+      const later = await snapshot(three.instance, 'snap-three-b', MATERIALIZE)
+      const second = { project: 'other-instance-project', snapshot: { baseCommit: later.baseCommit, ...await snapshotRecord({ workspace: later, policy: MATERIALIZE, projectDir: three.instance }) } }
+      const both = viewReader(testedViews(three.framework, 'framework-project', [three.entry, second]))
+      t.eq('two copies that disagree read as other (it matches no delivered state); where they agree, the blob', [await both.read('lib/a.js'), (await both.read('lib/b.js')).sha1], [{ other: true }, git(three.framework, 'rev-parse', 'HEAD:lib/b.js')])
     }
 
     t.section('4. the project\'s own snapshot: only the version itself may change in its version files; an excluded path it never held is not read')

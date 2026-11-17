@@ -35,9 +35,10 @@ const rows = computed(() => (cycle.value?.projects ?? []).map((p) => ({
   project: p.project,
   stage: p.stage,
   text: p.verifiedThrough ? 'verified through its instances'
-    : p.refusal ? `not started: ${p.refusal.message}`
-      : p.state === 'settled' ? `${p.status}${p.blockedReason ? ` (${p.blockedReason})` : ''}`
-        : p.state ?? 'pending',
+    : p.derived ? `derived from ${p.derived.from.map((f) => f.project).join(', ')}${p.derived.red.length ? ` (not green: ${p.derived.red.map((r) => r.project).join(', ')})` : ''}`
+      : p.refusal ? `not started: ${p.refusal.message}`
+        : p.state === 'settled' ? `${p.status}${p.blockedReason ? ` (${p.blockedReason})` : ''}`
+          : p.state ?? 'pending',
   verdict: p.verifiedThrough ? null : p.verdict ?? null,
   duration: p.durationMs != null ? `${Math.round(p.durationMs / 60000)} min` : null
 })))

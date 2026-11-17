@@ -3380,6 +3380,60 @@ cycle's checkpoint is bound to the bytes it tested
 - The `verification-ended` event carries `outcome.committed`, `outcome.withheld` and
   `outcome.untestedCommitted`, and per project `recheck` and `commitWithheld`.
 
+**A framework's entry derived from its pool instances.** A framework (a project another names
+with `framework:`) one of whose pool instances is driven in the same cycle is not driven
+alongside them: its entry waits (`state: deferred`, `derivation: {state: pending, instances}`)
+until every host's other entries settled. When an instance entry's snapshot materialized the
+framework's checkout (`entry.snapshot.links[].owner`), the framework gets no instance, snapshot,
+suite or run home of its own: its entry is derived from those instance entries
+(`full-verification.mjs deriveEntry`). Its own drive would compose the framework with the
+application as deployed on the stage's base instance; the instances already tested the
+framework's checkout with their own checkouts, and that is what a green cycle commits. When
+no instance entry materialized it (all refused before their snapshot, or no link reaches
+it), it is refused or driven exactly as any other entry, after them (`derivation.state:
+not-derived`, with the reason); a framework with no pool instance in the cycle is driven as
+before and has no `derivation`. A static `fullVerification: instances` entry
+(`verifiedThrough`) is never derived.
+
+- **Its verdict** (`derivedVerdict`): green only when every instance entry it is derived from
+  is `green`, `settled`, ran its whole suite (`suiteRan`) and established coverage; otherwise
+  red, and `derived.red` names each one that is not with why (refused, interrupted,
+  incomplete, red, suite not run, coverage not established).
+- **Its fields:** `mode: 'derived'`, `state` `deriving` then `settled`, and `derived`: `rule`;
+  `from` (each instance entry's project, stage, verdict, state, `suiteRan`,
+  `coverageEstablished`, drive or run id, evidence directory, and the links that copied the
+  framework); `red`; `unmaterialized` (the framework paths deliveries touched that no copy held,
+  20 shown with the total). No `driveId`, `instance`, `workspace`, `snapshot` or `runId`.
+  `snapshotAt` is the earliest instance snapshot's, `suiteRan` and `coverageEstablished` are
+  those of all its instance entries (and coverage read without error). A failure while deriving
+  is `refused` with `DERIVATION_FAILED`, never a drive.
+- **Its deliveries** are read by content through the instances' copies of its checkout
+  (`full-verification-snapshot.mjs viewReader`: each copy's tree in its pinned snapshot commit,
+  owner-relative paths; copies that disagree on a path match nothing), under the same rules as
+  a snapshot of its own (`coverage.basis: 'instance-views'`: `covered`, `indeterminate`,
+  `notShipped`). A delivery touching a framework path no copy held is `indeterminate` with
+  reason `not-materialized` and those paths (asked before anything about its bytes: a chmod of
+  such a path, its bytes unknown, is `not-materialized` too, and one whose paths are not known at
+  all is `not-materialized` with `pathsUnknown: true`): nothing tested them, so the delivery trigger never
+  retires it, whatever the entry established (verification-trigger.mjs). A module no
+  application composes is reported untested, never green.
+- **It takes part in the outcome** as a driven framework entry does: one that is not green
+  makes the cycle red; green, it is in the recheck (`no-snapshot`: the instances' rechecks
+  cover its copied paths and withhold the pool when they moved), the withheld pool
+  (`commitWithheld`, `coverage.retires`) and the checkpoint chain (the framework's `--minor`
+  first). Its commit is compared with the instances' copies only, so a framework path no copy
+  held, the root `version` and package files the checkpoint bumps included, is reported as
+  `outside-every-snapshot` in `outcome.bump.untestedCommitted`.
+- **Red**, it gets its own issue, which says it had no drive, lists the entries it is derived
+  from and quotes their failing tests with their excerpts, each named with its instance entry
+  (the instance's own issue opens as well). A run of that issue gets the instance entries'
+  evidence in its window ("Full verification evidence").
+- **`recover()`**: a derived or deferred entry left unsettled is `interrupted`, red, establishing
+  nothing; there is no instance to destroy, workspace to release or run home.
+- The `verification-ended` event carries per project `mode` and `derived: {from, red,
+  unmaterialized}` (null for any other entry); the API (`GET /api/verification/latest`) and
+  `cycle.json` hold the whole entry.
+
 **A snapshot taken during edits.** Each entry reads the checkouts its snapshot reads (the
 project's and those of the repositories the snapshot locks, a framework's included) just
 before and just after the snapshot (an instance entry around its own snapshot; a release

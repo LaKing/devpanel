@@ -437,7 +437,14 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   suite `FULL_SUITE_UNDECLARED`, `modules.browser` without `fullSuite.browser` `incomplete`; elsewhere one Deployment run
   (environment staging, `runOptions.fullVerification`) per `infrastructure.staging` in the run home
   `issues/<project>/.verification-<date>/` (`issues.getRunHolder`, never an issue); each drive against the previous green
-  cycle of its mode (`runtime/full-verification-drive.mjs`); each entry records where its snapshot lives (`entry.snapshot`:
+  cycle of its mode (`runtime/full-verification-drive.mjs`); a framework one of whose pool instances is driven in the cycle
+  waits (`state: deferred`) and, when an instance entry's snapshot materialized its checkout, gets no drive: its entry is
+  derived from those instance entries (`deriveEntry`, `mode: 'derived'`, `derived {rule, from, red, unmaterialized}`; green
+  only when every one is green, settled, ran its whole suite and established coverage, else red naming which and why), its
+  deliveries read through their copies (`viewReader`, `coverage.basis: 'instance-views'`; a path no copy held leaves a
+  delivery indeterminate `not-materialized`, never retired), its recheck `no-snapshot`, its commit compared with the copies,
+  its red issue quoting their failing tests, `recover()` marking it interrupted with nothing to destroy; with no materializing
+  instance entry it is driven as any other (`derivation.state: not-derived`); each entry records where its snapshot lives (`entry.snapshot`:
   repository, own commit, excludes, materialized links with their owning checkouts) and whether its checkouts were moving
   around it (`runtime/full-verification-snapshot.mjs`: a `git status` reading with modification times just before and just
   after the snapshot; `snapshotMotion` names the newest change, the paths changed within 5 minutes before it and those that

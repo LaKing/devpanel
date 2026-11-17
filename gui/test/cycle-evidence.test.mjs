@@ -128,6 +128,19 @@ export default async function (t) {
   t.ok('lib-project checks from its run home', relFiles(pw).includes('lib-project/checks/001/lib.log'), relFiles(pw).join(', '))
   t.ok('other-project still absent, also from withheld[].moved', !relFiles(pw).some((x) => x.startsWith('other-project')) && !(await fs.readFile(path.join(path.dirname(pw.manifest), 'cycle-evidence', 'cycle.json'), 'utf8')).includes('other-project'))
 
+  t.section('a framework entry derived from an instance entry: its red issue\'s window holds the instance entry\'s evidence, and says it has none of its own')
+  const derived = await fixture()
+  const drec = JSON.parse(await fs.readFile(path.join(derived.issues, '.verification', DATE, 'cycle.json'), 'utf8'))
+  drec.outcome.bump = null
+  drec.projects.push({ project: 'lib-project', stage: 'stage-a', mode: 'derived', verdict: 'red', derived: { from: [{ project: 'app-project', verdict: 'red' }], red: [{ project: 'app-project', reason: 'red' }] } })
+  await derived.write(`.verification/${DATE}/cycle.json`, JSON.stringify(drec))
+  await derived.write('lib-project/2026-11-01-full-verification-lib-red/issue.json', JSON.stringify({ name: 'lib red', status: 'open', openedBy: { user: 'engine', host: 'h', from: { project: 'lib-project', runId: null, via: 'full-verification', cycle: CYCLE } } }))
+  await derived.write('lib-project/2026-11-01-full-verification-lib-red/000-report/response.md', '# lib red\n')
+  const dw = await capture(path.join(derived.issues, 'lib-project', '2026-11-01-full-verification-lib-red'), 'd1')
+  t.eq('the framework and the instance entry it is derived from are exposed', dw.cycleEvidence.projects, ['lib-project', 'app-project'])
+  t.eq('the derived entry is recorded as derived, not as missing evidence; the instance entry\'s checks are captured', dw.cycleEvidence.entries.map((e) => [e.project, e.state]), [['lib-project', 'derived'], ['app-project', 'captured']])
+  t.ok('the instance entry\'s files are in the window', relFiles(dw).includes('app-project/checks/001/selftest.stdout'), relFiles(dw).join(', '))
+
   t.section('caps: a file over the per-file cap keeps its tail and says so; one beyond the total is omitted and listed')
   const big = await fixture()
   await big.write(`.verification/${DATE}/${CYCLE}/app-project/checks/001/project.log`, 'HEAD' + 'x'.repeat(5000) + 'TAIL\n')

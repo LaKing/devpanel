@@ -756,6 +756,45 @@ Three properties this shape exists to hold:
   wrong that way costs disk, being wrong the other way destroys the only copy.
   The lock always goes back either way.
 
+## Full verification
+
+`GET /api/verification/latest` returns `{schedule, active, frozen, deliveries, cycle}`:
+`cycle` is the cycle in progress, else the latest `issues/.verification/<date>/cycle.json`,
+as written (`server/full-verification.mjs`; docs/execution-contract.md "Full verification
+freeze"). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
+while one runs). The socket event `verification:changed` names the cycle and its state; the
+top-level supervisor is told `verification-ended` once it ended.
+
+`cycle.projects` holds one entry per project. Fields that say what kind it is:
+
+- `mode`: `instance` (driven on a stage instance of the cycle's own: `driveId`, `instance`,
+  `snapshot`, `evidence`), `release` (a Deployment run in its run home: `runId`, `runHome`), or
+  `derived`; `verifiedThrough: 'instances'` for a project with no infrastructure or whose
+  staging declares `fullVerification: instances`: not driven, not judged and not rechecked, yet
+  still a member of its pool's checkpoint chain (the chain is built from the projects'
+  `framework:` declarations, not from the entries).
+- **A derived entry** (`mode: 'derived'`) is a framework's when an instance of its pool was
+  driven in the same cycle and that entry's snapshot materialized the framework's checkout: no
+  drive of its own. `derived.rule` states its verdict: `green` only when every entry in
+  `derived.from` (`project`, `stage`, `verdict`, `state`, `suiteRan`, `coverageEstablished`,
+  `driveId`/`runId`, `evidence`, the `links` that copied it) is green, settled, ran its whole
+  suite and established coverage; else `red`, with `derived.red` naming each one that is not
+  and why. Its `coverage` has `basis: 'instance-views'`: deliveries read through the instances'
+  copies; one touching a framework path no copy held is `indeterminate` with reason
+  `not-materialized` and its `paths`, never retired by the delivery trigger, and those paths
+  are totalled in `derived.unmaterialized` (`{paths, total}`). That is asked before anything about
+  the delivery's bytes: a chmod (bytes unknown) of such a path is `not-materialized` too, and a
+  delivery whose paths are not known at all is `not-materialized` with `pathsUnknown: true`. It has no `driveId`, `instance`
+  or `snapshot`, so its `recheck` reads `no-snapshot`. While waiting for its instances it reads
+  `state: 'deferred'` with `derivation: {state: 'pending', instances}`; a framework driven
+  because no instance entry materialized it carries `derivation: {state: 'not-derived',
+  reason}`.
+- `coverage` (`covered`, `indeterminate`, `notShipped`) and `coverageEstablished` decide which
+  deliveries stop counting toward the next automatic cycle (`server/verification-trigger.mjs`).
+
+The `verification-ended` event repeats per project `mode`, `verdict`, `coverageEstablished`
+and `derived: {from, red, unmaterialized}` (`null` unless derived).
+
 ## Notes
 
 - **Icons are tree-shaken SVGs, not the webfont.** Only the icons listed in

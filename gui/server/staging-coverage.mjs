@@ -168,7 +168,7 @@ async function deliveredContent (issue, run) {
   const entries = await patchEntries(issue, run, ref).catch(() => null)
   if (!entries?.length) return { reason: 'patch-unreadable' }
   // A chmod names modes and no blob, so no comparison can say its bytes are the ones it left.
-  return entries.some((e) => e.post && !e.post.blob) ? { reason: 'mode-only-bytes-unknown' } : { entries }
+  return entries.some((e) => e.post && !e.post.blob) ? { reason: 'mode-only-bytes-unknown', paths: entries.map((e) => e.path) } : { entries }
 }
 
 /** Read once, when something asks: a delivery no question reaches never has its patch or bundle opened. */
@@ -411,17 +411,31 @@ export async function deliveriesOf (project) {
  * covered (its bytes, or a later delivery's built on them), indeterminate (unknown content, or
  * the snapshot differs) or notShipped (delivered after the snapshot). No staging release is
  * consulted and nothing is written: the cycle record keeps it (full-verification.mjs).
+ *
+ * A framework entry derived from its pool instances (full-verification.mjs deriveEntry) has no snapshot of its own:
+ * `read` reads its paths through the instances' copies (full-verification-snapshot.mjs viewReader) and
+ * `materialized(path)` says whether any copy held a path. A delivery touching a path none held is indeterminate
+ * (`not-materialized`, with those paths): nothing tested it, and the delivery trigger never retires it.
  */
-export async function cycleSnapshotCoverage ({ snapshotPath, snapshotAt, candidates = null, ...project }) {
+export const NOT_MATERIALIZED = 'not-materialized'
+export async function cycleSnapshotCoverage ({ snapshotPath, snapshotAt, candidates = null, read: readThrough = null, materialized = null, ...project }) {
   const state = await projectState(project)
   const wanted = candidates ? new Set(candidates) : null
-  const record = { basis: 'cycle-snapshot', covered: [], indeterminate: [], notShipped: [] }
-  const read = treeReader(snapshotPath)
+  const record = { basis: readThrough ? 'instance-views' : 'cycle-snapshot', covered: [], indeterminate: [], notShipped: [] }
+  const read = readThrough ?? treeReader(snapshotPath)
   for (const d of state.deliveries) {
     if (wanted && !wanted.has(d.runId)) continue
     const name = { issueId: d.issueId, runId: d.runId }
     if (!before(d, snapshotAt)) { record.notShipped.push(name); continue }
     await contentOf(d)
+    if (materialized) {
+      // Read through copies, materialization is asked first, of every path the delivery is known to touch, its bytes known
+      // or not; a delivery whose paths are not known at all cannot show that a copy held them, so it is not retired either.
+      const known = d.content.entries?.map((e) => e.path) ?? d.content.paths ?? recordedPaths(d.run)
+      const outside = known ? known.filter((p) => !materialized(p)) : []
+      if (!known) { record.indeterminate.push({ ...name, reason: NOT_MATERIALIZED, paths: [], pathsUnknown: true, content: d.content.reason }); continue }
+      if (outside.length) { record.indeterminate.push({ ...name, reason: NOT_MATERIALIZED, paths: outside, ...(d.content.entries ? {} : { content: d.content.reason }) }); continue }
+    }
     if (!d.content.entries) { record.indeterminate.push({ ...name, reason: d.content.reason, paths: [] }); continue }
     const { paths, superseded } = await compare(d, state.deliveries, read, snapshotAt)
     if (paths.length) record.indeterminate.push({ ...name, reason: 'snapshot-differs', paths })

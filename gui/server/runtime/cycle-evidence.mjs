@@ -11,9 +11,9 @@ import { packedSummary } from '../issue-bundle.mjs'
  * When the issue was opened by a full verification (`openedBy.from.via: 'full-verification'` with its `cycle`), or is
  * an inquiry whose `inquiry.relatedIssue` is such an issue, the window freezes a copy of that cycle's evidence beside
  * its other inputs, under `<window>/cycle-evidence/`, where every seat fence binds it read-only:
- *   - `cycle.json`: the cycle's record, filtered to the exposed projects (the issue's own, plus the members of a pool
- *     the record itself names with it under `outcome.bump`); every other project's entry, and every nested mention of
- *     one, is left out and counted in `windowFilter`;
+ *   - `cycle.json`: the cycle's record, filtered to the exposed projects (the issue's own, the instance entries its entry is
+ *     derived from, plus the members of a pool the record itself names with it under `outcome.bump`); every other
+ *     project's entry, and every nested mention of one, is left out and counted in `windowFilter`;
  *   - `<project>/checks/…`: each exposed entry's check evidence (selftest report, logs, browser report, flaky reruns),
  *     read from the directory the cycle's layout computes (never from a path the record holds), regular files only.
  * No other cycle's record or directory is read. Caps (files, total bytes, bytes per file) are separate from the
@@ -75,6 +75,9 @@ async function subjectOf (issuePath, issuesRoot, project) {
 /** The projects the record names in one pool with `project` (outcome.bump), the project itself first. */
 export function exposedProjects (record, project) {
   const out = new Set([project])
+  // A framework entry derived from instance entries: their evidence is its evidence.
+  const own = (Array.isArray(record?.projects) ? record.projects : []).find((e) => e?.project === project)
+  for (const f of Array.isArray(own?.derived?.from) ? own.derived.from : []) if (typeof f?.project === 'string') out.add(f.project)
   const bump = record?.outcome?.bump
   for (const w of bump?.withheld ?? []) if (Array.isArray(w.members) && w.members.includes(project)) for (const m of w.members) if (typeof m === 'string') out.add(m)
   const steps = [...(bump?.chain ?? []), ...(bump?.notRun ?? [])]
@@ -195,6 +198,7 @@ export async function captureCycleEvidence ({ issuePath, dir, limits = {} }) {
     const entry = (record.projects ?? []).find((e) => e?.project === p)
     if (!entry) { entries.push({ project: p, state: 'no-entry' }); continue }
     if (!SEGMENT.test(p)) { entries.push({ project: p, state: 'unreadable', note: 'the project name is not one path segment' }); continue }
+    if (entry.mode === 'derived') { entries.push({ project: p, mode: 'derived', state: 'derived', note: `no drive of its own: derived from ${(entry.derived?.from ?? []).map((f) => f?.project).filter((x) => typeof x === 'string').join(', ') || 'no entry'}, whose evidence is listed under their names` }); continue }
     // The evidence directory is computed from the cycle's layout, never taken from entry.runDir.
     const instance = path.join(verificationDir, date, cycle, p)
     const run = typeof entry.runId === 'string' && SEGMENT.test(entry.runId) ? path.join(issuesRoot, p, `.verification-${date}`, 'runs', entry.runId) : null

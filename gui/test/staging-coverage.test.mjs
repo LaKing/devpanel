@@ -12,12 +12,14 @@ import { CONFIG_ROOT, sandbox } from './helpers.mjs'
 import { markdownNodes } from '../src/markdown.js'
 import { buildOverview } from '../server/supervisor-overview.mjs'
 import { deployStaging, deploymentReport } from '../server/staging-deployment.mjs'
+import { gitIdentity } from '../server/runtime/fingerprint.mjs'
+import { deliveryCounts } from '../server/verification-trigger.mjs'
 import { executeRelease } from '../server/runtime/release.mjs'
 import { runProcess } from '../server/runtime/process.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
 import {
-  COVERAGE_BASELINE, DEPLOYMENT_UNPROVEN, cycleSnapshotCoverage, deliveriesOf, deploymentCoverage, holds, parsePatchContent, resumeArchivedCoverageNotes, resumeCoverageNotes, stagingPendingReport,
+  COVERAGE_BASELINE, DEPLOYMENT_UNPROVEN, NOT_MATERIALIZED, cycleSnapshotCoverage, deliveriesOf, deploymentCoverage, holds, parsePatchContent, resumeArchivedCoverageNotes, resumeCoverageNotes, stagingPendingReport,
   stagingRunCoverage, writeDeploymentNotes, writeRunCoverageNotes
 } from '../server/staging-coverage.mjs'
 
@@ -227,6 +229,49 @@ export default async function (t) {
       t.eq('only the runs it was given (those still counting)', [ids(given.covered), ids(given.indeterminate), ids(given.notShipped)], [['held'], [], []])
       t.eq('the staging pending list is the staging releases\' alone: the run the cycle covered stays pending there', ids((await w.report()).pending), ['held'])
       t.eq('the trigger counts every delivery from the baseline on, in order', (await deliveriesOf({ ...w.ctx, listHomes: async () => [] })).map((d) => d.runId), ['already', 'held', 'edited', 'after'])
+    }
+
+    t.section('a framework read through instances\' copies (a derived cycle entry): a delivery on a path no copy held is indeterminate, not-materialized, with the path')
+    {
+      const w = await world()
+      w.issue('i1'); w.issue('i2'); w.issue('i3')
+      await w.deliver('i1', 'composed', T(1), [['lib/a.js', 'a\n', 'b\n']])
+      await w.deliver('i2', 'root', T(2), [['lib/a.js', 'b\n', 'c\n'], ['version', '1.0.0\n', '1.1.0\n']])
+      await w.deliver('i3', 'differs', T(3), [['lib/z.js', null, 'z\n']])
+      // What the instances' copies held, keyed by the framework's own paths: only lib/ is materialized.
+      const copy = await w.snapshot({ 'lib/a.js': 'c\n', 'lib/z.js': 'by hand\n' })
+      const read = (rel) => gitIdentity(path.join(copy, rel))
+      const cycle = await cycleSnapshotCoverage({ ...w.ctx, listHomes: async () => [], snapshotAt: T(4), read, materialized: (rel) => rel.startsWith('lib/') })
+      t.eq('read through the copies: its basis says so', cycle.basis, 'instance-views')
+      t.eq('a delivery the copies hold (superseded on the same path) is covered; one touching the root version is not', [ids(cycle.covered), cycle.covered[0].superseded], [['composed'], ['lib/a.js']])
+      t.eq('the root delivery is indeterminate, not-materialized, naming only the path no copy held; a differing copied path stays snapshot-differs',
+        cycle.indeterminate.map((c) => [c.runId, c.reason, c.paths]), [['root', NOT_MATERIALIZED, ['version']], ['differs', 'snapshot-differs', ['lib/z.js']]])
+    }
+
+    t.section('read through copies, a delivery whose bytes are unknown is asked about its paths first: a chmod no copy held stays not-materialized and is never retired')
+    {
+      const w = await world()
+      w.issue('i1'); w.issue('i2'); w.issue('i3')
+      const mode = (run, issue, file, extra = {}) => {
+        w.runs.get(issue).push({ runId: run, status: 'completed', outcome: 'resolved', startedAt: T(1), revisions: [{ fingerprint: 'rev' }],
+          delivery: { action: 'apply-to-source', revision: 'rev', completedAt: T(1), artifactRef: `artifacts/${file}`, application: { verified: true }, ...extra } })
+      }
+      await fs.mkdir(path.join(w.root, 'issues/i1/runs/chmod/artifacts'), { recursive: true })
+      await fs.writeFile(path.join(w.root, 'issues/i1/runs/chmod/artifacts/x.patch'), 'diff --git a/root-tool.sh b/root-tool.sh\nold mode 100644\nnew mode 100755\n')
+      mode('chmod', 'i1', 'x.patch')
+      await fs.mkdir(path.join(w.root, 'issues/i2/runs/chmod-lib/artifacts'), { recursive: true })
+      await fs.writeFile(path.join(w.root, 'issues/i2/runs/chmod-lib/artifacts/y.patch'), 'diff --git a/lib/tool.sh b/lib/tool.sh\nold mode 100644\nnew mode 100755\n')
+      mode('chmod-lib', 'i2', 'y.patch')
+      // No patch on record and no changedPaths: what it touched is not known.
+      w.runs.get('i3').push({ runId: 'blind', status: 'completed', outcome: 'resolved', startedAt: T(1), revisions: [{ fingerprint: 'rev' }],
+        delivery: { action: 'apply-to-source', revision: 'rev', completedAt: T(1), application: { verified: true } } })
+      const copy = await w.snapshot({ 'lib/tool.sh': 'x\n' })
+      const cycle = await cycleSnapshotCoverage({ ...w.ctx, listHomes: async () => [], snapshotAt: T(2), read: (rel) => gitIdentity(path.join(copy, rel)), materialized: (rel) => rel.startsWith('lib/') })
+      t.eq('a chmod of a path no copy held: not-materialized with its path; one of a copied path keeps its unknown-content reason; unknown paths are not-materialized too',
+        cycle.indeterminate.map((c) => [c.runId, c.reason, c.paths, c.pathsUnknown ?? false]).sort(), [['blind', NOT_MATERIALIZED, [], true], ['chmod', NOT_MATERIALIZED, ['root-tool.sh'], false], ['chmod-lib', 'mode-only-bytes-unknown', [], false]])
+      const entry = { project: 'p', host: 'h', coverageEstablished: true, coverage: cycle }
+      const counts = await deliveryCounts({ stages: [{ host: 'h', stage: 's', projects: ['p'] }], deliveriesOf: async () => [{ runId: 'chmod' }, { runId: 'chmod-lib' }, { runId: 'blind' }], records: [{ id: 'c', projects: [entry] }], threshold: 1 })
+      t.eq('the delivery trigger keeps counting both not-materialized ones; the copied chmod retires under today\'s rule', counts[0].runs.map((r) => r.runId), ['chmod', 'blind'])
     }
 
     t.section('hand-changed: indeterminate, never silently covered')

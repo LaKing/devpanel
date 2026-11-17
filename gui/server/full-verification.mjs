@@ -20,9 +20,9 @@ import { recordDrive } from './runtime/selftest-history.mjs'
 import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
-import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries } from './staging-coverage.mjs'
+import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries, NOT_MATERIALIZED } from './staging-coverage.mjs'
 import { deliveryCounts } from './verification-trigger.mjs'
-import { checkoutsOf, committedBeyond, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews } from './runtime/full-verification-snapshot.mjs'
+import { checkoutsOf, committedBeyond, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
 
 /*
  * The full verification (docs/tactical-playbooks.md "The daily full
@@ -54,6 +54,12 @@ import { checkoutsOf, committedBeyond, forgetRef, MOTION_WINDOW_MS, motionOf, mo
  *        the development checkout as it stands and drives the full check tier on it;
  *      a project with no infrastructure, or whose staging declares
  *      `fullVerification: instances`, is recorded as verified through its instances.
+ *      A framework (a project others name with `framework:`) one of whose pool instances is
+ *      driven in the cycle waits for them; when an instance entry's snapshot materialized
+ *      its checkout it gets no drive of its own and its entry is derived from those entries
+ *      (deriveEntry: `mode: 'derived'`, green only when every one is green, settled, ran its
+ *      whole suite and established coverage; its deliveries read through their copies of it),
+ *      otherwise it is driven as any other;
  *      Each entry records the delivered runs its snapshot covered;
  *      Each entry records whether its checkouts were moving around the snapshot
  *      (snapshotMotion, snapshotDuringEdits; information, no verdict reads it);
@@ -153,6 +159,26 @@ const hostRefusal = (entry, hosts) => entry.mode !== 'instance' && hosts.has(ent
 /** Whether an entry can be verified at all, so its deliveries may start a cycle (verification-trigger.mjs). */
 const verifiable = (entry, infra, hosts) => Boolean(entry.stage && !entry.verifiedThrough && !hostRefusal(entry, hosts) && (entry.mode !== 'instance' || infra?.testDrive?.modules?.instance?.fullSuite))
 
+/**
+ * The verdict of a framework entry derived from instance entries: green only when every one is green, settled, ran
+ * its whole suite and established coverage; else red, each one that is not named with why.
+ */
+export function derivedVerdict (sources) {
+  const red = []
+  for (const s of sources) {
+    const reason = s.state === 'refused' ? `refused${s.refusal ? `: ${s.refusal.code ? `${s.refusal.code}: ` : ''}${s.refusal.message}` : ''}`
+      : s.state === 'interrupted' ? 'interrupted'
+        : s.state !== 'settled' ? `not settled (${s.state ?? 'pending'})`
+          : s.verdict === 'incomplete' ? `incomplete${s.incomplete ? `: ${s.incomplete.reason}` : ''}`
+            : s.verdict !== 'green' ? `red${s.check?.failingTests?.length ? ` on ${s.check.failingTests.length} failing ${plural(s.check.failingTests.length, 'test', 'tests')}` : ''}`
+              : !s.suiteRan ? 'its whole suite did not run'
+                : s.coverageEstablished !== true ? 'its coverage is not established'
+                  : null
+    if (reason) red.push({ project: s.project, verdict: s.verdict ?? null, state: s.state ?? null, reason })
+  }
+  return { verdict: sources.length && !red.length ? 'green' : 'red', red }
+}
+
 /** A run id for one cycle drive: names the instance, the snapshot ref and the drive's DEVPANEL_RUN_ID. */
 export const driveIdOf = (cycleId, project) => `fv-${String(cycleId).replace(/[^A-Za-z0-9]+/g, '-')}-${String(project).replace(/[^A-Za-z0-9]+/g, '-')}`.toLowerCase()
 
@@ -246,7 +272,7 @@ function fenced (text) {
   return `${fence}text\n${text}\n${fence}`
 }
 
-const failureBlock = (f) => [`### \`${f.command}: ${f.test}\` (${f.basis})`, '', ...(f.message ? [f.message, ''] : []),
+const failureBlock = (f) => [`### \`${f.command}: ${f.test}\` (${f.basis})`, '', ...(f.from ? [`From the instance entry of \`${f.from.project}\`${f.from.driveId ? ` (drive \`${f.from.driveId}\`)` : f.from.runId ? ` (run \`${f.from.runId}\`)` : ''}.`, ''] : []), ...(f.message ? [f.message, ''] : []),
   ...(f.context ? [`The command against the previous green drive: ${f.context}.`, ''] : []),
   f.excerpt?.text ? `${fenced(f.excerpt.text)}\n_From the ${f.excerpt.source}._` : 'No excerpt found: neither the selftest report, the log nor the stderr tail names it.', ''].join('\n')
 
@@ -288,7 +314,16 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
   const lines = [`# ${name}`, '',
     `The daily full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
     `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
-    entry.mode === 'instance' ? `- Drive: \`${entry.driveId}\` on stage instance \`${entry.instance?.name ?? 'none created'}\`${entry.instance?.destroyed ? (entry.instance.destroyed.passed ? ' (destroyed)' : ` (its destroy failed: ${entry.instance.destroyed.error})`) : ''}; evidence \`${entry.evidence?.dir ?? entry.runDir ?? 'none'}\`` : entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
+    entry.mode === 'derived' ? `- No drive of its own: the entry is derived from the instance entries of this cycle whose snapshots materialized ${entry.project}'s checkout (${entry.derived?.rule ?? 'every one green'}).`
+      : entry.mode === 'instance' ? `- Drive: \`${entry.driveId}\` on stage instance \`${entry.instance?.name ?? 'none created'}\`${entry.instance?.destroyed ? (entry.instance.destroyed.passed ? ' (destroyed)' : ` (its destroy failed: ${entry.instance.destroyed.error})`) : ''}; evidence \`${entry.evidence?.dir ?? entry.runDir ?? 'none'}\`` : entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
+  if (entry.derived) {
+    lines.push('- Derived from:')
+    for (const f of entry.derived.from) {
+      const bad = entry.derived.red.find((r) => r.project === f.project)
+      lines.push(`  - \`${f.project}\` on ${f.stage ?? 'its stage'}: ${bad ? bad.reason : 'green'}${f.driveId ? `, drive \`${f.driveId}\`` : f.runId ? `, run \`${f.runId}\`` : ''}; evidence \`${f.evidence ?? 'none'}\``)
+    }
+    if (entry.derived.unmaterialized?.total) lines.push(`- Framework paths no instance's snapshot held (untested): ${entry.derived.unmaterialized.total}, first ${entry.derived.unmaterialized.paths.map((p) => `\`${p}\``).join(', ')}`)
+  }
   if (entry.incomplete) lines.push(`- Incomplete: ${entry.incomplete.reason}: ${entry.incomplete.message}`)
   if (entry.status) lines.push(`- Run status: ${entry.status}${entry.blockedReason ? ` (${entry.blockedReason})` : ''}${entry.release ? `; release ${entry.release.status}` : ''}`)
   if (entry.refusal) lines.push(`- Not started: ${entry.refusal.code ? `${entry.refusal.code}: ` : ''}${entry.refusal.message}`)
@@ -305,10 +340,10 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
   lines.push('')
   if (moving.length) lines.push('## Moving paths at snapshot time', '', ...moving.map((p) => `- \`${p.checkout}\`: \`${p.path}\``), ...(moving.length >= SHOWN_PATHS ? ['', `The first ${moving.length} are shown; the cycle record's \`snapshotMotion\` has the totals.`] : []), '')
   if (failures.length) {
-    lines.push(`## Failing tests (${failures.length})`, '')
+    lines.push(entry.derived ? `## Failing tests of the instance entries it is derived from (${failures.length})` : `## Failing tests (${failures.length})`, '')
     if (failures.length > SHOWN_FAILURES) lines.push(`The first ${SHOWN_FAILURES} are shown here; every one is in the attachment named below.`, '')
     for (const f of failures.slice(0, SHOWN_FAILURES)) lines.push(failureBlock(f))
-  } else lines.push('## Failing tests', '', 'The check names no failing test; the run status above says why the stage is red.', '')
+  } else lines.push('## Failing tests', '', entry.derived ? 'The instance entries it is derived from name no failing test; the lines above say why each is not green.' : 'The check names no failing test; the run status above says why the stage is red.', '')
   if (unread.length) lines.push('## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), '')
   if (flaky.length) lines.push(flakySection(flaky))
   if (parts.length) lines.push(`All ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}: ${parts.map((p) => `\`${p.name}\``).join(', ')} on the report step (000).`, '')
@@ -364,7 +399,7 @@ export function createFullVerification ({
   releaseWorkspace = (workspace) => gitWorktreeProvider.release(workspace),
   drive = undefined,
   destroyInstances = (driveId, options) => destroyRunInstances(driveId, options),
-  coverageOf = (args) => cycleSnapshotCoverage({ ...args, listIssues: (p, o) => issues.listIssues(p, o), listHomes: (p) => issues.listRunHomes?.(p) ?? [] }),
+  coverageOf = ({ views, ...args }) => cycleSnapshotCoverage({ ...args, ...(views ? viewReader(views) : {}), listIssues: (p, o) => issues.listIssues(p, o), listHomes: (p) => issues.listRunHomes?.(p) ?? [] }),
   projectPathOf = (project) => resolveProjectPath(project),
   // The delivery trigger (verification-trigger.mjs): how many deliveries a stage takes, and a project's deliveries.
   afterDeliveries = () => hostSettings().verificationTrigger.afterDeliveries,
@@ -575,19 +610,49 @@ export function createFullVerification ({
       // A host with dynamic instances is protected whole: no project's entry releases there.
       const protectedOnes = protectedHosts(infras)
       if (protectedOnes.size) record.protectedHosts = Object.fromEntries(protectedOnes)
-      for (const entry of record.projects.filter((e) => e.stage && !e.verifiedThrough && !e.verdict)) {
-        const refusal = hostRefusal(entry, protectedOnes) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
-          ? { code: 'FULL_SUITE_UNDECLARED', message: `${entry.project} runs on dynamic stage instances but declares no testDrive.modules.instance.fullSuite: the whole suite has no instance command, and the base instance is never used instead` }
-          : null)
+      const drivable = (e) => e.stage && !e.verifiedThrough && !e.verdict
+      // A framework one of whose pool instances is driven in this cycle waits for them: its entry may be derived from
+      // theirs (deriveEntry). Unreadable projects' configuration: nothing is deferred, everything is driven as before.
+      const config = await Promise.resolve().then(() => projectsConfig()).catch(() => null)
+      const pools = new Map()
+      if (config) {
+        for (const entry of record.projects.filter(drivable)) {
+          const instances = poolMembers(entry.project, config).slice(1).filter((id) => record.projects.some((e) => e.project === id && drivable(e)))
+          if (!config.get(entry.project)?.framework && instances.length) {
+            Object.assign(entry, { state: 'deferred', derivation: { state: 'pending', instances } })
+            pools.set(entry.project, instances)
+          }
+        }
+      }
+      const refusalOf = (entry) => hostRefusal(entry, protectedOnes) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
+        ? { code: 'FULL_SUITE_UNDECLARED', message: `${entry.project} runs on dynamic stage instances but declares no testDrive.modules.instance.fullSuite: the whole suite has no instance command, and the base instance is never used instead` }
+        : null)
+      for (const entry of record.projects.filter((e) => drivable(e) && e.state !== 'deferred')) {
+        const refusal = refusalOf(entry)
         if (refusal) Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false })
       }
       await write(record)
+      const runOne = (entry) => entry.mode === 'instance' ? runInstanceStage(record, entry, infras.get(entry.project)) : runStage(record, entry, protectedOnes)
       const hosts = new Map()
-      for (const entry of record.projects.filter((e) => e.stage && !e.verifiedThrough && !e.verdict)) hosts.set(entry.host, [...(hosts.get(entry.host) ?? []), entry])
+      for (const entry of record.projects.filter((e) => drivable(e) && e.state !== 'deferred')) hosts.set(entry.host, [...(hosts.get(entry.host) ?? []), entry])
       // One stage at a time per staging host; hosts side by side (drive slots and instance slots still decide each drive).
       await Promise.all([...hosts.values()].map(async (entries) => {
-        for (const entry of entries) await (entry.mode === 'instance' ? runInstanceStage(record, entry, infras.get(entry.project)) : runStage(record, entry, protectedOnes))
+        for (const entry of entries) await runOne(entry)
       }))
+      // Then each deferred framework: derived from the instance entries whose snapshot materialized its checkout, or,
+      // when none did, refused or driven exactly as it would have been.
+      for (const [framework, instances] of [...pools].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+        const entry = record.projects.find((e) => e.project === framework)
+        const dir = await Promise.resolve().then(() => projectPathOf(framework)).catch(() => null)
+        const checkouts = dir ? [dir, await fs.realpath(dir).catch(() => dir)] : []
+        const sources = record.projects.filter((e) => instances.includes(e.project) && (e.snapshot?.links ?? []).some((l) => checkouts.includes(l.owner)))
+        if (sources.length) { await deriveEntry(record, entry, sources, checkouts); continue }
+        delete entry.state
+        entry.derivation = { state: 'not-derived', instances, reason: `no instance entry of this cycle has a snapshot that materializes ${framework}'s checkout, so it is driven itself` }
+        const refusal = refusalOf(entry)
+        if (refusal) { Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false }); await write(record); continue }
+        await runOne(entry)
+      }
       // Every entry that is not verified through its instances counts, a project whose
       // configuration could not be read included: one red entry makes the cycle red.
       const judged = record.projects.filter((e) => !e.verifiedThrough)
@@ -674,6 +739,8 @@ export function createFullVerification ({
         ...(e.snapshotDuringEdits ? { movingPaths: movingPaths(e.snapshotMotion), newestChangeAt: e.snapshotMotion?.newest?.at ?? null } : {}),
         recheck: e.recheck?.state ?? null,
         commitWithheld: Boolean(e.commitWithheld),
+        // A framework entry derived from instance entries of this cycle (deriveEntry): which, and which of them were not green.
+        derived: e.derived ? { from: e.derived.from.map((f) => f.project), red: e.derived.red.map((r) => ({ project: r.project, reason: r.reason })), unmaterialized: e.derived.unmaterialized?.total ?? 0 } : null,
         covered: e.coverageEstablished ? runIds(e.coverage?.covered) : [],
         stillCounting: [...(e.coverageEstablished ? [] : runIds(e.coverage?.covered)), ...runIds(e.coverage?.indeterminate), ...runIds(e.coverage?.notShipped)]
       })),
@@ -915,6 +982,48 @@ export function createFullVerification ({
     await write(record)
   }
 
+  /**
+   * A framework entry derived from the instance entries whose snapshots materialized its checkout (`sources`): no
+   * resolve, snapshot, instance, drive or run home of its own. Its verdict is derivedVerdict's; its deliveries are read
+   * through the instances' copies of its checkout (viewReader), a path no copy held leaving a delivery indeterminate
+   * (`not-materialized`). It has no snapshot, so its recheck reads no-snapshot and its commits are compared with the
+   * instances' copies; otherwise it takes part in judging, the checkpoint chain and the red issues as a driven entry does.
+   */
+  async function deriveEntry (record, entry, sources, checkouts) {
+    Object.assign(entry, { mode: 'derived', state: 'deriving', startedAt: clock.iso() })
+    delete entry.derivation
+    await write(record).catch(() => {})
+    const { verdict, red } = derivedVerdict(sources)
+    try {
+      const snapshotAt = sources.map((s) => s.snapshotAt).filter(Boolean).sort()[0] ?? null
+      const views = [...new Set(checkouts)].flatMap((checkout) => testedViews(checkout, entry.project, sources))
+      const counting = (await deliveryCounts({ stages: [{ host: entry.host, stage: entry.stage, projects: [entry.project] }], deliveriesOf, records: await cycleRecords(verificationDir), threshold: 0 }).catch(() => [{ runs: null }]))[0].runs
+      const coverage = pick(await Promise.resolve().then(() => coverageOf({ project: entry.project, projectPath: checkouts[0] ?? null, snapshotAt, candidates: counting?.map((r) => r.runId) ?? null, views }))
+        .catch((error) => ({ error: error.message })))
+      const unmaterialized = [...new Set((coverage?.indeterminate ?? []).filter((c) => c.reason === NOT_MATERIALIZED).flatMap((c) => c.paths ?? []))]
+      Object.assign(entry, {
+        state: 'settled',
+        derived: {
+          rule: 'green only when every instance entry it is derived from is green, settled, ran its whole suite and established coverage',
+          from: sources.map((s) => ({ project: s.project, stage: s.stage ?? null, host: s.host ?? null, mode: s.mode ?? null, verdict: s.verdict ?? null, state: s.state ?? null, suiteRan: Boolean(s.suiteRan), coverageEstablished: s.coverageEstablished === true,
+            driveId: s.driveId ?? null, runId: s.runId ?? null, evidence: s.evidence?.dir ?? s.runDir ?? null, links: (s.snapshot?.links ?? []).filter((l) => views.some((v) => v.at === l.path)).map((l) => ({ path: l.path, prefix: l.prefix })) })),
+          red,
+          unmaterialized: { paths: unmaterialized.slice(0, SHOWN_PATHS), total: unmaterialized.length }
+        },
+        verdict,
+        snapshotAt,
+        coverage,
+        suiteRan: sources.every((s) => Boolean(s.suiteRan)),
+        coverageEstablished: sources.every((s) => s.coverageEstablished === true) && Boolean(coverage) && !coverage.error
+      })
+    } catch (error) {
+      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: 'DERIVATION_FAILED', message: error.message }, coverageEstablished: false })
+    }
+    entry.endedAt = clock.iso()
+    entry.durationMs = Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt))
+    await write(record)
+  }
+
   // ------------------------------------------------------------ the outcome
 
   /** Bump or open issues, by the verdict; recorded as `record.outcome`. Never throws. */
@@ -1055,6 +1164,17 @@ export function createFullVerification ({
     }
   }
 
+  /** An entry's failing tests with their excerpts: after a rerun only the tests that failed again (or whose rerun proved nothing); the flaky ones are named apart. */
+  async function failuresOf (entry) {
+    const failing = entry.rerun?.state === 'ran'
+      ? entry.rerun.tests.filter((t) => t.rerun !== 'passed').map((t) => ({ command: t.command, test: t.test, basis: t.rerun === 'failed' ? 'failed-twice' : 'not-observed',
+        message: t.rerun === 'failed' ? `Failed in the whole suite and again alone on the same instance (rerun in ${t.dir}).` : `Failed in the whole suite; its rerun alone proved nothing: ${t.why} (rerun in ${t.dir}).` }))
+      : entry.check?.failingTests ?? []
+    const out = []
+    for (const f of failing) out.push({ ...f, excerpt: await excerptOf({ runDir: entry.runDir, dir: entry.check.dir, command: f.command, test: f.test, commands: entry.check.failedCommands ?? [] }) })
+    return out
+  }
+
   /** Any stage red: one new issue per red project, holding that cycle's failing tests, excerpts and run. */
   async function openIssues (record) {
     const out = []
@@ -1070,14 +1190,11 @@ export function createFullVerification ({
       const item = { project: entry.project, stage, name, runId: entry.runId ?? null, issueId: null, failingCount: 0, attachments: [] }
       out.push(item)
       try {
+        // A derived entry's failures are those of the instance entries it is derived from that are not green, each named with its entry.
+        const sources = entry.derived ? record.projects.filter((e) => entry.derived.red.some((r) => r.project === e.project)) : [entry]
         const failures = []
-        // After a rerun only the tests that failed again (or whose rerun proved nothing) fail; the flaky ones are named apart.
-        const failing = entry.rerun?.state === 'ran'
-          ? entry.rerun.tests.filter((t) => t.rerun !== 'passed').map((t) => ({ command: t.command, test: t.test, basis: t.rerun === 'failed' ? 'failed-twice' : 'not-observed',
-            message: t.rerun === 'failed' ? `Failed in the whole suite and again alone on the same instance (rerun in ${t.dir}).` : `Failed in the whole suite; its rerun alone proved nothing: ${t.why} (rerun in ${t.dir}).` }))
-          : entry.check?.failingTests ?? []
-        for (const f of failing) failures.push({ ...f, excerpt: await excerptOf({ runDir: entry.runDir, dir: entry.check.dir, command: f.command, test: f.test, commands: entry.check.failedCommands ?? [] }) })
-        const unread = entry.check?.unread ?? []
+        for (const source of sources) failures.push(...(await failuresOf(source)).map((f) => (entry.derived ? { ...f, from: { project: source.project, driveId: source.driveId ?? null, runId: source.runId ?? null } } : f)))
+        const unread = sources.flatMap((source) => (source.check?.unread ?? []).map((u) => (entry.derived ? { ...u, command: `${source.project}: ${u.command}` } : u)))
         const flaky = entry.flaky ?? []
         item.failingCount = failures.length
         if (flaky.length) item.flaky = flaky.map((f) => `${f.command}: ${f.test}`)
@@ -1199,6 +1316,10 @@ export function createFullVerification ({
       if (record && !SETTLED_CYCLE.includes(record.state)) {
         // Ended by recovery: owed to the top-level supervisor like any end, told once it exists (announcePending).
         Object.assign(record, { state: 'interrupted', endedAt: clock.iso(), error: 'the service stopped before the cycle ended; its runs were not resumed automatically', announce: 'pending' })
+        // A framework entry waiting for its instances or being derived from them has no instance, workspace or run home.
+        for (const entry of (record.projects ?? []).filter((e) => !e.driveId && ['deferred', 'deriving'].includes(e.state))) {
+          Object.assign(entry, { state: 'interrupted', verdict: 'red', coverageEstablished: false })
+        }
         for (const entry of (record.projects ?? []).filter((e) => e.driveId)) {
           if (entry.state !== 'settled' && entry.state !== 'refused') Object.assign(entry, { state: 'interrupted', verdict: entry.verdict ?? 'red', coverageEstablished: false })
           if (!entry.instance?.destroyed) {
