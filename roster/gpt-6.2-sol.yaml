@@ -1,0 +1,21 @@
+id: gpt-6.2-sol
+title: GPT-6.2 Sol
+harness: codex
+model: gpt-6.2-sol
+efforts: [ low, medium, high, xhigh, max ]
+defaultEffort: ~
+contextWindow: ~
+verification:
+  status: verified
+  verifiedAt: ~
+  method: "Live fresh and resumed turns at each listed effort through the Codex
+    adapter; model, effort records and session continuity matched. The CLI
+    recorded the requested model and effort on both turns at every level;
+    backend interpretation is not observed. This verifies connectivity and
+    continuity, not supervisor decision quality."
+notes: >-
+  Listed effort levels, access and session continuity are verified through the
+  default Codex connection. The Codex model cache also advertises `ultra`, which
+  is outside the roster schema and was not exercised. Context window (the cache
+  says 500000) remains unverified. Supervisor suitability requires separate
+  evaluation.
