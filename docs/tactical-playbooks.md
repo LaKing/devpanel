@@ -115,7 +115,7 @@ honoured only from an implement-review brief: anywhere else (a plan-review brief
 in particular) it is recorded as ignored (`coordinatorEffects[step].ignored`) and
 the plan simply takes its next loop round, so `maxRounds` stays in force. Plan
 and implementation review exhaust by rule (`extend-if-converging`, 2026-10-01):
-after five rounds a loop whose last round left fewer substantial findings than
+after its rounds (ten for plan review since 2026-11-18, five for implementation review) a loop whose last round left fewer substantial findings than
 the one before, none of them reopened after an earlier round closed it, gets one
 more round without asking; otherwise the run ends unresolved, keeping the work so
 far, and its explanation names any reopened finding and says whether the full drive

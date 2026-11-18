@@ -83,7 +83,9 @@ phases:
         to: ask-owner
   - id: plan-review
     loop:
-      maxRounds: 5
+      # Ten since 2026-11-18 (five before): a plan round costs minutes, and a strict plan auditor that
+      # names one real defect per round stopped a run at the limit five times in a row.
+      maxRounds: 10
       consensus: true
       until: review.verdict == approved && !review.substantial
       # Nobody is asked when the rounds run out: a loop whose last round left
