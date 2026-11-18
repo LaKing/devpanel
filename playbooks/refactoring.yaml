@@ -13,8 +13,8 @@ participants:
     model: opus-5-5
     effort: medium   # Opus 5.5 medium by default since 2026-09-26; high/xhigh selectable per run
   auditor-1:
-    model: gpt-6.1-sol
-    effort: medium   # GPT-6.1 Sol medium is the default auditor since 2026-10-01 (GPT-6 Sol before)
+    model: gpt-6.2-sol
+    effort: medium   # GPT-6.2 Sol medium is the default auditor since 2026-11-18 (GPT-6.1 Sol before)
 autoClose:
   minimumVerification: review-only
   justification: The occupied auditor reviews the plan and exact candidate for behavior preservation. Checks and remaining evidence limitations are recorded honestly.

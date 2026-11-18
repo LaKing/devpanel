@@ -29,8 +29,8 @@ export default async (t) => {
 
     t.section('1. a playbook in host-config/playbooks shadows the in-tree one, which stays the default')
     const inTree = await loadConfig({ root: CONFIG_ROOT, hostDir })
-    t.eq('without a host copy the tree\'s auditor is used', (await seats(inTree))['auditor-1'], 'gpt-6.1-sol')
-    await fs.writeFile(path.join(hostDir, 'playbooks', 'implementation.yaml'), tree.replace(/model: gpt-6\.1-sol/, 'model: fable-5-1'))
+    t.eq('without a host copy the tree\'s auditor is used', (await seats(inTree))['auditor-1'], 'gpt-6.2-sol')
+    await fs.writeFile(path.join(hostDir, 'playbooks', 'implementation.yaml'), tree.replace(/model: gpt-6\.2-sol/, 'model: fable-5-1'))
     const shadowed = await loadConfig({ root: CONFIG_ROOT, hostDir })
     t.eq('the host copy is read', (await seats(shadowed))['auditor-1'], 'fable-5-1')
     t.ok('and reported as shadowing the tree', shadowed.shadowed.some((s) => s.category === 'playbooks' && s.name === 'implementation.yaml'))
@@ -43,11 +43,11 @@ export default async (t) => {
     const off = await loadConfig({ root: CONFIG_ROOT, hostDir })
     t.ok('no codex model remains', ![...off.roster.values()].some((m) => m.harness === 'codex'))
     t.ok('claude models do', off.roster.has('opus-5-5'))
-    t.eq('the left-out ones are recorded with their harness', off.disabledModels.get('gpt-6.1-sol'), 'codex')
+    t.eq('the left-out ones are recorded with their harness', off.disabledModels.get('gpt-6.2-sol'), 'codex')
     const refused = await seats(off)
     t.ok('the default playbook naming one fails, saying why and what to do',
-      Array.isArray(refused) && refused.some((m) => /gpt-6\.1-sol.*harness, codex, is disabled.*host-config\/playbooks/.test(m)), JSON.stringify(refused))
-    await fs.writeFile(path.join(hostDir, 'playbooks', 'implementation.yaml'), tree.replace(/model: gpt-6\.1-sol/, 'model: fable-5-1'))
+      Array.isArray(refused) && refused.some((m) => /gpt-6\.2-sol.*harness, codex, is disabled.*host-config\/playbooks/.test(m)), JSON.stringify(refused))
+    await fs.writeFile(path.join(hostDir, 'playbooks', 'implementation.yaml'), tree.replace(/model: gpt-6\.2-sol/, 'model: fable-5-1'))
     t.eq('with a host override it resolves again', (await seats(await loadConfig({ root: CONFIG_ROOT, hostDir })))['auditor-1'], 'fable-5-1')
     let invalid = null
     // In a directory nothing was read from yet: a file that turns invalid after a valid read keeps its last valid content.

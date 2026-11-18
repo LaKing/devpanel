@@ -20,7 +20,7 @@ Everything is plain files: human-authored config is YAML, machine-written state 
 
 ## Tactical playbooks
 
-Read `docs/tactical-playbooks.md` before changing playbooks, coordinator effects, evidence windows or release operations. The normal catalogue now has Analysis, Triage, Implementation, Plan and implement and Deployment; a staging release is a Deployment run in its `staging` environment (the default). Refactoring and Prompt remain; the legacy pingpong and one-time migration playbooks were removed (2026-09-25), the Staging playbook (2026-11-07). Default seats: Opus 5.5 at medium coordinates and writes; coding playbooks occupy `auditor-1` with GPT-6.1 Sol at medium. Optional seats are omitted unless occupied; consensus requires every occupied auditor on the same artifact. Only the engine executes configured release mutations.
+Read `docs/tactical-playbooks.md` before changing playbooks, coordinator effects, evidence windows or release operations. The normal catalogue now has Analysis, Triage, Implementation, Plan and implement and Deployment; a staging release is a Deployment run in its `staging` environment (the default). Refactoring and Prompt remain; the legacy pingpong and one-time migration playbooks were removed (2026-09-25), the Staging playbook (2026-11-07). Default seats: Opus 5.5 at medium coordinates and writes; coding playbooks occupy `auditor-1` with GPT-6.2 Sol at medium. Optional seats are omitted unless occupied; consensus requires every occupied auditor on the same artifact. Only the engine executes configured release mutations.
 
 ## Project infrastructure
 
@@ -338,7 +338,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   its `project:action` socket event. Operators run these from the project page or with
   `project-action-cli.mjs`; the top-level supervisor has no action for them. See `docs/project-infrastructure.md`.
 - `consult/` — the consult panel (docs/consult.md): a question that would go to a person goes first to two senior
-  models that are not run seats (defaults: Fable 5.2 and GPT-6 Astra at medium). Each reads the project's live checkout,
+  models that are not run seats (defaults: Fable 5.2 and GPT-6.2 Astra at medium). Each reads the project's live checkout,
   its related projects, the issue's folder and the asking run's worktree read-only, as the adapters' read seat inside a
   proved fence (`roots.mjs`; credentials masked with the fence's `masks`; no fence, no consult), and answers with a
   validated opinion (`consult-opinion.schema.json`: verdict answer | owner, an option key, conditions, evidence,

@@ -13,7 +13,7 @@ export default async function(t){
   const select=()=>browser.all('select').find(s=>s.getAttribute('aria-label')==='auditor-1 model')
   await browser.until(()=>select(),{label:'optional auditor selector'})
   await browser.until(()=>browser.all('.row__role').length===3,{label:'default seats preview'})
-  t.eq('auditor defaults to GPT-6.1 Sol',select().value,'gpt-6.1-sol')
+  t.eq('auditor defaults to GPT-6.2 Sol',select().value,'gpt-6.2-sol')
   t.eq('coordinator, implementer and auditor occupied',browser.all('.row__role').length,3)
   select().value='gpt-6-astra';select().dispatchEvent(new browser.window.Event('change',{bubbles:true}))
   const auditorRow=()=>browser.all('.row').find(r=>r.querySelector('.row__role')?.textContent==='auditor-1')

@@ -35,7 +35,7 @@ in mode `brief` only: one seat reads and writes the question for the person, and
 enabled: true
 seats:
   consultant-1: { model: fable-5-2, effort: medium }
-  consultant-2: { model: gpt-6-astra, effort: medium }
+  consultant-2: { model: gpt-6.2-astra, effort: medium }
 maxRounds: 2            # a second round shows each seat the other's opinion, once
 turnTimeoutMinutes: 20
 maxTurnCostUsd: 5       # reserved on the spending ledger per seat turn

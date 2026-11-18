@@ -12,7 +12,7 @@ participants:
     model: opus-5-5
     effort: low
   investigator-2:
-    model: gpt-6.1-sol
+    model: gpt-6.2-sol
     effort: low
 autoClose:
   minimumVerification: review-only

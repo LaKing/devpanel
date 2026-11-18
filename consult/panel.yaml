@@ -7,7 +7,7 @@ seats:
     model: fable-5-2
     effort: medium
   consultant-2:
-    model: gpt-6-astra
+    model: gpt-6.2-astra
     effort: medium
 maxRounds: 2            # a second round shows each seat the other's opinion, once
 turnTimeoutMinutes: 20

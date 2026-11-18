@@ -23,7 +23,7 @@ export default async function (t) {
     const r = await resolvePlaybook('triage', { root: CONFIG_ROOT })
     t.ok('the triage playbook resolves', r.ok, JSON.stringify(r.errors))
     t.eq('investigator is opus-5-5 at low', [r.resolved.participants.investigator.model.id, r.resolved.participants.investigator.effort], ['opus-5-5', 'low'])
-    t.eq('investigator-2 is gpt-6.1-sol at low', [r.resolved.participants['investigator-2'].model.id, r.resolved.participants['investigator-2'].effort], ['gpt-6.1-sol', 'low'])
+    t.eq('investigator-2 is gpt-6.2-sol at low', [r.resolved.participants['investigator-2'].model.id, r.resolved.participants['investigator-2'].effort], ['gpt-6.2-sol', 'low'])
     t.eq('both investigate steps are concurrent', r.resolved.phases.filter((p) => p.step?.concurrent).map((p) => p.step.role), ['investigator', 'investigator-2'])
   }
 
@@ -83,7 +83,7 @@ export default async function (t) {
   t.section('6. previews: both investigator seats, and the sizing in the prompt worker\'s context')
   {
     const triage = await previewRun({ playbookId: 'triage', configRoot: CONFIG_ROOT })
-    t.eq('triage shows both investigator seats', triage.participants.filter((p) => p.role.startsWith('investigator')).map((p) => [p.role, p.model, p.effort]), [['investigator', 'opus-5-5', 'low'], ['investigator-2', 'gpt-6.1-sol', 'low']])
+    t.eq('triage shows both investigator seats', triage.participants.filter((p) => p.role.startsWith('investigator')).map((p) => [p.role, p.model, p.effort]), [['investigator', 'opus-5-5', 'low'], ['investigator-2', 'gpt-6.2-sol', 'low']])
     t.ok('marked as running at once', triage.phases.flatMap((p) => p.steps).filter((s) => s.concurrent).length === 2)
     const prompt = await previewRun({ playbookId: 'prompt', configRoot: CONFIG_ROOT })
     const worker = prompt.phases.flatMap((p) => p.steps).find((s) => s.role === 'worker')

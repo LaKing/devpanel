@@ -44,7 +44,7 @@ Review of existing material belongs in Analysis.
 Default seats (since 2026-09-26): every coordinator is Claude Opus 5.5 (`opus-5-5`)
 at medium effort. The source writer of Implementation, Plan and implement and
 Refactoring (`implementer` / `planner`) is Opus 5.5 at medium, and their `auditor-1`
-is occupied by default with GPT-6.1 Sol (`gpt-6.1-sol`, since 2026-10-01) at medium, so those playbooks are
+is occupied by default with GPT-6.2 Sol (`gpt-6.2-sol`, since 2026-11-18) at medium, so those playbooks are
 independently audited unless a run empties the seat. Other worker seats (analyser,
 investigator, release operator, prompt worker) keep their own efforts. Any seat's
 model and effort can be overridden per run.
@@ -307,7 +307,7 @@ catalogue to identify existing reports and avoid semantic duplicates.
 ### Two-seat sizing
 
 The investigate phase has two seats: `investigator` (Opus 5.5, low) and the optional
-`investigator-2` (GPT-6.1 Sol, low). Their steps are marked `concurrent: true`, so
+`investigator-2` (GPT-6.2 Sol, low). Their steps are marked `concurrent: true`, so
 they run at the same time, like the reviewers of a consensus round; the brief goes
 to both and neither reads the other. Besides its disposition, each seat records an
 order-of-magnitude sizing, not a design: `size` (`minor`, one write and one

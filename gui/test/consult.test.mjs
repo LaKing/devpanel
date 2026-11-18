@@ -74,7 +74,7 @@ export default async function (t) {
 
   t.section('the shipped panel resolves')
   const shipped = await loadPanel({ root: CONFIG_ROOT })
-  t.eq('two seats, the owner\'s defaults', [shipped.seats['consultant-1'], shipped.seats['consultant-2']], [{ model: 'fable-5-2', effort: 'medium' }, { model: 'gpt-6-astra', effort: 'medium' }])
+  t.eq('two seats, the owner\'s defaults', [shipped.seats['consultant-1'], shipped.seats['consultant-2']], [{ model: 'fable-5-2', effort: 'medium' }, { model: 'gpt-6.2-astra', effort: 'medium' }])
   const seats = await resolveSeats(panel, { roster })
   t.eq('both seats resolve against the roster', [seats.seats.map((s) => s.model.id), seats.problems], [['fable-5-2', 'gpt-6-astra'], []])
   const unverified = new Map([...roster, ['gpt-6-astra', { ...roster.get('gpt-6-astra'), verification: { status: 'unverified' } }]])
