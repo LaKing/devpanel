@@ -1317,6 +1317,15 @@ export class Engine {
     const record = { disposition, expectedStateHash, reason, actor, invocationId: report.invocationId, at: this.clock.iso() }
     const checkpoint = `recovery-${uuid()}`
     await writeIntegrity(this.integrityDir(), checkpoint, current)
+    // The time the run stood quarantined was a wait for this disposition, not its wall clock (as a Resume counts a
+    // stop). Recorded as an interval on resumeHistory, so a check lying inside it is not taken for an unplaced stop
+    // (run-metrics.mjs timeSplit). A quarantine found only at a restart is counted from when it was found: less is excused, never more.
+    const quarantinedAt = Date.parse(this.run.recovery?.detectedAt ?? this.run.endedAt ?? '')
+    if (disposition !== 'abandon' && Number.isFinite(quarantinedAt)) {
+      record.suspendedMs = Math.max(0, this.clock.now() - quarantinedAt)
+      this.run.resumeHistory = [...(this.run.resumeHistory ?? []), { at: record.at, actor, origin: 'integrity-disposition', previousStatus: this.run.status, previousReason: this.run.blockedReason, suspendedMs: record.suspendedMs }]
+      this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + record.suspendedMs
+    }
     this.run.integrity = { ...integrity, status: disposition === 'abandon' ? 'abandoned' : 'clear', checkpoint, dispositions: [...(integrity.dispositions ?? []), record] }
     this.run.recovery = { required: false, reason: null, detectedAt: null }
     // Retry the unaccepted step with a fresh session. No response or approval

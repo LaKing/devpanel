@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { startRun, resumeRun, releaseWorkspace, worktreeDiffDelivery } from '../server/runtime/launch.mjs'
 import { readRun, readEvents, runDir, writeRun } from '../server/runtime/store.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity } from '../server/runtime/integrity.mjs'
+import { wallClockElapsedMs } from '../server/runtime/wall-clock.mjs'
 import { FENCE_STUBS, fingerprint, workspaceProjection } from '../server/runtime/fingerprint.mjs'
 import { removeFenceStubs } from '../server/runtime/tooling-mounts.mjs'
 import { candidateDiff } from '../server/runtime/diff.mjs'
@@ -293,7 +294,18 @@ export default async function (t) {
       const current = await captureIntegrity(resumed.run.workspace, { clock: f.clock })
       t.ok('stale disposition rejected', await rejected(() => resumed.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: 'stale', actor: 'operator', reason: 'inspected' })))
       t.ok('false restoration rejected', await rejected(() => resumed.resolveIntegrity({ disposition: 'restored', expectedStateHash: current.hash, actor: 'operator', reason: 'inspected' })))
+      // The wait for a person's disposition is not the run's wall clock: seven hours stood quarantined leave the budget where it was.
+      const HOURS = 7 * 3_600_000
+      const elapsedBefore = wallClockElapsedMs(resumed.run, f.clock.now())
+      const suspendedBefore = resumed.run.controlSuspendedMs ?? 0
+      t.ok('the fixture clock can be advanced', typeof f.clock.advance === 'function')
+      f.clock.advance(HOURS)
       await resumed.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: current.hash, actor: 'operator', reason: 'retain partial work for author retry' })
+      const stood = resumed.run.resumeHistory?.at(-1)
+      t.eq('the quarantine is an interval on the record', [stood?.origin, stood?.previousReason, stood?.suspendedMs >= HOURS], ['integrity-disposition', 'recovery-required', true])
+      t.eq('excused by the same amount', (resumed.run.controlSuspendedMs ?? 0) - suspendedBefore, stood?.suspendedMs)
+      t.eq('and on the disposition', resumed.run.integrity.dispositions.at(-1).suspendedMs, stood?.suspendedMs)
+      t.ok('the wall clock did not count the quarantine', wallClockElapsedMs(resumed.run, f.clock.now()) - elapsedBefore < 60_000, `${wallClockElapsedMs(resumed.run, f.clock.now()) - elapsedBefore} ms`)
       t.eq('explicit acceptance clears quarantine', resumed.run.integrity.status, 'clear')
       t.eq('decision persisted', (await readRun(f.issuePath, engine.runId)).integrity.dispositions.at(-1).actor, 'operator')
       // The retry is a fresh invocation and must still produce a reviewed candidate.

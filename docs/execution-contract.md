@@ -3538,7 +3538,9 @@ is told once the supervisor exists, once.
 by it, whenever it started). The running deadline, the budget check between turns,
 Resume, Continue and the panel's figure all read the same number.
 
-- **Excluded:** time the run stood stopped or waited for an operator answer, and
+- **Excluded:** time the run stood stopped or waited for an operator answer (a source-integrity
+  quarantine waiting for its disposition included: `accept-partial` and `restored` record the wait as an
+  interval on `resumeHistory`, origin `integrity-disposition`), and
   time spent waiting for checks while no seat turn runs, a drive's wait for a slot on
   its staging host (a drive slot, a stage instance slot, or a stage that answers "full" to a start) and a diagnostic drive included. That exemption holds during the
   wait itself: a check not yet recorded is counted free from when it began, so a run
