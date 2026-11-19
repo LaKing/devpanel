@@ -22,7 +22,7 @@ import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
 import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries, NOT_MATERIALIZED } from './staging-coverage.mjs'
 import { deliveryCounts } from './verification-trigger.mjs'
-import { checkoutsOf, committedBeyond, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
+import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
 
 /*
  * The full verification (docs/tactical-playbooks.md "The daily full
@@ -1150,7 +1150,7 @@ export function createFullVerification ({
       if (!checkout) throw new Error('the project checkout could not be named')
       const head = await headOf(checkout)
       if (step.headBefore && head === step.headBefore) { step.afterCommit = { state: 'no-commit', ...by }; return }
-      step.afterCommit = { ...await compareCommit({ checkout, commit: head, headBefore: step.headBefore ?? null, views: testedViews(checkout, step.project, record.projects), versionBefore: step.versionBefore ?? null, versionAfter: step.versionAfter ?? null }), ...by }
+      step.afterCommit = { ...await compareCommit({ checkout, commit: head, headBefore: step.headBefore ?? null, views: [...testedViews(checkout, step.project, record.projects), ...followedViews(checkout, step.project, record.projects)], versionBefore: step.versionBefore ?? null, versionAfter: step.versionAfter ?? null }), ...by }
     } catch (error) {
       step.afterCommit = { state: 'unreadable', error: error.message, ...by }
     }

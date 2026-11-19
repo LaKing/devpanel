@@ -457,7 +457,8 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   its stage back, verification-trigger.mjs); otherwise each framework's `checkpoint --minor`, then its instances' `checkpoint`
   in `poolMembers` order, stopping at the first failure, through the engine-only `args` of `startProjectAction`, and after
   every attempt (failed or interrupted included, `recover()` for the latter) approach (a): the commit's tree listed in its
-  checkout and each tested view (own snapshot, instances' materialized copies) listed in its own repository, compared by blob
+  checkout and each tested view (own snapshot, instances' materialized copies; for an instance whose checkpoint commits what its
+  links point at, each of its own links read in its snapshot, `followedViews`) listed in its own repository, compared by blob
   id (a tested path missing from the commit counts too); differences beyond a version-only change of the root `version`/`package.json`/`package-lock.json`
   (the top-level version fields located in the parsed document, nothing else changed), and changed paths no
   view holds, are `step.afterCommit` and `outcome.bump.untestedCommitted`, reported and never reverted; any red: no action, one issue

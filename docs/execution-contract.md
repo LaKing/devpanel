@@ -3367,7 +3367,12 @@ cycle's checkpoint is bound to the bytes it tested
   `version`'s first line; `package.json`'s top-level `version`; `package-lock.json`'s
   top-level `version` and `packages[""].version`, located in the parsed document, the bytes
   differing nowhere else, so a nested version or any other edit is untested); a
-  path the commit changed that no view holds is untested as `outside-every-snapshot`. The
+  path the commit changed that no view holds is untested as `outside-every-snapshot`. An
+  instance's checkpoint may commit what its links point at (it follows them, so the commit
+  holds the framework's files below the link's path): each link of the instance's own
+  snapshot is then one more view of its checkout, the materialized copy read at the link and
+  compared below the same path (`followedViews`), used only when the commit holds files
+  there; a commit that keeps the link a link is not compared with it. The
   step records `afterCommit` (`compared`, `no-commit`, `incomparable` or `unreadable`), and
   every step with untested paths or no reading is in `outcome.bump.untestedCommitted`. Only
   read commands run; a difference is reported, never reverted by the engine.

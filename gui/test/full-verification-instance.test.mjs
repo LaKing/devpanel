@@ -491,9 +491,9 @@ export default async function (t) {
       t.eq('the instance\'s recheck covers the framework checkout it read through its link', by['site-project'].recheck.checkouts, [SITE, FRAMEWORK])
       t.eq('nothing moved: the chain ran as before', s.calls.actions.map((a) => [a.project, a.args]), [['framework-project', ['--minor']], ['site-project', []]])
       t.eq('the cycle committed', [record.outcome.committed, record.outcome.bump.withheld, record.outcome.commitWithheld], [true, [], undefined])
-      t.eq('each commit compared with every tested view of its checkout: the framework\'s only through the instance\'s copy of lib', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [
+      t.eq('each commit compared with every tested view of its checkout: the framework\'s only through the instance\'s copy of lib, the instance\'s with its own link as a followed view', s.calls.compared.map((c) => [c.checkout, c.headBefore, c.commit, c.views]), [
         [FRAMEWORK, 'f0', 'f0+1', [[`${SITE}/.git`, 'fw', 'lib']]],
-        [SITE, 's0', 's0+1', [[`${SITE}/.git`, '', '']]]
+        [SITE, 's0', 's0+1', [[`${SITE}/.git`, '', ''], [`${SITE}/.git`, 'fw', 'fw']]]
       ])
       t.eq('nothing untested was committed', [record.outcome.bump.chain.map((c) => c.afterCommit.state), record.outcome.bump.untestedCommitted], [['compared', 'compared'], []])
       t.eq('the event says the cycle committed', [s.calls.ended[0].outcome.committed, s.calls.ended[0].outcome.withheld, s.calls.ended[0].projects.map((p) => [p.project, p.recheck, p.commitWithheld])], [true, [], [['framework-project', 'no-snapshot', false], ['site-project', 'unchanged', false]]])

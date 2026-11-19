@@ -233,12 +233,25 @@ function jsonVersionsOnly (tested, committed, before, after, holders) {
  * it is a root version file whose committed bytes are the tested bytes with only the version
  * changed (`bumped`). A path the commit changed since `headBefore` that no view holds is
  * untested as `outside-every-snapshot`. Different object formats make the comparison `incomparable`.
+ *
+ * A `followed` view (followedViews) is a link of the project's own snapshot: it takes part only when
+ * the commit holds files below the link, that is when the checkpoint committed the linked content
+ * itself. A commit that holds the link as a link, or nothing there, is not compared with it.
  */
 /** Whether a view never held a path below its prefix: excluded, skipped by the owner's selection, or under a link of its own. */
 const dropOf = (view) => (rel) => matches(view.at ? `${view.at}/${rel}`.replace(/\/$/, '') : rel, view.consumerExcludes ?? []) || matches(rel, view.excludes ?? []) || (view.skipped ?? []).some((s) => inside(rel, s)) || (view.links ?? []).some((l) => inside(rel, l))
 
 export async function committedBeyond ({ checkout, commit, headBefore = null, views = [], versionBefore = null, versionAfter = null, git = readGit }) {
   const here = ['-C', checkout]
+  const held = new Map()
+  const committedAt = async (view) => {
+    if (!held.has(view)) held.set(view, await listTree(here, commit, view.prefix, git))
+    return held.get(view)
+  }
+  const used = []
+  // A link held as a link lists as the one entry '' (the link itself), which is no file below it.
+  for (const view of views) if (!view.followed || [...(await committedAt(view)).keys()].some((rel) => rel !== '')) used.push(view)
+  views = used
   const covered = (p) => views.some((v) => inside(p, v.prefix) && !dropOf(v)(below(p, v.prefix)))
   const format = await objectFormat(here, git)
   for (const view of views) {
@@ -251,7 +264,7 @@ export async function committedBeyond ({ checkout, commit, headBefore = null, vi
   for (const view of views) {
     const drop = dropOf(view)
     const tested = await listTree(['--git-dir', view.repository], view.commit, view.at, git)
-    const committed = await listTree(here, commit, view.prefix, git)
+    const committed = await committedAt(view)
     // Both sides in full: a tested path the commit lacks (deleted, or an untracked file the snapshot held that
     // went away) is a difference as much as a committed path the view never held.
     for (const rel of new Set([...tested.keys(), ...committed.keys()])) {
@@ -294,6 +307,23 @@ export function testedViews (checkout, project, entries) {
     if (!s?.repository || !s.baseCommit) continue
     if (e.project === project && s.ownCommit) views.push({ repository: s.repository, commit: s.ownCommit, at: '', prefix: '', excludes: s.excludes ?? [], links: (s.links ?? []).map((l) => l.path) })
     for (const l of s.links ?? []) if (l.owner === checkout) views.push({ repository: s.repository, commit: s.baseCommit, at: l.path, prefix: l.prefix, consumerExcludes: l.consumerExcludes ?? [], skipped: l.skipped ?? [] })
+  }
+  return views
+}
+
+/**
+ * The links of a project's own snapshot as views of its own checkout, for a checkpoint that commits what its links
+ * point at (it follows them, so the instance's commit holds the framework's files below the link's path): the
+ * materialized copy the instance was tested with, read at the link in the snapshot and compared below the same path
+ * in the commit. Without them every such file reads `outside-every-snapshot`, although it is exactly what was tested.
+ * Kept apart from testedViews: a derived entry's coverage reads that list's link views as copies of ANOTHER checkout.
+ */
+export function followedViews (checkout, project, entries) {
+  const views = []
+  for (const e of entries) {
+    const s = e.snapshot
+    if (e.project !== project || !s?.repository || !s.baseCommit) continue
+    for (const l of s.links ?? []) if (l.owner !== checkout) views.push({ repository: s.repository, commit: s.baseCommit, at: l.path, prefix: l.path, consumerExcludes: l.consumerExcludes ?? [], skipped: l.skipped ?? [], followed: true })
   }
   return views
 }

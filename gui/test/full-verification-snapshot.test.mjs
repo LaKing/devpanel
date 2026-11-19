@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
-import { committedBeyond, motionOf, ownerOf, readCheckouts, readGit, snapshotDiff, snapshotRecord, testedViews, viewReader } from '../server/runtime/full-verification-snapshot.mjs'
+import { committedBeyond, followedViews, motionOf, ownerOf, readCheckouts, readGit, snapshotDiff, snapshotRecord, testedViews, viewReader } from '../server/runtime/full-verification-snapshot.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 
 export const name = 'full verification snapshot — the recheck of a checkout, a commit compared with the tested bytes across independent repositories, the version rule, and the readings around a snapshot (real git)'
@@ -97,6 +97,37 @@ export default async function (t) {
       const second = { project: 'other-instance-project', snapshot: { baseCommit: later.baseCommit, ...await snapshotRecord({ workspace: later, policy: MATERIALIZE, projectDir: three.instance }) } }
       const both = viewReader(testedViews(three.framework, 'framework-project', [three.entry, second]))
       t.eq('two copies that disagree read as other (it matches no delivered state); where they agree, the blob', [await both.read('lib/a.js'), (await both.read('lib/b.js')).sha1], [{ other: true }, git(three.framework, 'rev-parse', 'HEAD:lib/b.js')])
+    }
+
+    t.section('3c. an instance whose checkpoint commits what its link points at: the linked files are compared with the copy the instance was tested with')
+    {
+      const four = await pair('four')
+      const viewsOf = () => [...testedViews(four.instance, 'instance-project', [four.entry]), ...followedViews(four.instance, 'instance-project', [four.entry])]
+      t.eq('the instance\'s own checkout: its own tree, and its link as a followed view at the same path', viewsOf().map((v) => [v.at, v.prefix, Boolean(v.followed)]), [['', '', false], ['fw', 'fw', true]])
+      t.eq('the framework\'s checkout gets no followed view from the instance\'s entry', followedViews(four.framework, 'framework-project', [four.entry]), [])
+      const linked = git(four.instance, 'rev-parse', 'HEAD')
+      await fs.writeFile(path.join(four.instance, 'README.md'), 'instance, an empty commit would not do\n')
+      git(four.instance, 'add', '-A'); git(four.instance, 'commit', '-q', '-m', 'a checkpoint that keeps the link a link')
+      const asLink = await committedBeyond({ checkout: four.instance, commit: git(four.instance, 'rev-parse', 'HEAD'), headBefore: linked, views: viewsOf() })
+      t.eq('a commit that holds the link as a link is not compared with the copy: one view, only the edit named', [asLink.views, asLink.untested.paths], [1, [{ path: 'README.md', reason: 'differs-from-tested' }]])
+      // The checkpoint follows the link: the commit holds the framework's files below fw/.
+      const follow = async (edit) => {
+        const headBefore = git(four.instance, 'rev-parse', 'HEAD')
+        await fs.rm(path.join(four.instance, 'fw'), { recursive: true, force: true })
+        await fs.cp(path.join(four.framework, 'lib'), path.join(four.instance, 'fw'), { recursive: true })
+        if (edit) await fs.writeFile(path.join(four.instance, 'fw/a.js'), edit)
+        git(four.instance, 'add', '-A'); git(four.instance, 'commit', '-q', '-m', 'a checkpoint that follows the link')
+        return { headBefore, commit: git(four.instance, 'rev-parse', 'HEAD') }
+      }
+      await fs.writeFile(path.join(four.instance, 'README.md'), 'instance\n')
+      const followed = await follow(null)
+      const without = await committedBeyond({ checkout: four.instance, ...followed, views: testedViews(four.instance, 'instance-project', [four.entry]) })
+      t.eq('without the followed view the link that became a directory and every file below it read as outside every snapshot', without.untested.paths, [{ path: 'fw', reason: 'outside-every-snapshot' }, { path: 'fw/a.js', reason: 'outside-every-snapshot' }, { path: 'fw/b.js', reason: 'outside-every-snapshot' }])
+      const withIt = await committedBeyond({ checkout: four.instance, ...followed, views: viewsOf() })
+      t.eq('with it the linked files are what was tested: two views, nothing untested', [withIt.state, withIt.views, withIt.untested.total], ['compared', 2, 0])
+      const slipped = await follow('a, edited after the snapshot\n')
+      const caught = await committedBeyond({ checkout: four.instance, ...slipped, views: viewsOf() })
+      t.eq('a linked file committed differently from the tested copy is named', caught.untested.paths, [{ path: 'fw/a.js', reason: 'differs-from-tested' }])
     }
 
     t.section('4. the project\'s own snapshot: only the version itself may change in its version files; an excluded path it never held is not read')
