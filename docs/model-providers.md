@@ -72,8 +72,8 @@ Gemini models run through Google's own **Gemini CLI** (`harness/gemini.mjs`), no
 through a compatibility endpoint. Google publishes no Anthropic-compatible API, so
 the DeepSeek route — the claude adapter with an endpoint substituted — does not
 apply, and putting a translating proxy in the path would add a permanent moving
-part to every run. The roster carries `gemini-4-argon` (the Gemini 3.x entries were retired on
-2026-11-07); an installation verifies it with its configured API key through
+part to every run. The roster carries `gemini-4-argon` and `gemini-4-neon` (the Gemini 3.x entries were retired on
+2026-11-07); an installation verifies each with its configured API key through
 session-resume checks and live fence checks, supplemented by installed-runtime
 policy evidence (`npm run policy:gemini`), and keeps the reports with its own roster
 copy.

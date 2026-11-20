@@ -1,0 +1,33 @@
+id: gemini-4-neon
+title: Gemini 4 Neon (via Gemini CLI)
+harness: gemini
+model: gemini-4-neon
+efforts: []
+defaultEffort: null
+contextWindow: 1048576
+credentialRef: file:~/.config/gemini/key
+verification:
+  status: verified
+  verifiedAt: ~
+  method: API model listing, session resume, live fence and installed runtime policy verification
+  notes: >
+    Listed by the provider's model endpoint (inputTokenLimit 1048576); the
+    installed Gemini CLI passes the identifier through to the API. API
+    authentication and session continuity passed through the adapter's admin
+    policy. The live read-only workspace stayed unchanged: the installed CLI's
+    policy engine excluded write, shell and mode-transition tools and denied
+    forced calls above a permissive control, and the proof matched the SHA-256
+    of the policy acknowledged by the live turn. The runtime reported no cost.
+notes: >
+  Runs through Google's Gemini CLI. `efforts: []` is a fact about this runtime,
+  not an unknown: the CLI exposes no effort or thinking control, by flag or by
+  setting, so a playbook naming an effort is refused rather than silently run at
+  whatever the runtime picked. Cost is unknown rather than estimated: the CLI
+  reports tokens only, so runs on this entry draw on the unpriced allowance.
+  A role that does not write source gets no write and no shell tools at all on
+  this harness — the fence is a policy — so a Gemini seat cannot run tests or
+  write scratch notes unless it is the author; an author given read-only roots
+  runs with them bind-mounted read-only through bubblewrap (proved before launch;
+  a host without it refuses the turn) and loses the shell for that turn. Each
+  turn is accepted only after the runtime acknowledged the policy file on stderr;
+  the API key is pinned as the auth method through system settings.
