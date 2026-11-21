@@ -337,6 +337,12 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operation per project at a time, recorded under `issues/<project>/.actions/<id>/` with output appended before
   its `project:action` socket event. Operators run these from the project page or with
   `project-action-cli.mjs`; the top-level supervisor has no action for them. See `docs/project-infrastructure.md`.
+- `playbook-seats.mjs` — the Playbooks page (`/playbooks`, `PlaybooksView.vue`; `GET /api/playbook-seats`, `PUT /api/playbook-seats/:id`): every
+  playbook's seats (each role of its strategy with the model and effort bound to it) and an operator's edit of those defaults. The edit is validated
+  in memory by the schema and by `resolvePlaybook` (only what the edit itself breaks is refused), then written as the installation's own copy
+  `<host-config>/playbooks/<file>` with only `participants` changed and comments kept, never into the tracked catalogue; a copy equal to the tracked
+  file is removed, `drift` marks one that differs outside its seats, and `playbooks/.history.jsonl` records who changed what. Later starts only; a new
+  configHash. The top-level supervisor has no such action. docs/host-config.md "Precedence".
 - `consult/` — the consult panel (docs/consult.md): a question that would go to a person goes first to two senior
   models that are not run seats (defaults: Fable 5.2 and GPT-6.2 Astra at medium). Each reads the project's live checkout,
   its related projects, the issue's folder and the asking run's worktree read-only, as the adapters' read seat inside a

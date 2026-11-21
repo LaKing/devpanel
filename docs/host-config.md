@@ -88,6 +88,17 @@ directory exists, and to `gui/live/reports/` before that.
 host-config <config root>/host-config (present)   roster 21 (tree 21, host 0)   projects 6 (tree 0, host 6)   …
 ```
 
+
+**Playbook seats from the panel.** The **Playbooks** page (`/playbooks`, `gui/server/playbook-seats.mjs`) edits the
+model and effort of a playbook's seats and writes the result here, as `playbooks/<file>`: the effective file's own
+text with only `participants` changed, comments kept. Nothing is written into the tracked catalogue. The candidate is
+validated by the schema and by the resolver a run start uses before it is written, so an edit the loader would refuse
+never reaches the disk. A copy shadows the whole tracked file, as any host-config playbook does: the page marks a copy
+that differs from the tracked file outside its seats (the tracked file changed since, or the copy was edited by hand),
+and removes a copy whose content has come to equal the tracked file. Who changed which seat, from what to what, and
+the configuration hash before and after, is appended to `playbooks/.history.jsonl` (not a playbook: the loader reads
+`*.yaml` only). An edit changes later starts only, and starts a new configuration group.
+
 ## Host settings
 
 `settings.json` holds the installation's own defaults

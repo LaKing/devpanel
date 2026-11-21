@@ -178,6 +178,10 @@ export const api = {
   coordinatorChat: (project, id, runId) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/chat`),
   sendCoordinatorChat: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/chat`, { method: 'POST', body: JSON.stringify(body) }),
   answerOwnerInput: (project, id, runId, body) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/owner-input`, { method: 'POST', body: JSON.stringify(body) }),
+  /** The Playbooks page: every playbook's seats and the roster models a seat can take. */
+  playbookSeats: () => request('/api/playbook-seats'),
+  /** Change seats of one playbook: `{ role: null | { model, effort? } }`, only the roles that change. */
+  savePlaybookSeats: (id, seats, actor) => request(`/api/playbook-seats/${enc(id)}`, { method: 'PUT', body: JSON.stringify({ seats, actor }) }),
   availability: () => request('/api/availability'),
   refreshAvailability: () => request('/api/availability/refresh', { method: 'POST' }),
   clearAvailability: (model) => request(`/api/availability/${enc(model)}`, { method: 'DELETE' }),

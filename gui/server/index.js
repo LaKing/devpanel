@@ -38,6 +38,7 @@ import { reportRouter } from './report.mjs'
 import { issueStats } from './issue-stats.mjs'
 import { CONFIG_ROOT, loadDecisionProvider } from './decisions/index.mjs'
 import { loadConfig } from './config/load.mjs'
+import { playbookSeats, savePlaybookSeats } from './playbook-seats.mjs'
 import { hostSettings } from './config/host-settings.mjs'
 import { sweepAtStart } from './runtime/stage-instances.mjs'
 import { sweepSyncs } from './runtime/sync-records.mjs'
@@ -617,6 +618,18 @@ app.post('/api/projects/:project/issues/:id/pregate/confirm', route(async (req, 
 
 app.get('/api/playbooks', route(async (_req, res) => {
   res.json(await listPlaybooks({}))
+}))
+
+// The Playbooks page (playbook-seats.mjs): each playbook's seats with the roster models they can take, and an
+// operator's edit of a playbook's default seats, written as the installation's own copy of that playbook.
+const seatOptions = { root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT, held: async (model) => (await supervisor.availability.check(model))?.exhaustedUntil ?? null }
+app.get('/api/playbook-seats', route(async (_req, res) => {
+  res.json(await playbookSeats(seatOptions))
+}))
+app.put('/api/playbook-seats/:id', route(async (req, res) => {
+  const result = await savePlaybookSeats(req.params.id, req.body?.seats, { ...seatOptions, actor: resumingActor(req) })
+  if (result.changed) console.log(`playbook seats: ${req.params.id} changed by ${resumingActor(req)}: ${result.changes.map((c) => `${c.role} ${c.from ? `${c.from.model}/${c.from.effort ?? 'default'}` : 'empty'} -> ${c.to ? `${c.to.model}/${c.to.effort ?? 'default'}` : 'empty'}`).join(', ')}`)
+  res.json(result)
 }))
 
 app.get('/api/playbooks/:id/preview', route(async (req, res) => {

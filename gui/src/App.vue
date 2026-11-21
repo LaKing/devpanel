@@ -92,6 +92,7 @@ watch(isAuthenticated, (ok) => { if (ok) loadIdentity() }, { immediate: true })
         />
         <v-list-item to="/supervisor" title="Supervisor" prepend-icon="$play" rounded="md" color="primary" />
         <v-list-item to="/models" title="Model availability" prepend-icon="$availability" rounded="md" color="primary" />
+        <v-list-item to="/playbooks" title="Playbooks" prepend-icon="$playbooks" rounded="md" color="primary" />
       </v-list>
 
       <div class="nav-heading">
