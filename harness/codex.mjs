@@ -213,6 +213,27 @@ export function codexErrors (stdout) {
   return found.slice(-5).join('\n').slice(-2000)
 }
 
+/*
+ * Settings the runtime said it ignored: `Codex is ignoring N unrecognized configuration setting(s) ... session-flags:
+ * `key` is ignored.` arrives as an error item on the event stream of a turn that otherwise succeeds.
+ * Decision: a setting that carries the fence (the sandbox mode, its writable roots, the approval policy) is not
+ * allowed to vanish silently with a runtime upgrade: a turn that ran without it fails as an environment fault, in the
+ * runtime's own words, and nothing of its answer is used. Any other ignored key is reported on the turn's diagnostics.
+ */
+const FENCE_SETTING = /^(sandbox_mode|approval_policy|sandbox_workspace_write(\.|$))/
+export function ignoredSettings (stdout) {
+  const keys = new Set()
+  for (const line of String(stdout ?? '').split('\n')) {
+    if (!line.includes('unrecognized configuration setting')) continue
+    let event
+    try { event = JSON.parse(line) } catch { continue }
+    const message = String(event?.item?.message ?? event?.message ?? '')
+    if (!/ignoring \d+ unrecognized configuration setting/i.test(message)) continue
+    for (const match of message.matchAll(/`([^`]+)` is ignored/g)) keys.add(match[1])
+  }
+  return [...keys]
+}
+
 /**
  * One turn. An error raised after the runtime ran carries its descendant scan
  * (shared.mjs withReap), so the engine never retries on unproved cleanup.
@@ -328,9 +349,13 @@ async function invokeOnce ({
   // by both fresh and resumed invocations and preserves the same write fence.
   if (enforcement) args.push('-c', 'sandbox_mode="workspace-write"')
   if (readOnlySource) {
-    // workspace-write implicitly includes cwd. Make that root scratch, including
-    // resumed sessions, and remove any extra writable roots from user config.
-    args.push('-c', `cwd=${JSON.stringify(scratchDir)}`, '-c', 'approval_policy="never"',
+    // workspace-write implicitly includes the working root, so that root must be scratch: it is the PROCESS's working
+    // directory, set below (and by the fence's --chdir), on fresh and resumed turns alike. Remove any extra writable
+    // roots from user config.
+    // Pitfall: there is no setting to say it with. `exec resume` takes no --cd, and a `cwd` config key, passed here
+    // until Codex 0.171 began to answer "session-flags: `cwd` is ignored" on every turn, never decided anything: the
+    // runtime's own session record (rollout `turn_context.cwd`) shows the process directory either way.
+    args.push('-c', 'approval_policy="never"',
       '-c', 'sandbox_workspace_write.writable_roots=[]', '-c', 'sandbox_workspace_write.exclude_slash_tmp=true')
     enforcement.writes = 'scratch-only'
     enforcement.source = 'read-only'
@@ -390,6 +415,14 @@ async function invokeOnce ({
     // The runtime's error events from the JSON stream beside the TAIL of stderr
     // (the error is its last words, not its first); never the model's text.
     throw runtimeError(`codex exited ${run.code}`, { code: run.code, stderr: run.stderr.trim().slice(-2000), stdout: codexErrors(run.stdout), invocationId })
+  }
+
+  const ignored = ignoredSettings(run.stdout)
+  const unfenced = ignored.filter((key) => FENCE_SETTING.test(key))
+  if (unfenced.length) {
+    await record(ledgerDir, { invocationId, marker, phase: 'failed', error: 'fence-setting-ignored', at: new Date().toISOString() })
+    throw new ProcessError(`codex ignored the fence setting${unfenced.length === 1 ? '' : 's'} ${unfenced.join(', ')}: this turn ran without ${unfenced.length === 1 ? 'it' : 'them'} and its answer is not used. The installed Codex no longer knows the key; the adapter must say it another way.`,
+      { kind: 'environment-error', invocationId, stderr: `unrecognized configuration setting: ${unfenced.join(', ')}` })
   }
 
   // Session id and usage come from the observer, which saw every line; the
@@ -456,6 +489,7 @@ async function invokeOnce ({
     usage,
     outcome: 'completed',
     diagnostics: { durationMs: run.durationMs, reap: run.leftovers?.scan ?? null, events: parsed.events.length, tooling: enforcement, hygiene: Boolean(hygiene),
+      ...(ignored.length ? { ignoredSettings: ignored } : {}),
       fence: fence ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null } : null,
       ...(readOnlyTools ? { access: readSeat ? 'read' : 'none (fence not proved)' } : {}) }
   }

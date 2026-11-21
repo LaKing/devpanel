@@ -197,6 +197,18 @@ supervisor, model oracle, performance probe) always pass `hygiene: true`.
 - **Codex workers:** `--ignore-user-config --ignore-rules` and the stated
   `WORKER_SETTINGS` (approval never, no MCP servers, apps, plugins, memories,
   browser or computer use); sandbox mode and network per turn as before.
+  A seat whose source is read-only writes into its scratch directory alone: the
+  sandbox is `workspace-write` with no extra writable roots, and its root is the
+  process's working directory, which the adapter sets to scratch on fresh and
+  resumed turns (`exec resume` takes no `--cd`; a `cwd` config key decides
+  nothing and Codex 0.171 reports it as ignored; the runtime's own record,
+  rollout `turn_context.cwd`, shows the process directory). A setting the
+  runtime says it ignored (`... unrecognized configuration setting ...
+  session-flags: `key` is ignored`, an error item on a turn that otherwise
+  succeeds) is read from the event stream (`ignoredSettings`): a fence setting
+  (`sandbox_mode`, `approval_policy`, `sandbox_workspace_write.*`) fails the
+  turn as an environment fault, any other is on the turn's
+  `diagnostics.ignoredSettings`.
 - **Gemini:** the allow-listed environment; its admin policy already states
   everything else.
 - **Project tooling** (`workspace.tooling.mounts` / `commands` in

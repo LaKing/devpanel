@@ -175,7 +175,7 @@ export default async function (t) {
       t.eq(`${shape}/${resumed}: source policy reported`, turn.diagnostics.tooling.source, 'read-only')
       if (shape === 'codex') {
         t.eq('process working root is scratch', call.cwd, scratchDir)
-        t.ok('sandbox cwd explicitly pinned', call.argv.includes(`cwd=${JSON.stringify(scratchDir)}`))
+        t.ok('no cwd setting is passed: the installed Codex ignores the key, the process directory is the root', !call.argv.some((arg) => String(arg).startsWith('cwd=')))
         t.ok('no additional writable roots', call.argv.includes('sandbox_workspace_write.writable_roots=[]'))
         t.ok('cannot request write escalation', call.argv.includes('approval_policy="never"'))
         t.ok('general temp writes disabled', call.argv.includes('sandbox_workspace_write.exclude_slash_tmp=true'))
@@ -188,6 +188,24 @@ export default async function (t) {
         t.ok('source edits denied through file tools', settings.permissions.deny.includes(`Edit(/${cwd}/**)`))
       }
     }
+  }
+
+  t.section('codex: a setting the runtime says it ignored is seen, and a fence setting stops the turn')
+  {
+    const codex = await import('../../harness/codex.mjs')
+    const run = async (mode) => {
+      const record = path.join(await temp(), 'calls')
+      process.env.DEVPANEL_CODEX_BIN = await shim({ shape: 'codex', record, mode })
+      const cwd = await temp()
+      const scratchDir = await temp()
+      try { return { turn: await codex.invoke({ model: 'm', cwd, scratchDir, tooling: { writesCode: false, worktree: cwd, allowedRoots: [scratchDir], allowLiveCheckout: true }, prompt: 'Review.' }) } } catch (error) { return { error } }
+    }
+    const harmless = await run('setting-ignored')
+    t.eq('an ignored key that carries no fence is reported on the turn, which stands', [harmless.turn?.outcome, harmless.turn?.diagnostics.ignoredSettings], ['completed', ['cwd']])
+    const unfenced = await run('fence-setting-ignored')
+    t.ok('an ignored fence setting fails the turn in the runtime\'s words', /ignored the fence setting sandbox_mode/.test(unfenced.error?.message ?? ''), unfenced.error?.message ?? JSON.stringify(unfenced.turn?.diagnostics))
+    t.eq('as an environment fault: no retry will fix it', classifyFailure(unfenced.error).class, 'environment')
+    t.eq('a clean turn reports none', (await run('ok')).turn?.diagnostics.ignoredSettings, undefined)
   }
 
   t.section('symlink spellings are denied; only canonical paths reach bubblewrap')

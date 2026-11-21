@@ -21,6 +21,8 @@
  *   resume-inherits (codex) a runtime that honours the override on a fresh turn but keeps
  *                  the session's earlier effort on resume
  *   model-substituted (codex) a runtime that served the turn with another model
+ *   setting-ignored (codex) a runtime that answers, after saying it ignored a `cwd` config key it no longer knows
+ *   fence-setting-ignored (codex) the same for `sandbox_mode`: a turn that ran without its write fence
  *   oauth-expired  (claude) a turn whose login was rejected: unless
  *                  the login's .credentials.json ($CLAUDE_CONFIG_DIR, else
  *                  ~/.claude, as the real CLI) says `fresh`, it fails
@@ -376,6 +378,11 @@ if (mode === 'sandbox-error' || mode === 'sandbox-error-array') {
     // JSONL events, session id announced up front, last message to a file.
     codexRollout()
     process.stdout.write(JSON.stringify({ type: 'session.created', session_id: sessionId }) + NL)
+    // Verbatim from codex-cli 0.171.0, which sends it twice on a turn that otherwise succeeds.
+    if (mode === 'setting-ignored' || mode === 'fence-setting-ignored') {
+      const key = mode === 'setting-ignored' ? 'cwd' : 'sandbox_mode'
+      for (const id of ['item_0', 'item_1']) process.stdout.write(JSON.stringify({ type: 'item.completed', item: { id, type: 'error', message: `Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: \`${key}\` is ignored.` } }) + NL)
+    }
     process.stdout.write(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }) + NL)
     process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: codexUsage() }) + NL)
     const out = flag('-o') ?? flag('--output-last-message')
