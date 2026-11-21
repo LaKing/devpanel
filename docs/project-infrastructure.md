@@ -1083,6 +1083,10 @@ deployments:
   (`POST /api/projects/:project/issues/:id/grants {environment, reason,
   expiresAt, seats?}`, the issue page's grant form; `…/grants/:grantId/revoke`),
   checked on every call as it stands then. The top-level supervisor cannot grant.
+- A **collection name** is letters, digits and `_ . - # @`, never one that begins
+  with `system.`: an application's sidecar collections (`orders#versions`,
+  `orders#versions@<id>`) are read by their own names. A grant that lists
+  `collections` admits a sidecar only when it lists that name.
 - The driver is the optional dependency `mongodb` of `gui/`; without it a query
   answers `UNAVAILABLE`.
 - The declaration is part of the run's snapshot: a run started before it was

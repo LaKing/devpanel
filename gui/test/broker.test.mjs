@@ -26,7 +26,14 @@ export default async function (t) {
     const only = (db, coll) => db === 'app' && (coll === null || ['users', 'orders'].includes(coll))
     t.ok('a find with operators passes', !refused(() => validateQuery({ op: 'find', database: 'app', collection: 'users', filter: { age: { $gte: 18 }, $or: [{ a: 1 }, { b: { $in: [1, 2] } }] }, projection: { name: 1 }, sort: { age: -1 }, limit: 5 }, all)))
     t.ok('an aggregate with $lookup into a granted collection passes', !refused(() => validateQuery({ op: 'aggregate', database: 'app', collection: 'users', pipeline: [{ $match: { a: 1 } }, { $lookup: { from: 'orders', localField: '_id', foreignField: 'user', as: 'o' } }, { $group: { _id: '$x', n: { $sum: 1 } } }] }, only)))
+    const sidecars = (db, coll) => db === 'app' && (coll === null || ['users', 'users#versions', 'users#versions@0364487a-0000-4000-8000-000000000001'].includes(coll))
+    t.ok('a sidecar collection (name#versions) is a plain name', !refused(() => validateQuery({ op: 'count', database: 'app', collection: 'users#versions', filter: { doc: 'x' } }, sidecars)))
+    t.ok('so is a per-document one (name#versions@<id>), and as a $lookup source', !refused(() => validateQuery({ op: 'aggregate', database: 'app', collection: 'users', pipeline: [{ $lookup: { from: 'users#versions@0364487a-0000-4000-8000-000000000001', localField: '_id', foreignField: 'doc', as: 'v' } }, { $unionWith: 'users#versions' }] }, sidecars)))
     for (const [label, q] of [
+      ['a sidecar of a granted collection that the grant does not list', { op: 'find', database: 'app', collection: 'orders#versions' }],
+      ['a collection name holding $', { op: 'find', database: 'app', collection: 'users$cmd' }],
+      ['a collection name holding a space', { op: 'find', database: 'app', collection: 'users versions' }],
+      ['a system collection behind a sidecar suffix', { op: 'find', database: 'app', collection: 'system.users#versions' }],
       ['$where in a filter', { op: 'find', database: 'app', collection: 'users', filter: { $where: 'sleep(1)' } }],
       ['$function in $expr', { op: 'find', database: 'app', collection: 'users', filter: { $expr: { $function: { body: 'x', args: [], lang: 'js' } } } }],
       ['$accumulator in $group', { op: 'aggregate', database: 'app', collection: 'users', pipeline: [{ $group: { _id: 1, x: { $accumulator: {} } } }] }],

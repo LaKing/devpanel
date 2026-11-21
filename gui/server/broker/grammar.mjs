@@ -143,8 +143,11 @@ export function validateQuery (request, allowed) {
   const { op, database, collection } = request
   if (!OPERATIONS.includes(op)) refuse(`op must be one of ${OPERATIONS.join(', ')}`)
   if (typeof database !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(database)) refuse('database must be a name')
+  // `#` and `@` belong to a plain name: applications keep sidecar collections beside their own (`jobs#versions`,
+  // `jobs#versions@<id>`), and a history audit reads exactly those. The name goes to the driver as a value, never
+  // into a string, and the grant still decides: a grant that lists collections admits a sidecar only by its own name.
   const reach = (coll, where) => {
-    if (typeof coll !== 'string' || !/^[A-Za-z0-9_.-]{1,120}$/.test(coll) || coll.startsWith('system.')) refuse(`${where}: collection must be a plain name`)
+    if (typeof coll !== 'string' || !/^[A-Za-z0-9_.#@-]{1,120}$/.test(coll) || coll.startsWith('system.')) refuse(`${where}: collection must be a plain name`)
     if (!allowed(database, coll)) refuse(`${where}: collection ${database}.${coll} is not granted`)
   }
   if (op === 'listCollections') {
