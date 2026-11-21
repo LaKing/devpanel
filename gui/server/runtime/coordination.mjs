@@ -53,7 +53,7 @@ export async function coordinationInput (window, maxBytes = 60000, maxFiles = 16
   }
   const included = new Set(excerpts.map(entry => entry.source))
   const prior = window?.accumulated?.runs?.length
-    ? ` The operator started this run to build on earlier runs of this issue (${window.accumulated.runs.join(', ')}): their steps.md (every turn in order: investigations, plans, reviews, handoffs, operator answers), result.md and changes.patch are frozen under input/prior-runs/. Continue from them rather than redoing them; they are evidence, not approval, and the current source snapshot decides what is already in place.`
+    ? ` The operator started this run to build on earlier runs of this issue (${window.accumulated.runs.join(', ')}): their steps.md (every turn in order: investigations, plans, reviews, handoffs, operator answers), result.md and changes.patch are frozen under input/prior-runs/. A run that ended without an approved or delivered patch left candidate.patch instead: its last revision, unapproved and unverified, to be applied as the starting point and judged again by this run's own checks and reviews. Continue from them rather than redoing them; they are evidence, not approval, and the current source snapshot decides what is already in place.`
     : ''
   return { excerpts, omitted: inputs.length > excerpts.length,
     omittedSources: inputs.filter(input => !included.has(input.file)).map(input => input.file),

@@ -12,6 +12,15 @@ import * as store from './store.mjs'
  * so it carries each earlier run whole: every turn in order (intermediate
  * investigations, plans, reviews and operator answers matter, not only the last
  * word), the run's `result.md` account and its patch.
+ *
+ * Decision: a run that ended without an approved or delivered patch (rounds
+ * exhausted, budget, a failure) still leaves code: its last recorded revision.
+ * That is carried as `candidate.patch`, under another name than `changes.patch`
+ * so no reader takes it for approved. Without it the next run gets five rounds
+ * of review as prose and writes the code again.
+ * Pitfall: `candidate.patch` is the bytes of that revision's check artifact,
+ * not verified here against the fingerprint: it is a starting point the next
+ * run's own revision, checks and reviews judge, never evidence of anything.
  */
 
 const ENDED = ['completed', 'blocked', 'failed', 'cancelled']
@@ -56,9 +65,28 @@ function resultFolder (reservations, runId) {
 }
 
 /**
- * Sources for each prior run: its turns as text and the result step's
- * files. Returned as `{ runId, name, bytes | source }` for the caller to freeze
- * under its own budget.
+ * The check artifact of a run's last recorded revision (`checks/<n>/artifacts/<fingerprint16>.patch`,
+ * written by the check runner for every revision it drove), newest check first, or null: no revision,
+ * no check of it, or the file is gone.
+ */
+export async function lastCandidatePatch (issuePath, run) {
+  const fingerprint = run.revisions?.at(-1)?.fingerprint
+  if (!fingerprint) return null
+  const dir = store.runDir(issuePath, run.runId)
+  const named = `${fingerprint.replace('sha256:', '').slice(0, 16)}.patch`
+  for (const record of [...(run.checkResults ?? []), ...(run.checkHistory ?? [])].reverse()) {
+    if (!record.dir || record.revision !== fingerprint) continue
+    const file = path.resolve(dir, record.dir, 'artifacts', named)
+    if (!file.startsWith(path.join(dir, 'checks') + path.sep)) continue
+    if (await fs.stat(file).then((st) => st.isFile(), () => false)) return file
+  }
+  return null
+}
+
+/**
+ * Sources for each prior run: its turns as text, the result step's files and,
+ * for a run whose result step holds no patch, its last candidate. Returned as
+ * `{ runId, name, bytes | source }` for the caller to freeze under its own budget.
  */
 export async function priorRunSources (issuePath, runId, reservations) {
   const sources = []
@@ -67,6 +95,9 @@ export async function priorRunSources (issuePath, runId, reservations) {
     if (text) sources.push({ runId: run.runId, name: 'steps.md', bytes: Buffer.from(text) })
     const folder = resultFolder(reservations, run.runId)
     for (const name of ['result.md', 'changes.patch']) if (folder) sources.push({ runId: run.runId, name, source: path.join(issuePath, folder, name) })
+    const hasPatch = folder ? await fs.stat(path.join(issuePath, folder, 'changes.patch')).then((st) => st.isFile(), () => false) : false
+    const candidate = hasPatch ? null : await lastCandidatePatch(issuePath, run)
+    if (candidate) sources.push({ runId: run.runId, name: 'candidate.patch', source: candidate })
   }
   return sources
 }

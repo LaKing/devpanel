@@ -1868,7 +1868,13 @@ the issue, oldest first, the window then also freezes
 `input/prior-runs/<runId>/`: `steps.md` (every turn in order — investigations,
 plans, reviews, handoffs, operator answers — headed with seat, phase, round,
 revision and contract, invalid outputs included), and the result step's
-`result.md` and `changes.patch` (`runtime/prior-runs.mjs`). These come after the
+`result.md` and `changes.patch` (`runtime/prior-runs.mjs`). A run whose result
+step holds no patch (it ended without an approved or delivered revision: rounds
+exhausted, a budget, a failure) leaves `candidate.patch` instead: the check
+artifact of its last recorded revision, when a check drove that revision. It is
+unapproved and not verified against the fingerprint here; the name says so, and
+the coordinator is told to have it applied as the starting point, for this
+run's own revision, checks and reviews to judge. These come after the
 human input under the same input budget, are recorded on `window.accumulated`,
 and the coordinator is told they are evidence to continue from, not approval.
 The tool-free coordinator sees them as bounded excerpts beside the report and

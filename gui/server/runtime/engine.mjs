@@ -876,7 +876,7 @@ export function windowSummary (window) {
   return {id:window.id,manifest:window.manifest,source:window.source,coverage:window.coverage,
     capturedAt:window.capturedAt,inputCount:window.inputs?.length??0,issueCount:window.issues?.length??0,
     inputBudget:window.inputBudget,logCount:window.files?.length??0,
-    ...(window.accumulated?.runs?.length?{priorRuns:window.accumulated.runs,priorRunInputs:'input/prior-runs/<runId>/ (steps.md, result.md, changes.patch): earlier runs of this issue, given to build on'}:{}),
+    ...(window.accumulated?.runs?.length?{priorRuns:window.accumulated.runs,priorRunInputs:'input/prior-runs/<runId>/ (steps.md, result.md, changes.patch, or candidate.patch where a run ended without an approved patch: its last revision, unapproved, a starting point to apply): earlier runs of this issue, given to build on'}:{}),
     // The issue's triage sizing, frozen at capture (issue.json `sizing`): every later run reads it.
     ...(window.sizing?{sizing:sizingSummary(window.sizing),affectedModules:window.sizing.affectedModules??[]}:{}),
     // The full verification evidence of a red issue or an inquiry's related one (cycle-evidence.mjs), read-only.
