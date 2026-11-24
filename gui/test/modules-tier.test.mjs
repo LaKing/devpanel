@@ -205,7 +205,7 @@ export default async function (t) {
       t.ok('every command is required', modulesErrors(target(declared({ load: { id: 'load', run: 'x', required: false } }))).some((e) => /required/.test(e)))
       t.ok('not with tiers', modulesErrors(target(declared(), { tiers: { smoke: ['x'] } })).some((e) => /tiers/.test(e)))
       t.ok('not with a baseline', modulesErrors(target(declared(), { compareBaseline: true })).some((e) => /no base drive/.test(e)))
-      t.ok('not with timing: approved', modulesErrors(target(declared(), { timing: 'approved' })).some((e) => /every revision/.test(e)))
+      t.eq('timing: approved is accepted; one disagreeing with modules.timing is refused', [modulesErrors(target(declared(), { timing: 'approved' })), modulesErrors(target(declared({ timing: 'every-revision' }), { timing: 'approved' })).some((e) => /disagree/.test(e))], [[], true])
       const { report, ...unreported } = declared().test
       t.ok('a declaration must collect a selftest report', modulesErrors(target(declared({ test: unreported }))).some((e) => /no command declares report: selftest/.test(e)))
       t.eq('a finalizer may collect it instead', modulesErrors(target(declared({ test: unreported, finallyCommands: [{ id: 'collect', run: 'x', report: 'selftest' }] }))), [])

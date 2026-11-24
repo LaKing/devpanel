@@ -642,6 +642,13 @@
               },
               "description": "Top-level directory names that are collections (`*` matches any run of characters, e.g. `@*`, `*-modules`). A module is `<collection>/<module>/`; every other path is core."
             },
+            "timing": {
+              "enum": [
+                "every-revision",
+                "approved"
+              ],
+              "description": "When the tier drives. every-revision (default, also when absent): each recorded revision, beside its reviews. approved: decided on the findings the round's reviews hold when the engine decides whether to launch it, only when every occupied reviewer approved or every substantial finding is marked awaitsCheck; a round whose reviews hold a finding of their own is not driven and the author's next turn begins at once, a drive for an all-awaitsCheck round approves nothing (the re-review may still reject the revision), and a failure of the drive returns the author. Only a final round with mixed findings (an ordinary blocker and at least one awaitsCheck finding) records driveNotRun.reason rejected-round; a final round with only ordinary blockers starts no drive and records no driveNotRun. Module locks are still taken with each revision before review. Refuses strategies whose shape cannot serve it (R0-R7, execution-contract.md \"The modules tier\"). On a playbook target it may stand here or as the target's timing, never as two different values."
+            },
             "rootFilter": {
               "type": "string",
               "pattern": "^[A-Za-z0-9_@%+=:,./-]+$",

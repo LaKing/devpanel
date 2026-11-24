@@ -231,7 +231,8 @@ tier below, and no `timing: approved` full drive runs there.
 
 On every project with `infrastructure` (a Boilerplate project) the check of every
 playbook that records revisions is the **modules tier** (`testDrive.modules`), run on each
-recorded revision beside its reviews. One drive does, in this order:
+recorded revision beside its reviews, or with `timing: approved` only when the round's
+reviews all approve or every substantial finding awaits the drive ("When the tier drives" below). One drive does, in this order:
 
 1. **lint**: the project's lint command over the revision's changed `.mjs`/`.vue` files
    (added or modified against the base), each passed as one quoted argument; left out,
@@ -254,6 +255,7 @@ recorded revision beside its reviews. One drive does, in this order:
 testDrive:
   modules:
     collections: ['@*', '*-modules']   # top-level directories that are collections
+    timing: approved                   # optional: drive when every reviewer approved or every substantial finding awaits the drive; default every-revision
     rootFilter: core                   # the filter a repository-root change gets; default '.'
     lint:    { id: lint, run: 'node_modules/.bin/eslint --no-warn-ignored {{files}}' }
     load:    { id: load, run: '<projectRoot>/quick-deploy.sh --from "$PWD"' }
@@ -263,6 +265,26 @@ testDrive:
     browser: { id: module-browser, run: '... {{filter}}' }   # optional
     finallyCommands: [ ... ]
 ```
+
+**When the tier drives.** `timing` in `testDrive.modules` says what a review round waits
+for. `every-revision` (the default, also when the key is absent) drives each recorded
+revision while its reviews run; a round is decided once both are recorded, so a
+round whose reviewers reject the revision still waits for its drive. `approved` decides
+the drive on the findings the reviews hold when the engine decides whether to launch it:
+only when every occupied reviewer approved, or every substantial finding is marked
+`awaitsCheck`. A round whose reviews hold a substantial finding of their own waits for
+nothing and the author's next turn begins at once. A drive started for an
+all-`awaitsCheck` round approves nothing: the re-review with its result may still reject
+the revision. In the last allowed round, only a final round with mixed findings (an ordinary blocker and at least one finding that awaits the drive) records `driveNotRun.reason: rejected-round`; a final round with only ordinary blockers starts no drive and records no `driveNotRun`. The approved revision's drive gates the round (a failure returns the
+author) and is what closure reads. Module locks are still taken with each revision
+before its review. That holds on the undisturbed path: a recovered run (an integrity
+quarantine restored, a restart) drives its restored candidate as before, so a rejected
+revision may be driven once more; that drive approves nothing, and a recorded blocker or
+a failed drive is never discarded. It needs a strategy the gate can serve, which every bundled coding
+playbook is (rules R0–R7, docs/execution-contract.md "Modules timing approved");
+`npm run config:check -- --project <id>` prints `modules timing=<value>` for each
+playbook the tier checks, and preview, readiness and the start dialog show it
+(`modulesTiming`).
 
 **One command for all filters.** A `test` (or `browser`) template that holds
 `{{filters}}` in place of `{{filter}}` runs once per drive (id `<id>-1`) and receives

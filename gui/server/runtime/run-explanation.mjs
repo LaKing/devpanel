@@ -39,6 +39,8 @@ function driveWords (run) {
   const smoke = entries.filter((h) => h.tier === 'smoke' || h.tier === 'targeted').at(-1)
   const smokeFailed = (smoke?.gating ?? smoke?.result) === 'failed'
   const earlier = smoke?.tier === 'targeted' ? 'targeted tier' : 'smoke'
+  // The modules tier waits for approval, and the last round rejected the revision for findings of its own.
+  if (run.driveNotRun?.reason === 'rejected-round') return ' The modules drive did not run on the last revision: its modules tier runs only on an approved revision (timing: approved), and the last round rejected it for findings of its own.'
   if (run.driveNotRun || full?.result === 'not-run') {
     if (run.workspace?.isolation === 'in-place') return ' No drive could run on the last revision: in-place work has no base plus patch to rebuild.'
     return run.driveNotRun?.reason === 'no-drive-configured' ? ' No drive could run on the last revision: this run has none configured.' : ' No drive could run on the last revision.'

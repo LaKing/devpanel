@@ -289,6 +289,7 @@ export function summarisePreview (preview) {
     phases: (preview.phases ?? []).map((p) => ({ id: p.id, kind: p.kind, maxRounds: p.loop?.maxRounds ?? null, steps: p.steps.map((s) => `${s.role}:${s.id}`) })),
     workspace: preview.workspace ?? null,
     checks: preview.checks ? { ...preview.checks, target: compactTarget(preview.checks.target) } : null,
+    modulesTiming: preview.modulesTiming ?? null,
     infrastructure: preview.infrastructure ? { ...preview.infrastructure, ...(preview.infrastructure.testDrive ? { testDrive: compactTarget(preview.infrastructure.testDrive) } : {}) } : null,
     autoClose: preview.autoClose ?? null,
     delivery: preview.delivery ?? null,

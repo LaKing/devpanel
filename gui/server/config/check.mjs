@@ -2,6 +2,7 @@
 import fs from 'node:fs/promises'
 import { discoveryCollisions, listProjectDirs, projectsRoot, resolveProjectPath } from '../project-path.mjs'
 import { probeProjectSandbox } from '../runtime/sandbox-probe.mjs'
+import { modulesTiming } from '../runtime/modules-tier.mjs'
 /*
  * Resolve configuration offline; explicit --preflight runs local diagnostics.
  *
@@ -115,6 +116,8 @@ for (const id of ids) {
   const p = r.resolved
   const live = p.liveExecution.eligible ? `${c.green}live-eligible${c.off}` : `${c.yellow}preview only${c.off}`
   console.log(`${c.green}✓${c.off} ${c.cyan}${id}${c.off} v${p.playbook.version}  ${c.dim}→ ${p.strategy.id} v${p.strategy.version}${c.off}  ${live}`)
+  // Which timing the modules tier has, for every playbook it is the check target of.
+  if (modulesTiming(p.checks.target)) console.log(`    ${c.dim}modules${c.off}    timing=${modulesTiming(p.checks.target)}`)
   // Not a failure: the configuration is valid without the tool, but every seat
   // turn of the project is refused until the source exists.
   for (const m of p.workspace.tooling.mounts ?? []) {

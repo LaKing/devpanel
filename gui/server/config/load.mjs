@@ -9,6 +9,7 @@ import { runOptionErrors, applyRunOptions, canonicalOptions } from './run-option
 import { releasePlan, RELEASE_ENVIRONMENTS } from './release-plan.mjs'
 import { infrastructureErrors, localChecksErrors, localTarget, modulesErrors, modulesTarget, stagingTarget, tierErrors } from '../infrastructure.mjs'
 import { tierTarget } from '../runtime/baseline-cache.mjs'
+import { approvedModulesShapeErrors } from '../runtime/modules-tier.mjs'
 import { forbiddenRoots, homeExemption, PANEL_ROOT } from '../runtime/selection.mjs'
 import { targetErrors, resolveMounts } from '../runtime/tooling-mounts.mjs'
 import { resolveProjectPath } from '../project-path.mjs'
@@ -741,7 +742,8 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
       : project?.checks && steps.some(({ step }) => step.recordsRevision)
         // A project's own local checks (no SSH staging) replace an absent playbook target the same way.
         ? { requirement: REQUIREMENT_RANK[playbookReq] > REQUIREMENT_RANK[project.checks.requirement ?? 'required'] ? playbookReq : (project.checks.requirement ?? 'required'), target: localTarget(project.checks), boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) }
-      : { requirement: playbookReq, target: playbook.checks?.target ?? null, boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) },
+      // A modules tier whose timing is declared in `modules` carries it on the target too, where the engine reads it.
+      : { requirement: playbookReq, target: playbook.checks?.target?.modules?.timing ? { ...playbook.checks.target, timing: playbook.checks.target.modules.timing } : (playbook.checks?.target ?? null), boundToRevision: true, ...(playbook.checks?.concurrent !== undefined ? { concurrent: playbook.checks.concurrent } : {}) },
     autoClose,
     budgets,
     completion,
@@ -760,6 +762,17 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     const errors = []
     err(errors, 'in-place work cannot satisfy required checks: checks rebuild the candidate from base plus patch, and in-place work has neither. Use an isolated worktree, or a playbook whose checks are optional.', playbook.file, resolved.workspace.isolationSource === 'run' ? '/isolation' : '/workspace/isolation')
     return { ok: false, errors }
+  }
+
+  // A modules tier that waits for approval reads the round's verdict: refuse a strategy
+  // whose shape the gate cannot serve (R0–R7), before anything is spent.
+  {
+    const shape = approvedModulesShapeErrors(resolved)
+    if (shape.length) {
+      const errors = []
+      for (const message of shape) err(errors, message, playbook.file, '/checks')
+      return { ok: false, errors }
+    }
   }
 
   // The seat fence (fence.namespace: 1) mounts nothing live: an isolated run

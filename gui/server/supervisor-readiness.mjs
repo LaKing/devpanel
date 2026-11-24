@@ -1,5 +1,6 @@
 import { inspectSourceRepository } from './runtime/source-repository.mjs'
 import { locksModules } from './runtime/module-locks.mjs'
+import { modulesTiming } from './runtime/modules-tier.mjs'
 
 /*
  * Could a run start here, and if not, what exactly is in the way?
@@ -123,7 +124,7 @@ export async function launchReadiness ({
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
     ...(Array.isArray(syncs) ? (syncs.length ? { stagingSyncs: syncs } : {}) : syncs ? { stagingSyncs: syncs } : {}),
-    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. stagingSyncs, when present, is information too: dependency syncs standing on a staging host now, each naming the run that installed them, the manifests the stage deviates by, its state and whether a live process answers for it (held: its drive reverts it as it ends). configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
+    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. stagingSyncs, when present, is information too: dependency syncs standing on a staging host now, each naming the run that installed them, the manifests the stage deviates by, its state and whether a live process answers for it (held: its drive reverts it as it ends). configuration.modulesTiming, when present, says when the playbook\'s modules tier drives: every-revision (each revision, beside its reviews) or approved (only a revision its round approved, or whose every substantial finding awaits the check). configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
 }
@@ -149,6 +150,9 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
   // What its modules tier would test (modules-coverage.mjs): information only, never a prerequisite.
   const coverage = modulesCoverage ? await Promise.resolve().then(() => modulesCoverage(resolved.checks?.target)).catch((error) => ({ state: 'unavailable', detail: error.message })) : null
   if (coverage) identity.modulesCoverage = coverage
+  // When its modules tier drives: every-revision (beside the reviews) or approved (after the round approves).
+  const timing = modulesTiming(resolved.checks?.target)
+  if (timing) identity.modulesTiming = timing
 
   // A base policy over a checkout git cannot read is not a question with an
   // answer; saying "unevaluated" is honest, inventing a verdict is not.

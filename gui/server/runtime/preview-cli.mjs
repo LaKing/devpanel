@@ -111,7 +111,8 @@ if (p.checks.target?.tiers) {
     if (continuing.outOfPosition.length) console.log(`  ${c.dim}order${c.off}      out of declared position: ${continuing.outOfPosition.map((o) => `${o.id} (declared before ${o.declaredBefore.join(', ')})`).join('; ')}`)
     if (continuing.declaredBeforeServices.length) console.log(`  ${c.yellow}warning${c.off}    ${continuing.declaredBeforeServices.join(', ')} will run after the service started: if the service depends on it at boot, or it needs the service down, set tiers.continueSmoke: false or declare it later`)
   }
-} else if (p.checks.target) console.log(`  ${c.dim}timing${c.off}     ${p.checks.target.timing ?? 'every-revision'}`)
+} else if (p.modulesTiming) console.log(`  ${c.dim}modules${c.off}    ${p.modulesTiming === 'approved' ? 'only on an approved revision (or one whose every substantial finding awaits its result), timing: approved' : 'every revision, beside the reviews, timing: every-revision'}`)
+else if (p.checks.target) console.log(`  ${c.dim}timing${c.off}     ${p.checks.target.timing ?? 'every-revision'}`)
 if (p.checks.target?.baselineCache) {
   const b = p.checks.target.baselineCache
   console.log(`  ${c.dim}baseline${c.off}   cached across runs (issues/<project>/.baselines), exact key: base commit, target hash, ${b.files?.length ? `files ${b.files.join(' ')}, ` : ''}environment command; keeps ${b.maxEntries ?? 12} entries, ${b.maxAgeDays ?? 14} days`)

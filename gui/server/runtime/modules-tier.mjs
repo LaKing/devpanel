@@ -230,6 +230,59 @@ export const countsForClosure = (c) => ['full', 'modules'].includes(c?.tier ?? '
 /** Whether a check target is the modules tier (declared or not). */
 export const isModulesTarget = (target) => target?.tier === 'modules' || Boolean(target?.modules)
 
+/**
+ * When a modules tier runs (`testDrive.modules.timing`, or a playbook target's own
+ * `timing`): `every-revision` beside the reviews (the default), or `approved`, only on
+ * a revision every occupied reviewer approved or whose every substantial finding
+ * awaits the check. Null for any other target. What the engine and every report read.
+ */
+export const modulesTiming = (target) => isModulesTarget(target) ? (target.modules?.timing ?? target.timing ?? 'every-revision') : null
+
+/**
+ * The strategy shapes a modules tier under `timing: approved` can serve (R0–R7,
+ * execution-contract.md "The modules tier"). The drive waits for the round's
+ * verdict, so that verdict must be one the gate reads: a consensus round with the
+ * revision recorded before every reviewer, no guarded or late reviewer, and an
+ * `until` that needs approval. Refused at resolution, before anything is spent.
+ */
+export function approvedModulesShapeErrors (resolved) {
+  if (modulesTiming(resolved?.checks?.target) !== 'approved') return []
+  const errors = []
+  const occupied = (step) => Boolean(step && resolved.participants?.[step.role])
+  const reviewer = (step) => step?.output === 'reviewResult' && occupied(step)
+  if (resolved.checks.requirement === 'none') errors.push('modules timing: approved needs checks required or optional (R0)')
+  let recorded = false
+  for (const [index, phase] of (resolved.phases ?? []).entries()) {
+    const steps = phase.loop ? phase.loop.steps : [phase.step]
+    const recording = steps.filter((s) => s?.recordsRevision === true)
+    const at = `phase "${phase.id}"`
+    // A step that reviews and records in one turn, in a loop or standalone, would have the engine drive bytes
+    // no reviewer approved: its own verdict is on the bytes before them (R2).
+    for (const s of steps) if (s?.output === 'reviewResult' && s.recordsRevision === true) errors.push(`${at}, step "${s.id}": a reviewer that also records a revision would have its own unreviewed bytes driven (R2)`)
+    if (phase.loop && recording.length) {
+      if (phase.loop.consensus !== true) errors.push(`${at}: a loop that records revisions needs consensus: true under modules timing: approved (R1)`)
+      const lastRecording = Math.max(...recording.map((s) => steps.indexOf(s)))
+      for (const [i, s] of steps.entries()) {
+        if (!reviewer(s)) continue
+        if (s.recordsRevision !== true && i < lastRecording) errors.push(`${at}, step "${s.id}": a reviewer comes before the step that records the revision (R2)`)
+        if (s.when) errors.push(`${at}, step "${s.id}": a reviewer guarded by when cannot decide the drive (R3)`)
+      }
+      for (const s of steps) if (s.output === 'closureConfirmation') errors.push(`${at}, step "${s.id}": a confirmation inside the recording loop would come before the drive (R4)`)
+      const terms = String(phase.loop.until ?? '').split('&&').map((term) => term.trim())
+      if (!terms.includes('review.verdict == approved')) errors.push(`${at}: until must require review.verdict == approved, or a round could pass without the drive (R7)`)
+      recorded = true
+      continue
+    }
+    if (recorded) for (const s of steps) if (reviewer(s)) errors.push(`${at}, step "${s.id}": a reviewer outside the loop that records the revision decides no drive (R5)`)
+    if (!phase.loop && recording.length) {
+      const later = (resolved.phases ?? []).slice(index + 1).flatMap((p) => p.loop ? p.loop.steps : [p.step])
+      if (later.some(reviewer)) errors.push(`${at}: a standalone step records the revision and a reviewer follows it outside its loop (R6)`)
+      recorded = true
+    }
+  }
+  return errors.map((e) => `${e}. Declare modules timing: every-revision, or use a strategy that conforms.`)
+}
+
 /** A report's failed tests, each with the module the tester states beside it, if any. */
 function failedOf (command, report) {
   const { state, modules } = selftestStates(report)
@@ -268,8 +321,12 @@ export async function modulesSelftestFailures ({ runDir, target, check }) {
   // collectors, proved no test (the declaration requires a collector, modulesErrors).
   // A declared tier whose drive held no test command tested nothing: no module or core directory was
   // affected (modulesDrive, driveFilters). Said apart from a report the tests did not show (testedNothing).
-  if (!read && !unreadable.length && check?.result === 'passed') {
-    const tested = !target.modules?.test || [...(target.commands ?? [])].some((c) => isTestCommand(target, c.id))
+  const tested = !target.modules?.test || [...(target.commands ?? [])].some((c) => isTestCommand(target, c.id))
+  // Under approved timing the one drive of a revision is its closure evidence: a drive that held no test
+  // command tested nothing even when a finalizer read a (necessarily empty) report.
+  if (!tested && check?.result === 'passed' && modulesTiming(target) === 'approved' && (read || unreadable.length)) {
+    unreadable.push({ command: declared.map((c) => c.id).join(', ') || null, error: 'no module or core directory was tested, so no selftest ran', testedNothing: true })
+  } else if (!read && !unreadable.length && check?.result === 'passed') {
     unreadable.push(tested
       ? { command: declared.map((c) => c.id).join(', ') || null, error: 'no selftest report was read' }
       : { command: declared.map((c) => c.id).join(', ') || null, error: 'no module or core directory was tested, so no selftest ran and no report was read', testedNothing: true })

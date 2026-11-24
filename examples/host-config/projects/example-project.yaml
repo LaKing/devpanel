@@ -61,6 +61,14 @@ infrastructure:
     modules:
       # Top-level directories that are collections; <collection>/<module>/ is a module.
       collections: ['@*', '*-modules']
+      # When the tier drives: every-revision (the default) beside the reviews, or approved:
+      # decided when the round's reviews are in, the drive starts if every reviewer approved
+      # or every substantial finding awaits the drive (a re-review with its result may then
+      # still reject the revision); a round whose reviews hold a blocker of their own waits
+      # for no drive and that revision is not driven. A final round
+      # holding an ordinary blocker beside an awaiting finding records driveNotRun
+      # rejected-round; one with ordinary blockers only starts no drive and records none.
+      # timing: approved
       # A change at the repository root runs the framework's own selftests under this filter.
       rootFilter: core
       # The project's linter over the changed files, each passed as one quoted argument.

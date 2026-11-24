@@ -126,7 +126,7 @@
     },
     "driveNotRun": {
       "type": "object",
-      "description": "On a run ended as rounds-exhausted whose last audit held awaitsCheck findings and that cannot have a drive of its last revision (no drive configured, or no result from one beside the reviews). Read by the run's explanation; decides nothing.",
+      "description": "On a run ended as rounds-exhausted whose last audit held awaitsCheck findings and that cannot have a drive of its last revision (no drive configured, or no result from one beside the reviews), or, under modules timing: approved, whose last round held mixed findings, an ordinary blocker beside at least one awaitsCheck finding (rejected-round: that revision gets no drive; a last round with ordinary blockers only also gets none but records no driveNotRun, and an all-awaitsCheck round is driven). Read by the run's explanation; decides nothing.",
       "required": [
         "phase",
         "round",
@@ -151,7 +151,8 @@
         "reason": {
           "enum": [
             "no-drive-configured",
-            "no-result"
+            "no-result",
+            "rejected-round"
           ]
         }
       }

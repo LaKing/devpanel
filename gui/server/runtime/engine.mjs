@@ -32,7 +32,7 @@ import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
-import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, revisionFiles } from './modules-tier.mjs'
+import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, modulesTiming, revisionFiles } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, testedNothing, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
@@ -386,7 +386,15 @@ const concurrentStep = (t) => t?.kind === 'turn' && !t.phase.loop && t.step.conc
  * the revision they approved is checked. A failure then sends the author
  * another round exactly as a failure beside the reviews would.
  */
-const checksAfterApproval = (snapshot) => snapshot.checks?.requirement !== 'none' && (snapshot.checks?.target?.timing === 'approved' || tiered(snapshot))
+const checksAfterApproval = (snapshot) => snapshot.checks?.requirement !== 'none' && (approvalTimed(snapshot.checks?.target) || tiered(snapshot))
+// A target that waits for approval: `timing: approved`, or a modules tier declaring it in `modules`.
+const approvalTimed = (target) => target?.timing === 'approved' || modulesTiming(target) === 'approved'
+/*
+ * The modules tier under `timing: approved` (execution-contract.md "The modules tier"):
+ * a round reads only its own recording's drive (ofRecording in plan), a rejected round's
+ * revision is never driven, and a drive that cannot run is recorded once per recording.
+ */
+const modulesApproved = (snapshot) => snapshot.checks?.requirement !== 'none' && modulesTiming(snapshot.checks?.target) === 'approved'
 /*
  * A target with tiers (`tiers.smoke`): the smoke tier runs on every recorded
  * revision beside the reviews, as an every-revision target does, and the full
@@ -474,6 +482,30 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
   // The answer to a question is the operator step recorded AFTER the step that
   // asked it. An older answer to the same key belongs to an earlier asking.
   const answerAfter = (key, stepNumber) => decisions.find((d) => d.key === key && d.step > stepNumber) ?? null
+  // Modules timing approved: a round's check records are those of its own recording instance.
+  // `s` is the revision-carrying step the round's reviews examined; its instance began at
+  // `from`, the first step of the unbroken run of steps carrying the same fingerprint (a
+  // fingerprint change or a delivery return breaks it). A record counts when its fingerprint
+  // matches and it names a step of that instance, or names none while that instance is the
+  // run's current one (no later step carries a revision). Other targets read every record of
+  // the fingerprint, as before.
+  const byModulesRecording = modulesApproved(snapshot)
+  const latestRecording = steps.findLast((x) => x.revision) ?? null
+  const recordingOf = (t) => {
+    const first = t.reviews[0]?.r.done
+    if (!byModulesRecording || !first || !t.reviewed) return null
+    const s = steps.findLast((x) => x.number < first.number && x.revision)
+    if (!s || s.revision !== t.reviewed) return null
+    let from = s.number
+    for (let i = steps.indexOf(s) - 1; i >= 0; i--) {
+      const x = steps[i]
+      if (x.decision?.deliveryReturn != null) break
+      if (x.revision) { if (x.revision !== s.revision) break; from = x.number }
+    }
+    return { recordedBy: s.number, from, current: latestRecording?.number === s.number }
+  }
+  const ofRecording = (revision, recording) => checkResults.filter((c) => c.revision === revision &&
+    (!recording || (c.step != null ? c.step >= recording.from && c.step <= recording.recordedBy : recording.current)))
 
   const inspect = (phase, step, round, recheck = null, drive = null, diagnosticOf = null) => {
     const turn = (phase, step, round, attempt, repair = false) => turnOf(phase, step, round, attempt, repair, recheck, drive, diagnosticOf)
@@ -662,7 +694,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       // on replay. A failed drive needs none, it fails the round below; a
       // passed one approves nothing by itself, only the new verdicts do.
       {
-        const ofReviewed = t.reviewed ? checkResults.filter((c) => c.revision === t.reviewed) : []
+        const ofReviewed = t.reviewed ? ofRecording(t.reviewed, recordingOf(t)) : []
         const full = ofReviewed.filter(isFull).at(-1)?.result
         // An accepted failure reads as passed (checkEvidence) but the drive failed, so the
         // round was decided without this re-review: replay must not ask for it now, or an
@@ -708,12 +740,15 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       }
       let { review } = t
       const { reviewed, findings, substantial, awaiting } = t
+      const recording = recordingOf(t)
+      // The recording a modules-approved drive is asked for, so the handler records a drive that cannot run for it.
+      const owed = recording ? { recordedBy: recording.recordedBy, from: recording.from } : {}
       // Checks run beside the reviews, so a reviewer may approve before a test
       // has failed. A failed check on the revision this round reviewed is a
       // finding the round cannot pass over: the author gets another round, as
       // when reviewers saw the failure first. (Unavailable is not a failure of
       // the candidate; closure's requirement decides that one.)
-      const ofReviewed = reviewed ? checkResults.filter((c) => c.revision === reviewed) : []
+      const ofReviewed = reviewed ? ofRecording(reviewed, recording) : []
       const verdictOfChecks = ofReviewed.at(-1)?.result
       // `timing: approved` targets run only on a revision every reviewer
       // approved: the round is not decided until its check has a result. With
@@ -724,7 +759,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       // (checkHistory) answers on replay.
       const awaitsCheck = substantial > 0 && awaiting === substantial
       if ((review?.verdict === 'approved' || awaitsCheck) && reviewed && ofReviewed.filter(isFull).at(-1)?.result == null && verdictOfChecks !== 'failed' && checksAfterApproval(snapshot) && !continued.has(round)) {
-        return { kind: 'checks', revision: reviewed, phase, round }
+        return { kind: 'checks', revision: reviewed, phase, round, ...owed }
       }
       // Failed only because the base's selftest run never finished (after its one redrive): nothing the author
       // could change answers that. Approved, the loop stops for Refresh checks, which drives a fresh base; with
@@ -768,7 +803,10 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       // the check evidence so it settles no gate and asks for no re-review.
       if (!satisfied && round + 1 >= maxRounds && awaiting > 0 && reviewed && ofReviewed.filter(isFull).at(-1)?.result == null) {
         if (!checksAfterApproval(snapshot)) driveNotRun = { phase: phase.id, round, revision: reviewed, result: 'not-run', reason: snapshot.checks?.target ? 'no-result' : 'no-drive-configured' }
-        else if (!continued.has(round)) return { kind: 'checks', revision: reviewed, phase, round }
+        // A modules tier that waits for approval never drives a revision its round rejected for findings
+        // of their own: the record says so, and the author's next turn has the findings.
+        else if (modulesApproved(snapshot) && substantial > awaiting) driveNotRun = { phase: phase.id, round, revision: reviewed, result: 'not-run', reason: 'rejected-round' }
+        else if (!continued.has(round)) return { kind: 'checks', revision: reviewed, phase, round, ...owed }
       }
     }
     if (!satisfied) {
@@ -2819,9 +2857,17 @@ export class Engine {
     // auditor withholding the approval that would run them.
     if (checksAfterApproval(this.snapshot)) {
       const target = this.snapshot.checks.target
+      // The modules tier waiting for approval: the same block, naming the drive, and a mixed last round is not driven.
+      const modules = modulesApproved(this.snapshot)
+      // The revision under review has a drive of its own (a same-round re-review after its drive): say so, never "not run".
+      const drivenRevision = this.run.revisions.at(-1)?.fingerprint ?? null
+      const driven = modules && this.run.checkResults.some((c) => c.revision === drivenRevision && isFull(c))
       ctx.checks.latest = { ...(ctx.checks.latest ?? { result: 'not-run-yet' }), timing: {
-        timing: 'approved', kind: target.kind, commands: (target.commands ?? []).map((c) => c.id),
-        instruction: 'These checks (for example the staging test drive) run only on a revision every reviewer approved, on a revision whose every substantial finding is marked `awaitsCheck`, or on the revision of the last allowed round when any finding is so marked (once per revision); their result then gates the round and closure. Brief: name the acceptance criteria only these checks can prove, and those triage flagged with `outsideChecks` as beyond them. Author: finish the code for them and do not hand over an unchanged revision to wait for the checks. Auditor: when the only thing still blocking is evidence these checks produce and this revision has no result yet, keep that finding blocking with `awaitsCheck: true`; the engine runs them and asks you to review the same revision again in this round with their result. When other findings stand beside it and this is the last allowed round, they run with no re-review: the next round is told their result.'
+        timing: 'approved', kind: target.kind, ...(modules ? { tier: 'modules' } : {}), commands: (target.commands ?? []).map((c) => c.id),
+        instruction: (modules
+          ? 'These checks (the modules drive: lint, load, restart and readiness on the stage instance, then the affected modules\' selftests) ' + (driven ? 'have run on the revision you review: their result is in checks.latest; judge it like any other evidence. They run' : 'have not run on the revision you review: they run')
+            + ' only on a revision every reviewer approved, or on a revision whose every substantial finding is marked `awaitsCheck` (once per revision), never on a revision the round rejected for findings of its own; their result then gates the round and closure. Brief:'
+          : 'These checks (for example the staging test drive) run only on a revision every reviewer approved, on a revision whose every substantial finding is marked `awaitsCheck`, or on the revision of the last allowed round when any finding is so marked (once per revision); their result then gates the round and closure. Brief:') + ' name the acceptance criteria only these checks can prove, and those triage flagged with `outsideChecks` as beyond them. Author: finish the code for them and do not hand over an unchanged revision to wait for the checks. Auditor: when the only thing still blocking is evidence these checks produce and this revision has no result yet, keep that finding blocking with `awaitsCheck: true`; the engine runs them and asks you to review the same revision again in this round with their result.' + (modules ? '' : ' When other findings stand beside it and this is the last allowed round, they run with no re-review: the next round is told their result.')
       } }
       if (target.tiers?.targeted) ctx.checks.latest.timing.instruction += ' Auditor: a blocking finding that says selftests fail names them in `failingTests`, exactly as the report names them; the author\'s next revision then runs those tests (the targeted tier) before its audit, instead of its smoke. That result is shown to you and never counts for closure.'
       // The revision's own drive has not run, and revision pruning dropped the last
@@ -2909,7 +2955,7 @@ export class Engine {
       // criteria only checks that wait for approval can prove, as brief.md asks.
       if (checksAfterApproval(this.snapshot)) {
         const target = this.snapshot.checks.target
-        append('first-handoff-checks', `This run's checks (${target.kind}: ${(target.commands ?? []).map((c) => c.id).join(', ') || 'no commands listed'}, for example the staging test drive) run only on a revision every reviewer approved. In the firstHandoff prompt, name the acceptance criteria only those checks can prove, or say that none exist, and tell the ${brief.targetRole} to finish the code for them rather than hand over an unchanged revision to wait for the drive: the engine runs it.`)
+        append('first-handoff-checks', `This run's checks (${target.kind}: ${(target.commands ?? []).map((c) => c.id).join(', ') || 'no commands listed'}, ${modulesApproved(this.snapshot) ? 'the modules drive' : 'for example the staging test drive'}) run only on a revision every reviewer approved. In the firstHandoff prompt, name the acceptance criteria only those checks can prove, or say that none exist, and tell the ${brief.targetRole} to finish the code for them rather than hand over an unchanged revision to wait for the drive: the engine runs it.`)
       }
     }
     // The fingerprint is computed by the engine, never self-reported. The turn
@@ -4199,11 +4245,17 @@ export class Engine {
    * to the confirmation with no author round. The records stay what ran.
    */
   checkEvidence () {
-    const accepted = this.run.closure?.acceptedCheckRisk?.revision ?? this.run.checkAcceptanceRequest?.revision ?? null
+    const acceptance = this.run.closure?.acceptedCheckRisk ?? this.run.checkAcceptanceRequest ?? null
+    const accepted = acceptance?.revision ?? null
+    // Modules timing approved: each round reads its own recording's drive (plan's ofRecording), so a current
+    // record says which step, directory and time it is, and an acceptance covers the drive it names only.
+    const byRecording = modulesApproved(this.snapshot)
+    const scoped = byRecording && acceptance?.check?.dir ? acceptance.check.dir : null
     return [...(this.run.checkHistory ?? []).map((h) => ({ ...h, result: h.gating ?? h.result })),
       ...this.run.checkResults.map((c) => ({ revision: c.revision, ...(c.tier ? { tier: c.tier } : {}), result: gatingResult(c, this.run), ...(inconclusiveBase(c, this.run) ? { inconclusive: true } : {}),
+        ...(byRecording ? { step: c.step ?? null, dir: c.dir, at: c.at } : {}),
         ...(c.baselineComparison?.selftest?.unstable?.length ? { dir: c.dir, unstableIgnored: c.baselineComparison.selftest.unstable.map(({ command, test }) => ({ command, test })) } : {}) }))]
-      .map((c) => c.revision === accepted ? { ...c, result: 'passed', inconclusive: false, ...(c.result === 'passed' ? {} : { accepted: true }) } : c)
+      .map((c) => c.revision === accepted && (!scoped || c.dir === scoped) ? { ...c, result: 'passed', inconclusive: false, ...(c.result === 'passed' ? {} : { accepted: true }) } : c)
   }
 
   /** What replay reads besides the steps. A plan without the drives would ask for every answered one again. */
@@ -4505,9 +4557,12 @@ export class Engine {
         await this.maybeRunChecks()
         // Checks that cannot run here (in place, quarantined, no target) leave
         // no result; `not-run` lets the round be decided, and closure judges it.
-        if (!this.checkEvidence().some((c) => c.revision === next.revision && isFull(c))) {
+        // Under modules timing approved the round asked for its own recording (`recordedBy`): only a record of
+        // that recording answers it, and the not-run names the recording, so the round that asked reads it.
+        const ofAsked = next.recordedBy != null ? (c) => c.step != null && c.step >= next.from && c.step <= next.recordedBy : () => true
+        if (!this.checkEvidence().some((c) => c.revision === next.revision && isFull(c) && ofAsked(c))) {
           this.run.checkHistory ??= []
-          this.run.checkHistory.push({ revision: next.revision, result: 'not-run', at: this.clock.iso(), step: null })
+          this.run.checkHistory.push({ revision: next.revision, result: 'not-run', at: this.clock.iso(), step: next.recordedBy ?? null })
           await this.persist({ type: 'checks', revision: next.revision, result: 'not-run', commands: 0 })
         }
         continue

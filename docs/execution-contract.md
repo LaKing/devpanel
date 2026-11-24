@@ -238,8 +238,26 @@ re-review: it makes the round `changes-needed` as above. A passed drive
 approves nothing by itself, so closure still needs an approval and a passing
 check on the same revision.
 
+The modules tier runs beside the reviews by default; with
+`testDrive.modules.timing: approved` it waits as any `timing: approved` target
+does ("The modules tier", "Modules timing approved" below). What a round waits for,
+then: under `every-revision` each recorded revision is driven while its reviews
+run, and the round is decided once both are recorded; under `approved` the drive is
+decided on the findings the round's reviews hold when the engine decides whether to
+launch it: it starts when every occupied reviewer approved, or when every substantial
+finding is `awaitsCheck`. A round whose reviews hold any substantial finding of their
+own waits for nothing: the author's next turn begins at once and that revision is not
+driven. A drive started for an all-`awaitsCheck` round makes nothing approved: the
+seats review the same revision again with its result, and that re-review may still
+reject it, so a revision can be driven and then rejected in one round. A failed drive
+returns the author. The last allowed round with findings of its own beside an
+`awaitsCheck` one is not driven either (`driveNotRun.reason: rejected-round`). On the undisturbed path, that is; when a run is recovered (an integrity quarantine restored, a restart), a restored candidate is driven at the next drive entry as before, so a revision its round rejected may be driven again. That drive approves nothing: a recorded blocker and a failed drive are never discarded, and closure reads the checks as before.
+
 The last allowed round is the one more exception, so that no run exhausts on
-revisions whose drive never ran. "Last" is read after the extension below, so it
+revisions whose drive never ran (except under modules `timing: approved`, where a
+final round with findings of its own beside an `awaitsCheck` one gets no drive and
+records `driveNotRun.reason: rejected-round`, as above; this paragraph describes every
+other `timing: approved` target and a tiered target's full drive). "Last" is read after the extension below, so it
 reflects Resume, Continue and an extra round. When that round's audit holds any
 `awaitsCheck` finding, with or without other blocking findings, and the revision
 has no full result, the planner returns `{kind: 'checks'}` before the loop is
@@ -471,10 +489,12 @@ module it is this case; preview and readiness say so before a start
 
 On a Boilerplate project (one with `infrastructure`) every playbook that records
 revisions resolves its check target to the **modules tier** (`modulesTarget`,
-`tier: modules`, `timing: every-revision`), never to the smoke/full drive, which
-stays on the project for the full verification (docs/project-infrastructure.md
-"The modules tier"). Its drive runs beside the reviews like any every-revision
-target, in a fixed order: lint of the revision's changed `.mjs`/`.vue` files, load
+`tier: modules`, `timing: every-revision` unless the tier declares `timing:
+approved`), never to the smoke/full drive, which stays on the project for the full
+verification (docs/project-infrastructure.md "The modules tier"). Its drive runs
+beside the reviews like any every-revision target (or, under `timing: approved`, only
+when the round's reviews all approve or every substantial finding awaits the drive:
+"Modules timing approved" below), in a fixed order: lint of the revision's changed `.mjs`/`.vue` files, load
 of the candidate into the stage instance, restart, readiness, one `selftest` run
 per affected module and per core directory (the root with `rootFilter`), the
 modules' browser runs when declared, then the finalizers. Which instance that is
@@ -579,6 +599,59 @@ or an instance of the run's own ("A stage instance per run" below).
   check is `unavailable`: the round is vetoed and closure cannot pass on it.
   `undeclared` (an empty `viaHooks`, nothing blocked) only when no pool member
   declares a reader.
+
+#### Modules timing approved
+
+`infrastructure.testDrive.modules.timing` (`every-revision`, the default also when
+absent, or `approved`; on a playbook target it may stand in `modules` or as the
+target's `timing`, and two different values are refused) says when the tier
+drives. Undeclared, nothing changes: the target, the snapshot and the configHash
+are what they were. Under `approved` the drive runs as any `timing: approved`
+target does ("Checks run beside the reviews"): only on the revision every occupied
+reviewer approved, or whose every substantial finding is `awaitsCheck`, and a
+failure returns the author. The launch is decided on the findings the round's reviews
+hold at that moment: on the undisturbed path a revision whose reviews hold a substantial
+finding of their own is not driven, the last allowed round included; there only a final round with mixed findings (an ordinary blocker and at least one finding that awaits the drive) records `driveNotRun.reason: rejected-round`; a final round with only ordinary blockers starts no drive and records no `driveNotRun`. A drive started because every substantial finding
+awaited it approves nothing, and the same-round re-review may still reject the revision;
+recovery may drive a rejected revision again ("Recovery" below). The audit prompt's check block says
+the drive has not run on the reviewed revision, and names `awaitsCheck` as the way to
+ask for it; a re-review that follows the revision's own drive is told it has run, with
+its result. Everything else of the tier is the same on
+that path: affected modules and `viaHooks`, `failedInTests`, the retry of a failed
+lint, load, restart or ready, the run's own stage instance (its first drive creates
+it, later ones load and restart it), dependency sync and `testedNothing`. Module
+locks are taken with each revision before its review, whether or not it is ever
+driven. Lint stays inside the drive: running it beside the reviews would need a
+check level of its own (record, gate and closure exclusion), which this does not add.
+
+- **Shapes.** The drive waits for a verdict the gate can read, so resolution
+  refuses a strategy that could not give one (modules-tier.mjs
+  `approvedModulesShapeErrors`, each refusal naming its rule): R0 `requirement:
+  none`; R1 a loop that records revisions without `consensus: true`; R2 a reviewer
+  before the recording step; R3 a reviewer guarded by `when`; R4 a confirmation
+  inside the recording loop; R5 a reviewer outside the recording loop after it; R6 a
+  standalone recording step with a reviewer after it (a single seat, Prompt, is
+  served: it is driven at once); R7 an `until` without the term `review.verdict ==
+  approved`. An empty reviewer seat breaks no rule. The bundled coding playbooks
+  conform.
+- **A result counts only for its own recording.** A round reads the drive records
+  of its revision's recording instance: the unbroken run of steps carrying that
+  fingerprint up to the step its reviews examined (a fingerprint change or a
+  delivery-return decision step breaks it). A record counts when its fingerprint
+  matches and it names a step of that instance, or names none while that instance
+  is the run's current one. So a revision restored after another (A → B → A) and a
+  delivery return that kept the approved bytes are driven again, and closure reads
+  that drive; an author answering a failed drive with the same bytes stays in one
+  instance, so the run stops `checks-failed-unchanged` as before. A drive that
+  cannot run (in place) leaves one `not-run` naming the recording step, and the run
+  goes on. An accepted check result covers the drive it names (`check.dir`), not an
+  earlier recording's drive of the same bytes.
+- **`testedNothing`.** A passing drive that held no test command reads
+  `testedNothing` even when a finalizer read a (necessarily empty) report, so it can
+  never be the drive that closes the run.
+- **Recovery.** A restored candidate is driven at the next drive entry as before,
+  so recovery may spend one drive on a revision its round rejected; that drive
+  approves nothing, and a recorded blocker still keeps its round from passing.
 
 #### A stage instance per run
 

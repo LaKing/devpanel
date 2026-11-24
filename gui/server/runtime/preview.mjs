@@ -2,6 +2,7 @@ import { resolveWithRelease } from '../release-selection.mjs'
 import { sizingSummary } from './triage-sizing.mjs'
 import { evaluate } from './engine.mjs'
 import { locksModules } from './module-locks.mjs'
+import { modulesTiming } from './modules-tier.mjs'
 
 /*
  * Dry-run preview.
@@ -254,6 +255,8 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     phases,
     prompts,
     checks: r.checks,
+    // When the modules tier drives (every-revision beside the reviews, or approved), null for any other target.
+    modulesTiming: modulesTiming(r.checks.target),
     infrastructure: r.infrastructure,
     autoClose: r.autoClose,
     delivery: { ...r.completion.delivery, destination: r.completion.delivery.action === 'apply-to-source' ? project?.path ?? null : null },

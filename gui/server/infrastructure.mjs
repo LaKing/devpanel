@@ -173,7 +173,8 @@ export function modulesErrors (target) {
   errors.push(...instanceErrors(modules, all))
   if (target.tiers) errors.push('modules and tiers do not go on one target: the modules tier is the per-revision check, tiers are the full verification')
   if (target.compareBaseline || target.baselineCache) errors.push('the modules tier has no base drive: compareBaseline and baselineCache do not apply')
-  if (target.timing === 'approved') errors.push('the modules tier runs on every revision beside the reviews; timing: approved contradicts it')
+  // One timing per tier: a playbook target may say it on the target or in modules, never two different ways.
+  if (modules.timing && target.timing && modules.timing !== target.timing) errors.push(`modules.timing (${modules.timing}) and the target's timing (${target.timing}) disagree; declare the modules tier's timing once`)
   errors.push(...confinedCommandErrors({ commands: slots.map(({ slot, ...c }) => c), finallyCommands: modules.finallyCommands, confinement: target.confinement }).filter((e) => !e.startsWith('testDrive.confinement is set')))
   return errors
 }
@@ -295,13 +296,14 @@ export function stagingTarget (infra) {
 /**
  * The check target of every playbook that records revisions on a Boilerplate
  * project (every project with `infrastructure`): the modules tier, beside the
- * reviews, never the smoke/full drive (those stay on the project for the full
+ * reviews (or after approval with `modules.timing: approved`), never the smoke/full drive (those stay on the project for the full
  * verification). Without `testDrive.modules` the target has no `modules` and
  * the engine records each revision's check as unavailable, naming why.
  */
 export function modulesTarget (infra) {
   const modules = infra.testDrive.modules
-  return { kind: 'ssh', materialize: 'archive', ssh: infra.staging.ssh, tier: 'modules', timing: 'every-revision',
+  // Beside the reviews unless the tier declares `timing: approved` (modules-tier.mjs modulesTiming).
+  return { kind: 'ssh', materialize: 'archive', ssh: infra.staging.ssh, tier: 'modules', timing: modules?.timing ?? 'every-revision',
     commands: modules ? MODULE_SLOTS.filter((slot) => modules[slot]).map((slot) => modules[slot]) : [],
     ...(modules ? { modules } : {}),
     ...(modules?.finallyCommands ? { finallyCommands: modules.finallyCommands } : {}),

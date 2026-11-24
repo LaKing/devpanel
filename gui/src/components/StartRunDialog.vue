@@ -542,6 +542,7 @@ async function start (override = false) {
           <div class="row">
             <span class="dim">checks {{ previewData.checks.requirement }}</span>
             <span class="dim">target {{ previewData.checks.target ? previewData.checks.target.kind : 'none' }}</span>
+            <span v-if="previewData.modulesTiming" class="dim" data-test="modules-timing">modules {{ previewData.modulesTiming === 'approved' ? 'after approval' : 'every revision' }}</span>
             <span class="dim">delivery {{ previewData.delivery.action }}</span>
             <span class="dim">autoClose {{ previewData.autoClose.minimumVerification }}</span>
           </div>
