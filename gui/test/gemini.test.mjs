@@ -655,15 +655,17 @@ export default async function (t) {
     t.eq('and no ledger at all is not evidence of absence', (await gemini.reconcile('inv-done', { ledgerDir: await temp() })).phase, 'uncertain')
   }
 
-  t.section('3e. the authentication method is pinned, not left to whatever is configured')
+  t.section('3e. the authentication method is selected where the runtime loads it, and what outranks it is refused')
   {
     /*
      * The runtime reads `security.auth.selectedType` from its merged settings
-     * before it looks at any environment variable, and system settings outrank
-     * the workspace's and the user's. So the variables the adapter sets choose
-     * nothing by themselves: an operator's ~/.gemini that selects their Google
-     * login, or a .gemini/settings.json shipped inside the candidate, would win.
-     * The fake resolves the method exactly as the runtime does.
+     * before it looks at any environment variable. A system settings file would
+     * outrank everything, but the runtime loads one only from a root-owned path,
+     * which this service cannot make: the method goes into the connection's own
+     * home (the user tier), and the two things that outrank or replace it, the
+     * workspace's settings and an account's own, are checked before launch.
+     * The fake resolves the method exactly as the runtime does, the skipped
+     * system file included.
      */
     const record = path.join(await temp(), 'calls')
     await underTest({ record })
@@ -671,44 +673,60 @@ export default async function (t) {
     process.env.GEMINI_CLI_HOME = ambientHome
     process.env.DEVPANEL_TEST_GEMINI_KEY = 'sk-roster-key'
     const cwd = await temp()
-    await fs.mkdir(path.join(cwd, '.gemini'), { recursive: true })
-    await fs.writeFile(path.join(cwd, '.gemini/settings.json'), JSON.stringify({ security: { auth: { selectedType: 'oauth-personal' } } }), 'utf8')
 
-    await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-key' } })
+    const keyed = await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', tooling: { writesCode: false, allowedRoots: [] }, meta: { invocationId: 'inv-auth-key' } })
     let calls = await readRecord(record)
     let seen = calls.at(-1).received
-    t.eq('a keyed connection resolves to the API key despite both selections', seen.effectiveAuth, 'gemini-api-key')
+    t.eq('a keyed connection resolves to the API key', seen.effectiveAuth, 'gemini-api-key')
     t.eq('with nothing the runtime could refuse', seen.authError, null)
     t.ok('under a home of its own, never the operator\'s', seen.geminiHome && seen.geminiHome !== ambientHome, seen.geminiHome)
-    t.ok('pinned through system settings the adapter controls', seen.systemSettingsPath && seen.systemSettingsPath !== '/etc/gemini-cli/settings.json', seen.systemSettingsPath)
-    t.eq('selected and enforced', [seen.systemSettings.security.auth.selectedType, seen.systemSettings.security.auth.enforcedType], ['gemini-api-key', 'gemini-api-key'])
-    t.eq('the system defaults keep their own path', seen.systemDefaultsPath, path.join(process.env.DEVPANEL_GEMINI_SYSTEM_CONFIG_DIR, 'system-defaults.json'))
-    t.eq('the pinned file is gone with the turn', await fs.stat(seen.systemSettingsPath).then(() => true, () => false), false)
+    t.eq('the method is in that home\'s settings, selected and enforced', seen.userSettings.security?.auth, { selectedType: 'gemini-api-key', enforcedType: 'gemini-api-key' })
+    t.eq('no system settings file is handed over for the runtime to skip', [seen.systemSettingsPath, seen.systemDefaultsPath, seen.systemSettingsSkipped], [null, null, false])
+    t.eq('the turn records where the method is in force', [keyed.diagnostics.tooling.authentication.tier, keyed.diagnostics.tooling.authentication.file], ['user', path.join(seen.geminiHome, '.gemini/settings.json')])
+    t.eq('a writing seat\'s home keeps the ignore filtering', seen.fileFiltering, {})
+
+    // What the home's file already held stays; a second turn finds nothing to write.
+    const homeFile = path.join(seen.geminiHome, '.gemini/settings.json')
+    await fs.writeFile(homeFile, JSON.stringify({ general: { vimMode: true }, security: { auth: { useExternal: false } } }), 'utf8')
+    await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-merge' } })
+    seen = (await readRecord(record)).at(-1).received
+    t.eq('what the file held is carried, with the method beside it', [seen.userSettings.general, seen.userSettings.security.auth], [{ vimMode: true }, { useExternal: false, selectedType: 'gemini-api-key', enforcedType: 'gemini-api-key' }])
+    const written = (await fs.stat(homeFile)).mtimeMs
+    await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-steady' } })
+    t.eq('an unchanged file is not rewritten (another turn\'s configuration guard compares it)', (await fs.stat(homeFile)).mtimeMs, written)
+
+    // The workspace's own settings outrank the user tier: one that selects another method is refused before launch.
+    await fs.mkdir(path.join(cwd, '.gemini'), { recursive: true })
+    await fs.writeFile(path.join(cwd, '.gemini/settings.json'), JSON.stringify({ security: { auth: { selectedType: 'oauth-personal' } } }), 'utf8')
+    let before = (await readRecord(record)).length
+    let thrown = null
+    try { await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-workspace' } }) } catch (error) { thrown = error }
+    t.eq('a workspace that selects another method is refused before launch', [thrown?.started, (await readRecord(record)).length], [false, before])
+    t.ok('naming the file and both methods', thrown?.message.includes(path.join(cwd, '.gemini', 'settings.json')) && /oauth-personal/.test(thrown.message) && /gemini-api-key/.test(thrown.message), thrown?.message)
+    await fs.writeFile(path.join(cwd, '.gemini/settings.json'), JSON.stringify({ ui: { theme: 'Default' }, security: { auth: { selectedType: 'gemini-api-key' } } }), 'utf8')
+    const agreeing = await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', tooling: { writesCode: false, allowedRoots: [] }, meta: { invocationId: 'inv-auth-workspace-ok' } })
+    t.eq('one that agrees, or says nothing about the method, runs and is named', agreeing.diagnostics.tooling.authentication.workspaceSettings, path.join(cwd, '.gemini', 'settings.json'))
+    await fs.writeFile(path.join(cwd, '.gemini/settings.json'), '{ not json', 'utf8')
+    thrown = null
+    try { await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-workspace-bad' } }) } catch (error) { thrown = error }
+    t.ok('one that cannot be read as JSON is refused, not guessed', thrown?.started === false && /not plain JSON/.test(thrown.message), thrown?.message)
+    await fs.rm(path.join(cwd, '.gemini'), { recursive: true, force: true })
 
     await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, account: 'cyd', meta: { invocationId: 'inv-auth-login' } })
     seen = (await readRecord(record)).at(-1).received
-    t.eq('an account resolves to the Google login', seen.effectiveAuth, 'oauth-personal')
-    t.eq('enforced as well', seen.systemSettings.security.auth.enforcedType, 'oauth-personal')
+    t.eq('an account resolves to the Google login, from the environment', seen.effectiveAuth, 'oauth-personal')
+    t.eq('and nothing is written into the person\'s home', await fs.stat(path.join(gemini.accountDir('cyd'), '.gemini/settings.json')).then(() => true, () => false), false)
 
     await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, meta: { invocationId: 'inv-auth-ambient' } })
     seen = (await readRecord(record)).at(-1).received
-    t.eq('the ambient route pins nothing and runs as the host is configured', [seen.systemSettingsPath, seen.effectiveAuth, seen.geminiHome], [null, 'oauth-personal', ambientHome])
+    t.eq('the ambient route writes nothing and runs as the host is configured', [seen.effectiveAuth, seen.geminiHome, seen.userSettings], ['oauth-personal', ambientHome, { security: { auth: { selectedType: 'oauth-personal' } } }])
 
-    // The host's own system settings survive the pin: only the auth method is
-    // added to them, and its defaults file is still the host's.
+    // A host whose own system settings enforce another method is a conflict, refused before launch.
     const hostSettings = path.join(await temp(), 'settings.json')
-    await fs.writeFile(hostSettings, JSON.stringify({ general: { vimMode: true }, security: { auth: { useExternal: false } } }), 'utf8')
-    process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = hostSettings
-    await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-merge' } })
-    seen = (await readRecord(record)).at(-1).received
-    t.eq('the host\'s settings are carried', seen.systemSettings.general, { vimMode: true })
-    t.eq('with the method added beside what was there', seen.systemSettings.security.auth, { useExternal: false, selectedType: 'gemini-api-key', enforcedType: 'gemini-api-key' })
-    t.eq('and the host\'s defaults path derived from the host\'s file', seen.systemDefaultsPath, path.join(path.dirname(hostSettings), 'system-defaults.json'))
-
-    // A host that enforces another method is a conflict, refused before launch.
     await fs.writeFile(hostSettings, JSON.stringify({ security: { auth: { enforcedType: 'vertex-ai' } } }), 'utf8')
-    const before = (await readRecord(record)).length
-    let thrown = null
+    process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = hostSettings
+    before = (await readRecord(record)).length
+    thrown = null
     try {
       await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', meta: { invocationId: 'inv-auth-enforced' } })
     } catch (error) { thrown = error }
@@ -717,20 +735,31 @@ export default async function (t) {
     t.eq('and nothing was spawned', (await readRecord(record)).length, before)
     delete process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH
 
-    // Conflicting existing configuration under the ACCOUNT's own home: the
-    // person's directory selects an API key (and the ambient environment still
-    // carries one). System settings outrank the home's, so the turn runs as the
-    // login it was assigned — never as the key.
+    // An ACCOUNT's own home that selects an API key: nothing this service can write outranks the person's file,
+    // so the conflict is refused before launch instead of running as the key.
     const misconfigured = gemini.accountDir('dee')
     await fs.mkdir(path.join(misconfigured, '.gemini'), { recursive: true })
     await fs.writeFile(path.join(misconfigured, '.gemini/settings.json'), JSON.stringify({ security: { auth: { selectedType: 'gemini-api-key' } } }), 'utf8')
-    process.env.GEMINI_API_KEY = 'ambient-key-must-not-be-used'
-    await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, account: 'dee', meta: { invocationId: 'inv-auth-conflict' } })
-    delete process.env.GEMINI_API_KEY
-    seen = (await readRecord(record)).at(-1).received
-    t.eq('the person\'s own selection is overridden by the pin', seen.effectiveAuth, 'oauth-personal')
-    t.eq('the ambient key never reached the process', seen.geminiKeyPresent, false)
-    t.eq('and the runtime had nothing to refuse', seen.authError, null)
+    before = (await readRecord(record)).length
+    thrown = null
+    try { await gemini.invoke({ prompt: 'hi', model: 'gemini-3-pro', cwd, account: 'dee', meta: { invocationId: 'inv-auth-conflict' } }) } catch (error) { thrown = error }
+    t.eq('the person\'s conflicting selection is refused before launch', [thrown?.started, (await readRecord(record)).length], [false, before])
+    t.ok('naming the account\'s file', thrown?.message.includes(path.join(misconfigured, '.gemini', 'settings.json')), thrown?.message)
+
+    // A read seat's settings: its own home, with the ignore filtering off; the writing seats' home is untouched.
+    const read = gemini.resolveConnection({ credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY', readSeat: true })
+    const write = gemini.resolveConnection({ credentialRef: 'env:DEVPANEL_TEST_GEMINI_KEY' })
+    t.eq('a read seat has a home of its own beside the connection\'s', read.env.GEMINI_CLI_HOME, `${write.env.GEMINI_CLI_HOME}.read`)
+    const applied = await gemini.applySettings(read.env, read.applied, { cwd, readSeat: true })
+    const readHome = JSON.parse(await fs.readFile(path.join(read.env.GEMINI_CLI_HOME, '.gemini/settings.json'), 'utf8'))
+    t.eq('there the ignore filtering is off, beside the method', [readHome.context.fileFiltering, readHome.security.auth.enforcedType, applied.fileFiltering], [{ respectGitIgnore: false, respectGeminiIgnore: false }, 'gemini-api-key', { respectGitIgnore: false, respectGeminiIgnore: false }])
+    t.eq('and the writing seats\' home never gets it', JSON.parse(await fs.readFile(path.join(write.env.GEMINI_CLI_HOME, '.gemini/settings.json'), 'utf8')).context, undefined)
+    const person = gemini.resolveConnection({ account: 'cyd', readSeat: true })
+    t.ok('an account\'s read seat says the filtering was not applied', /not applied/.test((await gemini.applySettings(person.env, person.applied, { cwd, readSeat: true })).fileFiltering))
+
+    // Prepaid API credit that ran out (seen live 2026-11-24): quota, so the model is held, not a nameless runtime fault.
+    t.eq('depleted prepaid credits classify as quota', classifyFailure({ message: 'gemini exited 146', stderr: 'Error when talking to Gemini API _ApiError: {"error":{"message":"{\\n \\"error\\": {\\n \\"code\\": 402,\\n \\"message\\": \\"Your prepayment credits are depleted. Please go to AI Studio\\", \\"status\\": \\"RESOURCE_EXHAUSTED\\"}}","code":402,"status":"Payment Required"}}' }).class, 'quota')
+    t.eq('a rate limit that also says RESOURCE_EXHAUSTED stays a rate limit', classifyFailure({ message: 'gemini exited 1', stderr: '{"error":{"code":429,"message":"Too many requests","status":"RESOURCE_EXHAUSTED"}}' }).class, 'rate-limit')
 
     // Should the runtime ever find itself under an enforced type it cannot
     // satisfy, its refusal is an authentication fault, not a generic failure.

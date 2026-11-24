@@ -647,9 +647,11 @@ holds any TOML, a malformed one only warns, a missing one is ignored — so the 
 launching, aborts on `[ADMIN] Policy file error` or `Ignoring --admin-policy`, and requires a positive
 acknowledgement: the policy names a tool that does not exist (`glob_`), the runtime warns about it naming the
 file and the ADMIN tier, and a turn without that stderr line is an environment failure, never an accepted
-answer. Authentication is pinned through a per-invocation copy of the host's system settings
-(`GEMINI_CLI_SYSTEM_SETTINGS_PATH`, method selected and enforced), because the runtime reads `selectedType`
-before any environment variable and system settings outrank the operator's `~/.gemini` and the candidate's.
+answer. The runtime reads `selectedType` from its settings before any environment variable and loads a system
+settings file only from a root-owned path, so the method is written, selected and enforced, into the connection's
+own home (the user tier; `applySettings`), and what outranks that is refused before launch: a workspace
+`.gemini/settings.json` or an account's own settings selecting another method. A read seat's home (`<home>.read`)
+also turns the ignore filtering off, which its read and search tools have no parameter for.
 Gemini has no read-only workspace root, so a non-writing seat has no write or shell tools at all (no scratch
 writes, no test runs); a writing seat's read-only roots (evidence, configured roots) are bind-mounted
 read-only over themselves through bubblewrap for the turn, proved from inside the sandbox before launch (a

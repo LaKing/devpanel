@@ -48,10 +48,13 @@ deny: []                # absolute paths shown empty even inside a readable dire
 
 A seat names a verified roster entry on any harness. A Gemini seat reads with its file tools and has no shell, so it
 sees the checkouts as they stand and cannot run git; its roster entry lists no efforts, so the seat names none. Its
-read and search tools also skip whatever a checkout's ignore rules cover (seen live with Gemini CLI 0.60.0: such a path
-can be listed, `read_file` refuses it and `grep_search` passes it over), so inside a repository it reads the tracked
-tree only: not the logs, and for the panel's own project not the issue folders. A single-file root reaches it through
-the file's directory, which inside the fence holds only what the fence bound. The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
+read and search tools would skip whatever a checkout's ignore rules cover (logs, and for the panel's own project the
+issue folders), so a read seat's settings turn that filtering off (`harness/gemini.mjs` `applySettings`); an account's
+seat keeps it, because its home is the person's. Text search is the exception on a host without ripgrep: the CLI then
+searches a repository with `git grep`, which never looks into ignored files whatever the settings say (seen live with
+Gemini CLI 0.60.0: `read_file` and listings reach an ignored file, `grep_search` does not find it). With `rg` on the
+PATH the CLI searches with it and honours the setting. A single-file root reaches it through the file's directory, which
+inside the fence holds only what the fence bound. The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
 `configHash`: a run reads a consult's record, never this file. `npm run config:check` warns when a seat cannot be
 used. The host settings' `operatorLanguage` (an ISO 639-1 code, default `en`) is the language the question for a
 person is written in; everything else stays English.

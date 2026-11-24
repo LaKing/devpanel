@@ -99,12 +99,16 @@ and a turn without that line on stderr is an environment failure — its answer 
 never accepted. An adapter whose fence can be absent without anyone noticing has
 no fence, and reading the file back proves only that the adapter can read.
 
-**Authentication is pinned in system settings.** The runtime chooses its auth
-method from its merged settings before the environment, and system settings win.
-A connection that names a credential or an account therefore runs under a
-per-invocation copy of the host's system settings with the method selected and
-enforced (`GEMINI_CLI_SYSTEM_SETTINGS_PATH`), so neither the operator's own
-`~/.gemini` nor a settings file inside the candidate can reroute the turn.
+**Authentication is selected in the connection's own settings, and what
+outranks them is refused.** The runtime chooses its auth method from its merged
+settings before the environment. It loads a system settings file only from a
+root-owned path, which the service cannot make, so the method is written,
+selected and enforced, into the user tier of the connection's own home
+(`applySettings`). The workspace's `.gemini/settings.json` outranks that tier and
+an account's home is the person's own: either one selecting another method is
+refused before launch, so a settings file inside the candidate cannot reroute
+the turn. A read seat's home (`<home>.read`) also turns the ignore filtering off.
+See docs/model-providers.md.
 
 **Read-only cannot be expressed per path, so it is expressed per argument.**
 There is no read-only workspace root: `--include-directories` grants reading and

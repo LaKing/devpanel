@@ -102,10 +102,10 @@ export async function fenceManifest ({ binary, env, writable = [], readOnly = []
 }
 
 /*
- * One turn's fence manifest. The policy directory holds the ADMIN policy and the
- * pinned system-settings copy: the turn's own fence, so it is bound read-only.
- * Nothing shows the CLI must write there (it reads both files); a seat able to
- * rewrite them could lift its own fence for a later read of the same file.
+ * One turn's fence manifest. The policy directory holds the ADMIN policy: the
+ * turn's own fence, so it is bound read-only. Nothing shows the CLI must write
+ * there; a seat able to rewrite it could lift its own fence for a later read of
+ * the same file.
  * Only the runtime's private TMPDIR stays writable.
  */
 export function turnFenceManifest ({ binary, env, policyDir, runtimeTemp = null }) {
@@ -120,7 +120,7 @@ export function turnFenceManifest ({ binary, env, policyDir, runtimeTemp = null 
  * Before a fenced seat turn the missing directories and the empty-safe file are
  * created and bound read-only; the JSON and .env files cannot be empty
  * placeholders and are integrity-checked. settings.json is the settings file
- * this adapter already reasons about (pinAuthentication); extensions, policies,
+ * this adapter writes its own keys into (applySettings); extensions, policies,
  * agents and skills exist in the runtime (the denied tools, the system policy
  * directory); their user directories, `commands`, GEMINI.md, trustedFolders.json
  * and .env are taken from the CLI's published behaviour, not verified from its
@@ -176,10 +176,11 @@ const INHERITABLE = [
  *
  * `applied.authType` is the runtime's own name for the method this connection
  * requires (AuthType, v0.60.0), or null for the ambient route. It is what
- * `invoke` pins in the controlled system settings; the environment variables
- * below are set as well, because the pinned method still needs its credential.
+ * `invoke` selects and enforces in the connection's settings (applySettings); the
+ * environment variables below are set as well, because the method still needs
+ * its credential.
  */
-export function resolveConnection ({ profile = 'default', endpointRef = null, credentialRef = null, account = null, hygiene = false } = {}) {
+export function resolveConnection ({ profile = 'default', endpointRef = null, credentialRef = null, account = null, hygiene = false, readSeat = false } = {}) {
   // Under hygiene the child starts from an allow-list (shared.mjs childEnvironment).
   const env = hygiene ? childEnvironment('gemini') : { ...process.env }
   const applied = { profile, endpointRef, credentialRef, account, endpoint: false, credential: false, auth: 'ambient', authType: null }
@@ -237,12 +238,13 @@ export function resolveConnection ({ profile = 'default', endpointRef = null, cr
   /*
    * Every credential route gets a home of its own, the default profile included.
    * The operator's `~/.gemini` holds their own settings and login; a keyed
-   * connection that ran under it would mix its sessions with theirs and, before
-   * authentication was pinned, could have been routed through their login by a
-   * `selectedType` they set for themselves.
+   * connection that ran under it would mix its sessions with theirs and could be
+   * routed through their login by a `selectedType` they set for themselves.
    */
   const namespace = crypto.createHash('sha256').update(`${profile}${NL}${endpoint ?? 'default'}`).digest('hex').slice(0, 16)
-  env.GEMINI_CLI_HOME = path.join(PROFILE_ROOT(), namespace)
+  // A read seat's settings differ (applySettings: no ignore filtering), and settings are per home: it gets its
+  // own, so a seat that writes never starts under them. Its sessions live there too; a read seat resumes only itself.
+  env.GEMINI_CLI_HOME = path.join(PROFILE_ROOT(), readSeat ? `${namespace}.read` : namespace)
   return { env, applied, error: null }
 }
 
@@ -630,47 +632,104 @@ export async function systemPolicyFiles () {
   }
 }
 
+/** The keys this adapter manages in a settings file, merged over what is there; null when nothing would change. */
+function mergeManaged (existing, { authType, readSeat }) {
+  const next = structuredClone(existing)
+  if (authType) next.security = { ...(next.security ?? {}), auth: { ...(next.security?.auth ?? {}), selectedType: authType, enforcedType: authType } }
+  if (readSeat) next.context = { ...(next.context ?? {}), fileFiltering: { ...(next.context?.fileFiltering ?? {}), ...READ_SEAT_FILTERING } }
+  return JSON.stringify(next) === JSON.stringify(existing) ? null : next
+}
+
+/** A settings file as a JSON object: {} when absent, a refusal when it cannot be read as one. */
+async function readSettings (file, what, refuse) {
+  let raw
+  try { raw = await fs.readFile(file, 'utf8') } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return { settings: {}, present: false }
+    throw refuse(`${what} ${file} cannot be read (${error.code}); refusing to launch without knowing what it selects`)
+  }
+  let settings
+  try { settings = JSON.parse(raw) } catch { throw refuse(`${what} ${file} are not plain JSON; refusing to guess what they select`) }
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw refuse(`${what} ${file} are not a JSON object; refusing to guess what they select`)
+  return { settings, present: true }
+}
+
+/** What a read seat's file tools must not skip: a consult seat is asked because it can read the ignored files too. */
+const READ_SEAT_FILTERING = Object.freeze({ respectGitIgnore: false, respectGeminiIgnore: false })
+
 /**
- * Pin the authentication method in a controlled SYSTEM settings file.
+ * Put this connection's settings where the installed runtime loads them, and
+ * refuse what would outrank them.
  *
- * The runtime picks `security.auth.selectedType` from its merged settings before
- * it looks at any environment variable, and system settings outrank workspace
- * and user settings (settings.ts mergeSettings, v0.60.0). Setting the variables
- * alone therefore does not select the method: an operator's `~/.gemini` that
- * selects their Google login, or a `.gemini/settings.json` inside the candidate,
- * would win. The file written here is the host's own system settings with the
- * connection's method both selected and ENFORCED, so a mismatch anywhere is a
- * refused start rather than a different login. The host's system defaults keep
- * their own path, which the runtime would otherwise derive from ours.
+ * Decision: the USER tier of the connection's own home, not a system settings
+ * file. The runtime loads a system settings file only from a path it finds
+ * secure: the file and every directory above it owned by root and closed to
+ * group and others (its settings loader, v0.60.0). A service that is not root
+ * cannot make one, and inside the seat fence even root's files read as another
+ * uid. The copy this adapter used to hand over through
+ * GEMINI_CLI_SYSTEM_SETTINGS_PATH was skipped with a warning on every turn, so
+ * nothing it held was in force.
+ *
+ * The runtime still picks `security.auth.selectedType` from its merged settings
+ * before it looks at any environment variable, and the workspace's own
+ * `.gemini/settings.json` outranks the user tier (a headless turn must state
+ * trust, so it is loaded). What cannot be outranked is therefore checked before
+ * launch: a workspace file, or an account's own settings, that selects or
+ * enforces another method is a refused start, never another login. A host's
+ * real system settings are the operator's and outrank everything; one that
+ * enforces another method is refused the same way.
+ *
+ * A keyed connection's home is this adapter's (resolveConnection), so the
+ * method is written there, selected and enforced, beside whatever the file
+ * already holds. An account's home is the person's: it is only read. A read
+ * seat's home (its own, `.read`) also turns the ignore filtering off, which
+ * `read_file` and `grep_search` offer no parameter for.
+ *
+ * Pitfall: the file is shared by every turn of that home, and each turn's
+ * configuration guard compares it before and after. The content is a function
+ * of the home alone, so it changes only the first time (or when this code
+ * changes); a turn of the same home running at that moment would see a change
+ * it did not make.
  */
-async function pinAuthentication (env, applied, dir, invocationId) {
+export async function applySettings (env, applied, { cwd, readSeat = false, invocationId = null } = {}) {
   if (!applied.authType) return null
-  const hostPath = hostSystemSettingsPath(env)
   const refuse = (message) => new ProcessError(message, { kind: 'configuration-error', started: false, invocationId })
-  let host = {}
-  let raw = null
-  try {
-    raw = await fs.readFile(hostPath, 'utf8')
-  } catch (error) {
-    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw refuse(`gemini system settings ${hostPath} cannot be read (${error.code}); refusing to launch without knowing what the host enforces`)
+  const conflict = (settings, file, whose) => {
+    const auth = settings.security?.auth ?? {}
+    for (const key of ['enforcedType', 'selectedType']) {
+      if (auth[key] && auth[key] !== applied.authType) {
+        throw refuse(`${whose} ${file} ${key === 'enforcedType' ? 'enforce' : 'select'} authentication "${auth[key]}"; this connection needs "${applied.authType}"`)
+      }
+    }
   }
-  if (raw !== null) {
-    try { host = JSON.parse(raw) } catch { throw refuse(`gemini system settings ${hostPath} are not plain JSON; refusing to guess what the host enforces`) }
-    if (!host || typeof host !== 'object' || Array.isArray(host)) throw refuse(`gemini system settings ${hostPath} are not a JSON object; refusing to guess what the host enforces`)
+  const hostPath = hostSystemSettingsPath(env)
+  const host = await readSettings(hostPath, 'gemini system settings', refuse)
+  conflict(host.settings, hostPath, 'gemini system settings')
+
+  // The workspace tier: loaded from the directory the turn runs in, unless that is the home itself.
+  const workspacePath = path.join(cwd, '.gemini', 'settings.json')
+  const userPath = path.join(env.GEMINI_CLI_HOME ?? os.homedir(), '.gemini', 'settings.json')
+  let workspace = { settings: {}, present: false }
+  if (path.resolve(workspacePath) !== path.resolve(userPath)) {
+    workspace = await readSettings(workspacePath, 'the workspace\'s gemini settings', refuse)
+    conflict(workspace.settings, workspacePath, 'the workspace\'s gemini settings')
   }
-  const enforced = host.security?.auth?.enforcedType
-  if (enforced && enforced !== applied.authType) {
-    throw refuse(`gemini system settings ${hostPath} enforce authentication "${enforced}"; this connection needs "${applied.authType}"`)
+  const user = await readSettings(userPath, applied.account ? 'the account\'s gemini settings' : 'this connection\'s gemini settings', refuse)
+  let tier = 'verified'
+  if (applied.account) conflict(user.settings, userPath, 'the account\'s gemini settings')
+  else {
+    const next = mergeManaged(user.settings, { authType: applied.authType, readSeat })
+    if (next) {
+      await fs.mkdir(path.dirname(userPath), { recursive: true })
+      const temp = `${userPath}.${process.pid}.${crypto.randomUUID()}.tmp`
+      await fs.writeFile(temp, JSON.stringify(next, null, 2), { encoding: 'utf8', mode: 0o600 })
+      await fs.rename(temp, userPath)
+    }
+    tier = 'user'
   }
-  const pinned = {
-    ...host,
-    security: { ...(host.security ?? {}), auth: { ...(host.security?.auth ?? {}), selectedType: applied.authType, enforcedType: applied.authType } }
-  }
-  const file = path.join(dir, 'system-settings.json')
-  await fs.writeFile(file, JSON.stringify(pinned, null, 2), 'utf8')
-  env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH = env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH ?? path.join(path.dirname(hostPath), 'system-defaults.json')
-  env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = file
-  return { selectedType: applied.authType, enforcedType: applied.authType, hostSettings: hostPath, merged: raw !== null }
+  const filtering = !readSeat ? null
+    : applied.account ? 'not applied: an account\'s home is the person\'s own'
+      : workspace.settings.context?.fileFiltering ? 'set, but the workspace\'s settings name their own' : READ_SEAT_FILTERING
+  return { selectedType: applied.authType, enforcedType: applied.authType, tier, file: userPath, hostSettings: host.present ? hostPath : null, workspaceSettings: workspace.present ? workspacePath : null, fileFiltering: filtering }
 }
 
 export async function probe ({ depth = 'installation', models = [], profile = 'default', endpointRef = null, credentialRef = null, account = null, signal = null, timeoutMs = 120000, hygiene = false } = {}) {
@@ -899,7 +958,8 @@ async function invokeOnce ({
     if (model) args.push('--model', model)
     for (const dir of workspaceDirs) args.push('--include-directories', dir)
 
-    const connection = resolveConnection({ profile, endpointRef, credentialRef, account, hygiene })
+    const readSeat = readOnlyTools && Boolean(fenceSpec)
+    const connection = resolveConnection({ profile, endpointRef, credentialRef, account, hygiene, readSeat })
     if (connection.error) {
       throw new ProcessError(connection.error, { kind: 'configuration-error', profile, account, invocationId })
     }
@@ -907,7 +967,7 @@ async function invokeOnce ({
     // Extensions and their policies are configuration this panel did not write.
     env.GEMINI_CLI_TRUST_WORKSPACE = 'true'
     if (supervisorOnly) { delete env.DEVPANEL_TOKEN; delete env.DEVPANEL_TOKEN_FILE }
-    enforcement.authentication = await pinAuthentication(env, connection.applied, policyDir, invocationId) ?? { selectedType: null, enforcedType: null, hostSettings: null, merged: false }
+    enforcement.authentication = await applySettings(env, connection.applied, { cwd, readSeat, invocationId }) ?? { selectedType: null, enforcedType: null, tier: null, file: null, hostSettings: null, workspaceSettings: null, fileFiltering: null }
     /*
      * Durable artifacts belong in scratch, but the runtime's own temporary files
      * belong nowhere near the candidate: TMPDIR is what `os.tmpdir()` resolves to

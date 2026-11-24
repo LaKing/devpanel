@@ -114,22 +114,49 @@ GEMINI_CLI_HOME=~/.config/devpanel/gemini-profiles/account-ana gemini
 `npm run contract` checks that the installed CLI still honours that variable, and
 fails rather than skips if an isolated home ever reports a login.
 
-**The method is pinned, not merely requested.** The runtime resolves its auth
-method from `security.auth.selectedType` in its merged settings *before* it looks
-at any environment variable (`validateNonInterActiveAuth.ts`, v0.60.0), and
-system settings outrank the workspace's and the user's. Setting `GEMINI_API_KEY`
-therefore selects nothing by itself: an operator's `~/.gemini` that selects their
-Google login, or a `.gemini/settings.json` inside the candidate, would decide
-instead. So every connection that names a credential or an account runs under a
-**controlled system settings file**: the host's own `/etc/gemini-cli/settings.json`
-(or whatever `GEMINI_CLI_SYSTEM_SETTINGS_PATH` names), copied per invocation with
-the connection's method both *selected* and *enforced*, handed to the runtime
-through `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, with the host's system defaults kept
-at their own path. A host whose system settings enforce a different method is a
-configuration conflict, refused before launch. The ambient route — no credential,
-no account — pins nothing and runs exactly as the host is configured. The host's
-system settings must be plain JSON; a file the adapter cannot parse is refused
-rather than guessed at.
+**The method is selected in settings, and what outranks them is refused.** The
+runtime resolves its auth method from `security.auth.selectedType` in its merged
+settings *before* it looks at any environment variable
+(`validateNonInterActiveAuth.ts`, v0.60.0). Setting `GEMINI_API_KEY` therefore
+selects nothing by itself: a settings file that selects another method would
+decide instead. The runtime's tiers are system defaults, user, workspace, system,
+later ones winning, and it loads a system settings file only from a path it finds
+secure: the file and every directory above it owned by root and closed to group
+and others. A service that is not root cannot make one (and inside the seat fence
+root's own files read as another uid), so the adapter does not hand one over; a
+copy it wrote itself was skipped with a warning on every turn.
+
+What it does instead (`applySettings`, `harness/gemini.mjs`):
+
+- A connection that names a credential runs under a home of its own, and the
+  method is written into that home's `.gemini/settings.json` (the user tier),
+  *selected* and *enforced*, beside whatever the file already holds.
+- The workspace's own `.gemini/settings.json` outranks the user tier, and a
+  headless turn must state trust, so it is loaded. One that selects or enforces
+  another method is refused before launch, naming the file; one that cannot be
+  read as a JSON object is refused too.
+- An account's home is the person's: nothing is written there. Settings in it
+  that select another method are refused before launch.
+- A host's real system settings (`/etc/gemini-cli/settings.json`, or whatever
+  `GEMINI_CLI_SYSTEM_SETTINGS_PATH` names) are the operator's and outrank all of
+  it; one that enforces a different method is a configuration conflict, refused
+  before launch.
+- The ambient route — no credential, no account — writes nothing and runs exactly
+  as the host is configured.
+
+A read seat (a consult seat, a coordinator's `access: read` turn) has a home of
+its own beside the connection's (`<home>.read`), whose settings also turn the
+ignore filtering off (`context.fileFiltering.respectGitIgnore` and
+`respectGeminiIgnore`): `read_file` and `grep_search` have no parameter for it,
+and such a seat is asked because it can read the ignored files too. Settings are
+per home, so the seats that write never start under them. `grep_search` follows
+the setting only when the CLI finds ripgrep (`rg` on the PATH, or its own bundled
+copy): without it the search inside a repository is `git grep --untracked`, which
+skips ignored files unconditionally. An account's read seat
+keeps the filtering, since its home is not the adapter's to write.
+
+Not covered: anything else a workspace's settings file may set. The admin policy
+decides the tools whatever it says.
 
 ## Sessions
 

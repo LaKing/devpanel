@@ -54,7 +54,9 @@ function refusalWords (error) {
 const RULES = [
   // Order matters: the most specific words first. A quota message often also
   // says "limit", so quota is judged before rate-limit.
-  { cls: 'quota', re: /insufficient[_ ]quota|quota (?:exceeded|exhausted)|usage limit|weekly limit|monthly limit|spend(?:ing)? limit|billing (?:hard )?limit|out of credits|credit balance|exceeded your current quota|plan limit|hit your limit/i },
+  // Prepaid credit that ran out is quota too (the Gemini API answers 402 "Your prepayment credits are depleted"):
+  // no wait brings it back, a person tops it up. Google's RESOURCE_EXHAUSTED alone is not the sign, a 429 carries it as well.
+  { cls: 'quota', re: /insufficient[_ ]quota|quota (?:exceeded|exhausted)|usage limit|weekly limit|monthly limit|spend(?:ing)? limit|billing (?:hard )?limit|out of credits|credit balance|exceeded your current quota|plan limit|hit your limit|prepayment credits|credits are depleted|payment required/i },
   { cls: 'auth', re: /(?:http(?: status)?|status(?: code)?|error|code)[: =]+(?:401|403)\b|unauthori[sz]ed|forbidden|invalid (?:api[_ ]?key|token|credential)|authentication[_ ](?:failed|error|required)|failed to authenticate|oauth (?:session|token) (?:has )?expired|not logged in|login required|permission denied by provider|enforced authentication type|please re-authenticate/i },
   { cls: 'rate-limit', re: /(?:http(?: status)?|status(?: code)?|error|code)[: =]+429\b|rate[_ -]?limit|too many requests|(?:http(?: status)?|status(?: code)?|error|code)[: =]+529\b|overloaded|capacity|please (?:retry|try again) (?:later|in)|retry[_ -]after|slow down/i },
   { cls: 'transient', re: /(?:http(?: status)?|status(?: code)?|error|code)[: =]+5(?:00|02|03|04)\b|internal server error|bad gateway|service unavailable|gateway time-?out|econnreset|econnrefused|etimedout|eai_again|enotfound|socket hang up|network (?:error|failure)|connection (?:reset|closed|refused|error)|stream (?:ended|closed) unexpectedly|fetch failed/i },

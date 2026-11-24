@@ -70,15 +70,20 @@ const sessionId = resumed ?? preassigned ?? crypto.randomUUID()
  * Gemini's settings, resolved the way the runtime resolves them (v0.60.0):
  * system settings outrank the workspace's, which outrank the user's, and the
  * auth method is the merged `security.auth.selectedType` when one is set, else
- * whatever the environment implies. This is what lets a test prove the adapter
- * pinned the method, rather than merely set a variable the runtime may ignore.
+ * whatever the environment implies. A system settings file counts only from a
+ * path the runtime finds secure, the file and its directory owned by root:
+ * anything else is skipped with a warning, which is why a file a test (or the
+ * service) wrote itself selects nothing here either.
  */
 const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return {} } }
+const rootOwned = (file) => { try { return fs.statSync(file).uid === 0 && fs.statSync(path.dirname(file)).uid === 0 } catch { return false } }
 const geminiHome = process.env.GEMINI_CLI_HOME ?? process.env.HOME ?? ''
+const systemSettingsFile = process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH ?? '/etc/gemini-cli/settings.json'
+const systemSettingsSkipped = fs.existsSync(systemSettingsFile) && !rootOwned(systemSettingsFile)
 const geminiSettings = {
   user: readJson(path.join(geminiHome, '.gemini/settings.json')),
   workspace: readJson(path.join(process.cwd(), '.gemini/settings.json')),
-  system: readJson(process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH ?? '/etc/gemini-cli/settings.json')
+  system: systemSettingsSkipped ? {} : readJson(systemSettingsFile)
 }
 const authFrom = (settings) => settings?.security?.auth ?? {}
 const mergedAuth = { ...authFrom(geminiSettings.user), ...authFrom(geminiSettings.workspace), ...authFrom(geminiSettings.system) }
@@ -125,6 +130,9 @@ const received = {
   systemSettingsPath: process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH ?? null,
   systemDefaultsPath: process.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH ?? null,
   systemSettings: geminiSettings.system,
+  systemSettingsSkipped,
+  userSettings: geminiSettings.user,
+  fileFiltering: { ...(geminiSettings.user?.context?.fileFiltering ?? {}), ...(geminiSettings.workspace?.context?.fileFiltering ?? {}), ...(geminiSettings.system?.context?.fileFiltering ?? {}) },
   effectiveAuth,
   authError,
   approvalMode: flag('--approval-mode'),
