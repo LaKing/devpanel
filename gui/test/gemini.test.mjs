@@ -279,6 +279,28 @@ export default async function (t) {
     }
   }
 
+  t.section('2d1. a read seat says whether it read, as the other adapters do')
+  {
+    const record = path.join(await temp(), 'calls')
+    await underTest({ record })
+    const cwd = await temp()
+    // No fence is requested here (the runner's default), so the turn stays tool-free and must say so: the consult
+    // panel takes an opinion only from a turn reporting `access: 'read'`.
+    const unfenced = await gemini.invoke({ prompt: 'read and answer', model: 'gemini-3-pro', cwd, supervisorOnly: true, readOnlyTools: true, meta: { invocationId: 'inv-read-seat' } })
+    t.eq('a read seat without a fence reports that it did not read', unfenced.diagnostics.access, 'none (fence not proved)')
+    t.eq('and its policy allows no read tool', decide((await readRecord(record))[0].received.adminPolicy, 'read_file'), 'deny')
+    const plain = await gemini.invoke({ prompt: 'answer', model: 'gemini-3-pro', cwd, supervisorOnly: true, meta: { invocationId: 'inv-plain' } })
+    t.ok('a turn that asked for no read access carries no such claim', !('access' in plain.diagnostics))
+    // The installed CLI exits on a file passed to --include-directories, so a single-file root never reaches it.
+    const fileRoot = path.join(await temp(), 'project.yaml')
+    await fs.writeFile(fileRoot, 'id: demo\n')
+    const scratch = await temp()
+    const withFile = await gemini.invoke({ prompt: 'audit this', model: 'gemini-3-pro', cwd, scratchDir: scratch, tooling: { writesCode: false, allowedRoots: [scratch, fileRoot] }, meta: { invocationId: 'inv-file-root' } })
+    const included = (await readRecord(record)).at(-1).received.includeDirectories
+    t.ok('a file root is not handed to the runtime as a directory', !included.includes(fileRoot) && included.includes(scratch), included.join(','))
+    t.eq('and, outside a fenced read seat, it is named as out of reach instead of widened to its directory', [withFile.diagnostics.tooling.unreachableRoots, included.includes(path.dirname(fileRoot))], [[fileRoot], false])
+  }
+
   t.section('2d2. a fence the runtime could not load, dropped, or never mentioned stops the turn')
   {
     /*

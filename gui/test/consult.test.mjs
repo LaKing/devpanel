@@ -82,7 +82,10 @@ export default async function (t) {
   const held = await resolveSeats(panel, { roster, availability: { check: async (id) => (id === 'fable-5-2' ? { exhaustedUntil: '2030-01-01T00:00:00Z', reason: 'quota' } : null) } })
   t.ok('a held model is a problem naming when it is back', /unavailable until 2030/.test(held.problems[0]))
   const gemini = new Map([...roster, ['fable-5-2', { ...roster.get('fable-5-2'), harness: 'gemini' }]])
-  t.ok('a gemini seat is refused', /gemini/.test((await resolveSeats(panel, { roster: gemini })).problems[0]))
+  const onGemini = await resolveSeats(panel, { roster: gemini })
+  t.eq('a gemini seat resolves like any other harness', [onGemini.seats.map((s) => s.model.harness), onGemini.problems], [['gemini', roster.get('gpt-6-astra').harness], []])
+  const noEfforts = new Map([...roster, ['fable-5-2', { ...roster.get('fable-5-2'), harness: 'gemini', efforts: [] }]])
+  t.ok('a seat effort the model does not have is still a problem', /has no effort/.test((await resolveSeats(panel, { roster: noEfforts })).problems[0]))
 
   t.section('the seat prompt')
   const prompt = decidePrompt({ request: request(), options, roots: [{ path: '/opt/demo', what: 'the live checkout' }], scratchDir: '/tmp/x', language: 'hu' })
@@ -429,6 +432,19 @@ export default async function (t) {
     const throwing = { invoke: async () => { throw new Error('not asked') }, recoverPending: async () => { throw new Error('config-checked could not be persisted') }, resolveConfig: async () => true }
     const thrown = await fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? throwing : { invoke: async () => ({ outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } }) }) }).consult(throwReq, { callerDir: throwDir })
     t.eq('a replay that throws leaves the seat pending: pendingRecovery, no turn, no result', [thrown.pendingRecovery, await fs.readFile(path.join(throwRound, 'consultant-1.turn.json'), 'utf8').then(() => 'written', () => 'absent'), await fs.readFile(path.join(throwDir, 'consults', consultId(throwReq), 'result.json'), 'utf8').then(() => 'written', () => 'absent')], [true, 'absent', 'absent'])
+
+    // A seat's output is kept as the adapters hand it over, onOutput(stream, chunk): a turn that died early is
+    // explained only by its stderr there.
+    const liveDir = await callerDir()
+    const liveReq = request({ key: 'live-output:stream-and-chunk' })
+    const speaking = { invoke: async ({ observe }) => { observe.onOutput('stderr', 'Error: Path is not a directory'); return { outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } } } }
+    await fakePanel({}, { loadAdapter: async () => speaking }).consult(liveReq, { callerDir: liveDir })
+    let liveLine = null
+    for (let i = 0; i < 50 && !liveLine; i++) {
+      liveLine = await fs.readFile(path.join(liveDir, 'consults', consultId(liveReq), 'live', 'r1-consultant-1.jsonl'), 'utf8').then((s) => JSON.parse(s.trim().split('\n')[0]), () => null)
+      if (!liveLine) await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    t.eq('the live record names the stream and holds the text', [liveLine?.kind, liveLine?.text, liveLine?.seq], ['stderr', 'Error: Path is not a directory', 0])
 
     // An interrupted seat turn is replayed through the harness recorded with its ids, not the one the seat resolves to now.
     const movedDir = await callerDir()

@@ -46,8 +46,12 @@ readOnly: []            # further absolute paths every consult may read
 deny: []                # absolute paths shown empty even inside a readable directory
 ```
 
-A seat names a verified roster entry on the `claude` or `codex` harness (Gemini has no read-only workspace root and is
-refused). The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
+A seat names a verified roster entry on any harness. A Gemini seat reads with its file tools and has no shell, so it
+sees the checkouts as they stand and cannot run git; its roster entry lists no efforts, so the seat names none. Its
+read and search tools also skip whatever a checkout's ignore rules cover (seen live with Gemini CLI 0.60.0: such a path
+can be listed, `read_file` refuses it and `grep_search` passes it over), so inside a repository it reads the tracked
+tree only: not the logs, and for the panel's own project not the issue folders. A single-file root reaches it through
+the file's directory, which inside the fence holds only what the fence bound. The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
 `configHash`: a run reads a consult's record, never this file. `npm run config:check` warns when a seat cannot be
 used. The host settings' `operatorLanguage` (an ISO 639-1 code, default `en`) is the language the question for a
 person is written in; everything else stays English.
@@ -55,7 +59,8 @@ person is written in; everything else stays English.
 ## Access
 
 Each seat turn runs inside a proved bubblewrap fence (`harness/fence.mjs`), as the adapters' read seat (the mode a
-coordinator's `access: read` turn uses): read tools and a read-only shell. `consult/roots.mjs` grants, read-only:
+coordinator's `access: read` turn uses): read tools and a read-only shell (a Gemini seat: read tools only, and it is
+refused rather than run when the fence cannot be proved). `consult/roots.mjs` grants, read-only:
 
 - the project's live checkout as it stands, uncommitted work, ignored files and logs included;
 - the checkouts of the projects its project file ties it to (`framework`, `workspace.related`), and what a checkout's

@@ -138,7 +138,8 @@ export function createConsult ({
         cliHome: path.join(dir, 'cli-homes', seat.seat), ledgerDir: path.join(dir, 'ledger'),
         instructions: SEAT_INSTRUCTIONS, prompt, marker: `consult-${tag}`,
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
-        observe: { onOutput: (chunk) => { fs.appendFile(live, JSON.stringify({ seq: seq++, at: clock.iso(), ...chunk }) + NL).catch(() => {}) } },
+        // The adapters call onOutput(stream, chunk) (harness/shared.mjs); the record has the shape of a run's live file.
+        observe: { onOutput: (stream, chunk) => { fs.appendFile(live, JSON.stringify({ seq: seq++, at: clock.iso(), kind: stream, text: String(chunk) }) + NL).catch(() => {}) } },
         meta: { invocationId, role: seat.seat, stepId: 'consult' }
       })
       const usage = result.usage ?? null

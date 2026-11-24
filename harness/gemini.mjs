@@ -806,7 +806,16 @@ async function invokeOnce ({
     }
 
     if (tooling && !supervisorOnly) {
-      for (const root of tooling.allowedRoots ?? []) workspaceDirs.push(root)
+      for (const root of tooling.allowedRoots ?? []) {
+        // `--include-directories` takes directories only: given a file the CLI exits ("Path is not a directory").
+        // A single-file root (a consult's project configuration) is reached through its parent directory, and only
+        // for a read seat that asked for a fence: inside it the parent holds nothing the fence did not bind, and
+        // that turn never runs unfenced (refused below). Anywhere else the file stays outside the workspace, named.
+        const isFile = await fs.stat(root).then((s) => !s.isDirectory(), () => false)
+        if (!isFile) { workspaceDirs.push(root); continue }
+        const parent = path.dirname(root)
+        if (readOnlyTools && fenceSpec) { if (!workspaceDirs.includes(parent)) workspaceDirs.push(parent) } else (enforcement.unreachableRoots ??= []).push(root)
+      }
       if (tooling.allowLiveCheckout && tooling.liveCheckout) {
         /*
          * Gemini has no read-only workspace root: `--include-directories` grants
@@ -947,6 +956,14 @@ async function invokeOnce ({
     fenced = fenceSpec ? await applyFence({ spec: { ...fenceSpec, cwd }, command: COMMAND(), signal, guard: configGuardFor(env), replay: afterFence,
       manifest: await turnFenceManifest({ binary: COMMAND(), env, policyDir, runtimeTemp }) }) : null
     assertFenced(fenced, { turn: 'a fenced Gemini turn', mounts: fenceSpec?.mounts ?? [] })
+    // A read seat's policy was written before the fence was tried, so here it already holds read tools. Where
+    // DEVPANEL_FENCE_UNPROVED=run lets other turns go on unfenced, this one would read its roots with nothing masked
+    // (a consult's roots hold the panel's token); the other adapters fall back to a tool-free turn, this one refuses.
+    if (readOnlyTools && fenceSpec && !fenced?.applied) {
+      throw new ProcessError(`a Gemini read seat gets its read tools only inside a proved seat fence, and the fence could not be proved: ${fenced?.reason ?? 'no fence'}`, {
+        kind: 'environment-error', started: false, invocationId
+      })
+    }
     const inner = { command: sandboxArgv ? BWRAP() : COMMAND(), args: sandboxArgv ? [...sandboxArgv, '--', COMMAND(), ...args] : args }
     const launch = fenced?.applied ? fenced.wrap(inner.command, inner.args) : inner
     // The operator's configuration (config-guard.mjs): checked after the turn
@@ -1079,6 +1096,9 @@ async function invokeOnce ({
         hygiene: Boolean(hygiene),
         fence: fenceSpec ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null, config: configDiagnostics(config) } : null,
         tooling: supervisorOnly || tooling ? enforcement : null,
+        // What the consult panel and a coordinator's `access: read` turn branch on, as claude and codex report it:
+        // 'read' only when the read tools ran inside a proved fence.
+        ...(readOnlyTools ? { access: fenced?.applied === true ? 'read' : 'none (fence not proved)' } : {}),
         // Every tool the runtime reported running, with what the policy said.
         // This is what a fence check reads: an attempt that was DENIED is
         // evidence the fence held; a turn with no attempts proves nothing.

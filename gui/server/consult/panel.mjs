@@ -53,8 +53,9 @@ export async function resolveSeats (panel, { roster, availability = null }) {
     const model = roster.get(id)
     if (!model) { problems.push(`${seat}: roster model "${id}" does not exist`); continue }
     if (model.verification?.status !== 'verified') { problems.push(`${seat}: ${id} is not verified`); continue }
-    // Gemini has no read-only workspace root: a non-writing seat there has no tools at all.
-    if (model.harness === 'gemini') { problems.push(`${seat}: ${id} runs on gemini, which cannot give a seat read-only access`); continue }
+    // No harness is refused here. A Gemini seat reads with its file tools inside the same proved fence but has no
+    // shell (harness/gemini.mjs, the non-writer policy): it cannot run git, so it sees the checkout as it stands and
+    // no history. Whether a seat really read is decided per turn, from the adapter's `diagnostics.access` (consult.mjs).
     if (effort && Array.isArray(model.efforts) && !model.efforts.includes(effort)) { problems.push(`${seat}: ${id} has no effort "${effort}"`); continue }
     const hold = await availability?.check(id)
     if (hold) { problems.push(`${seat}: ${id} is unavailable${hold.exhaustedUntil ? ` until ${hold.exhaustedUntil}` : ''}${hold.reason ? ` (${hold.reason})` : ''}`); continue }
