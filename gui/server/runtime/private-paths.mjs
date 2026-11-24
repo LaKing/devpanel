@@ -17,7 +17,8 @@ import { hostSettings } from '../config/host-settings.mjs'
 export const PRIVATE_HOME = ['.ssh', '.gnupg', '.claude', '.claude.json', '.codex', '.gemini', '.config', '.netrc', '.git-credentials', '.npmrc', '.aws', '.docker', '.kube']
 
 const PANEL_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..')
-const overlaps = (a, b) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep)
+const isRoot = (p) => p === path.sep
+const overlaps = (a, b) => a === b || isRoot(a) || isRoot(b) || a.startsWith(b + path.sep) || b.startsWith(a + path.sep)
 const real = (p) => fs.realpath(p).catch(() => path.resolve(p))
 
 /** The private home entry `dir` (a real path) is, contains or lies in; null when none. */
@@ -37,7 +38,7 @@ export async function panelDataHit (dir, { projectsDir = projectsRoot() } = {}) 
     if (overlaps(dir, r)) return r
   }
   const root = await real(projectsDir)
-  if (root === dir || root.startsWith(dir + path.sep)) return root
+  if (root === dir || isRoot(dir) || root.startsWith(dir + path.sep)) return root
   for (const { dir: project } of await listProjectDirs(projectsDir)) {
     const r = await real(project)
     if (overlaps(dir, r)) return r

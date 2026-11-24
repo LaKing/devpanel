@@ -14,11 +14,16 @@ export function persistence (io = fs) {
   const syncDir = async dir => use(await io.open(dir, 'r'), handle => handle.sync())
   const prepare = async (file, parents = true) => {
     const dir = path.dirname(file)
-    if (parents) await io.mkdir(dir, { recursive: true })
-    // Include ancestors: a caller may just have created the run/issue folders.
-    for (let current = dir; ; current = path.dirname(current)) {
-      await syncDir(current)
-      if (path.dirname(current) === current) break
+    if (parents) {
+      const created = await io.mkdir(dir, { recursive: true })
+      if (created) {
+        // Sync each newly created directory and the existing parent that now references it.
+        const stopAt = path.dirname(created)
+        for (let current = dir; ; current = path.dirname(current)) {
+          await syncDir(current)
+          if (current === stopAt || path.dirname(current) === current) break
+        }
+      }
     }
     return dir
   }

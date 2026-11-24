@@ -721,13 +721,14 @@ async function load ({ keepSelection = true } = {}) {
     issueVersion.value++
     runs.value = nextRuns
 
+    const prevRunId = selectedRunId.value
     const requested = route.query.run
     if (requested && nextRuns.some((r) => r.runId === requested)) {
       selectedRunId.value = requested
     } else if (!keepSelection || !nextRuns.some((r) => r.runId === selectedRunId.value)) {
       selectedRunId.value = nextRuns[0]?.runId ?? null
     }
-    await loadRun()
+    if (selectedRunId.value === prevRunId) await loadRun()
   } catch (err) {
     if (current()) loadError.value = err.message
   } finally {

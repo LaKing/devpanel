@@ -6,10 +6,12 @@ import { connection } from '@/socket'
 import FullVerificationCard from '@/components/FullVerificationCard.vue'
 import RunTimeline from '@/components/RunTimeline.vue'
 import LiveOutput from '@/components/LiveOutput.vue'
+import CycleOutput from '@/components/CycleOutput.vue'
 
 /*
- * The latest daily full verification in detail: the record (issues/.verification/<date>/cycle.json)
- * and each stage's Deployment run, read through the run routes from its run home
+ * The latest full verification in detail: the record (issues/.verification/<date>/cycle.json), and per stage
+ * either its drive on a stage instance of the cycle's own, with a terminal that follows what the drive prints
+ * (CycleOutput.vue), or its Deployment run, read through the run routes from its run home
  * (issues/<project>/.verification-<date>/, which is not an issue).
  */
 
@@ -20,6 +22,18 @@ const error = ref('')
 
 const cycle = computed(() => state.value?.cycle ?? null)
 const started = computed(() => (cycle.value?.projects ?? []).filter((p) => p.runId))
+// Entries the cycle drives itself (instance mode), derives from them (a framework) or holds back for them.
+const driven = computed(() => (cycle.value?.projects ?? []).filter((p) => !p.runId && (p.mode === 'instance' || p.mode === 'derived' || p.state === 'deferred')))
+const minutes = (ms) => typeof ms === 'number' ? `${(ms / 60000).toFixed(1)} min` : null
+function entryLine (p) {
+  const parts = [p.verdict ?? p.state ?? '—']
+  if (p.mode === 'derived') parts.push(`derived from ${(p.derived?.from ?? []).map((f) => f.project).join(', ') || 'its instances'}`)
+  if (p.state === 'deferred') parts.push('waits for the instances that carry its modules')
+  if (p.instance?.name) parts.push(`instance ${p.instance.name}`)
+  if (p.startedAt) parts.push(`started ${p.startedAt.slice(11, 19)}Z`)
+  if (minutes(p.instance?.readyMs)) parts.push(`ready after ${minutes(p.instance.readyMs)}`)
+  return parts.join(' · ')
+}
 
 async function load () {
   try {
@@ -85,6 +99,18 @@ function invocationOf (project) {
           <template v-if="item.error"> · {{ item.error }}</template>
         </div>
         <div v-if="cycle.outcome.error">Error: {{ cycle.outcome.error }}</div>
+      </v-card-text>
+    </v-card>
+
+    <v-card v-for="p in driven" :key="`drive-${p.project}`" elevation="0" border class="mb-4" data-test="cycle-entry">
+      <v-card-item>
+        <v-card-title>{{ p.project }}<template v-if="p.stage"> · {{ p.stage }}</template></v-card-title>
+        <v-card-subtitle>{{ entryLine(p) }}</v-card-subtitle>
+      </v-card-item>
+      <v-card-text v-if="p.mode === 'instance'">
+        <p v-if="p.flaky?.length">Flaky (passed alone on the same instance): {{ p.flaky.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
+        <p v-else-if="p.rerun?.state === 'skipped'">No rerun of failed tests: {{ p.rerun.message }}</p>
+        <CycleOutput :project="p.project" :active="Boolean(state?.active)" />
       </v-card-text>
     </v-card>
 

@@ -45,8 +45,9 @@ const entries = computed(() => {
 const container = computed(() => ['object', 'array', 'json-string'].includes(kind.value) && entries.value.length > 0)
 const isArray = computed(() => Array.isArray(inner.value))
 
-// Open near the top and when small; a large branch deep down starts folded.
-const open = ref(props.depth < 2 || entries.value.length <= 6)
+const MAX_RENDER_DEPTH = 16
+// Open near the top and when small; a large or deep branch starts folded.
+const open = ref(props.depth < 2 || (props.depth < 6 && entries.value.length <= 6))
 const textOpen = ref(true)
 
 const summary = computed(() => {
@@ -68,7 +69,10 @@ const lines = computed(() => (typeof props.value === 'string' ? props.value.spli
         <span v-if="!open" class="jt__summary">{{ summary }} <span class="jt__brace">{{ isArray ? ']' : '}' }}</span></span>
       </button>
       <div v-if="open" class="jt__children">
-        <JsonTree v-for="([k, v], i) in entries" :key="k" :name="k" :value="v" :depth="depth + 1" :last="i === entries.length - 1" />
+        <template v-if="depth < MAX_RENDER_DEPTH">
+          <JsonTree v-for="([k, v], i) in entries" :key="k" :name="k" :value="v" :depth="depth + 1" :last="i === entries.length - 1" />
+        </template>
+        <p v-else class="jt__empty">max nesting depth ({{ MAX_RENDER_DEPTH }}) reached</p>
         <p v-if="!entries.length" class="jt__empty">empty</p>
       </div>
       <div v-if="open" class="jt__row jt__close"><span class="jt__brace">{{ isArray ? ']' : '}' }}</span></div>

@@ -83,24 +83,29 @@ function absorb (incoming) {
   else draw()
 }
 
+let inflightTarget = null
+let loadSeq = 0
 function load ({ reset = false } = {}) {
-  if (reset) { entries = []; next = 0; redraw() }
-  if (inflight) return inflight
   const target = props.invocationId
-  inflight = (async () => {
+  if (reset) { entries = []; next = 0; redraw() }
+  if (inflight && inflightTarget === target) return inflight
+  const seq = ++loadSeq
+  inflightTarget = target
+  const promise = (async () => {
     try {
       const page = await api.liveOutput(props.project, props.issueId, props.runId, target, next)
-      if (target !== props.invocationId) return
+      if (seq !== loadSeq || target !== props.invocationId) return
       absorb(page.entries)
       error.value = ''
     } catch (e) {
-      error.value = e.message
+      if (seq === loadSeq && target === props.invocationId) error.value = e.message
     } finally {
-      loading.value = false
-      inflight = null
+      if (inflight === promise) { inflight = null; inflightTarget = null }
+      if (seq === loadSeq && target === props.invocationId) loading.value = false
     }
   })()
-  return inflight
+  inflight = promise
+  return promise
 }
 
 function onRunEvent (event) {

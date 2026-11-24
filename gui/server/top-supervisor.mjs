@@ -1133,12 +1133,16 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       if (!await tools.getRun(r.project, r.issueId, r.runId).then(() => true, (e) => e.status !== 404)) continue
       try {
         let run
+        const deadline = Date.now() + 60_000
         do {
-          run = await tools.getRun(r.project, r.issueId, r.runId);r.status=run.status
-          if (live.includes(run.status)) await new Promise(resolve=>setTimeout(resolve,100))
+          run = await tools.getRun(r.project, r.issueId, r.runId); r.status = run.status
+          if (live.includes(run.status)) {
+            if (Date.now() >= deadline) { errors.push(`Run ${r.runId} did not settle within 60s`); break }
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
         } while (live.includes(run.status))
-        if (run.recovery?.required || run.blockedReason==='recovery-required') errors.push(`Run ${r.runId} requires recovery`)
-      } catch(e) { if (e.status !== 404) errors.push(e.message) }
+        if (run.recovery?.required || run.blockedReason === 'recovery-required') errors.push(`Run ${r.runId} requires recovery`)
+      } catch (e) { if (e.status !== 404) errors.push(e.message) }
     }
     state.status = errors.length || state.pending ? 'recovery-required' : 'stopped'
     state.finishing = false

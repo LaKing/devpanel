@@ -151,6 +151,12 @@ The key is `chmod 600` and `cert/` is git-ignored — it must never be committed
 > directory the name is read unverified, for attribution only, and the token is required.
 > Direct clients (the devpanel skill, tests) keep using the token.
 >
+> **Only from the panel's own pages.** A browser sends its cached Basic header with cross-site
+> requests too (a foreign page's form POST, image or WebSocket), so a proxy-login request whose
+> `Sec-Fetch-Site` is not `same-origin`/`none`, or whose `Origin` does not name the `Host`, is
+> refused 403, and such a socket handshake is refused (`server/same-site.mjs`). A token request
+> is not checked: browsers never attach the token by themselves.
+>
 > **A local single-user install may drop the token** (`DEVPANEL_AUTH=local`, set by
 > `install-on-osx.sh`; `server/local-login.mjs`). The server refuses to start with it unless
 > `HOST` is loopback. A request whose `Host` is the loopback address and port, whose `Origin`
@@ -766,6 +772,15 @@ as written (`server/full-verification.mjs`; docs/execution-contract.md "Full ver
 freeze"). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
 while one runs). The socket event `verification:changed` names the cycle and its state; the
 top-level supervisor is told `verification-ended` once it ended.
+
+`GET /api/verification/output?project=<id>[&command=<key>&after=<bytes>]` is the **Full verification** page's terminal
+(`/verification`, in the drawer; `CycleOutput.vue`): the commands of one entry's drive in the latest cycle, oldest first
+(`key` is `<check directory>/<command id>`, with `running`, `bytes`, `changedAt`; a rerun of failed tests has a check
+directory of its own), and with `command` that command's text from byte `after` on (`text`, `next`, `running`,
+`truncated`, `restarted`), at most 256 kB a reading, cut at a character boundary. A running command is read from its
+live copy `<id>.live` (`runtime/checks.mjs` appends every command's output there as it arrives and removes it once the
+log is written), an ended one from `<id>.log`. Read-only; the entry's directory comes from the cycle record
+(`server/verification-output.mjs`).
 
 `cycle.projects` holds one entry per project. Fields that say what kind it is:
 

@@ -337,6 +337,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operation per project at a time, recorded under `issues/<project>/.actions/<id>/` with output appended before
   its `project:action` socket event. Operators run these from the project page or with
   `project-action-cli.mjs`; the top-level supervisor has no action for them. See `docs/project-infrastructure.md`.
+- `verification-output.mjs` — what a full verification's drives print, for the Full verification page (`/verification`, in the drawer; `VerificationView.vue`,
+  `CycleOutput.vue`): `GET /api/verification/output` lists the commands of one entry's drive and returns one command's text from a byte offset, so the page
+  follows a running command like a terminal. A running command has `<id>.live` in its check directory: `runtime/checks.mjs` `runOne` appends every command's
+  output there as it arrives (any drive, a run's too) and removes it once `<id>.log` and `<id>.stdout` are written, which stay the evidence. Read-only.
 - `playbook-seats.mjs` — the Playbooks page (`/playbooks`, `PlaybooksView.vue`; `GET /api/playbook-seats`, `PUT /api/playbook-seats/:id`): every
   playbook's seats (each role of its strategy with the model and effort bound to it) and an operator's edit of those defaults. The edit is validated
   in memory by the schema and by `resolvePlaybook` (only what the edit itself breaks is refused), then written as the installation's own copy
@@ -805,7 +809,8 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
 - The person is the reverse proxy's basic-auth login when there is one (`src/identity.js`, `GET /api/whoami`,
   `server/proxy-user.mjs` overrides every body `actor`); only without it do "Your name" fields appear. A login
   verified against the proxy's users directory (`DEVPANEL_USERS_DIR` or the host settings' `proxyLogin`) admits
-  API and socket without the token (`auth.mjs`).
+  API and socket without the token (`auth.mjs`), only from the panel's own pages: a cross-site
+  request or handshake on that login is refused (`server/same-site.mjs`, Sec-Fetch-Site / Origin vs Host).
 - `POST /api/report/:project` (`server/report.mjs`) is the one tokenless route: a private-network peer that did not
   come through the proxy and is not the panel itself may open an issue, nothing more. A reporter key
   (`server/reporters.mjs`, `tools/reporter.mjs`) makes it trust `fault` or `request`, else `anonymous`; `issue.report.trust`

@@ -2562,8 +2562,9 @@ export class Engine {
         continue
       }
       await new Promise((resolve) => {
-        const timer = setTimeout(resolve, this.moduleLockPollMs ?? 5000)
-        this.controller.signal.addEventListener('abort', () => { clearTimeout(timer); resolve() }, { once: true })
+        const onAbort = () => { clearTimeout(timer); resolve() }
+        const timer = setTimeout(() => { this.controller.signal.removeEventListener('abort', onAbort); resolve() }, this.moduleLockPollMs ?? 5000)
+        this.controller.signal.addEventListener('abort', onAbort, { once: true })
       })
     }
   }
@@ -3085,7 +3086,7 @@ export class Engine {
       let brokerTurn = null
       if (!coordinationOnly && !readAccess && brokerConfigured(this.snapshot.infrastructure)) {
         brokerTurn = await openBrokerTurn({ configRoot: this.configRoot, binding: { project: this.run.issue.project, issueId: this.run.issue.id, issuePath: this.issuePath,
-          runId: this.runId, runDir: store.runDir(this.issuePath, this.runId), invocationId, seat: role } })
+          runId: this.runId, runDir: store.runDir(this.issuePath, this.runId), invocationId, seat: role, provider: spec.model?.harness ?? null, profile: spec.model?.profile ?? null } })
         if (turnFence) { turnFence.writable = [...turnFence.writable, ...brokerTurn.fence.writable]; turnFence.readOnly = [...turnFence.readOnly, ...brokerTurn.fence.readOnly] }
       }
       // The daily full verification's freeze (execution-contract.md "Full verification
@@ -4211,7 +4212,9 @@ export class Engine {
     return null
   }
 
-  async drive ({ maxTurns = 200 } = {}) {
+  async drive ({ maxTurns } = {}) {
+    const explicitMax = maxTurns !== undefined
+    const turnLimit = maxTurns ?? 200
     await this.assertJournal()
     // A persisted cancellation must survive a restart. Resetting status here is
     // how a cancelled run silently came back to life and invoked an agent.
@@ -4243,7 +4246,7 @@ export class Engine {
     if (this.run.integrity?.dispositions?.length) await this.maybeRunChecks()
 
     try {
-    for (let i = 0; i < maxTurns; i++) {
+    for (let i = 0; i < turnLimit; i++) {
       if (this.controller.signal.aborted) {
         // Aborted between turns: nothing is in flight, so termination is already
         // true and the run settles without waiting for a process to die.
@@ -4451,6 +4454,12 @@ export class Engine {
       throw error
     }
     await this.settleChecks()
+    if (!explicitMax && this.run.status === 'running') {
+      this.run.status = 'blocked'
+      this.run.blockedReason = 'max-turns-reached'
+      this.run.endedAt = this.clock.iso()
+      await this.persist({ type: 'blocked', reason: 'max-turns-reached' })
+    }
     // However the drive ended: a pause has no time limit, and nothing here waits on staging.
     await this.discardKeptInstance('run-ended')
     if (['blocked','failed','cancelled'].includes(this.run.status) || (this.run.status === 'completed' && this.run.outcome !== 'resolved')) await this.recoverUnacceptedRelease(`Run ended ${this.run.status}/${this.run.outcome}`)

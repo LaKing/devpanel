@@ -821,9 +821,16 @@ async function runOne ({ command, cwd, dir, clock, signal, spawn }) {
   const timeout = AbortSignal.timeout(timeoutMs)
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
   const record = { id: command.id, ...(command.kind ? { kind: command.kind } : {}), run: command.run, required: command.required !== false, ...(command.kind === 'candidate' && command.service === true && command.startedMarker ? { startedMarker: command.startedMarker } : {}), exitCode: null, signal: null, timedOut: false, durationMs: null, log: path.basename(log), passed: false }
+  // What the command prints, as it prints it: `<id>.live`, for a person watching a drive that takes twenty minutes
+  // (the Full verification page tails it, verification-output.mjs). The log and the stdout file below, written when
+  // the command has ended, stay the evidence; the live copy is best effort, appended in arrival order, and removed
+  // once they exist. A drive cut by a crash leaves it behind as the only output there is.
+  const live = path.join(dir, `${command.id}.live`)
+  let appending = fs.writeFile(live, `$ ${command.run}${NL}${NL}`).catch(() => {})
+  const onOutput = (_stream, chunk) => { appending = appending.then(() => fs.appendFile(live, chunk)).catch(() => {}) }
   try {
     const { command: cmd, args, remoteTimeout, env } = spawn(command)
-    const out = await runProcess({ command: cmd, args, cwd: cwd ?? undefined, signal: combined, maxBuffer: 16 * 1024 * 1024, ...(env ? { env } : {}) })
+    const out = await runProcess({ command: cmd, args, cwd: cwd ?? undefined, signal: combined, maxBuffer: 16 * 1024 * 1024, observe: { onOutput }, ...(env ? { env } : {}) })
     await fs.writeFile(log, `$ ${command.run}${NL}${NL}${out.stdout}${out.stderr ? `${NL}--- stderr ---${NL}${out.stderr}` : ''}${NL}--- exit ${out.code ?? out.signal} in ${clock.now() - started} ms${out.cancelled ? ' (terminated)' : ''} ---${NL}`, 'utf8')
     record.exitCode = out.code
     record.signal = out.signal
@@ -852,6 +859,8 @@ async function runOne ({ command, cwd, dir, clock, signal, spawn }) {
   } catch (error) {
     await fs.writeFile(log, `$ ${command.run}${NL}${NL}could not run: ${error.message}${NL}`, 'utf8')
   }
+  await appending
+  await fs.rm(live, { force: true }).catch(() => {})
   record.durationMs = clock.now() - started
   return record
 }

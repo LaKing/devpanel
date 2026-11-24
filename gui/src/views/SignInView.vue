@@ -35,7 +35,7 @@ function submit () {
           code. It needs the operator token before showing any of it.
         </p>
 
-        <v-alert v-if="wasRejected && submitted" type="error" variant="tonal" density="compact" class="mb-4">
+        <v-alert v-if="wasRejected" type="error" variant="tonal" density="compact" class="mb-4">
           That token was refused.
         </v-alert>
 

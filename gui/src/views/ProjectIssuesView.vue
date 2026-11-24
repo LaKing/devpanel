@@ -97,6 +97,20 @@ let loadSeq = 0
 const checkoutOverlap = ref(null)
 // The project's module pool and the locks live runs hold in it (module-locks.mjs); null without a pool.
 const moduleLocks = ref(null)
+// One line on the page however many modules are held: the modules are grouped by the run that holds them and
+// shown only when the line is opened (a run of nine modules used to take half the screen).
+const lockRuns = computed(() => {
+  const runs = new Map()
+  for (const l of moduleLocks.value?.held ?? []) {
+    if (!runs.has(l.runId)) runs.set(l.runId, { runId: l.runId, project: l.project, issueId: l.issueId, owner: l.owner ?? null, state: l.state, waiting: false, modules: [] })
+    const run = runs.get(l.runId)
+    run.modules.push(l.module)
+    if (l.waiting) run.waiting = true
+    if (l.state !== 'held') run.state = l.state
+  }
+  return [...runs.values()]
+})
+const lockCount = computed(() => moduleLocks.value?.held?.length ?? 0)
 
 async function load () {
   const seq = ++loadSeq
@@ -281,7 +295,7 @@ watch([project, archived], () => {
              data-test="checkout-overlap">
       Uncommitted changes in this checkout are also being changed by a live run.
       Nothing is blocked: its delivery merges with these edits and stops only on lines both changed.
-      <details v-for="o in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`" class="mt-1" data-test="checkout-overlap-run">
+      <details v-for="o in checkoutOverlap.overlaps" :key="`${o.runId}-${o.ownerProject}`" class="mt-1 issues__locks" data-test="checkout-overlap-run">
         <summary>
           {{ o.files.length + (o.more || 0) }} {{ o.files.length + (o.more || 0) === 1 ? 'file' : 'files' }} —
           <router-link :to="`/projects/${encodeURIComponent(o.project)}/${encodeURIComponent(o.issueId)}`">{{ o.issueId }}</router-link>
@@ -292,14 +306,19 @@ watch([project, archived], () => {
       </details>
     </v-alert>
 
-    <v-alert v-if="moduleLocks?.held?.length" type="info" variant="tonal" density="compact" class="mb-3"
+    <v-alert v-if="lockCount" type="info" variant="tonal" density="compact" class="mb-3"
              data-test="module-locks">
-      Module locks in the pool of {{ moduleLocks.pool }} ({{ moduleLocks.members.join(', ') }}): a start that needs one of these modules waits until its run ends.
-      <div v-for="l in moduleLocks.held" :key="l.module" class="mt-1">
-        <code>{{ l.module }}</code>
-        <span v-if="l.owner"> ({{ l.owner }})</span>
-        — run {{ l.runId }} of {{ l.project }}/{{ l.issueId }}<span v-if="l.state !== 'held'">, {{ l.state }}</span><span v-if="l.waiting">, waiting for another module</span>
-      </div>
+      <details class="issues__locks">
+        <summary :title="`Pool of ${moduleLocks.pool}: ${moduleLocks.members.join(', ')}`">
+          Module locks: {{ lockCount }} {{ lockCount === 1 ? 'module' : 'modules' }} held by
+          {{ lockRuns.length }} {{ lockRuns.length === 1 ? 'run' : 'runs' }} in the pool of {{ moduleLocks.pool }}; a start that needs one of them waits.
+        </summary>
+        <div v-for="r in lockRuns" :key="r.runId" class="mt-1" data-test="module-locks-run">
+          <router-link :to="`/projects/${encodeURIComponent(r.project)}/${encodeURIComponent(r.issueId)}`">{{ r.issueId }}</router-link>
+          <span :title="r.runId"> (run {{ r.runId.slice(-8) }}<span v-if="r.project !== String(project)"> of {{ r.project }}</span><span v-if="r.state !== 'held'">, {{ r.state }}</span><span v-if="r.waiting">, waiting for another module</span>)</span>:
+          <span v-for="(m, i) in r.modules" :key="m"><code>{{ m }}</code><span v-if="i < r.modules.length - 1">, </span></span>
+        </div>
+      </details>
     </v-alert>
 
     <v-alert v-if="deleteError" type="error" variant="tonal" density="compact" closable
@@ -455,6 +474,7 @@ watch([project, archived], () => {
 /* Tags sit on their own wrapping line under the name, so a row never grows
    wider than the table: on a phone they stack, they do not push sideways. */
 .issues__tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.issues__locks summary { cursor: pointer; }
 .issues__tags .v-chip { font-size: 0.6875rem; }
 .issues__table :deep(td) { white-space: normal; }
 /* Provenance depth as indentation; the toggle column keeps names aligned whether or not a row has children. */
@@ -471,6 +491,10 @@ watch([project, archived], () => {
   flex-direction: column;
   min-height: 0;
 }
+
+/* Pitfall: Vuetify's alert carries `flex: 1 1`. In this column it grew like the issue list beside it, so a one-line
+   notice took half of the page's height. A notice is as tall as its text. */
+.issues > .v-alert { flex: none; }
 
 .issues__head {
   display: flex;

@@ -63,9 +63,11 @@ const declaredEffect = (value) => ACTION_EFFECTS.includes(value) ? value : null
  * carry another marker word (an editor's own convention) names it in the host
  * settings' projectActions.headerMarkers; DEVPANEL is always read.
  */
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
 export function parseScriptHeader (text, markers = hostSettings().projectActions.headerMarkers) {
   const header = {}
-  const pattern = new RegExp(`^#\\s*(?:${markers.join('|')})\\s+([a-z]+):\\s*(.*?)\\s*$`, 'i')
+  const pattern = new RegExp(`^#\\s*(?:${markers.map(escapeRegex).join('|')})\\s+([a-z]+):\\s*(.*?)\\s*$`, 'i')
   for (const line of text.split('\n').slice(0, 30)) {
     const m = pattern.exec(line)
     if (m) header[m[1].toLowerCase()] = m[2]
@@ -184,6 +186,14 @@ export async function readOperation (project, operationId, { issuesDir = ISSUES_
   return { operation, entries, next: entries.at(-1)?.seq ?? after }
 }
 
+const SECRET_ENV_RE = /(?:^DEVPANEL_TOKEN(?:_FILE)?$|(?:_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIALS|_AUTH)$|^MONGODB_URI$|^DATABASE_URL$)/i
+function actionEnv (extra) {
+  const out = {}
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && !SECRET_ENV_RE.test(k)) out[k] = v
+  }
+  return { ...out, ...extra }
+}
 // Operations this process started, so a stop request reaches the right child.
 const inflight = new Map()
 
@@ -267,8 +277,8 @@ export async function startProjectAction ({ project, actionId, args = [], root, 
         // Arguments reach the action's command line as separate words, never re-parsed.
         args: args.length ? ['-c', `${action.run} "$@"`, 'devpanel-action', ...args] : ['-c', action.run],
         cwd: action.cwd,
-        // Non-interactive by construction: no terminal, no credential prompts.
-        env: { ...process.env, DEVPANEL_PROJECT_ACTION: action.id, DEVPANEL_OPERATION_ID: id, GIT_TERMINAL_PROMPT: '0', TERM: 'dumb' },
+        // Non-interactive by construction: no terminal, no credential prompts, no panel secrets.
+        env: actionEnv({ DEVPANEL_PROJECT_ACTION: action.id, DEVPANEL_OPERATION_ID: id, GIT_TERMINAL_PROMPT: '0', TERM: 'dumb' }),
         signal: AbortSignal.any(signals),
         maxBuffer: 4 * 1024 * 1024,
         observe: {
@@ -326,6 +336,13 @@ export async function stopProjectAction (project, operationId, { issuesDir = ISS
   const deadline = Date.now() + 30000
   while (inflight.has(`${project}/${operationId}`) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25))
   return (await readOperation(project, operationId, { issuesDir })).operation
+}
+
+/** Stop every running project action owned by this process during shutdown. */
+export async function stopAllProjectActions (graceMs = 10_000) {
+  for (const controller of inflight.values()) controller.abort()
+  const deadline = Date.now() + graceMs
+  while (inflight.size > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25))
 }
 
 /**

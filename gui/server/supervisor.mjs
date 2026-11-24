@@ -29,7 +29,7 @@ import {
 import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from './runtime/engine.mjs'
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
-import { LockHeld, ownerLiveness, withLock } from './runtime/lock.mjs'
+import { LockHeld, ownerLiveness, releaseDeadLock, withLock } from './runtime/lock.mjs'
 import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, writesCheckout } from './run-exclusivity.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
 import { terminatePids } from './runtime/process.mjs'
@@ -264,6 +264,9 @@ export function createSupervisor ({
     if (issue.kind !== 'inquiry' && runOptions?.inquiry === true) throw err(409, 'only an inquiry runs as an inquiry')
   }
 
+  /** Cache loaded harness modules by path + mtimeMs so repeated runs do not leak V8 ESM entries. */
+  const harnessCache = new Map()
+
   /**
    * Every adapter in the harness directory, keyed by its filename.
    *
@@ -285,12 +288,18 @@ export function createSupervisor ({
     for (const file of files) {
       const id = file.slice(0, -4)
       if (['shared', 'fence', 'mcp-devpanel'].includes(id)) continue   // helpers and the broker's MCP shim, not runtimes
-      // The cache-buster reloads the adapter file only: what it imports
-      // (shared.mjs, gui/server/runtime/*) stays the copy this process loaded at
-      // start. An adapter updated on disk that needs a newer export from those
-      // therefore fails to import until the service restarts; the reason is kept
-      // so the probe can name it instead of reporting a missing adapter.
-      try { adapters[id] = await import(`${path.join(harnessDir, file)}?t=${Date.now()}`) } catch (error) { adapters[HARNESS_LOAD_FAILURES][id] = error }
+      const fullPath = path.join(harnessDir, file)
+      try {
+        const mtimeMs = (await fs.stat(fullPath)).mtimeMs
+        const cached = harnessCache.get(fullPath)
+        if (cached && cached.mtimeMs === mtimeMs) {
+          adapters[id] = cached.mod
+        } else {
+          const mod = await import(`${fullPath}?t=${mtimeMs}`)
+          harnessCache.set(fullPath, { mtimeMs, mod })
+          adapters[id] = mod
+        }
+      } catch (error) { adapters[HARNESS_LOAD_FAILURES][id] = error }
     }
     return adapters
   }
@@ -986,6 +995,7 @@ export function createSupervisor ({
       const refusal = autoReconcileRefusal(await store.readRun(issue.path, runId), await reconcilePolicyOf(project))
       if (refusal) throw new Error(refusal)
       if (freeze) return defer()
+      if (attemptedReconciles.size >= 2000) attemptedReconciles.delete(attemptedReconciles.values().next().value)
       attemptedReconciles.add(mark)
       try {
         await finalize({ project, issueId, runId, reconcile: true, actor: 'engine' })
@@ -1854,7 +1864,7 @@ export function createSupervisor ({
     // A dead owner's lock must not keep the issue hostage — but only the lock
     // that belonged to THIS run, and only if nothing living is behind it.
     if (releaseLock) {
-      await fs.rm(path.join(issuePath, '.run.lock'), { force: true }).catch(() => {})
+      await releaseDeadLock(path.join(issuePath, '.run.lock'), { runId: run.runId, platform }).catch(() => {})
     }
     return run
   }

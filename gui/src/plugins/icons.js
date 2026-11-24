@@ -9,6 +9,7 @@ import {
   mdiChevronLeft,
   mdiChevronRight,
   mdiChip,
+  mdiClipboardCheckOutline,
   mdiCircleOutline,
   mdiClockOutline,
   mdiDeleteOutline,
@@ -91,5 +92,6 @@ export const appIcons = {
   sync: mdiSync,
   themeDark: mdiWeatherNight,
   themeLight: mdiWeatherSunny,
+  verification: mdiClipboardCheckOutline,
   viewGridPlus: mdiViewGridPlusOutline
 }

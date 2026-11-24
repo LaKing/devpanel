@@ -624,7 +624,7 @@ function standingOf (run, { outputs, active, ownership }) {
       if (p.kind === 'manual') return { tone: 'waiting', headline: 'Paused', detail: 'Everything done so far is saved.', next: 'Resume continues from the next unfinished step.' }
       if (p.kind === 'full-verification') return { tone: 'waiting', headline: 'Paused for the daily full verification',
         detail: `Admission closed for cycle ${p.cycleId ?? 'unknown'}; everything done so far is saved.`,
-        next: p.manualPending ? 'An operator pause was pending as well, so the cycle leaves this run paused: Resume continues it.' : 'It resumes when the cycle ends; Resume continues it after that.' }
+        next: p.manualPending ? 'An operator pause was pending as well, so the cycle leaves this run paused: Resume continues it.' : 'It resumes when the cycle ends; Resume continues it after that. The Full verification page (/verification) shows how far the cycle is and what its drives print.' }
       const answered = answeredWords(run)
       if (p.request) {
         // The question is what to answer; the reason is why the run cannot do it.

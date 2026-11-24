@@ -53,26 +53,31 @@ function absorb (incoming) {
   next = merged.next
 }
 
-/** One catch-up at a time; a second caller waits for the first. */
+let inflightTarget = null
+let loadSeq = 0
+/** One catch-up at a time per operation; switching operations starts a fresh request. */
 function load () {
-  if (inflight) return inflight
   const target = operation.value?.id
   if (!target) return Promise.resolve()
-  inflight = (async () => {
+  if (inflight && inflightTarget === target) return inflight
+  const seq = ++loadSeq
+  inflightTarget = target
+  const promise = (async () => {
     try {
       const page = await api.actionOperation(props.project, target, next)
-      if (operation.value?.id !== target) return
+      if (seq !== loadSeq || operation.value?.id !== target) return
       absorb(page.entries)
       operation.value = page.operation
       error.value = ''
     } catch (e) {
-      error.value = e.message
+      if (seq === loadSeq && operation.value?.id === target) error.value = e.message
     } finally {
-      inflight = null
-      scrollToEnd()
+      if (inflight === promise) { inflight = null; inflightTarget = null }
+      if (seq === loadSeq && operation.value?.id === target) scrollToEnd()
     }
   })()
-  return inflight
+  inflight = promise
+  return promise
 }
 
 function open (op) {

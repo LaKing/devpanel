@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { proxyLogin } from './proxy-user.mjs'
 import { tokenFile as tokenFileFor } from './project-path.mjs'
+import { sameSite } from './same-site.mjs'
 
 /*
  * A shared bearer token guarding the API and the socket.
@@ -23,8 +24,9 @@ let cached = null
 export async function loadToken () {
   if (cached) return cached
 
-  if (process.env.DEVPANEL_TOKEN) {
-    cached = process.env.DEVPANEL_TOKEN.trim()
+  const envToken = process.env.DEVPANEL_TOKEN?.trim()
+  if (envToken) {
+    cached = envToken
     return cached
   }
 
@@ -46,7 +48,7 @@ export const resetTokenCache = () => { cached = null }
 
 /** Constant-time compare, so a wrong token cannot be discovered by timing. */
 function matches (a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false
+  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false
   const left = Buffer.from(a)
   const right = Buffer.from(b)
   if (left.length !== right.length) return false
@@ -79,7 +81,11 @@ function presented (req) {
 export function requireToken (token, { publicPaths = ['/api/health'] } = {}) {
   return (req, res, next) => {
     if (publicPaths.includes(req.path)) return next()
-    if (matches(presented(req), token) || req.login?.verified) return next()
+    if (matches(presented(req), token)) return next()
+    if (req.login?.verified) {
+      if (sameSite(req.headers)) return next()
+      return res.status(403).json({ error: 'a cross-site request is refused', hint: 'the panel accepts its basic-auth login only from its own pages (same-site.mjs)' })
+    }
     res.status(401).json({ error: 'a bearer token is required', hint: 'the operator can find it in .devpanel-token' })
   }
 }
@@ -91,7 +97,7 @@ export function socketAuth (token, { local = null } = {}) {
     if (matches(offered, token)) return next()
     if (local?.admits(socket.handshake?.headers)) return next()
     proxyLogin(socket.handshake?.headers).then((login) => {
-      if (login?.verified) return next()
+      if (login?.verified && sameSite(socket.handshake?.headers)) return next()
       const error = new Error('unauthorised')
       error.data = { reason: 'a bearer token is required' }
       next(error)

@@ -590,6 +590,7 @@ export function createFullVerification ({
     try {
       // No run of an issue left in this process: no seat turn is running.
       for (;;) {
+        if (stopped) throw new Error('full verification stopped while waiting for active runs to settle')
         const busy = supervisor.busy()
         if (!busy.length) break
         if (JSON.stringify(busy) !== JSON.stringify(record.waitingOn)) { record.waitingOn = busy; await write(record) }
@@ -835,7 +836,7 @@ export function createFullVerification ({
           else { entry.waits = [...(entry.waits ?? []), { reason: entry.waiting?.reason ?? null, from: w.from, to: w.to }]; delete entry.waiting }
           await write(record).catch(() => {})
         } })
-      await fs.writeFile(path.join(home, 'drive.json'), JSON.stringify({ driveId, cycleId: record.id, project: entry.project, fullVerification: { check } }, null, 2))
+      await writeJson(path.join(home, 'drive.json'), { driveId, cycleId: record.id, project: entry.project, fullVerification: { check } })
       const suiteRan = await suiteRanOf({ runDir: home, check: check.result, target, suiteId: suite.test.id })
       const notOnInstance = await notOnInstanceOf({ runDir: home, check: check.result, target })
       const incomplete = infra.testDrive.modules.browser && !suite.browser
@@ -855,7 +856,7 @@ export function createFullVerification ({
       // Before the finally below destroys the instance: each failed test alone on it (full-verification-rerun.mjs).
       if (entry.verdict !== 'green') {
         await rerunFailed(record, { entry, infra, check, target, home, driveId, workspace })
-        if (entry.rerun?.state === 'ran') await fs.writeFile(path.join(home, 'drive.json'), JSON.stringify({ driveId, cycleId: record.id, project: entry.project, fullVerification: { check, rerun: entry.rerun } }, null, 2))
+        if (entry.rerun?.state === 'ran') await writeJson(path.join(home, 'drive.json'), { driveId, cycleId: record.id, project: entry.project, fullVerification: { check, rerun: entry.rerun } })
       }
     } catch (error) {
       Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
@@ -945,8 +946,15 @@ export function createFullVerification ({
       Object.assign(entry, { runId: started.runId, runDir: path.join(home.path, 'runs', started.runId), state: 'running', startedAt: clock.iso() })
       await write(record)
       let run = null
+      let readFailures = 0
       for (;;) {
+        if (stopped) throw new Error('full verification stopped while waiting for stage run')
         run = await readRun(home.path, started.runId).catch(() => null)
+        if (!run) {
+          if (++readFailures >= 30 && !supervisor.isActive(entry.project, home.id)) throw new Error(`stage run ${started.runId} record could not be read`)
+        } else {
+          readFailures = 0
+        }
         if (run?.workspace && !after && projectDir && !before.error) after = await readMotion({ projectDir, policy, extra: (run.workspace.symlinks?.owners ?? []).map((o) => o.owner?.path).filter(Boolean) }).catch((error) => ({ error: error.message }))
         if (run && !LIVE.includes(run.status) && !supervisor.isActive(entry.project, home.id)) break
         await wait(pollMs)

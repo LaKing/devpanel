@@ -28,7 +28,7 @@ import { projectInfrastructure, inspectEnvironment } from './infrastructure.mjs'
 import { stagingPendingReport } from './staging-coverage.mjs'
 import { checkoutPaths } from './runtime/path-overlap.mjs'
 import { readGrants, writeGrant, revokeGrant } from './broker/broker.mjs'
-import { listProjectActions, readOperation, startProjectAction, stopProjectAction } from './project-actions.mjs'
+import { listProjectActions, readOperation, startProjectAction, stopAllProjectActions, stopProjectAction } from './project-actions.mjs'
 import { createSupervisor } from './supervisor.mjs'
 import { createFullVerification } from './full-verification.mjs'
 import { createOwnerInput } from './owner-input.mjs'
@@ -39,6 +39,7 @@ import { issueStats } from './issue-stats.mjs'
 import { CONFIG_ROOT, loadDecisionProvider } from './decisions/index.mjs'
 import { loadConfig } from './config/load.mjs'
 import { playbookSeats, savePlaybookSeats } from './playbook-seats.mjs'
+import { cycleOutput } from './verification-output.mjs'
 import { hostSettings } from './config/host-settings.mjs'
 import { sweepAtStart } from './runtime/stage-instances.mjs'
 import { sweepSyncs } from './runtime/sync-records.mjs'
@@ -114,13 +115,20 @@ function readTlsMaterial () {
 // In dev the Vue app is served by Vite on its own origin, so socket.io needs to
 // accept it. In production the app is served from this origin and needs nothing.
 const DEV_ORIGINS = (process.env.DEVPANEL_DEV_ORIGINS ??
-  'https://localhost:5173,https://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5173')
+  (process.env.NODE_ENV === 'production' ? '' : 'https://localhost:5173,https://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5173'))
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean)
 
 const app = express()
 app.disable('x-powered-by')
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'self'")
+  next()
+})
 
 // tokenFile is public so the sign-in page can say where the token is on THIS
 // install (/srv on the Linux hosts, ~/devpanel on a Mac); the home directory is
@@ -149,7 +157,12 @@ app.get('/api/info', (_req, res) => {
   res.json(info())
 })
 
-app.use(express.json({ limit: '2mb' }))
+const jsonBody = express.json({ limit: '2mb' })
+app.use((req, res, next) => {
+  // Raw step-file uploads use express.raw() below; do not let express.json() consume JSON attachments.
+  if (req.method === 'POST' && /^\/api\/projects\/[^/]+\/issues\/[^/]+\/steps\/[^/]+\/files\/[^/]+\/?$/.test(req.path)) return next()
+  return jsonBody(req, res, next)
+})
 // The reverse proxy's basic-auth login, when there is one, is the actor of every request (proxy-user.mjs).
 app.use('/api', proxyActor())
 app.get('/api/whoami', (req, res) => res.json({ user: req.actor, verified: req.login?.verified === true }))
@@ -208,7 +221,8 @@ app.get('/api/projects/:project/actions', route(async (req, res) => {
 }))
 app.post('/api/projects/:project/actions/:action', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
-  const { operation } = await startProjectAction({ project: req.params.project, actionId: req.params.action, root: process.env.DEVPANEL_CONFIG_ROOT, actor: req.actor ?? 'operator', emit: emitProjectAction })
+  const { operation, done } = await startProjectAction({ project: req.params.project, actionId: req.params.action, root: process.env.DEVPANEL_CONFIG_ROOT, actor: req.actor ?? 'operator', emit: emitProjectAction })
+  done.catch((error) => console.error(`[devpanel] project action ${req.params.project}/${req.params.action} failed: ${error?.message ?? error}`))
   res.status(202).json({ operation })
 }))
 app.get('/api/projects/:project/actions/operations/:operationId', route(async (req, res) => {
@@ -490,6 +504,17 @@ async function unpackedIssue (project, id) {
 // The daily full verification (server/full-verification.mjs): the latest cycle and
 // "Full verification now", which starts the same cycle the schedule does.
 app.get('/api/verification/latest', route(async (_req, res) => res.json(await fullVerification.latest())))
+// What the latest cycle's drives print (verification-output.mjs): an entry's commands, and one command's text from
+// a byte offset on, for the Full verification page's terminal. Read-only; the entry comes from the cycle record.
+app.get('/api/verification/output', route(async (req, res) => {
+  const { project, command } = req.query
+  if (typeof project !== 'string' || !project) throw Object.assign(new Error('project is required'), { status: 400 })
+  const after = req.query.after === undefined ? 0 : Number(req.query.after)
+  if (!Number.isInteger(after) || after < 0) throw Object.assign(new Error('after is a byte offset'), { status: 400 })
+  const { cycle } = await fullVerification.latest()
+  res.json(await cycleOutput({ cycle, project, command: typeof command === 'string' && command ? command : null, after }))
+}))
+
 app.post('/api/verification/start', route(async (req, res) => {
   const cycle = await fullVerification.startNow({ by: req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || 'operator') })
   res.status(202).json({ cycleId: cycle.id, state: cycle.state, cycle })
@@ -1004,7 +1029,7 @@ const tls = readTlsMaterial()
 const server = tls ? https.createServer(tls, app) : http.createServer(app)
 const scheme = tls ? 'https' : 'http'
 io = new Server(server, {
-  cors: { origin: DEV_ORIGINS, methods: ['GET', 'POST'] }
+  ...(DEV_ORIGINS.length ? { cors: { origin: DEV_ORIGINS, methods: ['GET', 'POST'] } } : {})
 })
 
 // The socket carries run events, so it needs the same credential as the API.
@@ -1118,15 +1143,19 @@ async function tick () {
   // Checked here rather than in the 'disconnect' handler: clientsCount has not
   // necessarily settled by the time that fires, so the ticker retires itself.
   if (io.engine.clientsCount === 0) return stopTicker()
-  io.emit('metrics', metricsSnapshot({
-    clients: io.engine.clientsCount,
-    source: await sourceState()
-  }))
+  try {
+    io.emit('metrics', metricsSnapshot({
+      clients: io.engine.clientsCount,
+      source: await sourceState()
+    }))
+  } catch (error) {
+    console.warn(`[devpanel] metrics tick failed: ${error?.message ?? error}`)
+  }
 }
 
 function startTicker () {
   if (ticker) return
-  ticker = setInterval(tick, TICK_MS)
+  ticker = setInterval(() => { tick().catch(() => {}) }, TICK_MS)
   ticker.unref()
 }
 
@@ -1140,7 +1169,7 @@ io.on('connection', (socket) => {
     version,
     tickMs: TICK_MS,
     metrics: metricsSnapshot({ clients: io.engine.clientsCount, source })
-  }))
+  })).catch((error) => console.warn(`[devpanel] socket hello failed: ${error?.message ?? error}`))
 
   // Round-trip latency probe: the client sends a timestamp, we hand it straight back.
   socket.on('ping:check', (sentAt, ack) => {
@@ -1161,10 +1190,16 @@ const announce = () => {
   console.log(`              API and socket require a bearer token — ${tokenFile()}`)
   if (!tls) console.log('              TLS is off — serving plain HTTP')
 }
+server.on('error', (error) => {
+  console.error(`[devpanel] server error: ${error?.message ?? error}`)
+})
 const listeners = HOSTS.length > 1 ? HOSTS.map(() => net.createServer((socket) => server.emit('connection', socket))) : []
 if (listeners.length) {
   let pending = listeners.length
-  listeners.forEach((listener, i) => listener.listen(PORT, HOSTS[i], () => { if (--pending === 0) announce() }))
+  listeners.forEach((listener, i) => {
+    listener.on('error', (error) => console.error(`[devpanel] listener ${HOSTS[i]}:${PORT} error: ${error?.message ?? error}`))
+    listener.listen(PORT, HOSTS[i], () => { if (--pending === 0) announce() })
+  })
 } else server.listen(PORT, HOST, announce)
 // Armed once serving: no block in the host settings, no scheduled cycle.
 fullVerification.start()
@@ -1178,17 +1213,24 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     closing = true
     console.log(`\n${signal} — stopping supervised runs`)
 
-    // Stop listening first, so nothing new arrives while runs are being stopped.
-    io.close()
-    server.close()
-    for (const listener of listeners) listener.close()
+    // Stop accepting new connections immediately, without delaying run shutdown on keep-alive sockets.
+    stopTicker()
     fullVerification?.stop()
+    const closeQuietly = (target) => new Promise((resolve) => {
+      const timer = setTimeout(resolve, 1000)
+      timer.unref()
+      try { target.close(() => { clearTimeout(timer); resolve() }) } catch { clearTimeout(timer); resolve() }
+    })
+    const closingServers = Promise.all([closeQuietly(io), closeQuietly(server), ...listeners.map(closeQuietly)])
+    server.closeIdleConnections?.()
 
     // Exiting without this leaves agent processes running with no owner, and
     // runs persisted as live whose owner is about to disappear.
+    await stopAllProjectActions().catch((error) => console.error(error.message))
     await modelPerformance.shutdown().catch(error => console.error(error.message))
     await topSupervisor.shutdown().catch(error => console.error(error.message))
     const result = await supervisor.shutdown().catch(() => ({ stopped: 0, settled: false }))
+    await closingServers
     console.log(result.settled
       ? `stopped ${result.stopped} run(s)`
       : `${result.stopped} run(s) did not settle in time — they will be reconciled on the next start`)

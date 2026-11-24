@@ -328,8 +328,9 @@ export async function appendLiveFile (file, entry, sizes = new Map(), { maxBytes
   if (!capped && size + Buffer.byteLength(line) > maxBytes && !TERMINAL_KINDS.has(entry.kind)) {
     record = { ...entry, kind: 'truncated', text: `live log capped at ${maxBytes} bytes; further output was not kept` }
   }
-  const bytes = Buffer.byteLength(JSON.stringify(record) + NL)
-  await appendDurable(file, JSON.stringify(record) + NL)
+  const payload = JSON.stringify(record) + NL
+  const bytes = Buffer.byteLength(payload)
+  await fs.appendFile(file, payload, { mode: 0o600 })
   sizes.set(file, record.kind === 'truncated' ? Math.max(size + bytes, maxBytes) : size + bytes)
   return { kept: record === entry, entry: record }
 }

@@ -192,7 +192,9 @@ async function takeOver (file, held, platform = hostPlatform(), stale = null) {
     const { held: gateHolder, liveness } = await examine(gate, platform)
     if (liveness === 'dead') {
       const now = await fs.readFile(gate, 'utf8').catch(() => null)
-      if (now !== null && (gateHolder === null || JSON.parse(now).token === gateHolder.token)) await fs.rm(gate, { force: true })
+      let nowToken = null
+      if (now !== null) { try { nowToken = JSON.parse(now).token } catch { nowToken = null } }
+      if (now !== null && (gateHolder === null || nowToken === gateHolder.token)) await fs.rm(gate, { force: true })
     }
     return false
   }
@@ -215,6 +217,22 @@ async function takeOver (file, held, platform = hostPlatform(), stale = null) {
   } finally {
     await fs.rm(gate, { force: true })
   }
+}
+
+/**
+ * Release a dead owner's lock through the serialized takeover gate, only if it
+ * still belongs to `runId` (when given) and has not been replaced by a new owner.
+ * Retries once so a stale/corrupt `.takeover` gate cleared on the first pass
+ * still releases the dead lock in the same call.
+ */
+export async function releaseDeadLock (file, { runId = null, platform = hostPlatform() } = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const { held, liveness } = await examine(file, platform)
+    if (!held || liveness !== 'dead') return false
+    if (runId !== null && held.owner?.runId && held.owner.runId !== runId) return false
+    if (await takeOver(file, held, platform)) return true
+  }
+  return false
 }
 
 /** Run `fn` while holding the lock, releasing it however `fn` ends. */

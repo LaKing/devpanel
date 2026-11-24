@@ -112,6 +112,12 @@ export async function mongoDriver (uri, { direct = false } = {}) {
   }
 }
 
+function scrubUri (message, uri) {
+  let out = String(message ?? '')
+  if (uri) out = out.replaceAll(uri, '[REDACTED-URI]')
+  return out.replace(/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi, '[REDACTED-URI]')
+}
+
 /**
  * The driver for an environment's declared database: by its URI, or, when the
  * declaration names a `socket`, through an SSH socket forward that lives as long
@@ -120,15 +126,19 @@ export async function mongoDriver (uri, { direct = false } = {}) {
 export async function environmentDriver (env, { connect = mongoDriver, forward = openSocketForward } = {}) {
   const uri = await reference(env.database.uriRef)
   if (!uri) throw new BrokerError(`the connection reference of ${env.id} resolves to nothing`, 'UNAVAILABLE')
-  if (!env.database.socket) return connect(uri)
+  if (!env.database.socket) {
+    try { return await connect(uri) } catch (error) {
+      throw new BrokerError(scrubUri(error.message, uri), error.code ?? 'UNAVAILABLE')
+    }
+  }
   let tunnel
-  try { tunnel = await forward({ ssh: env.ssh, remotePath: env.database.socket.path }) } catch (error) { throw new BrokerError(error.message, 'UNAVAILABLE') }
+  try { tunnel = await forward({ ssh: env.ssh, remotePath: env.database.socket.path }) } catch (error) { throw new BrokerError(scrubUri(error.message, uri), 'UNAVAILABLE') }
   try {
     const driver = await connect(uriThroughSocket(uri, tunnel.localPath), { direct: true })
     return { run: (request) => driver.run(request), close: async () => { try { await driver.close?.() } finally { await tunnel.close() } } }
   } catch (error) {
     await tunnel.close()
-    throw error
+    throw new BrokerError(scrubUri(error.message, uri), error.code ?? 'UNAVAILABLE')
   }
 }
 
@@ -141,9 +151,9 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
   const turns = new Map()
   const sequences = new Map()
 
-  function openTurn ({ project, issueId, issuePath, runId, runDir, invocationId, seat, operations = TOOLS }) {
+  function openTurn ({ project, issueId, issuePath, runId, runDir, invocationId, seat, provider = null, profile = null, operations = TOOLS }) {
     const token = crypto.randomBytes(24).toString('hex')
-    turns.set(token, { project, issueId, issuePath, runId, runDir, invocationId, seat, operations: [...operations], revoked: false })
+    turns.set(token, { project, issueId, issuePath, runId, runDir, invocationId, seat, provider, profile, operations: [...operations], revoked: false })
     return { token, revoke: () => { const t = turns.get(token); if (t) t.revoked = true; turns.delete(token) } }
   }
 
@@ -153,7 +163,10 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
     if (env.kind === 'staging') return { env, grant: { kind: 'project', environment: name } }
     const now = clock.now()
     const grant = (await readGrants(binding.issuePath)).find((g) => g.environment === name && !g.revokedAt && Date.parse(g.expiresAt) > now &&
-      (!g.seats?.length || g.seats.includes(binding.seat)))
+      (!g.seats?.length || g.seats.includes(binding.seat)) &&
+      (!g.providers || g.providers === 'any' || (Array.isArray(g.providers) &&
+        ((binding.provider && g.providers.includes(binding.provider)) ||
+          (binding.profile && binding.profile !== 'default' && g.providers.includes(binding.profile))))))
     if (!grant) throw new BrokerError(`no operator grant on this issue for ${name}${binding.seat ? ` and seat ${binding.seat}` : ''}`, 'FORBIDDEN')
     return { env, grant: { kind: 'issue', id: grant.id, environment: name, expiresAt: grant.expiresAt } }
   }
@@ -195,16 +208,32 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
         const allowed = (db, coll) => granted.some((d) => d.name === db && (coll === null || (d.collections ?? ['*']).includes('*') || d.collections.includes(coll)))
         const query = validateQuery(args.query, allowed)
         const limit = Math.min(query.limit ?? caps.documents, caps.documents)
-        const pipeline = query.op === 'aggregate' ? [...query.pipeline, { $limit: caps.documents + 1 }] : undefined
+        const boundFacets = (stages) => stages.map((st) => {
+          if (!st || typeof st !== 'object') return st
+          if ('$facet' in st) {
+            const capped = {}
+            for (const [k, sub] of Object.entries(st.$facet)) capped[k] = [...boundFacets(sub), { $limit: caps.documents + 1 }]
+            return { $facet: capped }
+          }
+          if ('$lookup' in st && Array.isArray(st.$lookup?.pipeline)) {
+            return { $lookup: { ...st.$lookup, pipeline: boundFacets(st.$lookup.pipeline) } }
+          }
+          if ('$unionWith' in st && st.$unionWith && typeof st.$unionWith === 'object' && Array.isArray(st.$unionWith.pipeline)) {
+            return { $unionWith: { ...st.$unionWith, pipeline: boundFacets(st.$unionWith.pipeline) } }
+          }
+          return st
+        })
+        const pipeline = query.op === 'aggregate' ? [...boundFacets(query.pipeline), { $limit: caps.documents + 1 }] : undefined
         // A held timer (AbortSignal.timeout's is unref'd): the cap must fire even
         // when nothing else keeps the process busy.
         const cap = new AbortController()
         const timer = setTimeout(() => cap.abort(new BrokerError(`the query exceeded ${caps.timeMs} ms`, 'TIMEOUT')), caps.timeMs)
-        const driver = await driverFor(env)
+        let driver = null
         let raw
         try {
+          driver = await driverFor(env)
           raw = await driver.run({ ...query, limit: limit + 1, pipeline, maxTimeMS: caps.timeMs, signal: signal ? AbortSignal.any([signal, cap.signal]) : cap.signal })
-        } finally { clearTimeout(timer); await driver.close?.().catch?.(() => {}) }
+        } finally { clearTimeout(timer); await driver?.close?.().catch?.(() => {}) }
         // A driver that ends its cursor on abort returns what it had: that is a
         // timeout, not a complete answer (implementation audit).
         if (cap.signal.aborted) throw cap.signal.reason instanceof BrokerError ? cap.signal.reason : new BrokerError(`the query exceeded ${caps.timeMs} ms`, 'TIMEOUT')
@@ -222,9 +251,11 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
         entry = { ...base, grant, outcome: 'ok', bytes: Buffer.byteLength(body), truncated, durationMs: clock.now() - started }
       }
     } catch (error) {
-      entry = { ...base, outcome: 'refused', error: error.message, code: error.code ?? (error instanceof GrammarError ? 'GRAMMAR' : 'ERROR'), durationMs: clock.now() - started }
+      const safeMessage = scrubUri(error.message)
+      entry = { ...base, outcome: 'refused', error: safeMessage, code: error.code ?? (error instanceof GrammarError ? 'GRAMMAR' : 'ERROR'), durationMs: clock.now() - started }
       try { await record(binding, entry) } catch { /* the refusal itself is returned */ }
-      throw error instanceof BrokerError || error instanceof GrammarError ? error : new BrokerError(error.message, 'ERROR')
+      if (safeMessage !== error.message) throw new BrokerError(safeMessage, error.code ?? (error instanceof GrammarError ? 'GRAMMAR' : 'ERROR'))
+      throw error instanceof BrokerError || error instanceof GrammarError ? error : new BrokerError(safeMessage, 'ERROR')
     }
     // Recorded before it returns; a failed write refuses the result.
     let receipt
@@ -240,13 +271,22 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
     await fs.mkdir(path.dirname(socketPath), { recursive: true })
     await fs.rm(socketPath, { force: true })
     const sockets = new Set()
+    const MAX_CONCURRENT_CONNECTIONS = 16
     const server = net.createServer((conn) => {
+      if (sockets.size >= MAX_CONCURRENT_CONNECTIONS) {
+        conn.end(JSON.stringify({ ok: false, error: 'too many concurrent broker connections', code: 'BUSY' }) + '\n')
+        return
+      }
       sockets.add(conn); conn.once('close', () => sockets.delete(conn))
       let buffer = ''
+      let handled = false
       conn.on('data', async (chunk) => {
+        if (handled) return
         buffer += chunk
         const nl = buffer.indexOf('\n')
         if (nl < 0) { if (buffer.length > 1024 * 1024) conn.destroy(); return }
+        handled = true
+        conn.pause()
         const line = buffer.slice(0, nl)
         buffer = ''
         let reply
@@ -254,8 +294,8 @@ export function createBroker ({ loadInfrastructure, inspect, driverFor = environ
           const request = JSON.parse(line)
           if (request.token !== token) throw new BrokerError('the turn token does not match this socket', 'TOKEN')
           reply = { ok: true, result: await call(token, request) }
-        } catch (error) { reply = { ok: false, error: error.message, code: error.code ?? 'ERROR' } }
-        conn.end(JSON.stringify(reply) + '\n')
+        } catch (error) { reply = { ok: false, error: scrubUri(error.message), code: error.code ?? 'ERROR' } }
+        if (!conn.destroyed) conn.end(JSON.stringify(reply) + '\n')
       })
       conn.on('error', () => {})
     })

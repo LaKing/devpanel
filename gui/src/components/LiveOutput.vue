@@ -47,6 +47,8 @@ const box = ref(null)
 let next = 0
 let loadedFor = null
 let inflight = null
+let inflightTarget = null
+let loadSeq = 0
 
 function absorb (incoming) {
   const merged = mergeEntries(entries.value, incoming)
@@ -54,26 +56,31 @@ function absorb (incoming) {
   next = merged.next
 }
 
-/** One catch-up at a time: a second caller waits for the first request. */
+/** One catch-up at a time per invocation: a target switch starts a fresh request. */
 function load ({ reset = false } = {}) {
-  if (reset) { entries.value = []; next = 0 }
-  if (inflight) return inflight
   const target = props.invocationId
-  inflight = (async () => {
+  if (reset) { entries.value = []; next = 0 }
+  if (inflight && inflightTarget === target) return inflight
+  const seq = ++loadSeq
+  inflightTarget = target
+  const promise = (async () => {
     try {
       const page = props.supervisor ? await api.supervisorLive(target, next) : await api.liveOutput(props.project, props.issueId, props.runId, target, next)
-      if (target !== props.invocationId) return
+      if (seq !== loadSeq || target !== props.invocationId) return
       absorb(page.entries)
       error.value = ''
     } catch (e) {
-      error.value = e.message
+      if (seq === loadSeq && target === props.invocationId) error.value = e.message
     } finally {
-      loading.value = false
-      inflight = null
-      scrollToEnd()
+      if (inflight === promise) { inflight = null; inflightTarget = null }
+      if (seq === loadSeq && target === props.invocationId) {
+        loading.value = false
+        scrollToEnd()
+      }
     }
   })()
-  return inflight
+  inflight = promise
+  return promise
 }
 
 function onRunEvent (event) {

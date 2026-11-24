@@ -4,6 +4,7 @@ import { writeAtomic, writeJson } from './runtime/persistence.mjs'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
@@ -40,6 +41,7 @@ export const ISSUES_DIR = issuesRoot()
 const META_FILE = 'issue.json'
 const ISSUE_PATTERN = /^(\d{4}-\d{2}-\d{2})-(.+)$/
 const STEP_PATTERN = /^(\d{3})-(.+)$/
+const RUN_ID_PATTERN = /^[A-Za-z0-9_-]+$/
 const STEP_NUMBER_WIDTH = 3
 
 export class IssueError extends Error {
@@ -589,10 +591,20 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
     const value = input.trim()
     if (!value.includes('\n') && (/^(?:\/|\.\.?\/|~\/)/.test(value) || /\.md$/i.test(value))) {
       if (!/\.md$/i.test(value)) throw new IssueError('The local file must have a .md extension')
-      sourcePath = path.resolve(projectSourceDir(project, PROJECTS_DIR), value.startsWith('~/') ? path.join(process.env.HOME, value.slice(2)) : value)
+      const projectRoot = await fs.realpath(projectSourceDir(project, PROJECTS_DIR)).catch(() => path.resolve(projectSourceDir(project, PROJECTS_DIR)))
+      sourcePath = path.resolve(projectRoot, value.startsWith('~/') ? path.join(os.homedir(), value.slice(2)) : value)
+      const rel = path.relative(projectRoot, sourcePath)
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+        throw new IssueError('The local Markdown file must reside inside the project directory', 400)
+      }
       let handle
       try {
-        handle = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NONBLOCK)
+        const realParent = await fs.realpath(path.dirname(sourcePath))
+        const parentRel = path.relative(projectRoot, realParent)
+        if (parentRel.startsWith('..') || path.isAbsolute(parentRel)) {
+          throw new IssueError('The local Markdown file must reside inside the project directory', 400)
+        }
+        handle = await fs.open(sourcePath, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW)
         const stat = await handle.stat()
         if (!stat.isFile()) throw new IssueError('The path must reference a regular Markdown file')
         if (stat.size > 1024 * 1024) throw new IssueError('Report exceeds 1 MiB')
@@ -1011,6 +1023,7 @@ export async function setIssueDisposition (project, id, { value, evidence, runId
   const summaries = await runSummaries(dir)
   let runRecord = null
   if (runId) {
+    if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) throw new IssueError('invalid run id', 400)
     try { runRecord = JSON.parse(await fs.readFile(path.join(dir, 'runs', runId, 'run.json'), 'utf8')) } catch { throw new IssueError(`no run ${runId} on this issue`, 404) }
   } else {
     for (const s of summaries) {
@@ -1124,6 +1137,7 @@ function currentPriority (history) {
  * tracks work that remains, it never absorbs the defect that was reported.
  */
 export async function createFollowUps (project, id, runId, { by = null } = {}) {
+  if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) throw new IssueError('invalid run id', 400)
   const dir = await issueDir(project, id)
   const runFile = path.join(dir, 'runs', runId, 'run.json')
   let run

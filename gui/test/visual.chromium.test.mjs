@@ -960,6 +960,58 @@ export default async function (t) {
     await page.setViewportSize({ width: 1280, height: 800 })
   }
 
+  t.section('8b. a notice on the project page is as tall as its text')
+  {
+    // Vuetify's alert carries flex: 1 1; in the page's column a one-line notice grew to half of the page's height.
+    const lock = (module, suffix) => ({ module, owner: stage.project, runId: `2026-01-01T00-00-00-000Z-${suffix}`, project: stage.project, issueId: '2026-01-01-holder', state: 'held', waiting: false })
+    const held = [...['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'].map((name) => lock(`@pool-modules/${name}`, 'aaaaaaaa')), lock('@pool-modules/ten', 'bbbbbbbb')]
+    const fulfil = (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ pool: stage.project, members: [stage.project], held }) })
+    await page.route('**/module-locks*', fulfil)
+    await page.goto(`${stage.origin}/projects/${stage.project}`)
+    const notice = page.locator('[data-test="module-locks"]')
+    await notice.waitFor()
+    const closed = await notice.boundingBox()
+    t.ok('ten held modules of two runs are one line', closed.height < 60 && /10 modules held by 2 runs/.test(await notice.innerText()), `${Math.round(closed.height)} px: ${(await notice.innerText()).slice(0, 120)}`)
+    t.eq('the modules are not listed until it is opened', await page.locator('[data-test="module-locks-run"]').first().isVisible(), false)
+    await notice.locator('summary').click()
+    t.eq('opened, it lists the modules by run', [await page.locator('[data-test="module-locks-run"]').count(), await page.locator('[data-test="module-locks-run"]').first().isVisible()], [2, true])
+    t.ok('and is as tall as that list, not as the page', (await notice.boundingBox()).height < 260, `${Math.round((await notice.boundingBox()).height)} px`)
+    await page.unroute('**/module-locks*', fulfil)
+  }
+
+  t.section('8c. the Full verification page follows a running drive like a terminal')
+  {
+    const cycle = { id: '2026-01-01.1', date: '2026-01-01', trigger: 'hand', state: 'running', verdict: null, frozenAt: '2026-01-01T00:00:00.000Z', seatsIdleAt: '2026-01-01T00:01:00.000Z', endedAt: null, waitingOn: [], resumed: [], projects: [
+      { project: 'app-project', stage: 'stage', mode: 'instance', state: 'running', startedAt: '2026-01-01T00:01:01.000Z', runDir: '/nowhere', instance: { name: 'dp-fv-app', readyMs: 120000 } },
+      { project: 'framework-project', stage: 'stage', state: 'deferred' }] }
+    const commands = [{ key: 'full-verification/ready', id: 'ready', rerun: false, running: false, bytes: 10, changedAt: '2026-01-01T00:03:00Z' }, { key: 'full-verification/full-suite', id: 'full-suite', rerun: false, running: true, bytes: 100, changedAt: '2026-01-01T00:04:00Z' }]
+    let reads = 0
+    const latest = (route) => route.fulfill({ contentType: 'application/json', body: JSON.stringify({ cycle, active: true }) })
+    const output = (route) => {
+      const url = new URL(route.request().url())
+      const key = url.searchParams.get('command')
+      if (!key) return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ commands, output: null }) })
+      const after = Number(url.searchParams.get('after') ?? 0)
+      const text = key.endsWith('ready') ? '$ ready\n\n12/12 READY\n' : after === 0 ? '$ suite\n\nworker: PASS first\n' : `worker: PASS later-${++reads}\n`
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ commands, output: { key, text: key.endsWith('ready') && after > 0 ? '' : text, next: after + Buffer.byteLength(text), running: !key.endsWith('ready'), truncated: false, restarted: false } }) })
+    }
+    await page.route('**/api/verification/latest', latest)
+    await page.route('**/api/verification/output*', output)
+    await page.goto(`${stage.origin}/verification`)
+    const terminal = page.locator('[data-test="cycle-output"] pre')
+    await terminal.waitFor()
+    t.ok('the drawer leads to the page', await page.locator('a[href="/verification"]').first().isVisible())
+    t.eq('an entry the cycle drives has a terminal, one it holds back has none', [await page.locator('[data-test="cycle-entry"]').count(), await page.locator('[data-test="cycle-output"]').count()], [2, 1])
+    await page.waitForFunction(() => /worker: PASS later-\d+/.test(document.querySelector('[data-test="cycle-output"] pre')?.textContent ?? ''), null, { timeout: 15000 })
+    const shown = await terminal.innerText()
+    t.ok('it shows the running command from its first line and what was printed since', shown.includes('$ suite') && shown.includes('worker: PASS first') && /later-\d+/.test(shown), shown.slice(0, 200))
+    await page.locator('[data-test="cycle-output"] .v-chip', { hasText: 'ready' }).click()
+    await page.waitForFunction(() => (document.querySelector('[data-test="cycle-output"] pre')?.textContent ?? '').includes('12/12 READY'), null, { timeout: 10000 })
+    t.ok('a finished command can be read by choosing it, which stops following', (await terminal.innerText()).includes('12/12 READY') && !(await terminal.innerText()).includes('worker: PASS'))
+    await page.unroute('**/api/verification/latest', latest)
+    await page.unroute('**/api/verification/output*', output)
+  }
+
   t.section('9. the console stayed quiet')
   t.eq('no request was refused but the token-less identity probe',
     unauthorised.filter((u) => !u.probe).map((u) => u.path), [])

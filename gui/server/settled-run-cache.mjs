@@ -47,18 +47,24 @@ const ownFiles = (issue, project, issueId, runId) => issue.packed ? null : [path
  * @param filesOf  (issue, project, issueId, runId) => the files whose signature keeps the summary, or null to keep nothing
  * @returns (project, issueId, runId, { monitoring }) => the summary; a kept one is returned as a copy
  */
-export function settledRunCache ({ locate, read, isActive = () => false, filesOf = ownFiles, keepMs = SETTLED_KEEP_MS, now = () => Date.now() }) {
+export function settledRunCache ({ locate, read, isActive = () => false, filesOf = ownFiles, keepMs = SETTLED_KEEP_MS, maxEntries = 500, now = () => Date.now() }) {
   const kept = new Map()
   return async function detail (project, issueId, runId, { monitoring = false } = {}) {
     const key = JSON.stringify([project, issueId, runId])
     const entry = kept.get(key)
-    if (entry && (monitoring || now() - entry.at < keepMs) && !isActive(project, issueId) && await signature(entry.files).catch(() => null) === entry.signature) return structuredClone(entry.value)
+    if (entry && (monitoring || now() - entry.at < keepMs) && !isActive(project, issueId) && await signature(entry.files).catch(() => null) === entry.signature) {
+      kept.delete(key); kept.set(key, entry)
+      return structuredClone(entry.value)
+    }
     kept.delete(key)
     const issue = await locate(project, issueId)
     const files = filesOf(issue, project, issueId, runId)
     const before = files ? await signature(files).catch(() => null) : null
     const value = await read(issue, project, issueId, runId)
-    if (before && !UNSETTLED.includes(value.status) && !value.reconcilePending && !isActive(project, issueId)) kept.set(key, { at: now(), files, signature: before, value: structuredClone(value) })
+    if (before && !UNSETTLED.includes(value.status) && !value.reconcilePending && !isActive(project, issueId)) {
+      while (kept.size >= maxEntries) kept.delete(kept.keys().next().value)
+      kept.set(key, { at: now(), files, signature: before, value: structuredClone(value) })
+    }
     return value
   }
 }

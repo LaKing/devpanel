@@ -174,18 +174,18 @@ export async function proveFence ({ fence, spec, canaries = [], command = null, 
   for (const mask of spec.masks ?? []) if (await exists(mask)) masks.push(await canonical(mask))
   const script = [
     'status=0',
-    'for d in $WRITABLE; do f="$d/.devpanel-fence-probe-$$"; if ( : > "$f" ) 2>/dev/null; then rm -f "$f"; else echo "NOT-WRITABLE $d"; status=1; fi; done',
-    'for d in $READONLY; do f="$d/.devpanel-fence-probe-$$"; if ( : > "$f" ) 2>/dev/null; then rm -f "$f"; echo "WRITABLE $d"; status=1; fi; done',
-    'for c in $CANARIES; do if [ -e "$c" ] || [ -L "$c" ]; then echo "VISIBLE $c"; status=1; fi; done',
+    'if [ -n "$WRITABLE" ] && ! printf "%s\\n" "$WRITABLE" | { fail=0; while IFS= read -r d; do [ -n "$d" ] || continue; f="$d/.devpanel-fence-probe-$$"; if ( : > "$f" ) 2>/dev/null; then rm -f "$f"; else echo "NOT-WRITABLE $d"; fail=1; fi; done; exit $fail; }; then status=1; fi',
+    'if [ -n "$READONLY" ] && ! printf "%s\\n" "$READONLY" | { fail=0; while IFS= read -r d; do [ -n "$d" ] || continue; f="$d/.devpanel-fence-probe-$$"; if ( : > "$f" ) 2>/dev/null; then rm -f "$f"; echo "WRITABLE $d"; fail=1; fi; done; exit $fail; }; then status=1; fi',
+    'if [ -n "$CANARIES" ] && ! printf "%s\\n" "$CANARIES" | { fail=0; while IFS= read -r c; do [ -n "$c" ] || continue; if [ -e "$c" ] || [ -L "$c" ]; then echo "VISIBLE $c"; fail=1; fi; done; exit $fail; }; then status=1; fi',
     // The CLI itself must be runnable inside, or the turn would fail at launch.
     'if [ -n "$COMMAND" ] && ! [ -x "$COMMAND" ]; then echo "CLI-NOT-VISIBLE $COMMAND"; status=1; fi',
     'if [ -n "$MOUNTS" ] && ! printf "%s\\n" "$MOUNTS" | { fail=0; while IFS="|" read -r t s; do f="$t/.devpanel-fence-probe-$$"; if ! [ -d "$t" ]; then echo "MOUNT-MISSING $t"; fail=1; elif ( : > "$f" ) 2>/dev/null; then rm -f "$f"; echo "MOUNT-WRITABLE $t"; fail=1; elif [ -n "$s" ] && ! [ -e "$t/$s" ] && ! [ -L "$t/$s" ]; then echo "MOUNT-NOT-BOUND $t"; fail=1; fi; done; exit $fail; }; then status=1; fi',
     'if [ -n "$TOOLING" ] && ! [ -x "$TOOLING/offline" ]; then echo "TOOLING-NOT-VISIBLE $TOOLING"; status=1; fi',
-    'for m in $MASKS; do if [ -d "$m" ]; then [ -z "$(ls -A "$m" 2>/dev/null)" ] || { echo "MASK-VISIBLE $m"; status=1; }; elif [ -s "$m" ]; then echo "MASK-VISIBLE $m"; status=1; fi; done',
+    'if [ -n "$MASKS" ] && ! printf "%s\\n" "$MASKS" | { fail=0; while IFS= read -r m; do [ -n "$m" ] || continue; if [ -d "$m" ]; then [ -z "$(ls -A "$m" 2>/dev/null)" ] || { echo "MASK-VISIBLE $m"; fail=1; }; elif [ -s "$m" ]; then echo "MASK-VISIBLE $m"; fail=1; fi; done; exit $fail; }; then status=1; fi',
     'exit $status'
   ].join(NL)
   const wrapped = fencedCommand({ command: '/bin/sh', args: ['-c', script], fence })
-  const probeEnv = { PATH: '/usr/bin:/bin', WRITABLE: writable.join(' '), READONLY: readOnly.join(' '), CANARIES: canaries.join(' '), COMMAND: command ?? '', MOUNTS: mounts.join(NL), TOOLING: spec.toolingBin ? TOOLING_BIN : '', MASKS: masks.join(' '), ...env }
+  const probeEnv = { PATH: '/usr/bin:/bin', WRITABLE: writable.join(NL), READONLY: readOnly.join(NL), CANARIES: canaries.join(NL), COMMAND: command ?? '', MOUNTS: mounts.join(NL), TOOLING: spec.toolingBin ? TOOLING_BIN : '', MASKS: masks.join(NL), ...env }
   let result
   try {
     result = await runProcess({ command: wrapped.command, args: wrapped.args, env: probeEnv, signal, stdin: '', maxBuffer: 1024 * 1024 })
@@ -305,7 +305,7 @@ export async function hostReadOnly ({ home = os.homedir(), dirs = hostSettings()
   for (const dir of dirs) {
     if (!await exists(dir)) continue
     const real = await canonical(dir)
-    if (real === realHome || realHome.startsWith(real + '/')) throw new Error(`fence.readOnly: ${dir} is or contains the home`)
+    if (real === realHome || real === '/' || realHome.startsWith(real + '/')) throw new Error(`fence.readOnly: ${dir} is or contains the home`)
     const hit = privateHomeHit(realHome, real) ?? await panelDataHit(real, { projectsDir })
     if (hit) throw new Error(`fence.readOnly: ${dir} reaches ${hit}, which no seat may read`)
     out.push(real)

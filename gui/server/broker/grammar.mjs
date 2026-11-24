@@ -47,14 +47,17 @@ export class GrammarError extends Error {
 }
 const refuse = (message) => { throw new GrammarError(message) }
 
+const MAX_DEPTH = 20
+
 /** An expression or filter: every `$` key must be named; values recurse. */
-function expression (value, where) {
-  if (Array.isArray(value)) { value.forEach((v, i) => expression(v, `${where}[${i}]`)); return }
+function expression (value, where, depth = 0) {
+  if (depth > MAX_DEPTH) refuse(`${where}: expression nesting exceeds ${MAX_DEPTH}`)
+  if (Array.isArray(value)) { value.forEach((v, i) => expression(v, `${where}[${i}]`, depth + 1)); return }
   if (!value || typeof value !== 'object') return
   for (const [key, inner] of Object.entries(value)) {
     if (key.startsWith('$') && !OPERATORS.has(key)) refuse(`${where}: operator ${key} is not allowed`)
     if (!key.startsWith('$') && key.includes('\0')) refuse(`${where}: invalid field name`)
-    expression(inner, `${where}.${key}`)
+    expression(inner, `${where}.${key}`, depth + 1)
   }
 }
 
@@ -102,7 +105,7 @@ function stage (spec, where, reach) {
       if (typeof body !== 'string' && !(Array.isArray(body) && body.every((b) => typeof b === 'string'))) refuse(`${where}: ${name} takes field names`)
       return
     case '$sample':
-      if (!body || !Number.isInteger(body.size) || Object.keys(body).length !== 1) refuse(`${where}: $sample takes {size}`)
+      if (!body || !Number.isInteger(body.size) || body.size < 1 || body.size > 10000 || Object.keys(body).length !== 1) refuse(`${where}: $sample takes {size} between 1 and 10000`)
       return
     case '$unwind':
       if (typeof body === 'string') return

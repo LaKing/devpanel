@@ -7,7 +7,10 @@ import '@/styles/app.css'
 import { loadIdentity } from '@/identity'
 
 // Asked before the first render, so a verified proxy login never sees the token page flash.
-loadIdentity().finally(() => createApp(App)
-  .use(router)
-  .use(vuetify)
-  .mount('#app'))
+loadIdentity().finally(() => {
+  const app = createApp(App)
+  app.config.errorHandler = (err, _instance, info) => {
+    console.error(`[devpanel] unhandled Vue error (${info}):`, err)
+  }
+  app.use(router).use(vuetify).mount('#app')
+})

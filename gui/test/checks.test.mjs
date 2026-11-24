@@ -58,6 +58,19 @@ export default async function (t) {
       target: { kind: 'local', commands: [{ id: 'digest', run: 'echo "PASS calculation-view 2"; head -c 5000 /dev/zero | tr "\\0" x' }] },
       revision: c.fp.fingerprint, fingerprint: c.fp, baseCommit: c.ws.baseCommit, baseline: c.baseline, workspacePath: c.ws.path, runDir: c.runDir
     })
+    // A running command's output is readable while it runs (the Full verification page tails `<id>.live`).
+    const slow = runChecks({
+      target: { kind: 'local', commands: [{ id: 'slow', run: 'echo first-line; sleep 1.5; echo last-line' }] },
+      revision: c.fp.fingerprint, fingerprint: c.fp, baseCommit: c.ws.baseCommit, baseline: c.baseline, workspacePath: c.ws.path, runDir: c.runDir, dirName: 'live-copy'
+    })
+    const liveFile = path.join(c.runDir, 'checks', 'live-copy', 'slow.live')
+    let during = ''
+    for (let tries = 0; tries < 100 && !during.includes('first-line'); tries++) { during = await fs.readFile(liveFile, 'utf8').catch(() => ''); if (!during.includes('first-line')) await new Promise((resolve) => setTimeout(resolve, 20)) }
+    const printed = during.slice(during.indexOf('\n\n') + 2)
+    t.ok('while a command runs, what it printed so far is in its live copy, after its command line', during.startsWith('$ echo first-line') && printed.includes('first-line') && !printed.includes('last-line'), during)
+    const slowResult = await slow
+    t.eq('the command ends as any other', [slowResult.result, slowResult.commands[0].stdout.trim().split('\n').at(-1)], ['passed', 'last-line'])
+    t.eq('and the live copy is gone once the log is written', [await fs.stat(liveFile).then(() => true, () => false), (await fs.readFile(path.join(c.runDir, 'checks', 'live-copy', 'slow.log'), 'utf8')).includes('last-line')], [false, true])
     const excerpt = digest.commands[0].stdout
     t.ok('a command\'s stdout head is on its record, bounded', excerpt.startsWith('PASS calculation-view 2') && excerpt.length === 2000, String(excerpt?.length))
     t.ok('and reaches the reviewers\' summary', checkSummary(digest).commands[0].stdout.startsWith('PASS calculation-view 2'))

@@ -102,13 +102,20 @@ export async function examineLogin (headers, { usersDir = defaultUsersDir(), dig
 }
 
 // A refused login is logged once per user and reason per 10 minutes: enough to diagnose, never a flood.
+const REPORTED_MAX = 2000
+const REPORTED_WINDOW_MS = 10 * 60 * 1000
 const reported = new Map()
 function reportRefusal (outcome, req) {
   if (!outcome.reason || outcome.reason === 'no-users-directory') return
   if (outcome.reason === 'no-basic-header' && req.headers?.['x-forwarded-for'] === undefined) return
+  const now = Date.now()
   const key = `${outcome.user ?? '-'}:${outcome.reason}`
-  if (Date.now() - (reported.get(key) ?? 0) < 10 * 60 * 1000) return
-  reported.set(key, Date.now())
+  if (now - (reported.get(key) ?? 0) < REPORTED_WINDOW_MS) return
+  if (reported.size >= REPORTED_MAX) {
+    for (const [k, ts] of reported) if (now - ts >= REPORTED_WINDOW_MS) reported.delete(k)
+    while (reported.size >= REPORTED_MAX) reported.delete(reported.keys().next().value)
+  }
+  reported.set(key, now)
   console.warn(`proxy login not verified: ${outcome.reason}${outcome.user ? ` (user ${outcome.user})` : ''} on ${req.method} ${req.path}${req.headers?.['x-forwarded-for'] ? ' via proxy' : ''}`)
 }
 
