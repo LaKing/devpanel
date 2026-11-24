@@ -3275,7 +3275,7 @@ export class Engine {
         // The run's frozen seat-access policy; absent on runs resolved before it.
         hygiene: this.snapshot.fence?.hygiene === 1,
         fence: turnFence,
-        broker: brokerTurn ? { socket: brokerTurn.socketPath, token: brokerTurn.token, shim: brokerTurn.shim, node: brokerTurn.node } : null,
+        broker: brokerTurn ? { socket: brokerTurn.socketPath, tokenFile: brokerTurn.tokenFile, shim: brokerTurn.shim, node: brokerTurn.node } : null,
         // Per-run CLI home for this seat (Phase 0a); adapters use it only
         // inside a proved fence and record the choice on the session.
         cliHome: path.join(store.runDir(this.issuePath, this.runId), 'cli-homes', readAccess ? `${role}-read` : role),

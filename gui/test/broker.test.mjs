@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 import { validateQuery } from '../server/broker/grammar.mjs'
 import { createBroker, writeGrant, revokeGrant, brokerConfigured, environmentDriver } from '../server/broker/broker.mjs'
 import { openSocketForward, uriThroughSocket } from '../server/broker/socket-forward.mjs'
-import { SHIM } from '../server/broker/index.mjs'
+import { SHIM, openBrokerTurn } from '../server/broker/index.mjs'
 import YAML from 'yaml'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
@@ -141,8 +141,12 @@ export default async function (t) {
     const turn2 = broker.openTurn({ project, issueId: 'i1', issuePath, runId: 'r1', runDir, invocationId: 'inv-4', seat: 'analyser' })
     const dir = await temp('dpb-test-')
     const served = await broker.serveTurn({ socketPath: path.join(dir, 's'), token: turn2.token })
+    // The shim reads the token from the 0600 file the adapters name in its MCP environment (AC3).
+    let tokenFiles = 0
     const rpc = async (token, messages) => {
-      const child = spawn(process.execPath, [SHIM], { env: { PATH: process.env.PATH, DEVPANEL_BROKER_SOCKET: path.join(dir, 's'), DEVPANEL_BROKER_TOKEN: token }, stdio: ['pipe', 'pipe', 'inherit'] })
+      const tokenFile = path.join(dir, `t${++tokenFiles}`)
+      await fs.writeFile(tokenFile, token, { mode: 0o600 })
+      const child = spawn(process.execPath, [SHIM], { env: { PATH: process.env.PATH, DEVPANEL_BROKER_SOCKET: path.join(dir, 's'), DEVPANEL_BROKER_TOKEN_FILE: tokenFile }, stdio: ['pipe', 'pipe', 'inherit'] })
       let out = ''
       child.stdout.on('data', (c) => { out += c })
       for (const m of messages) child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n')
@@ -164,7 +168,7 @@ export default async function (t) {
     t.eq('a query returns its result', JSON.parse(byId[3]?.result?.content?.[0]?.text ?? '{}').result, 10)
     t.ok('a forbidden query is an error result', byId[4]?.result?.isError === true && /\$where/.test(byId[4].result.content[0].text))
     const wrong = await rpc('not-the-token', [{ id: 1, method: 'tools/call', params: { name: 'db_query', arguments: { environment: 'stage', query: { op: 'count', database: 'app', collection: 'users' } } } }])
-    t.ok('a wrong token is refused at the socket', wrong[0]?.result?.isError === true && /token/.test(wrong[0].result.content[0].text))
+    t.ok('a token file holding a wrong token is refused at the socket', wrong[0]?.result?.isError === true && /token/.test(wrong[0].result.content[0].text))
     // A leftover process holding a connection open must not hold the turn open.
     const dangling = net.connect(path.join(dir, 's'))
     await new Promise((r) => dangling.once('connect', r))
@@ -173,6 +177,15 @@ export default async function (t) {
     dangling.destroy()
     turn2.revoke()
   }
+  t.section('3b. a turn whose broker setup fails leaves no token file, socket or listener behind')
+  {
+    const tmpRoot = await temp('dpb-root-')
+    const failed = await openBrokerTurn({ configRoot: tmpRoot, binding: { project, issueId: 'i1', issuePath, runId: 'r9', runDir, invocationId: 'inv-9', seat: 'analyser' }, tmpRoot,
+      resolveNode: async () => { throw new Error('injected: node could not be resolved') } }).then(() => null, (e) => e)
+    t.ok('the failure is reported', /injected/.test(failed?.message ?? ''), failed?.message)
+    t.eq('the turn directory, with its token file and socket, is gone', await fs.readdir(tmpRoot), [])
+  }
+
   t.section('4. the engine attaches the broker to seats with tools, for the invocation only')
   {
     const seen = []
@@ -180,7 +193,9 @@ export default async function (t) {
     const original = f.harnesses.fake.invoke
     f.harnesses.fake.invoke = async (options) => {
       const alive = options.broker ? await fs.stat(options.broker.socket).then(() => true, () => false) : null
-      seen.push({ role: options.meta?.role, broker: options.broker, alive, prompt: options.prompt })
+      const tokenMode = options.broker?.tokenFile ? await fs.stat(options.broker.tokenFile).then((st) => st.mode & 0o777, () => null) : null
+      const token = options.broker?.tokenFile ? await fs.readFile(options.broker.tokenFile, 'utf8').catch(() => null) : null
+      seen.push({ role: options.meta?.role, broker: options.broker, alive, tokenMode, token, prompt: options.prompt })
       return original(options)
     }
     const infraFile = path.join(f.configRoot, 'projects', 'devpanel-project.yaml')
@@ -200,10 +215,12 @@ export default async function (t) {
         configRoot: f.configRoot, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery })
       await engine.drive()
       const workers = seen.filter((x) => x.role !== 'coordinator')
-      t.ok('every seat with tools got the broker, its socket live during the turn', workers.length > 0 && workers.every((x) => x.broker?.token && x.alive === true), JSON.stringify(workers.map((x) => [x.role, Boolean(x.broker), x.alive])))
+      t.ok('every seat with tools got the broker, its socket live during the turn', workers.length > 0 && workers.every((x) => x.broker?.tokenFile && x.alive === true), JSON.stringify(workers.map((x) => [x.role, Boolean(x.broker), x.alive])))
+      t.ok('the adapter is handed a token file, never the token itself (it would reach the CLI argv)', workers.every((x) => !('token' in x.broker)), JSON.stringify(workers.map((x) => Object.keys(x.broker))))
+      t.ok('the token file is 0600 and holds the turn token during the turn', workers.every((x) => x.tokenMode === 0o600 && /^[0-9a-f]{48}$/.test(x.token ?? '')), JSON.stringify(workers.map((x) => [x.tokenMode, x.token?.length])))
       t.ok('tool-free coordinator turns did not', seen.filter((x) => x.role === 'coordinator').every((x) => !x.broker))
-      t.ok('each turn had its own token', new Set(workers.map((x) => x.broker.token)).size === workers.length)
-      t.ok('the socket is gone after the turn', !(await fs.stat(workers[0].broker.socket).then(() => true, () => false)))
+      t.ok('each turn had its own token', new Set(workers.map((x) => x.token)).size === workers.length)
+      t.ok('the socket and the token file are gone after the turn', !(await fs.stat(workers[0].broker.socket).then(() => true, () => false)) && !(await fs.stat(workers[0].broker.tokenFile).then(() => true, () => false)))
       t.ok('the brief names the broker tools instead of SSH', workers.every((x) => /db_query/.test(x.prompt) && /never over SSH/.test(x.prompt)))
       await releaseWorkspace(engine)
     } finally { if (savedSsh === undefined) delete process.env.DEVPANEL_SSH_BIN; else process.env.DEVPANEL_SSH_BIN = savedSsh }

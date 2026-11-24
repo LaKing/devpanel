@@ -115,6 +115,9 @@ case "$MODE" in
     fi
     say "production mode"
     say "  app  ${SCHEME}://$(display_host)$(display_port "$PORT")"
+    # As the service unit does: no Vite origins are accepted in production, and the
+    # build above ran before this, so it is not affected.
+    export NODE_ENV=production
     exec node server/index.js
     ;;
 

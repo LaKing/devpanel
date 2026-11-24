@@ -3,17 +3,24 @@
  * The devpanel broker's MCP server, run by a seat's CLI inside the fence
  * (phase 3 of the seat-access fence). It holds nothing:
  * each tool call is forwarded, with the turn's token, over the per-turn Unix
- * socket the panel bound into the fence (DEVPANEL_BROKER_SOCKET,
- * DEVPANEL_BROKER_TOKEN). The panel checks the token, the grant and the query
+ * socket the panel bound into the fence (DEVPANEL_BROKER_SOCKET). The token
+ * is read from the 0600 file DEVPANEL_BROKER_TOKEN_FILE names, so it never
+ * appears on any command line (DEVPANEL_BROKER_TOKEN is still read when set
+ * directly, for a caller that runs the shim by hand). The panel checks the token, the grant and the query
  * on every call and records it before answering.
  *
  * MCP over stdio: newline-delimited JSON-RPC 2.0.
  */
+import fs from 'node:fs'
 import net from 'node:net'
 import readline from 'node:readline'
 
 const SOCKET = process.env.DEVPANEL_BROKER_SOCKET
-const TOKEN = process.env.DEVPANEL_BROKER_TOKEN
+const TOKEN = (() => {
+  const file = process.env.DEVPANEL_BROKER_TOKEN_FILE
+  if (file) { try { return fs.readFileSync(file, 'utf8').trim() || null } catch { return null } }
+  return process.env.DEVPANEL_BROKER_TOKEN || null
+})()
 
 const TOOL_LIST = [
   {

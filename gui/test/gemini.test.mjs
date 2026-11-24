@@ -105,6 +105,14 @@ export default async function (t) {
   delete process.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH
 
   // ============================================================ 1. sessions
+  t.section('0. the policy directory is read-only to the seat (the admin policy and the pinned settings copy)')
+  {
+    const manifest = await gemini.turnFenceManifest({ binary: process.execPath, env: {}, policyDir: '/tmp/devpanel-gemini-x', runtimeTemp: '/tmp/devpanel-gemini-tmp-x' })
+    t.eq('policyDir is bound read-only and is not in the writable set', [manifest.readOnly.includes('/tmp/devpanel-gemini-x'), manifest.writable.includes('/tmp/devpanel-gemini-x')], [true, false])
+    t.eq('only the runtime\'s private TMPDIR stays writable', manifest.writable, ['/tmp/devpanel-gemini-tmp-x'])
+    t.eq('without a TMPDIR nothing of the adapter\'s is writable', (await gemini.turnFenceManifest({ binary: process.execPath, env: {}, policyDir: '/tmp/p' })).writable, [])
+  }
+
   t.section('1. the session is pre-assigned, and resumed by its full id')
   {
     const record = path.join(await temp(), 'calls')

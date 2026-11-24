@@ -1250,6 +1250,26 @@ actions:
     effect: commit-checkout
 ```
 
+### What an action's environment holds
+
+An action does not inherit the panel's environment, which can hold its API token, database
+references and providers' keys under any name. It gets an allow-list: `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TMPDIR`, `SSH_AUTH_SOCK`, `SSH_AGENT_PID`,
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_ENV`, `NODE_EXTRA_CA_CERTS`, `NODE_PATH`, `NVM_DIR`,
+`NVM_BIN`, `NVM_INC`, `GIT_SSH`, `GIT_SSH_COMMAND`, the `GIT_AUTHOR_*`/`GIT_COMMITTER_*` names and
+emails, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM` and the `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`/
+`XDG_DATA_HOME`/`XDG_RUNTIME_DIR` folders, plus its own `DEVPANEL_PROJECT_ACTION` and
+`DEVPANEL_OPERATION_ID` (and `GIT_TERMINAL_PROMPT=0`, `TERM=dumb`). Anything else a project's
+scripts read, a proxy for instance, is named in `projects/<id>.yaml`:
+
+```yaml
+actionEnvironment:
+  - HTTPS_PROXY       # an exact name
+  - MYAPP_*           # a prefix; a match that looks like a secret (_TOKEN, _KEY, ...) is still left out
+```
+
+No `DEVPANEL_*` variable is ever passed, whatever is listed (the schema refuses such names).
+
 ### What an action does is declared, never inferred
 
 `effect` is the one thing about an action that an agent is allowed to act on by

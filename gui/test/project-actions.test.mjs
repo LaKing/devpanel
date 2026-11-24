@@ -4,7 +4,7 @@ import path from 'node:path'
 import YAML from 'yaml'
 
 import { sandbox } from './helpers.mjs'
-import { listProjectActions, parseScriptHeader, readOperation, startProjectAction, stopProjectAction, operationReport } from '../server/project-actions.mjs'
+import { listProjectActions, parseScriptHeader, readOperation, startProjectAction, stopProjectAction, operationReport, actionEnvironment } from '../server/project-actions.mjs'
 import { parseSupervisorResponse } from '../server/supervisor-response.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
 
@@ -34,10 +34,14 @@ export default async function (t) {
     'echo "committed as $DEVPANEL_PROJECT_ACTION/$DEVPANEL_OPERATION_ID" >&2',
     'test -z "$PUSH_FAIL" || { echo "nothing to commit" >&2; exit 3; }',
     'test -z "$PUSH_SLEEP" || sleep "$PUSH_SLEEP"',
+    'echo "env:[$(env | cut -d= -f1 | sort | tr "\\n" ",")]"',
     'echo "args:[$#:$1]"',
     'echo done'
   ].join('\n') + '\n'
   await fs.writeFile(path.join(projectPath, 'checkpoint.sh'), push, { mode: 0o755 })
+  // The fixture's control variables reach the script only because the project lists them (AC2):
+  // a projects/<id>.yaml holding nothing but actionEnvironment is a valid declaration.
+  await fs.writeFile(path.join(root, 'projects', `${project}.yaml`), YAML.stringify({ id: project, actionEnvironment: ['PUSH_FAIL', 'PUSH_SLEEP'] }))
   const opts = { root, projectsDir, issuesDir }
   const events = []
   const emit = (e) => events.push(e)
@@ -66,13 +70,40 @@ export default async function (t) {
     try { await listProjectActions('../etc', opts) } catch (e) { traversal = e.status }
     t.eq('a path-like project id is refused', traversal, 404)
 
+    t.section('the action environment is an allow-list')
+    {
+      const source = {
+        PATH: '/usr/bin', HOME: '/home/o', USER: 'o', LANG: 'C.UTF-8', LC_ALL: 'C', TZ: 'UTC', SSH_AUTH_SOCK: '/run/agent',
+        GIT_SSH_COMMAND: 'ssh -i k', NVM_DIR: '/n', NODE_ENV: 'production',
+        XDG_PRIVATE_VALUE: 'x', NODE_SECRET_THING: 'x', NVM_X_PRIVATE: 'x', GIT_PRIVATE_BLOB: 'x', MYAPP_SEKRIT: 'x', WEIRD_CREDENTIAL_BLOB: 'x',
+        DEVPANEL_TOKEN: 'x', DEVPANEL_X: 'x', DEVPANZ: 'z', EXTRA_X: 'e', EXTRA_KEY: 'k'
+      }
+      const env = actionEnvironment({ DEVPANEL_PROJECT_ACTION: 'checkpoint', DEVPANEL_OPERATION_ID: 'op' }, [], source)
+      t.eq('the required variables are passed', ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TZ', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'NVM_DIR', 'NODE_ENV'].filter((k) => env[k] !== source[k]), [])
+      t.eq('the action\'s own variables are set', [env.DEVPANEL_PROJECT_ACTION, env.DEVPANEL_OPERATION_ID], ['checkpoint', 'op'])
+      t.eq('a secret with an unexpected name is not, not even inside the NODE_/NVM_/GIT_/XDG_ families',
+        ['XDG_PRIVATE_VALUE', 'NODE_SECRET_THING', 'NVM_X_PRIVATE', 'GIT_PRIVATE_BLOB', 'MYAPP_SEKRIT', 'WEIRD_CREDENTIAL_BLOB', 'DEVPANEL_TOKEN', 'DEVPANEL_X', 'DEVPANZ', 'EXTRA_X'].filter((k) => k in env), [])
+      const extended = actionEnvironment({}, ['MYAPP_SEKRIT', 'EXTRA_*'], source)
+      t.eq('a project adds exact names and prefixes; a prefix match that looks like a secret stays out', [extended.MYAPP_SEKRIT, extended.EXTRA_X, 'EXTRA_KEY' in extended], ['x', 'e', false])
+      const locale = actionEnvironment({}, [], { LC_ALL: 'C', LC_SERVICE_TOKEN: 'secret' })
+      t.eq('the LC_* wildcard passes locales but not a secret-shaped name', [locale.LC_ALL, 'LC_SERVICE_TOKEN' in locale], ['C', false])
+      const proto = actionEnvironment({}, ['__proto__'], JSON.parse('{"__proto__": "listed", "PATH": "/usr/bin"}'))
+      t.eq('a listed name such as __proto__ becomes an own string property', [Object.hasOwn(proto, '__proto__'), proto.__proto__, Object.hasOwn({ ...proto }, '__proto__')], [true, 'listed', true])
+      const reserved = actionEnvironment({ DEVPANEL_OPERATION_ID: 'op' }, ['DEVPAN*', 'DEVPANEL_TOKEN'], source)
+      t.eq('no DEVPANEL_* variable is inherited, whatever the project lists', [reserved.DEVPANZ, 'DEVPANEL_TOKEN' in reserved, 'DEVPANEL_X' in reserved, reserved.DEVPANEL_OPERATION_ID], ['z', false, false, 'op'])
+    }
+
     t.section('running checkpoint')
-    const started = await startProjectAction({ project, actionId: 'checkpoint', emit, actor: 'test', ...opts })
+    process.env.MYAPP_SEKRIT = 'do-not-leak'
+    let started
+    try { started = await startProjectAction({ project, actionId: 'checkpoint', emit, actor: 'test', ...opts }) } finally { delete process.env.MYAPP_SEKRIT }
     t.eq('the record is returned as soon as the operation exists', started.operation.status, 'running')
     t.ok('the start event carries the record', events[0]?.type === 'started' && events[0].operation.id === started.operation.id)
     const finished = await started.done
     t.eq('a zero exit completes the operation', [finished.status, finished.exitCode], ['completed', 0])
+    const seen = (/env:\[([^\]]*)\]/.exec(finished.stdoutTail)?.[1] ?? '').split(',').filter(Boolean)
     t.eq('the script ran in the project root', (await fs.readFile(path.join(projectPath, 'version'), 'utf8')).trim(), '1')
+    t.ok('the script got PATH, HOME and its operation id, and not a panel secret of an unexpected name', ['PATH', 'HOME', 'DEVPANEL_OPERATION_ID'].every((k) => seen.includes(k)) && !seen.includes('MYAPP_SEKRIT'), seen.join(','))
     t.ok('stdout and stderr tails are kept on the record', finished.stdoutTail.includes('done') && finished.stderrTail.includes('committed as checkpoint/'))
     const read = await readOperation(project, finished.id, { issuesDir })
     const kinds = read.entries.map((e) => e.kind)
@@ -120,6 +151,13 @@ export default async function (t) {
     t.eq('stop interrupts and confirms termination', [stopped.status, stopped.cancelled, stopped.timedOut], ['interrupted', true, false])
     t.ok('the process is gone', !processAlive(stopped.pid))
     t.eq('the lock is released after an interruption', (await (await startProjectAction({ project, actionId: 'checkpoint', ...opts })).done).status, 'completed')
+
+    t.section('the project\'s actionEnvironment is schema-validated')
+    t.eq('the environment-only declaration was accepted and handed to the built-in checkpoint', (await listProjectActions(project, opts)).actions[0].environment, ['PUSH_FAIL', 'PUSH_SLEEP'])
+    await fs.writeFile(path.join(root, 'projects', `${project}.yaml`), YAML.stringify({ id: project, actionEnvironment: ['DEVPANEL_TOKEN'] }))
+    let reservedName = null
+    try { await listProjectActions(project, opts) } catch (e) { reservedName = e.status }
+    t.eq('a DEVPANEL_* name is refused by the schema (422)', reservedName, 422)
 
     t.section('declared actions')
     await fs.writeFile(path.join(root, 'projects', `${project}.yaml`), YAML.stringify({ id: project, actions: [

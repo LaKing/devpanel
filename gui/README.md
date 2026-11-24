@@ -34,7 +34,7 @@ and `/socket.io` through to the backend, and it is the one that hot-reloads.
 | `DEVPANEL_TICK_MS` | `2000` | how often metrics are broadcast |
 | `DEVPANEL_TLS` | on | set `0` to serve plain HTTP |
 | `DEVPANEL_CERT_DIR` | `../cert` | where `localhost.crt` / `localhost.key` live |
-| `DEVPANEL_DEV_ORIGINS` | localhost:5173, 127.0.0.1:5173 | origins socket.io accepts in dev |
+| `DEVPANEL_DEV_ORIGINS` | localhost:5173, 127.0.0.1:5173 | origins socket.io accepts in dev; ignored under `NODE_ENV=production` (the service unit and `./start.sh` prod set it), so production accepts none |
 | `DEVPANEL_ISSUES_DIR` | `../issues` | the issue root: where issue folders are created; independent of the projects root |
 | `DEVPANEL_PROJECTS_DIR` | the host settings' `projectsRoot`, else the directory holding the panel's checkout | the projects root (`<projects-root>`): scanned for `<name>-project` directories (labelled `<name>`) |
 | `DEVPANEL_USERS_DIR` | the host settings' `proxyLogin.usersDir`, else none | the reverse proxy's users directory, where basic-auth logins are verified |
@@ -71,6 +71,33 @@ Run as a non-root user, `--service` renders the unit and prints the three
 commands to run as root rather than failing. The user and group come from who
 owns the project directory, not from who ran the installer — under `sudo` the
 latter is root, which is exactly wrong.
+
+As root, `./install.sh --service` runs `tools/install-sandbox.sh` and installs a unit rendered
+from `systemd/devpanel.service.in`. Both come from this checkout, which the panel's own user can
+change, so a change there would run as root. Before it runs or installs anything, it prints the
+rendered unit, its sha256 and the sha256 of `install-sandbox.sh` (`--sandbox` prints the latter);
+a digest that cannot be computed stops it. The unit is staged in a new folder under a root-owned
+parent (`/run`), never under an inherited `TMPDIR`. That parent and every folder above it must be
+owned by root (the checkout owner is not trusted here, since they could rename the staging folder)
+and pass the other checks below; otherwise the installer refuses.
+
+It refuses to continue when a checked file (`install.sh`, `tools/install-sandbox.sh` and the
+three files under `systemd/`), or any folder above it up to `/`:
+
+- is owned by someone other than root or the checkout owner;
+- is writable by its group (any group, root's and the owner's included);
+- is writable by others;
+- carries an ACL, or cannot be checked for one;
+- is reached through a symlink inside the checkout.
+
+The one exception: a folder that others (but not its group) can write is accepted when its sticky
+bit is set (mode 1757, say). A file that others can write is always refused, whatever its sticky
+bit. To fix a refusal, run `chmod g-w,o-w <path>` or `setfacl -b <path>`. Everything is read
+through the checkout's real path, so the unit names that path even when the checkout is reached
+through a linked parent folder.
+
+The checkout owner stays trusted: a change they make between the check and the install is not
+detected.
 
 Afterwards:
 
@@ -222,6 +249,10 @@ The key is `chmod 600` and `cert/` is git-ignored — it must never be committed
 > crash report, `kind: request` a person relayed by an assistant; `category` is one of `bug`,
 > `feature`, `error`, `warning`, `crash`. Without a key it is `anonymous`, whatever it claims;
 > a key that matches nothing, or another project's reporter, is refused (403), not downgraded.
+> From one source address, at most 10 refused keys are answered in any 10 minutes; after that,
+> keyed requests from that address get 429 until the window passes. At most 20 keyed lookups may
+> wait at once per address. Reporters that share an address share that cap, so one can get 429
+> while still within its own quota.
 > The issue records `report: {kind, category, reporter, trust}` and `openedBy` is
 > `<reporter>@<host>` (or `report@<host>`). The trust bounds the **top-level supervisor**
 > only, read at start time from the current reporter record: `anonymous` → it starts

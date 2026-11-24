@@ -57,6 +57,7 @@ import { applyRunArtifact, approvedCheckPatch, retainedPatch } from './runtime/a
 import { checkPatch } from './runtime/patch-check.mjs'
 import { availabilityReport } from './availability-api.mjs'
 import { createModelPerformanceService } from './model-performance.mjs'
+import { devOrigins } from './dev-origins.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -112,13 +113,8 @@ function readTlsMaterial () {
   }
 }
 
-// In dev the Vue app is served by Vite on its own origin, so socket.io needs to
-// accept it. In production the app is served from this origin and needs nothing.
-const DEV_ORIGINS = (process.env.DEVPANEL_DEV_ORIGINS ??
-  (process.env.NODE_ENV === 'production' ? '' : 'https://localhost:5173,https://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5173'))
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean)
+// The Vite origins socket.io accepts in dev; none in production (dev-origins.mjs).
+const DEV_ORIGINS = devOrigins()
 
 const app = express()
 app.disable('x-powered-by')

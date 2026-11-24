@@ -631,6 +631,71 @@ export default async function (t) {
     } finally { await s.close() }
   }
 
+  t.section('3b. refused reporter keys are limited per source address, and old buckets are pruned')
+  {
+    let clock = 0
+    let gate = null
+    const buckets = new Map()
+    const lookups = new Map()
+    const s = await serve({
+      createIssue: async (project) => ({ project, id: `issue-${Math.random().toString(16).slice(2)}` }),
+      emit: () => {},
+      now: () => clock,
+      refuse: () => null,
+      // The address is read from a header so one test server can play several sources.
+      peerOf: (req) => req.headers['x-test-peer'] ?? '10.0.0.1',
+      buckets,
+      lookups,
+      identify: async (key) => { if (gate) await gate.promise; return key === 'good' ? { name: 'app-prod', project: 'app-project' } : null }
+    })
+    const hold = () => { let release; const promise = new Promise((r) => { release = r }); gate = { promise, release } }
+    const open = () => { const g = gate; gate = null; g?.release() }
+    const keyed = (key, peer = '10.0.0.1', input = '# r\nx') => s.post('app-project', { input }, { 'X-Devpanel-Reporter-Key': key, 'X-Test-Peer': peer })
+    const count = (rs, status) => rs.filter((r) => r.status === status).length
+    try {
+      const sequential = []
+      for (let i = 0; i < 11; i++) sequential.push((await keyed('bad')).status)
+      t.eq('(i) ten wrong keys are refused (403), the eleventh is limited (429)', [sequential.slice(0, 10).every((x) => x === 403), sequential[10]], [true, 429])
+      t.eq('(i) a valid key from that address is limited too, so guessing gains nothing', (await keyed('good')).status, 429)
+      t.eq('(iv) another address in the same window still gets 403, not 429', (await keyed('bad', '10.0.0.2')).status, 403)
+      clock += 10 * 60 * 1000
+      t.eq('(i) after the window a wrong key is refused again, not limited', (await keyed('bad')).status, 403)
+
+      clock += 10 * 60 * 1000
+      hold()
+      const wrongBurst = Array.from({ length: 15 }, () => keyed('bad', '10.0.0.3'))
+      await delay(100)
+      open()
+      const wrong = await Promise.all(wrongBurst)
+      t.eq('(ii) 15 overlapping wrong keys from one address: exactly 10 refused, 5 limited', [count(wrong, 403), count(wrong, 429)], [10, 5])
+
+      hold()
+      const validBurst = Array.from({ length: 12 }, (_, i) => keyed('good', '10.0.0.4', `# valid ${i}\nx`))
+      await delay(100)
+      open()
+      const valid = await Promise.all(validBurst)
+      t.eq('(iii) 12 overlapping valid keys with no refusal on record are all accepted', count(valid, 201), 12)
+      t.eq('(iii) and they recorded no refusal', buckets.has('refused:10.0.0.4'), false)
+
+      clock += 10 * 60 * 1000
+      hold()
+      const answeredWhileHeld = []
+      const flood = Array.from({ length: 25 }, () => keyed('bad', '10.0.0.5').then((r) => { answeredWhileHeld.push(r); return r }))
+      for (let i = 0; i < 50 && (lookups.get('10.0.0.5')?.pending ?? 0) < 20; i++) await delay(20)
+      for (let i = 0; i < 50 && answeredWhileHeld.length < 5; i++) await delay(20)
+      const pendingWhileHeld = lookups.get('10.0.0.5')?.pending
+      const immediate = answeredWhileHeld.map((r) => r.status)
+      open()
+      await Promise.all(flood)
+      t.eq('(vi) at most 20 lookups wait per address: 20 queued, and the other 5 answered 429 before any lookup finished', [pendingWhileHeld, immediate], [20, [429, 429, 429, 429, 429]])
+      t.eq('(vi) the queue is empty again afterwards', lookups.size, 0)
+
+      clock += 10 * 60 * 1000 + 1
+      await keyed('good', '10.0.0.9', '# after\nx')
+      t.eq('(v) once the window has passed, the expired buckets are pruned and only the live one is left', [...buckets.keys()], ['reporter:app-prod'])
+    } finally { open(); await s.close() }
+  }
+
   t.section('4. a duplicate report is answered with the existing id and logged at info')
   {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'report-duplicate-'))

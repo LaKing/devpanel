@@ -88,7 +88,7 @@ const COMMAND = () => resolveCommand('gemini', process.env.DEVPANEL_GEMINI_BIN)
  * (`GEMINI_CLI_HOME` or `~/.gemini`, read-write: login and sessions), git's
  * identity, and this invocation's policy and temp directories.
  */
-export async function fenceManifest ({ binary, env, writable = [] }) {
+export async function fenceManifest ({ binary, env, writable = [], readOnly = [] }) {
   const home = os.homedir()
   const real = await fs.realpath(binary)
   const pkg = real.includes(`${path.sep}node_modules${path.sep}`) ? real.slice(0, real.lastIndexOf(`${path.sep}bundle${path.sep}`)) || path.dirname(real) : path.dirname(real)
@@ -96,8 +96,20 @@ export async function fenceManifest ({ binary, env, writable = [] }) {
     home,
     homeBinds: [{ path: pkg, writable: false }, { path: binary, writable: false },
       { path: env.GEMINI_CLI_HOME ?? path.join(home, '.gemini'), writable: true }, { path: path.join(home, '.gitconfig'), writable: false }],
-    writable
+    writable,
+    readOnly
   }
+}
+
+/*
+ * One turn's fence manifest. The policy directory holds the ADMIN policy and the
+ * pinned system-settings copy: the turn's own fence, so it is bound read-only.
+ * Nothing shows the CLI must write there (it reads both files); a seat able to
+ * rewrite them could lift its own fence for a later read of the same file.
+ * Only the runtime's private TMPDIR stays writable.
+ */
+export function turnFenceManifest ({ binary, env, policyDir, runtimeTemp = null }) {
+  return fenceManifest({ binary, env, writable: runtimeTemp ? [runtimeTemp] : [], readOnly: [policyDir] })
 }
 
 /*
@@ -933,7 +945,7 @@ async function invokeOnce ({
     // sandbox included (it then binds within the fenced view).
     // afterFence (chat's replay) runs inside applyFence, after the first proof and before preparation.
     fenced = fenceSpec ? await applyFence({ spec: { ...fenceSpec, cwd }, command: COMMAND(), signal, guard: configGuardFor(env), replay: afterFence,
-      manifest: await fenceManifest({ binary: COMMAND(), env, writable: [policyDir, ...(runtimeTemp ? [runtimeTemp] : [])] }) }) : null
+      manifest: await turnFenceManifest({ binary: COMMAND(), env, policyDir, runtimeTemp }) }) : null
     assertFenced(fenced, { turn: 'a fenced Gemini turn', mounts: fenceSpec?.mounts ?? [] })
     const inner = { command: sandboxArgv ? BWRAP() : COMMAND(), args: sandboxArgv ? [...sandboxArgv, '--', COMMAND(), ...args] : args }
     const launch = fenced?.applied ? fenced.wrap(inner.command, inner.args) : inner

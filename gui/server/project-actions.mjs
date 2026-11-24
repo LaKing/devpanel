@@ -129,6 +129,8 @@ export async function listProjectActions (project, { root, projectsDir = project
   const config = await loadConfig(root ? { root } : {})
   const errors = config.errors.filter((e) => e.file?.endsWith(`/projects/${project}.yaml`))
   if (errors.length) throw fail(errors.map((e) => e.message).join('; '), 422)
+  const environment = config.projects.get(project)?.actionEnvironment ?? []
+  if (actions.has('checkpoint')) actions.get('checkpoint').environment = environment
   for (const declared of config.projects.get(project)?.actions ?? []) {
     actions.set(declared.id, {
       id: declared.id,
@@ -140,6 +142,7 @@ export async function listProjectActions (project, { root, projectsDir = project
       cwd: projectPath,
       timeoutSeconds: declared.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS,
       source: `projects/${project}.yaml`,
+      environment,
       builtin: false
     })
   }
@@ -186,13 +189,45 @@ export async function readOperation (project, operationId, { issuesDir = ISSUES_
   return { operation, entries, next: entries.at(-1)?.seq ?? after }
 }
 
+/*
+ * What an action inherits from the panel: an allow-list, never a copy of
+ * process.env. The panel's environment can hold its API token, database
+ * references and providers' keys under any name, and a denylist only catches
+ * the names someone thought of. Exact names only, plus the locale family; a
+ * project that needs more names them in projects/<id>.yaml `actionEnvironment`
+ * (an exact name, or `PREFIX*`, whose matches still pass SECRET_ENV_RE). No
+ * DEVPANEL_* name is ever inherited, whatever a project lists; the action's own
+ * DEVPANEL_PROJECT_ACTION / DEVPANEL_OPERATION_ID are set after the filter.
+ */
+const ACTION_ENV_NAMES = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'LANGUAGE', 'TZ', 'TMPDIR',
+  'SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  'NODE_ENV', 'NODE_EXTRA_CA_CERTS', 'NODE_PATH', 'NVM_DIR', 'NVM_BIN', 'NVM_INC',
+  'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
+  'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM',
+  'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_RUNTIME_DIR'
+])
+const ACTION_ENV_PREFIXES = ['LC_']
 const SECRET_ENV_RE = /(?:^DEVPANEL_TOKEN(?:_FILE)?$|(?:_TOKEN|_KEY|_SECRET|_PASSWORD|_PASS|_CREDENTIALS|_AUTH)$|^MONGODB_URI$|^DATABASE_URL$)/i
-function actionEnv (extra) {
-  const out = {}
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !SECRET_ENV_RE.test(k)) out[k] = v
+
+export function actionEnvironment (extra = {}, allow = [], source = process.env) {
+  const names = new Set(ACTION_ENV_NAMES)
+  const prefixes = [...ACTION_ENV_PREFIXES]
+  const projectPrefixes = []
+  for (const item of allow ?? []) {
+    if (typeof item !== 'string' || !item) continue
+    if (item.endsWith('*')) projectPrefixes.push(item.slice(0, -1))
+    else names.add(item)
   }
-  return { ...out, ...extra }
+  // A null-prototype object, so every listed name (even `__proto__`) is an own property.
+  const out = Object.create(null)
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined || key.startsWith('DEVPANEL_')) continue
+    // A wildcard match, the panel's LC_* or a project's prefix, must still not look like a secret.
+    const byPrefix = [...prefixes, ...projectPrefixes].some((p) => key.startsWith(p)) && !SECRET_ENV_RE.test(key)
+    if (names.has(key) || byPrefix) out[key] = value
+  }
+  return Object.assign(out, extra)
 }
 // Operations this process started, so a stop request reaches the right child.
 const inflight = new Map()
@@ -278,7 +313,7 @@ export async function startProjectAction ({ project, actionId, args = [], root, 
         args: args.length ? ['-c', `${action.run} "$@"`, 'devpanel-action', ...args] : ['-c', action.run],
         cwd: action.cwd,
         // Non-interactive by construction: no terminal, no credential prompts, no panel secrets.
-        env: actionEnv({ DEVPANEL_PROJECT_ACTION: action.id, DEVPANEL_OPERATION_ID: id, GIT_TERMINAL_PROMPT: '0', TERM: 'dumb' }),
+        env: actionEnvironment({ DEVPANEL_PROJECT_ACTION: action.id, DEVPANEL_OPERATION_ID: id, GIT_TERMINAL_PROMPT: '0', TERM: 'dumb' }, action.environment),
         signal: AbortSignal.any(signals),
         maxBuffer: 4 * 1024 * 1024,
         observe: {

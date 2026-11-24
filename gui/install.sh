@@ -24,7 +24,6 @@ die () { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 MODE="${1:-all}"
 
 UNIT_NAME=devpanel.service
-UNIT_TEMPLATE="$HERE/systemd/devpanel.service.in"
 UNIT_TARGET="/etc/systemd/system/$UNIT_NAME"
 UNIT_RENDERED="$HERE/systemd/$UNIT_NAME"
 
@@ -36,21 +35,114 @@ resolve_node () {
   readlink -f "$bin"
 }
 
+# render_unit <node> <user> <group> [<gui dir> <output>]: the checkout's own gui/
+# and systemd/devpanel.service unless named.
 render_unit () {
-  local node_bin="$1" user="$2" group="$3"
-  [[ -f "$UNIT_TEMPLATE" ]] || die "missing unit template at $UNIT_TEMPLATE"
-  sed -e "s|@DIR@|$HERE|g" \
+  local node_bin="$1" user="$2" group="$3" dir="${4:-$HERE}" out="${5:-$UNIT_RENDERED}"
+  local template="$dir/systemd/devpanel.service.in"
+  [[ -f "$template" ]] || die "missing unit template at $template"
+  sed -e "s|@DIR@|$dir|g" \
       -e "s|@NODE@|$node_bin|g" \
       -e "s|@USER@|$user|g" \
       -e "s|@GROUP@|$group|g" \
-      "$UNIT_TEMPLATE" > "$UNIT_RENDERED"
+      "$template" > "$out"
 }
+
+# --- what root runs comes from this checkout --------------------------------
+#
+# As root, --service runs tools/install-sandbox.sh and installs a unit rendered
+# from systemd/devpanel.service.in, and --sandbox runs the helper: files the
+# panel's own user can change. Before anything runs, every such file and every
+# folder above it must be writable by nobody but root and the checkout's owner.
+# Everything is read through the checkout's canonical path, which has no links
+# in it, and no link is allowed inside the checkout, so the checked path is the
+# one that is hashed, run and rendered. The owner stays trusted (gui/README.md).
+CHECKOUT="$(cd -- "$HERE/.." && pwd -P)"
+GUI="$CHECKOUT/gui"
+SANDBOX_INPUTS=(install.sh tools/install-sandbox.sh systemd/run-devpanel-proc.mount systemd/devpanel-sandbox.conf)
+SERVICE_INPUTS=("${SANDBOX_INPUTS[@]}" systemd/devpanel.service.in)
+
+# Why someone other than root and <owner> could change <path>; nothing when nobody can.
+untrusted_writer () {
+  local p="$1" owner="$2" user mode acl
+  user="$(stat -c '%U' -- "$p")" || { echo "cannot be read"; return; }
+  mode="$(stat -c '%a' -- "$p")" || { echo "cannot be read"; return; }
+  mode=$((8#$mode))
+  if [[ "$user" != root && "$user" != "$owner" ]]; then
+    if [[ "$owner" == root ]]; then echo "is owned by $user, not root"; else echo "is owned by $user, neither root nor the checkout owner $owner"; fi
+    return
+  fi
+  if (( mode & 8#020 )); then echo "is writable by its group (fix: chmod g-w $p)"; return; fi
+  # A folder others may write is safe only with the sticky bit (like /tmp); a file never is.
+  if (( mode & 8#002 )); then
+    if [[ ! -d "$p" ]] || (( (mode & 8#1000) == 0 )); then echo "is writable by others (fix: chmod o-w $p)"; return; fi
+  fi
+  # A probe that fails, or answers nothing usable, is a refusal: an unknown is not clean.
+  if command -v getfacl >/dev/null 2>&1; then
+    acl="$(getfacl --skip-base --absolute-names -- "$p" 2>/dev/null)" || { echo "could not be checked for an ACL (getfacl failed)"; return; }
+    if [[ -n "$acl" ]]; then echo "carries an ACL (fix: setfacl -b $p)"; return; fi
+  else
+    acl="$(ls -ld -- "$p" 2>/dev/null)" || { echo "could not be checked for an ACL (ls failed)"; return; }
+    if (( ${#acl} < 11 )); then echo "could not be checked for an ACL (ls printed no mode)"; return; fi
+    if [[ "${acl:10:1}" == "+" ]]; then echo "carries an ACL (fix: setfacl -b $p)"; return; fi
+  fi
+}
+
+# check_chain <dir> <owner>: refuse unless <dir> and every folder above it is safe.
+check_chain () {
+  local dir="$1" owner="$2" why
+  while :; do
+    why="$(untrusted_writer "$dir" "$owner")"
+    [[ -z "$why" ]] || die "refusing to run as root: $dir $why"
+    [[ "$dir" == / ]] && break
+    dir="$(dirname -- "$dir")"
+  done
+}
+
+# Refuse unless every <input> (relative to gui/) and every folder above it is safe.
+check_root_inputs () {
+  local owner rel p part why dir parts
+  owner="$(stat -c '%U' -- "$CHECKOUT")"
+  [[ "$(stat -c '%U' -- "$GUI")" == "$owner" ]] \
+    || die "refusing to run as root: $GUI is owned by $(stat -c '%U' -- "$GUI"), the checkout $CHECKOUT by $owner"
+  check_chain "$CHECKOUT" "$owner"
+  for rel in "$@"; do
+    p="$CHECKOUT"
+    IFS=/ read -ra parts <<< "gui/$rel"
+    for part in "${parts[@]}"; do
+      p="$p/$part"
+      [[ -L "$p" ]] && die "refusing to run as root: $p is a symlink inside the checkout"
+      why="$(untrusted_writer "$p" "$owner")"
+      [[ -z "$why" ]] || die "refusing to run as root: $p $why"
+    done
+    [[ -f "$p" ]] || die "refusing to run as root: $p is not a regular file"
+  done
+}
+
+# sha256_of <file>: its digest, or failure when it cannot be computed.
+sha256_of () {
+  local d
+  d="$(sha256sum < "$1")" || return 1
+  d="${d%% *}"
+  [[ "$d" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$d"
+}
+
+sandbox_digest () {
+  local d
+  d="$(sha256_of "$GUI/tools/install-sandbox.sh")" || die "refusing to run as root: the sha256 of tools/install-sandbox.sh could not be computed"
+  say "sha256 of tools/install-sandbox.sh: $d"
+}
+
+# Where the rendered unit is staged as root: a fixed folder, never the inherited
+# TMPDIR. It and every folder above it must be owned by root, with no exception
+# for the checkout owner (who could otherwise rename the staging folder), and pass
+# the other writer checks. The variable exists for the test suite; whatever it
+# names is held to the same root-only rule.
+STAGE_PARENT="${DEVPANEL_INSTALL_STAGE_PARENT:-/run}"
 
 install_service () {
   local node_bin user group
-  if [[ "$(id -u)" -eq 0 ]]; then
-    bash "$HERE/tools/install-sandbox.sh"
-  fi
   node_bin="$(resolve_node)"
   # Installed as root, but the service must run as whoever owns the project —
   # deciding that from the directory rather than from who ran the installer,
@@ -72,9 +164,8 @@ install_service () {
     fi
   fi
 
-  render_unit "$node_bin" "$user" "$group"
-
   if [[ "$(id -u)" -ne 0 ]]; then
+    render_unit "$node_bin" "$user" "$group"
     say "the unit is rendered at:"
     say "  $UNIT_RENDERED"
     say "installing it needs root — run:"
@@ -84,7 +175,23 @@ install_service () {
     return 1
   fi
 
-  install -m 0644 "$UNIT_RENDERED" "$UNIT_TARGET"
+  # As root: check first, then show what will run and be installed, then do it.
+  # The unit is rendered into a root-owned folder, never into the checkout.
+  check_root_inputs "${SERVICE_INPUTS[@]}"
+  local parent unit_sha
+  parent="$(cd -- "$STAGE_PARENT" && pwd -P)" || die "refusing to run as root: cannot use $STAGE_PARENT to stage the unit"
+  check_chain "$parent" root
+  STAGED="$(mktemp -d -p "$parent" devpanel-unit.XXXXXX)" || die "refusing to run as root: cannot create a staging folder in $parent"
+  trap 'rm -rf -- "$STAGED"' EXIT
+  render_unit "$node_bin" "$user" "$group" "$GUI" "$STAGED/$UNIT_NAME"
+  unit_sha="$(sha256_of "$STAGED/$UNIT_NAME")" || die "refusing to run as root: the sha256 of the rendered unit could not be computed"
+  say "the unit that will be installed as $UNIT_TARGET:"
+  cat -- "$STAGED/$UNIT_NAME"
+  say "sha256 of that unit: $unit_sha"
+  sandbox_digest
+  bash "$GUI/tools/install-sandbox.sh"
+
+  install -m 0644 "$STAGED/$UNIT_NAME" "$UNIT_TARGET"
   systemctl daemon-reload
   systemctl enable "$UNIT_NAME" >/dev/null
   say "installed $UNIT_TARGET and enabled it at boot"
@@ -106,6 +213,11 @@ install_service () {
 
 case "$MODE" in
   --sandbox|sandbox)
+    if [[ "$(id -u)" -eq 0 ]]; then
+      check_root_inputs "${SANDBOX_INPUTS[@]}"
+      sandbox_digest
+      exec bash "$GUI/tools/install-sandbox.sh"
+    fi
     exec bash "$HERE/tools/install-sandbox.sh"
     ;;
   --service|service)

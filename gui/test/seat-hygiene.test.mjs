@@ -156,7 +156,13 @@ export default async function (t) {
 
   t.section('6b. a turn carrying the broker gets exactly the devpanel MCP server, and its tools allowed (Phase 3)')
   {
-    const broker = { socket: '/tmp/dpb-x/s', token: 'tok', shim: '/opt/devpanel/harness/mcp-devpanel.mjs', node: process.execPath }
+    // The token lives only in a 0600 file; the adapters are handed its path (AC3).
+    const tokenDir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-hygiene-token-'))
+    temps.push(tokenDir)
+    const SENTINEL = 'tok-sentinel-4f1c9e'
+    const tokenFile = path.join(tokenDir, 't')
+    await fs.writeFile(tokenFile, SENTINEL, { mode: 0o600 })
+    const broker = { socket: '/tmp/dpb-x/s', tokenFile, shim: '/opt/devpanel/harness/mcp-devpanel.mjs', node: process.execPath }
     const cRecords = await spawned('DEVPANEL_CLAUDE_BIN', async (dir) => {
       const w = await workspace(dir)
       return claude.invoke({ model: 'm', cwd: w.cwd, scratchDir: w.scratchDir, ledgerDir: w.ledgerDir, prompt: 'hi', hygiene: true, broker,
@@ -165,7 +171,8 @@ export default async function (t) {
     const argv = cRecords[0]?.argv ?? []
     const mcp = JSON.parse(argAfter(argv, '--mcp-config') ?? '{}')
     t.eq('Claude: one strict server, the devpanel shim with the turn\'s socket and token', [argv.includes('--strict-mcp-config'), Object.keys(mcp.mcpServers ?? {}), mcp.mcpServers?.devpanel?.args, mcp.mcpServers?.devpanel?.env],
-      [true, ['devpanel'], [broker.shim], { DEVPANEL_BROKER_SOCKET: broker.socket, DEVPANEL_BROKER_TOKEN: broker.token }])
+      [true, ['devpanel'], [broker.shim], { DEVPANEL_BROKER_SOCKET: broker.socket, DEVPANEL_BROKER_TOKEN_FILE: tokenFile }])
+    t.ok('Claude: the token itself is nowhere in the argv, only the file that holds it', argv.length > 0 && !argv.join('\0').includes(SENTINEL) && !argv.join('\0').includes('DEVPANEL_BROKER_TOKEN"'), argv.join(' ').slice(0, 300))
     const allow = JSON.parse(argAfter(argv, '--settings') ?? '{}').permissions?.allow ?? []
     t.ok('and its two tools allowed', claude.BROKER_TOOLS.every((x) => allow.includes(x)), JSON.stringify(allow))
     const xRecords = await spawned('DEVPANEL_CODEX_BIN', async (dir) => {
@@ -176,6 +183,19 @@ export default async function (t) {
     const xs = (xRecords[0]?.argv ?? []).filter((a, i, all) => all[i - 1] === '-c')
     t.ok('Codex: the devpanel server after the emptied table', xs.indexOf('mcp_servers={}') < xs.findIndex((x) => x.startsWith('mcp_servers.devpanel.command=')) && xs.some((x) => x === `mcp_servers.devpanel.args=${JSON.stringify([broker.shim])}`), xs.join(' '))
     t.ok('with its calls approved (approval_policy is never; the broker is the gate)', xs.includes('mcp_servers.devpanel.default_tools_approval_mode="approve"'))
+    const xargv = xRecords[0]?.argv ?? []
+    t.ok('Codex: the token itself is nowhere in the argv, only the file that holds it', xargv.length > 0 && !xargv.join('\0').includes(SENTINEL) && !xargv.join('\0').includes('DEVPANEL_BROKER_TOKEN=') && xs.some((x) => x.includes(`DEVPANEL_BROKER_TOKEN_FILE=${JSON.stringify(tokenFile)}`)), xs.join(' '))
+    for (const [name, adapter, bin] of [['Claude', claude, 'DEVPANEL_CLAUDE_BIN'], ['Codex', codex, 'DEVPANEL_CODEX_BIN']]) {
+      let refused = null
+      const records = await spawned(bin, async (dir) => {
+        const w = await workspace(dir)
+        try {
+          await adapter.invoke({ model: 'm', cwd: w.cwd, scratchDir: w.scratchDir, ledgerDir: w.ledgerDir, prompt: 'hi', hygiene: true, broker: { socket: broker.socket, token: SENTINEL, shim: broker.shim, node: broker.node },
+            tooling: { writesCode: true, allowLiveCheckout: false, liveCheckout: null, allowedRoots: [w.evidence, w.scratchDir], networkAccess: true } })
+        } catch (error) { refused = error }
+      })
+      t.ok(`${name}: a broker carrying the token instead of a token file is refused before anything is spawned`, refused?.kind === 'configuration-error' && records.length === 0, `${refused?.kind} ${refused?.message} records=${records.length}`)
+    }
   }
 
   t.section('7. Gemini resolves its connection from the allow-list as well')

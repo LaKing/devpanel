@@ -57,7 +57,7 @@ export const WORKER_ALLOW = Object.freeze(['Read', 'WebFetch', 'WebSearch', 'Tas
 export const BROKER_TOOLS = Object.freeze(['mcp__devpanel__inspect_environment', 'mcp__devpanel__db_query'])
 /** The one MCP server a worker seat may have: the devpanel broker, when attached. */
 export const brokerServers = (broker) => broker
-  ? { devpanel: { command: broker.node, args: [broker.shim], env: { DEVPANEL_BROKER_SOCKET: broker.socket, DEVPANEL_BROKER_TOKEN: broker.token } } }
+  ? { devpanel: { command: broker.node, args: [broker.shim], env: { DEVPANEL_BROKER_SOCKET: broker.socket, DEVPANEL_BROKER_TOKEN_FILE: broker.tokenFile } } }
   : {}
 /** A read-only coordinator turn (Phase 1): reading and a sandboxed, offline shell. */
 export const READ_TOOLS = Object.freeze(['Read', 'Bash', 'ToolSearch'])
@@ -298,6 +298,9 @@ async function invokeOnce ({
 } = {}, ran = {}) {
   const invocationId = meta.invocationId ?? crypto.randomUUID()
   if (fork && !session?.id) throw new ProcessError('a fork needs the session it copies', { kind: 'configuration-error', started: false, invocationId })
+  // The broker's turn token reaches the shim through a 0600 file named in its MCP
+  // environment, never the command line (/proc/<pid>/cmdline is readable by others).
+  if (broker && !broker.tokenFile) throw new ProcessError('the broker token must be handed to the shim as a file (broker.tokenFile), never on the command line', { kind: 'configuration-error', started: false, invocationId })
 
   // Pre-assign on the first turn; resume by the same id afterwards. A fork
   // gets an id of its own.

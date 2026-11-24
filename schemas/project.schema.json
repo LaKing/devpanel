@@ -110,6 +110,15 @@
         }
       }
     },
+    "actionEnvironment": {
+      "type": "array",
+      "description": "Environment variables the project's actions receive beyond the panel's allow-list (PATH, HOME, USER, LANG/LC_*, TZ, the named NODE_/NVM_/GIT_/XDG_ variables, SSH_AUTH_SOCK, ...). Each entry is an exact name, or a prefix ending in * whose matches are still refused when they look like a secret (_TOKEN, _KEY, _SECRET, ...). No DEVPANEL_* variable is ever passed.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(?!DEVPANEL_)[A-Za-z_][A-Za-z0-9_]*\\*?$"
+      }
+    },
     "actions": {
       "type": "array",
       "description": "Operator scripts that act on the live project checkout, run on this host from the project root. A project with a push.sh always has a built-in `push` action (bash ./push.sh); declaring an action with id `push` replaces it. What runs is this configuration, never text supplied by a model or a browser.",
@@ -782,6 +791,11 @@
     {
       "required": [
         "actions"
+      ]
+    },
+    {
+      "required": [
+        "actionEnvironment"
       ]
     },
     {

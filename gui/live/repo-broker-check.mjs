@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 import { gitWorktreeProvider } from '../server/runtime/launch.mjs'
 import { createBroker } from '../server/broker/broker.mjs'
-import { SHIM } from '../server/broker/index.mjs'
+import { SHIM, writeTokenFile } from '../server/broker/index.mjs'
 
 /*
  * Do private repositories (fence.repository: 1) and the broker (Phase 3) work
@@ -28,7 +28,8 @@ const exec = promisify(execFile)
 const NL = String.fromCharCode(10)
 const PANEL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
-export async function runRepoBrokerCheck ({ adapter, harnessId, model, root, ledgerDir, reserve = () => {}, log = () => {}, ledger }) {
+// `tokenWriter` is injectable only so a test can make the setup fail and see nothing left behind.
+export async function runRepoBrokerCheck ({ adapter, harnessId, model, root, ledgerDir, reserve = () => {}, log = () => {}, ledger, tokenWriter = writeTokenFile }) {
   const result = { harness: harnessId, model, stages: [] }
   const stage = (name, status, detail = {}) => { result.stages.push({ name, status, ...detail }); log(name, status, detail) }
   const probed = await adapter.probe({ depth: 'installation' })
@@ -47,62 +48,73 @@ export async function runRepoBrokerCheck ({ adapter, harnessId, model, root, led
   await fs.mkdir(path.join(runs, runId), { recursive: true })
   const ws = await gitWorktreeProvider.create({ projectPath, runId, root: runs, policy: { base: 'head', repository: 1 } })
   const repo = ws.repository
-  const scratch = path.join(root, 'scratch'); const evidence = path.join(root, 'evidence')
-  for (const d of [scratch, evidence]) await fs.mkdir(d, { recursive: true })
-
-  const answer = crypto.randomInt(100000, 999999)
-  const broker = createBroker({
-    loadInfrastructure: async () => ({ staging: { id: 'stage', files: {}, database: { uriRef: 'env:NONE', databases: [{ name: 'app' }] } }, deployments: [] }),
-    inspect: async () => ({ available: false }),
-    driverFor: async () => ({ run: async (q) => (q.op === 'count' ? answer : []) })
-  })
-  const turnDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dpb-'))
-  const { token, revoke } = broker.openTurn({ project: 'live', issueId: 'live', issuePath: root, runId, runDir: path.join(runs, runId), invocationId: 'live-repo-broker', seat: 'implementer' })
-  const served = await broker.serveTurn({ socketPath: path.join(turnDir, 's'), token })
-  const node = await fs.realpath(process.execPath)
-  const nodeRoot = node.startsWith('/usr/') ? null : path.dirname(path.dirname(node))
-
-  const prompt = [
-    'This is an environment check. Do EVERY step, in order; do not ask for confirmation.',
-    '1. Append the line "seat edit" to notes.txt in the current directory.',
-    '2. With your shell run: git add -A && git commit -m "seat commit"  and then: git log --oneline',
-    '3. Call the devpanel tool db_query with {"environment":"stage","query":{"op":"count","database":"app","collection":"users"}} and quote the number it returns.',
-    'Report each step\'s output verbatim.'
-  ].join(NL)
-  let turn
   try {
-    reserve()
-    turn = await adapter.invoke({
-      model, cwd: ws.path, scratchDir: scratch, ledgerDir, prompt, hygiene: true, marker: `devpanel:repo-broker:${Date.now()}`,
-      tooling: { writesCode: true, allowLiveCheckout: false, liveCheckout: null, allowedRoots: [evidence, scratch], networkAccess: true, gitWorker: repo.worker, gitDirectories: [repo.engine] },
-      fence: { cwd: ws.path, writable: [ws.path, repo.worker, scratch, turnDir], readOnly: [evidence, path.join(repo.engine, 'objects'), SHIM, ...(nodeRoot ? [nodeRoot] : [])], entries: [path.join(ws.path, '.git')], panelRoot: PANEL },
-      broker: { socket: path.join(turnDir, 's'), token, shim: SHIM, node },
-      meta: { invocationId: 'live-repo-broker', role: 'implementer' }
+    const scratch = path.join(root, 'scratch'); const evidence = path.join(root, 'evidence')
+    for (const d of [scratch, evidence]) await fs.mkdir(d, { recursive: true })
+
+    const answer = crypto.randomInt(100000, 999999)
+    const broker = createBroker({
+      loadInfrastructure: async () => ({ staging: { id: 'stage', files: {}, database: { uriRef: 'env:NONE', databases: [{ name: 'app' }] } }, deployments: [] }),
+      inspect: async () => ({ available: false }),
+      driverFor: async () => ({ run: async (q) => (q.op === 'count' ? answer : []) })
     })
-    ledger?.record({ stage: 'repo-broker', outcome: 'completed', session: turn.session?.id ?? null, usage: turn.usage })
-    stage('turn completed', 'pass', { session: turn.session?.id ?? null })
-  } catch (error) {
-    ledger?.record({ stage: 'repo-broker', outcome: 'failed', error: error.message, usage: null })
-    stage('turn completed', 'fail', { detail: [error.message, error.stderr].filter(Boolean).join(' — ').slice(0, 400) })
+    const { token, revoke } = broker.openTurn({ project: 'live', issueId: 'live', issuePath: root, runId, runDir: path.join(runs, runId), invocationId: 'live-repo-broker', seat: 'implementer' })
+    // Everything the turn's broker holds (token, listener, token file) is released however setup or the turn ends.
+    let turnDir = null, served = null
+    let turn
+    try {
+      turnDir = await fs.mkdtemp(path.join(os.tmpdir(), 'dpb-'))
+      served = await broker.serveTurn({ socketPath: path.join(turnDir, 's'), token })
+      const tokenFile = await tokenWriter(turnDir, token)
+      const node = await fs.realpath(process.execPath)
+      const nodeRoot = node.startsWith('/usr/') ? null : path.dirname(path.dirname(node))
+
+      const prompt = [
+        'This is an environment check. Do EVERY step, in order; do not ask for confirmation.',
+        '1. Append the line "seat edit" to notes.txt in the current directory.',
+        '2. With your shell run: git add -A && git commit -m "seat commit"  and then: git log --oneline',
+        '3. Call the devpanel tool db_query with {"environment":"stage","query":{"op":"count","database":"app","collection":"users"}} and quote the number it returns.',
+        'Report each step\'s output verbatim.'
+      ].join(NL)
+      try {
+        reserve()
+        turn = await adapter.invoke({
+          model, cwd: ws.path, scratchDir: scratch, ledgerDir, prompt, hygiene: true, marker: `devpanel:repo-broker:${Date.now()}`,
+          tooling: { writesCode: true, allowLiveCheckout: false, liveCheckout: null, allowedRoots: [evidence, scratch], networkAccess: true, gitWorker: repo.worker, gitDirectories: [repo.engine] },
+          fence: { cwd: ws.path, writable: [ws.path, repo.worker, scratch, turnDir], readOnly: [evidence, path.join(repo.engine, 'objects'), SHIM, ...(nodeRoot ? [nodeRoot] : [])], entries: [path.join(ws.path, '.git')], panelRoot: PANEL },
+          broker: { socket: path.join(turnDir, 's'), tokenFile, shim: SHIM, node },
+          meta: { invocationId: 'live-repo-broker', role: 'implementer' }
+        })
+        ledger?.record({ stage: 'repo-broker', outcome: 'completed', session: turn.session?.id ?? null, usage: turn.usage })
+        stage('turn completed', 'pass', { session: turn.session?.id ?? null })
+      } catch (error) {
+        ledger?.record({ stage: 'repo-broker', outcome: 'failed', error: error.message, usage: null })
+        stage('turn completed', 'fail', { detail: [error.message, error.stderr].filter(Boolean).join(' — ').slice(0, 400) })
+      }
+    } finally {
+      revoke()
+      await served?.close().catch(() => {})
+      if (turnDir) await fs.rm(turnDir, { recursive: true, force: true })
+    }
+    if (turn) {
+      const fence = turn.diagnostics?.fence
+      stage('the turn ran inside a proved fence', fence?.namespace === 1 ? 'pass' : 'fail', { detail: (JSON.stringify(fence) ?? 'no fence diagnostics').slice(0, 300) })
+      const head = await exec('git', ['--git-dir', repo.worker, 'rev-parse', 'HEAD']).then((r) => r.stdout.trim(), () => null)
+      const parent = head ? await exec('git', ['--git-dir', repo.worker, 'rev-parse', `${head}^`]).then((r) => r.stdout.trim(), () => null) : null
+      stage('the seat committed in its worker directory', head && head !== ws.baseCommit && parent === ws.baseCommit ? 'pass' : 'fail', { detail: `worker HEAD ${head?.slice(0, 12)}, parent ${parent?.slice(0, 12)}, base ${ws.baseCommit.slice(0, 12)}` })
+      const engineHead = await exec('git', ['--git-dir', repo.engine, 'rev-parse', 'HEAD']).then((r) => r.stdout.trim())
+      stage('the engine directory did not move', engineHead === ws.baseCommit ? 'pass' : 'fail')
+      const records = await fs.readdir(path.join(runs, runId, 'evidence', 'broker')).catch(() => [])
+      const ok = []
+      for (const f of records) { const r = JSON.parse(await fs.readFile(path.join(runs, runId, 'evidence', 'broker', f), 'utf8')); if (r.outcome === 'ok' && r.tool === 'db_query') ok.push(r) }
+      stage('the broker recorded the db_query call', ok.length ? 'pass' : 'fail', { detail: `${records.length} record(s)` })
+      stage('the random answer reached the model', (turn.response ?? '').includes(String(answer)) ? 'pass' : 'fail', { detail: `expected ${answer}` })
+      stage('the history before the snapshot is not visible', (turn.response ?? '').includes('history one') ? 'fail' : 'pass')
+    }
   } finally {
-    revoke(); await served.close(); await fs.rm(turnDir, { recursive: true, force: true })
+    // The worktree is handed back whatever happened above.
+    await gitWorktreeProvider.release({ projectPath, path: ws.path, repository: repo })
   }
-  if (turn) {
-    const fence = turn.diagnostics?.fence
-    stage('the turn ran inside a proved fence', fence?.namespace === 1 ? 'pass' : 'fail', { detail: JSON.stringify(fence).slice(0, 300) })
-    const head = await exec('git', ['--git-dir', repo.worker, 'rev-parse', 'HEAD']).then((r) => r.stdout.trim(), () => null)
-    const parent = head ? await exec('git', ['--git-dir', repo.worker, 'rev-parse', `${head}^`]).then((r) => r.stdout.trim(), () => null) : null
-    stage('the seat committed in its worker directory', head && head !== ws.baseCommit && parent === ws.baseCommit ? 'pass' : 'fail', { detail: `worker HEAD ${head?.slice(0, 12)}, parent ${parent?.slice(0, 12)}, base ${ws.baseCommit.slice(0, 12)}` })
-    const engineHead = await exec('git', ['--git-dir', repo.engine, 'rev-parse', 'HEAD']).then((r) => r.stdout.trim())
-    stage('the engine directory did not move', engineHead === ws.baseCommit ? 'pass' : 'fail')
-    const records = await fs.readdir(path.join(runs, runId, 'evidence', 'broker')).catch(() => [])
-    const ok = []
-    for (const f of records) { const r = JSON.parse(await fs.readFile(path.join(runs, runId, 'evidence', 'broker', f), 'utf8')); if (r.outcome === 'ok' && r.tool === 'db_query') ok.push(r) }
-    stage('the broker recorded the db_query call', ok.length ? 'pass' : 'fail', { detail: `${records.length} record(s)` })
-    stage('the random answer reached the model', (turn.response ?? '').includes(String(answer)) ? 'pass' : 'fail', { detail: `expected ${answer}` })
-    stage('the history before the snapshot is not visible', (turn.response ?? '').includes('history one') ? 'fail' : 'pass')
-  }
-  await gitWorktreeProvider.release({ projectPath, path: ws.path, repository: repo })
   return result
 }
 

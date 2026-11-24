@@ -316,6 +316,9 @@ async function invokeOnce ({
 } = {}, ran = {}) {
   const invocationId = meta.invocationId ?? crypto.randomUUID()
   if (fork && !session?.id) throw new ProcessError('a fork needs the session it copies', { kind: 'configuration-error', started: false, invocationId })
+  // The broker's turn token reaches the shim through a 0600 file named in its MCP
+  // environment, never the command line (/proc/<pid>/cmdline is readable by others).
+  if (broker && !broker.tokenFile) throw new ProcessError('the broker token must be handed to the shim as a file (broker.tokenFile), never on the command line', { kind: 'configuration-error', started: false, invocationId })
 
   const readOnlySource = tooling?.writesCode === false && !supervisorOnly
   if (readOnlySource) scratchDir = (await assertScratchOutsideWorktree(cwd, scratchDir)).scratchRoot
@@ -373,7 +376,7 @@ async function invokeOnce ({
     // The one MCP server a worker seat may have: the devpanel broker (Phase 3).
     if (broker) {
       args.push('-c', `mcp_servers.devpanel.command=${JSON.stringify(broker.node)}`, '-c', `mcp_servers.devpanel.args=${JSON.stringify([broker.shim])}`,
-        '-c', `mcp_servers.devpanel.env={DEVPANEL_BROKER_SOCKET=${JSON.stringify(broker.socket)},DEVPANEL_BROKER_TOKEN=${JSON.stringify(broker.token)}}`,
+        '-c', `mcp_servers.devpanel.env={DEVPANEL_BROKER_SOCKET=${JSON.stringify(broker.socket)},DEVPANEL_BROKER_TOKEN_FILE=${JSON.stringify(broker.tokenFile)}}`,
         // approval_policy is never: without this Codex refuses every MCP call
         // ("requires approval"). The broker is the gate: it checks each call.
         '-c', 'mcp_servers.devpanel.default_tools_approval_mode="approve"')

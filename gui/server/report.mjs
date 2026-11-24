@@ -29,7 +29,8 @@ import { reporterForKey } from './reporters.mjs'
  * for kind `fault` (the framework's own error/warning/crash report), `request` for kind `request`
  * (a person, relayed by an assistant). Without a key it is `anonymous`, whatever it claims. A key
  * that matches nothing, or another project's reporter, is refused rather than downgraded, so a
- * misconfigured deployment finds out. The trust is recorded on the issue (`issue.report`) and
+ * misconfigured deployment finds out. Refusals count per source address: past REFUSED_PER_WINDOW in
+ * the window, every keyed request from it gets 429, so a key cannot be guessed at speed. The trust is recorded on the issue (`issue.report`) and
  * bounds what the top-level supervisor may start on it; it never limits an operator.
  *
  * Pitfall: createIssue reads a single-line `….md` input as a LOCAL FILE PATH. Report input is
@@ -39,6 +40,10 @@ import { reporterForKey } from './reporters.mjs'
 const MAX_BYTES = 256 * 1024
 const WINDOW_MS = 10 * 60 * 1000
 const PER_WINDOW = 20
+// Refused reporter keys (unknown, or another project's) answered per source address and window; then 429.
+const REFUSED_PER_WINDOW = 10
+// Keyed lookups one address may have waiting at once; beyond that, 429 at once.
+const MAX_PENDING_LOOKUPS = PER_WINDOW
 const KINDS = ['fault', 'request']
 const CATEGORIES = ['bug', 'feature', 'error', 'warning', 'crash']
 
@@ -71,17 +76,57 @@ export function reportText (input) {
   return /[\r\n]/.test(input) ? input : `# ${input.trim()}\n`
 }
 
-// `refuse` and `identify` are injectable only so a test over loopback can reach the accepting path.
-export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refusal, identify = reporterForKey }) {
+// `refuse`, `identify`, `peerOf`, `buckets` and `lookups` are injectable only so a test over loopback
+// can reach the accepting path, tell addresses apart and look at the limiter's state.
+export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refusal, identify = reporterForKey, peerOf = (req) => bare(req.socket?.remoteAddress), buckets = new Map(), lookups = new Map() }) {
   const router = express.Router()
-  const recent = new Map()
+  // Times per bucket: `reporter:<name>` and `peer:<address>` (accepted reports), `refused:<address>` (refused keys).
+  const inWindow = (key) => (buckets.get(key) ?? []).filter((t) => now() - t < WINDOW_MS)
+  let prunedAt = -Infinity
+  const prune = () => {
+    if (now() - prunedAt < WINDOW_MS / 10) return
+    prunedAt = now()
+    for (const [key, times] of buckets) if (!times.some((t) => now() - t < WINDOW_MS)) buckets.delete(key)
+  }
+  /*
+   * A key is identified one request at a time per address, and the refusal count is
+   * read inside that turn: overlapping wrong keys cannot all pass the check before the
+   * first refusal is counted, and only refusals that happened are counted, so
+   * overlapping valid keys are never limited by it. At most MAX_PENDING_LOOKUPS wait.
+   */
+  const identifyQueued = (peer, offered, project) => {
+    const entry = lookups.get(peer) ?? { tail: Promise.resolve(), pending: 0 }
+    if (entry.pending >= MAX_PENDING_LOOKUPS) return Promise.resolve({ busy: true })
+    entry.pending++
+    lookups.set(peer, entry)
+    const turn = entry.tail.then(async () => {
+      if (inWindow(`refused:${peer}`).length >= REFUSED_PER_WINDOW) return { limited: true }
+      const reporter = await identify(offered)
+      if (!reporter || reporter.project !== project) buckets.set(`refused:${peer}`, [...inWindow(`refused:${peer}`), now()])
+      return { reporter }
+    })
+    entry.tail = turn.catch(() => {})
+    const settle = () => { if (--entry.pending === 0 && lookups.get(peer) === entry) lookups.delete(peer) }
+    turn.then(settle, settle)
+    return turn
+  }
 
   router.post('/api/report/:project', express.json({ limit: MAX_BYTES }), async (req, res, next) => {
     try {
       const why = refuse(req)
       if (why) return res.status(403).json({ error: `reporting is refused: ${why}`, hint: 'call the panel by its private address, not through the proxy' })
+      prune()
+      const peer = peerOf(req)
       const offered = req.headers['x-devpanel-reporter-key']
-      const reporter = offered ? await identify(offered) : null
+      let reporter = null
+      if (offered) {
+        const limitedError = { error: `at most ${REFUSED_PER_WINDOW} refused reporter keys per ${WINDOW_MS / 60000} minutes from one address` }
+        if (inWindow(`refused:${peer}`).length >= REFUSED_PER_WINDOW) return res.status(429).json(limitedError)
+        const looked = await identifyQueued(peer, offered, req.params.project)
+        if (looked.busy) return res.status(429).json({ error: `at most ${MAX_PENDING_LOOKUPS} reporter-key lookups may wait at once from one address` })
+        if (looked.limited) return res.status(429).json(limitedError)
+        reporter = looked.reporter
+      }
       if (offered && !reporter) return res.status(403).json({ error: 'the reporter key matches no reporter' })
       if (reporter && reporter.project !== req.params.project) return res.status(403).json({ error: `reporter ${reporter.name} reports for ${reporter.project}, not ${req.params.project}` })
       const kind = req.body?.kind ?? 'fault'
@@ -92,10 +137,10 @@ export function reportRouter ({ createIssue, emit, now = Date.now, refuse = refu
       if (fingerprint !== null && !validFingerprint(fingerprint)) return res.status(400).json({ error: 'fingerprint must be one word of 6 to 128 letters, digits and . _ : + / = -, starting with a letter or digit' })
       const input = reportText(req.body?.input)
       if (!input) return res.status(400).json({ error: 'input (the report as Markdown) is required' })
-      const bucket = reporter ? `reporter:${reporter.name}` : `peer:${bare(req.socket.remoteAddress)}`
-      const times = (recent.get(bucket) ?? []).filter((t) => now() - t < WINDOW_MS)
+      const bucket = reporter ? `reporter:${reporter.name}` : `peer:${peer}`
+      const times = inWindow(bucket)
       if (times.length >= PER_WINDOW) return res.status(429).json({ error: `at most ${PER_WINDOW} reports per ${WINDOW_MS / 60000} minutes from one reporter or address` })
-      recent.set(bucket, [...times, now()])
+      buckets.set(bucket, [...times, now()])
       const report = { kind, category, reporter: reporter?.name ?? null, trust: reporter ? kind : 'anonymous', ...(fingerprint ? { fingerprint } : {}) }
       const issue = await createIssue(req.params.project, { input, reportOrigin: report, openedBy: { user: reporter?.name ?? 'report', host: await clientHost(req) } })
       emit({ reason: 'issue-created', project: issue.project, id: issue.id })
