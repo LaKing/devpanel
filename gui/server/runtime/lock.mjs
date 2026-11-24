@@ -82,9 +82,11 @@ export async function acquire (file, {
   detail = null,
   // async (held) => true when a LIVE owner's lock no longer stands for anything (the run it
   // names has ended): taken over like a dead one. Never consulted for 'unknown' or 'dead'.
-  stale = null
+  stale = null,
+  // false: never bring back a directory that has gone (a missing folder throws ENOENT).
+  mkdir = true
 } = {}) {
-  await fs.mkdir(path.dirname(file), { recursive: true })
+  if (mkdir) await fs.mkdir(path.dirname(file), { recursive: true })
   const owner = await currentOwner(runId, { platform })
   const token = crypto.randomUUID()
   const record = { ...(detail ?? {}), purpose, token, owner, acquiredAt: clock.iso(), heartbeatAt: clock.iso() }
@@ -96,18 +98,10 @@ export async function acquire (file, {
     token,
     /**
      * Release only what we still hold. Unlinking blindly would delete a lock a
-     * different owner acquired after ours was taken over.
+     * different owner acquired after ours was taken over — so the token is
+     * checked again under the takeover gate, where no takeover can intervene.
      */
-    async release () {
-      try {
-        const held = JSON.parse(await fs.readFile(file, 'utf8'))
-        if (held.token !== token) return false
-      } catch {
-        return false
-      }
-      await fs.rm(file, { force: true })
-      return true
-    }
+    release () { return removeUnderGate(file, token, owner, platform) }
   }
 
   // Losing a takeover race to another contender is worth a short re-look even
@@ -183,29 +177,32 @@ async function examine (file, platform = hostPlatform()) {
  * the dead owner and both unlink — which would let one delete the other's newly
  * acquired lock and leave two holders believing they own it.
  */
-async function takeOver (file, held, platform = hostPlatform(), stale = null) {
+async function takeOver (file, held, platform = hostPlatform(), stale = null, depth = 0) {
   const gate = `${file}.takeover`
   const token = crypto.randomUUID()
   if (!await createWith(gate, { purpose: 'takeover', token, owner: await currentOwner(null, { platform }), at: new Date().toISOString() })) {
     // Another contender is taking over — unless that contender died inside the
     // gate, which would otherwise block this lock forever.
     const { held: gateHolder, liveness } = await examine(gate, platform)
-    if (liveness === 'dead') {
-      const now = await fs.readFile(gate, 'utf8').catch(() => null)
-      let nowToken = null
-      if (now !== null) { try { nowToken = JSON.parse(now).token } catch { nowToken = null } }
-      if (now !== null && (gateHolder === null || nowToken === gateHolder.token)) await fs.rm(gate, { force: true })
-    }
+    if (liveness === 'dead') await clearDeadGate(gate, gateHolder, platform, depth)
     return false
   }
 
   try {
     // Re-read under the gate: the lock may already have been replaced.
     let current = null
-    try { current = JSON.parse(await fs.readFile(file, 'utf8')) } catch {
+    let text
+    try { text = await fs.readFile(file, 'utf8') } catch (error) {
+      // Gone already: nothing to remove. Removing the path anyway could delete a
+      // lock a new owner publishes (without this gate) in the meantime.
+      if (error.code === 'ENOENT') return true
+      throw error
+    }
+    try { current = JSON.parse(text) } catch {
       // Unreadable: only an old one left by the earlier writer may be removed.
-      const { liveness } = await examine(file, platform)
-      if (held !== null || liveness !== 'dead') return false
+      // A present file cannot be replaced except by its removal under this gate.
+      const { liveness, unreadable } = await examine(file, platform)
+      if (held !== null || !unreadable || liveness !== 'dead') return false
       await fs.rm(file, { force: true })
       return true
     }
@@ -219,20 +216,57 @@ async function takeOver (file, held, platform = hostPlatform(), stale = null) {
   }
 }
 
-/**
- * Release a dead owner's lock through the serialized takeover gate, only if it
- * still belongs to `runId` (when given) and has not been replaced by a new owner.
- * Retries once so a stale/corrupt `.takeover` gate cleared on the first pass
- * still releases the dead lock in the same call.
+/*
+ * A gate whose holder died is itself a lock: it is removed the same way, under
+ * its own gate (`<gate>.takeover`) after the token and the death are checked
+ * again there, so a delayed cleaner can never delete a gate a live contender
+ * has published since. Bounded: a chain of dead gates this deep is not cleared.
  */
-export async function releaseDeadLock (file, { runId = null, platform = hostPlatform() } = {}) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { held, liveness } = await examine(file, platform)
-    if (!held || liveness !== 'dead') return false
-    if (runId !== null && held.owner?.runId && held.owner.runId !== runId) return false
-    if (await takeOver(file, held, platform)) return true
+const MAX_GATE_DEPTH = 4
+async function clearDeadGate (gate, gateHolder, platform, depth) {
+  if (depth >= MAX_GATE_DEPTH) return false
+  return takeOver(gate, gateHolder, platform, null, depth + 1)
+}
+
+/** How long a release waits for a takeover gate held by someone else. */
+const RELEASE_GATE_WAIT_MS = 10_000
+
+/*
+ * Remove `file` only if it still holds `token`, checked under `<file>.takeover`:
+ * every removal of a lock happens there, so no takeover can replace the lock
+ * between the check and the unlink. A missing folder creates nothing. A gate
+ * that stays busy leaves the lock in place rather than remove it unguarded.
+ */
+async function removeUnderGate (file, token, owner, platform, { pollMs = 10 } = {}) {
+  const gate = `${file}.takeover`
+  const gateRecord = { purpose: 'release', token: crypto.randomUUID(), owner, at: new Date().toISOString() }
+  const deadline = Date.now() + RELEASE_GATE_WAIT_MS
+  for (;;) {
+    try {
+      if (await createWith(gate, gateRecord)) break
+    } catch (error) {
+      if (error.code === 'ENOENT') return false            // the folder has gone, and the lock with it
+      throw error
+    }
+    const { held: gateHolder, liveness, unreadable } = await examine(gate, platform)
+    // A dead holder's gate is cleared under its own gate; an absent one was released meanwhile.
+    if (liveness === 'dead' && (gateHolder !== null || unreadable) && await clearDeadGate(gate, gateHolder, platform, 0)) continue
+    if (liveness === 'dead' && gateHolder === null && !unreadable) continue
+    if (Date.now() >= deadline) {
+      console.warn(`[devpanel] ${path.basename(file)} not released: its takeover gate stayed held (${liveness}); the lock stays until its owner is gone`)
+      return false
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs))
   }
-  return false
+  try {
+    let held
+    try { held = JSON.parse(await fs.readFile(file, 'utf8')) } catch { return false }
+    if (held.token !== token) return false
+    await fs.rm(file, { force: true })
+    return true
+  } finally {
+    await fs.rm(gate, { force: true })
+  }
 }
 
 /** Run `fn` while holding the lock, releasing it however `fn` ends. */

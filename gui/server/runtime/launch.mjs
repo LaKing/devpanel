@@ -1061,30 +1061,34 @@ function tryAssert (result) {
 
 /** Reopen an existing run — the restart path. */
 export async function resumeRun ({ issuePath, runId, harnesses, stepStore, clock = systemClock, hooks = {}, emit = null, deliveryProvider = null, configRoot = undefined, workspaceProvider = gitWorktreeProvider, projectPath = null, projectAlias = projectPath, takeLock = true, availability = null }) {
-  const engine = new Engine({ issuePath, runId, harnesses, steps: stepStore, clock, hooks, emit, deliveryProvider, configRoot, availability })
-  await engine.load()
+  // The lock first: run.json and the baseline are read under it, so a writer
+  // that held the lock until just now is never read stale and then overwritten.
+  // A folder that has gone is not brought back (mkdir: false).
+  const runLock = takeLock ? await acquire(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock, mkdir: false }) : null
+  try {
+    const engine = new Engine({ issuePath, runId, harnesses, steps: stepStore, clock, hooks, emit, deliveryProvider, configRoot, availability })
+    engine.runLock = runLock
+    await engine.load()
 
-  // The ORIGINAL baseline, or the run's notion of "changed" silently shifts.
-  const stored = await store.readBaseline(issuePath, runId)
-  if (stored) {
-    engine.baseline = stored
-  } else {
-    engine.baseline = new Map()
-    engine.baselineMissing = true
-  }
+    // The ORIGINAL baseline, or the run's notion of "changed" silently shifts.
+    const stored = await store.readBaseline(issuePath, runId)
+    if (stored) {
+      engine.baseline = stored
+    } else {
+      engine.baseline = new Map()
+      engine.baselineMissing = true
+    }
 
-  engine.workspaceProvider = engine.run.workspace?.isolation === 'in-place' ? inPlaceProvider : engine.run.workspace?.base?.policy === 'staged-release' ? directoryProvider : workspaceProvider
-  const originalProjectPath = projectPath ?? engine.run.issue?.projectPath ?? null
-  engine.projectPath = originalProjectPath ? await fs.realpath(originalProjectPath) : null
-  engine.projectAlias = projectAlias ?? originalProjectPath
-  if (takeLock) {
-    engine.runLock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock })
-  }
-  try { await requireUnarchived(issuePath) } catch (error) {
-    await engine.runLock?.release()
+    engine.workspaceProvider = engine.run.workspace?.isolation === 'in-place' ? inPlaceProvider : engine.run.workspace?.base?.policy === 'staged-release' ? directoryProvider : workspaceProvider
+    const originalProjectPath = projectPath ?? engine.run.issue?.projectPath ?? null
+    engine.projectPath = originalProjectPath ? await fs.realpath(originalProjectPath) : null
+    engine.projectAlias = projectAlias ?? originalProjectPath
+    await requireUnarchived(issuePath)
+    return engine
+  } catch (error) {
+    await runLock?.release()
     throw error
   }
-  return engine
 }
 
 /*

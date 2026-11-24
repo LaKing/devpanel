@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { writeJson } from './persistence.mjs'
+import { updateIssueMeta } from '../issue-meta.mjs'
 
 /*
  * Two-seat triage sizing (docs/tactical-playbooks.md "Triage").
@@ -99,20 +99,17 @@ export function foldSizing (snapshot, steps, outputs) {
  * same run's decision again changes nothing, so a replay after a crash is harmless.
  */
 export async function recordIssueSizing (issuePath, sizing, { runId, byStep, at = new Date().toISOString() }) {
-  const file = path.join(issuePath, 'issue.json')
-  let meta = {}
-  try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-  if (meta.sizing?.runId === runId && meta.sizing?.byStep === byStep) return false
-  meta.sizing = {
-    runId, byStep, at,
-    size: sizing.size,
-    affectedModules: sizing.affectedModules,
-    recommendedPlaybook: sizing.recommendedPlaybook,
-    autonomy: sizing.autonomy,
-    seats: sizing.seats.map(({ role, model, size, reason, modules }) => ({ role, model, size, reason, modules }))
-  }
-  await writeJson(file, meta)
-  return true
+  return updateIssueMeta(issuePath, (meta) => {
+    if (meta.sizing?.runId === runId && meta.sizing?.byStep === byStep) return false
+    meta.sizing = {
+      runId, byStep, at,
+      size: sizing.size,
+      affectedModules: sizing.affectedModules,
+      recommendedPlaybook: sizing.recommendedPlaybook,
+      autonomy: sizing.autonomy,
+      seats: sizing.seats.map(({ role, model, size, reason, modules }) => ({ role, model, size, reason, modules }))
+    }
+  })
 }
 
 /** The parts of an issue's sizing a participant reads: what was decided, by which run, and each seat's sentence. */

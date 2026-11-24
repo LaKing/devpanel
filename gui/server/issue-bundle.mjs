@@ -79,8 +79,8 @@ export function withMoves (issuesDir, project, fn, { waitMs = 10000 } = {}) {
   return withLock(path.join(archiveRoot(issuesDir), project, '.moves.lock'), { purpose: 'issue-moves', waitMs }, fn)
 }
 
-/** Locks mean nothing once packed; worktrees are left out only once their changes are saved. */
-const lock = (rel) => /^\.(run|step-alloc)\.lock$/.test(rel)
+/** Locks mean nothing once packed, nor do their takeover gates and publication temp files; worktrees are left out only once their changes are saved. */
+const lock = (rel) => /^\.(run|step-alloc)\.lock($|\.)/.test(rel)
 
 async function filesIn (dir, rel = '') {
   const out = []
@@ -224,7 +224,7 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
     const tmp = path.join(work, 'bundle.tar.gz')
     let removing
     try {
-      await run('tar', ['-C', path.join(issuesDir, project), '--exclude', `${id}/.run.lock`, '--exclude', `${id}/.step-alloc.lock`, '-czf', tmp, id], BIG)
+      await run('tar', ['-C', path.join(issuesDir, project), '--exclude', `${id}/.run.lock`, '--exclude', `${id}/.run.lock.*`, '--exclude', `${id}/.step-alloc.lock`, '--exclude', `${id}/.step-alloc.lock.*`, '-czf', tmp, id], BIG)
       // Verified before anything is removed: the bundle unpacks, and holds every
       // file that was there. Unpacked rather than listed: tar escapes names in a
       // listing (a seat once created a file named with git's C-quoting, `\\303\\237…`),

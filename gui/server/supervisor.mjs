@@ -29,7 +29,7 @@ import {
 import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from './runtime/engine.mjs'
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
-import { LockHeld, ownerLiveness, releaseDeadLock, withLock } from './runtime/lock.mjs'
+import { LockHeld, acquire, ownerLiveness, withLock } from './runtime/lock.mjs'
 import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, writesCheckout } from './run-exclusivity.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
 import { terminatePids } from './runtime/process.mjs'
@@ -1538,8 +1538,17 @@ export function createSupervisor ({
       })
     }
 
-    const foreignLive = held(owner) && !owner.mine
-    const reconciled = await markUnowned(issue.path, run, owner, { releaseLock: !foreignLive })
+    const reconciled = await markUnowned(issue.path, run, owner)
+    if (!reconciled) {
+      // Nothing written: the lock is held, or the run settled meanwhile.
+      const now = await store.readRun(issue.path, runId).catch(() => null)
+      if (now && !LIVE_STATUSES.includes(now.status)) {
+        return now.blockedReason === 'recovery-required'
+          ? { runId, status: now.status, blockedReason: now.blockedReason, recoveryRequired: true, detail: now.recovery?.reason ?? null }
+          : { runId, status: now.status, alreadyStopped: true }
+      }
+      throw err(409, 'the issue\'s run lock is held by another process, so this run cannot be marked from here now')
+    }
     return {
       runId,
       status: reconciled.status,
@@ -1819,7 +1828,27 @@ export function createSupervisor ({
    * quietly cancelled — a cancelled run says "nothing further happened", and
    * nobody here knows that.
    */
-  async function markUnowned (issuePath, run, owner, { releaseLock = true } = {}) {
+  async function markUnowned (issuePath, observed, owner) {
+    // Under the issue's run lock, or not at all: a dead owner's lock is taken
+    // over, a live or unknown one refuses, and the record is read again under it,
+    // so an owner that appeared since `owner` was read is never overwritten.
+    let lock
+    try {
+      lock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'recovery', runId: observed.runId, platform, mkdir: false })
+    } catch (error) {
+      if (error instanceof LockHeld) return null
+      throw error
+    }
+    try {
+      const run = await store.readRun(issuePath, observed.runId).catch(() => null)
+      if (!run || !LIVE_STATUSES.includes(run.status)) return null
+      return await markUnownedHeld(issuePath, run, owner)
+    } finally {
+      await lock.release()
+    }
+  }
+
+  async function markUnownedHeld (issuePath, run, owner) {
     const wasStopping = run.status === 'stopping'
     const detail = owner.liveness === 'absent'
       ? 'no lock was held for it when this server took over'
@@ -1867,12 +1896,6 @@ export function createSupervisor ({
     }
     await store.writeRun(issuePath, run.runId, run)
     await keepOnBarrier(path.dirname(issuePath), run)
-
-    // A dead owner's lock must not keep the issue hostage — but only the lock
-    // that belonged to THIS run, and only if nothing living is behind it.
-    if (releaseLock) {
-      await releaseDeadLock(path.join(issuePath, '.run.lock'), { runId: run.runId, platform }).catch(() => {})
-    }
     return run
   }
 
@@ -1947,7 +1970,11 @@ export function createSupervisor ({
           // someone else, so leave it entirely alone.
           if (owner.forThisRun && foreignLive) continue
 
-          await markUnowned(issue.path, run, owner, { releaseLock: !foreignLive })
+          if (!await markUnowned(issue.path, run, owner)) {
+            const now = await lockOwner(issue.path, runId)
+            if (held(now)) console.warn(`[devpanel] reconcile skipped ${projectId}/${issue.id} run ${runId}: the issue's run lock is held (${now.liveness}, pid ${now.record?.owner?.pid ?? 'unknown'})`)
+            continue
+          }
           recovered.push({ project: projectId, issueId: issue.id, runId })
           emit?.({ type: 'run-recovery-required', project: projectId, issueId: issue.id, runId })
         }

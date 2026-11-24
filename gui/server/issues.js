@@ -13,7 +13,8 @@ import { explainRun, limitRaises } from './runtime/run-explanation.mjs'
 import { readOutputs } from './runtime/store.mjs'
 import { reconcilePending } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
-import { withLock } from './runtime/lock.mjs'
+import { LockHeld, withLock } from './runtime/lock.mjs'
+import { updateIssueMeta } from './issue-meta.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { ARCHIVE_FILE, archiveState, issueStatus, requireUnarchived } from './issue-archive.mjs'
 import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
@@ -727,14 +728,13 @@ export async function createInquiry (project, { question, relatedIssue = null, c
 /** Record or remove an inquiry's closure. Callers hold the project's admission lock. */
 export async function setInquiryClosure (project, id, closure, { reopenedBy = null, reason = null } = {}) {
   const dir = await issueDir(project, id)
-  const file = path.join(dir, META_FILE)
-  const meta = JSON.parse(await fs.readFile(file, 'utf8'))
-  if (meta.kind !== 'inquiry') throw new IssueError(`${id} is not an inquiry`, 409)
-  meta.inquiry ??= {}
-  // A reopen keeps the closure it removes, with who reopened it and why.
-  if (meta.inquiry.closure && closure === null) meta.inquiry.history = [...(meta.inquiry.history ?? []), { ...meta.inquiry.closure, reopened: { by: reopenedBy, reason, at: new Date().toISOString() } }]
-  meta.inquiry.closure = closure
-  await writeJson(file, meta)
+  await updateIssueMeta(dir, (meta) => {
+    if (meta.kind !== 'inquiry') throw new IssueError(`${id} is not an inquiry`, 409)
+    meta.inquiry ??= {}
+    // A reopen keeps the closure it removes, with who reopened it and why.
+    if (meta.inquiry.closure && closure === null) meta.inquiry.history = [...(meta.inquiry.history ?? []), { ...meta.inquiry.closure, reopened: { by: reopenedBy, reason, at: new Date().toISOString() } }]
+    meta.inquiry.closure = closure
+  })
   return readIssue(project, id)
 }
 
@@ -1030,25 +1030,25 @@ export async function setIssueDisposition (project, id, { value, evidence, runId
       try { const r = JSON.parse(await fs.readFile(path.join(dir, 'runs', s.runId, 'run.json'), 'utf8')); if (r.closure) { runRecord = r; runId = s.runId; break } } catch { /* skip */ }
     }
   }
-  const accepted = await readAcceptedRisks(dir)
-  const at = new Date().toISOString()
-  const newlyAccepted = riskAcceptances(unacceptedRisks(runRecord, accepted), acceptRisks ?? [], { runId, by, at })
-  const remaining = unacceptedRisks(runRecord, [...accepted, ...newlyAccepted])
-  const openRisks = remaining.map((r) => ({ description: r.description, relatesTo: r.relatesTo ?? null }))
-  let overrideRecord = null
-  if (value === 'resolved' && openRisks.length) {
-    // Only an operator may override, and only by saying why, on the record.
-    if (by !== 'operator' || typeof override !== 'string' || !override.trim()) {
-      throw new IssueError(`run ${runId} left ${openRisks.length} residual risk(s) unaccepted; "resolved" contradicts them — choose partially-resolved, accept each with a reason in acceptRisks [{id or text, reason}] (${[...new Set(remaining.map((r) => riskId(r.description)))].join(', ')}), or (operator only) override with a stated reason`, 409)
+  // Everything that reads issue.json and writes it back happens under the
+  // issue's lock, the accepted risks included, so no other writer's change is lost.
+  await updateIssueMeta(dir, (meta) => {
+    const accepted = Array.isArray(meta.acceptedRisks) ? meta.acceptedRisks : []
+    const at = new Date().toISOString()
+    const newlyAccepted = riskAcceptances(unacceptedRisks(runRecord, accepted), acceptRisks ?? [], { runId, by, at })
+    const remaining = unacceptedRisks(runRecord, [...accepted, ...newlyAccepted])
+    const openRisks = remaining.map((r) => ({ description: r.description, relatesTo: r.relatesTo ?? null }))
+    let overrideRecord = null
+    if (value === 'resolved' && openRisks.length) {
+      // Only an operator may override, and only by saying why, on the record.
+      if (by !== 'operator' || typeof override !== 'string' || !override.trim()) {
+        throw new IssueError(`run ${runId} left ${openRisks.length} residual risk(s) unaccepted; "resolved" contradicts them — choose partially-resolved, accept each with a reason in acceptRisks [{id or text, reason}] (${[...new Set(remaining.map((r) => riskId(r.description)))].join(', ')}), or (operator only) override with a stated reason`, 409)
+      }
+      overrideRecord = { reason: override.trim(), openRisksAtOverride: openRisks.length }
     }
-    overrideRecord = { reason: override.trim(), openRisksAtOverride: openRisks.length }
-  }
-  const file = path.join(dir, META_FILE)
-  let meta = {}
-  try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-  if (newlyAccepted.length) meta.acceptedRisks = [...(Array.isArray(meta.acceptedRisks) ? meta.acceptedRisks : []), ...newlyAccepted]
-  meta.disposition = { value, evidence: evidence.trim(), runId: runId ?? null, by, at, openRisks, override: overrideRecord, related: links }
-  await writeJson(file, meta)
+    if (newlyAccepted.length) meta.acceptedRisks = [...accepted, ...newlyAccepted]
+    meta.disposition = { value, evidence: evidence.trim(), runId: runId ?? null, by, at, openRisks, override: overrideRecord, related: links }
+  })
   return getIssue(project, id)
 }
 
@@ -1101,21 +1101,18 @@ export async function setIssuePriority (project, id, { value, reason, by = 'oper
   if (typeof reason !== 'string' || !reason.trim()) throw new IssueError('a priority needs a reason: say why this order')
   if (!['operator', 'supervisor'].includes(by)) throw new IssueError('by must be operator or supervisor')
   const dir = await issueDir(project, id)
-  const file = path.join(dir, META_FILE)
-  let meta = {}
-  try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-
-  // The TRAIL is the record, and it only ever grows. Keeping one "previous"
-  // value would mean every reordering quietly erased the one before it, and the
-  // question a manager actually asks — how often has this moved, and who kept
-  // moving it — would have no answer on disk.
-  const history = Array.isArray(meta.priorityHistory) ? [...meta.priorityHistory] : []
-  // A decision written before the trail existed is not lost to it.
-  if (!history.length && meta.priority) history.push({ value: meta.priority.value, reason: meta.priority.reason ?? null, by: meta.priority.by ?? null, at: meta.priority.at ?? null })
-  history.push({ value, reason: reason.trim(), by, at: new Date().toISOString() })
-  meta.priorityHistory = history
-  meta.priority = currentPriority(history)
-  await writeJson(file, meta)
+  await updateIssueMeta(dir, (meta) => {
+    // The TRAIL is the record, and it only ever grows. Keeping one "previous"
+    // value would mean every reordering quietly erased the one before it, and the
+    // question a manager actually asks — how often has this moved, and who kept
+    // moving it — would have no answer on disk.
+    const history = Array.isArray(meta.priorityHistory) ? [...meta.priorityHistory] : []
+    // A decision written before the trail existed is not lost to it.
+    if (!history.length && meta.priority) history.push({ value: meta.priority.value, reason: meta.priority.reason ?? null, by: meta.priority.by ?? null, at: meta.priority.at ?? null })
+    history.push({ value, reason: reason.trim(), by, at: new Date().toISOString() })
+    meta.priorityHistory = history
+    meta.priority = currentPriority(history)
+  })
   return getIssue(project, id)
 }
 
@@ -1139,6 +1136,20 @@ function currentPriority (history) {
 export async function createFollowUps (project, id, runId, { by = null } = {}) {
   if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) throw new IssueError('invalid run id', 400)
   const dir = await issueDir(project, id)
+  // run.json is read and written back under the issue's run lock (no run or
+  // other writer of it in between), and the accepted risks under the issue's
+  // step lock (no disposition in between): run, then step, as archiving takes them.
+  try {
+    return await withLock(path.join(dir, '.run.lock'), { purpose: 'follow-ups', takeOverDead: false, mkdir: false }, () =>
+      withLock(path.join(dir, '.step-alloc.lock'), { purpose: 'follow-ups', waitMs: 10000, mkdir: false }, () =>
+        followUpsHeld(project, id, runId, dir, by)))
+  } catch (error) {
+    if (error instanceof LockHeld) throw new IssueError('a run of this issue is live or its state is being changed; try again when it ends', 409)
+    throw error
+  }
+}
+
+async function followUpsHeld (project, id, runId, dir, by) {
   const runFile = path.join(dir, 'runs', runId, 'run.json')
   let run
   try { run = JSON.parse(await fs.readFile(runFile, 'utf8')) } catch { throw new IssueError(`no run ${runId} on this issue`, 404) }

@@ -557,8 +557,10 @@ async function identity (t) {
       t.eq('nothing was recorded', await exists(path.join(folder(busy), 'occurrences.json')), false)
       t.eq('released, the same report is recorded', await outcome(again('Busy again', 'mmmm0001', { seams: fast })), [409, busy, true, false])
       const busyDecided = await openFixture('2026-01-11-busy-decided', 'mmmm0002')
+      // Decided just before the lock was taken: a disposition is itself written
+      // under the step lock, so it cannot land while another holder has it.
+      await decide(busyDecided)
       const decidedWhileHeld = await withLock(path.join(folder(busyDecided), '.step-alloc.lock'), { purpose: 'test' }, async () => {
-        await decide(busyDecided)
         return outcome(again('Busy and decided', 'mmmm0002', { seams: fast }))
       })
       t.eq('held, but decided meanwhile: proved closed, a new issue that repeats it', decidedWhileHeld.repeats, busyDecided)

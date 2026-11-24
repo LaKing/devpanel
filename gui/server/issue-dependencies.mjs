@@ -1,7 +1,5 @@
-import fs from 'node:fs/promises'
-import path from 'node:path'
 import { getIssue, IssueError } from './issues.js'
-import { writeJson } from './runtime/persistence.mjs'
+import { updateIssueMeta } from './issue-meta.mjs'
 import { settled } from './issue-family.mjs'
 
 /*
@@ -37,11 +35,9 @@ export async function setIssueDependencies (project, id, { dependsOn, reason, by
     if (through) throw new IssueError(`${ref} already depends on this issue${through.length ? ` (through ${through.join(' → ')})` : ''}`)
     issues.push({ project: p, id: i })
   }
-  const file = path.join(issue.path, 'issue.json')
-  let meta = {}
-  try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-  meta.dependsOn = issues.length ? { issues, reason: reason.trim(), by, at: new Date().toISOString() } : null
-  await writeJson(file, meta)
+  await updateIssueMeta(issue.path, (meta) => {
+    meta.dependsOn = issues.length ? { issues, reason: reason.trim(), by, at: new Date().toISOString() } : null
+  })
   return read(project, id)
 }
 
