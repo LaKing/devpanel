@@ -41,6 +41,8 @@ export const ISSUES_DIR = issuesRoot()
 
 const META_FILE = 'issue.json'
 const ISSUE_PATTERN = /^(\d{4}-\d{2}-\d{2})-(.+)$/
+/** Whether a directory name is one the panel takes for an issue (getIssue's rule). */
+export const isIssueId = (name) => typeof name === 'string' && ISSUE_PATTERN.test(name)
 const STEP_PATTERN = /^(\d{3})-(.+)$/
 const RUN_ID_PATTERN = /^[A-Za-z0-9_-]+$/
 const STEP_NUMBER_WIDTH = 3

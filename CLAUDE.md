@@ -59,6 +59,10 @@ npm run --silent selftest-history -- --project <id> [--test <name>]   # recorded
 npm run --silent drive-records -- --project <id> --from <utc> --to <utc>   # the test drives that began in a period: drive time, slot wait and
                              # result, as JSON; read-only, beside tools/staging-host-sampler.sh's samples
                              # (tools/drive-records.mjs; docs/project-infrastructure.md "Measuring a host during concurrent drives")
+npm run --silent retire-refs [-- --project <id>] [--apply]   # per repository, the refs/devpanel/* the retention rule would
+                             # retire and why the rest stay, as JSON; read-only without --apply (no lock, nothing written);
+                             # --apply retires them in one transaction per repository under its delivery lock; exit 1 on any
+                             # enumeration error or Git warning (tools/retire-refs.mjs; execution-contract.md "Retiring refs/devpanel/*")
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
 npm run --silent supervisor-calls -- --from <YYYY-MM-DD> --to <YYYY-MM-DD>   # the top-level supervisor's calls per started run
@@ -580,7 +584,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - Run deletion: `DELETE …/runs/:runId` (`supervisor.deleteRun`, operator only; the trash icon on the issue page deletes
   on the click) removes a settled run's workspace (`launch.removeRunWorkspace`, never an in-place checkout), its
   `runs/<id>/` and its step folders, under the issue's run lock; live and paused runs are refused. Step reservations
-  stay so numbers and provenance never repeat; the ledger stays as accounting.
+  stay so numbers and provenance never repeat; the ledger stays as accounting. Its `refs/devpanel/*` go too when the
+  retention gates, read before anything is removed, hold (`runtime/ref-retention.mjs`, `refs` on the result);
+  execution-contract.md "Retiring refs/devpanel/*".
 - Manual landings: `POST …/runs/:runId/landed` (operator) and `mark_landed` (supervisor) record `run.landed`
   (`applied`, `commit` or `checkout`, `by`, `landedAt`/`recordedAt`, `handChanges`, the run's latest `revision`) on a settled
   run, once: `supervisor.markLanded` loads the run's engine holding the run lock and `engine.recordLanding` re-reads

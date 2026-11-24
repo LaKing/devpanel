@@ -28,6 +28,7 @@ import {
 } from './runtime/launch.mjs'
 import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from './runtime/engine.mjs'
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
+import { planDeletedRun, retireRefs } from './runtime/ref-retention.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
 import { LockHeld, acquire, ownerLiveness, withLock } from './runtime/lock.mjs'
 import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, writesCheckout } from './run-exclusivity.mjs'
@@ -1712,8 +1713,12 @@ export function createSupervisor ({
    * Irreversible, and on the operator's click alone: the panel asks nothing, as
    * the trash icon promises. What stays: the step reservations, so a number is
    * never handed out twice and provenance holds; the spending ledger, which is
-   * accounting; refs/devpanel/* in the source repository, which pin nothing
-   * reviewable once the run is gone. A live or paused run is refused — stop or
+   * accounting. Its refs/devpanel/* go too, but only when the run would have
+   * kept nothing else (ref-retention.mjs, execution-contract.md "Retiring
+   * refs/devpanel/*"): the gates are read before anything is removed, the refs
+   * captured with their oids, and deleted in one transaction once the record is
+   * gone; a run that fails a gate keeps its refs and is deleted all the same
+   * (`refs` on the result says which). A live or paused run is refused — stop or
    * abandon it first — and the issue lock is taken so no start races the delete.
    */
   async function deleteRun ({ project, issueId, runId }) {
@@ -1728,6 +1733,9 @@ export function createSupervisor ({
         if (reconcilePending(run)) throw err(409, 'An automatic reconcile of this run is undecided; wait for it before deleting.')
         // Its record may be the only durable copy of an unproved cleanup (the barrier file refused it).
         if ((await unrecordedCleanup(path.dirname(issue.path), run)).length) throw err(409, unrecordedRefusal(run, 'deleting the run'), { code: 'CLEANUP_UNRECORDED' })
+        // Before anything goes: may its refs go with it, and which, at which oids.
+        const refPlan = await planDeletedRun({ issuesRoot: path.dirname(path.dirname(issue.path)), issuePath: issue.path, runId, actionsOf: (r) => supportedActions(r) })
+          .catch((error) => ({ eligible: false, reason: 'error', error }))
         await removeRunWorkspace(run, await resolveProjectPath(project, { projectsDir }).catch(() => null))
         // Its end destroyed its stage instances; one that could not be removed then is tried once more.
         await destroyRunInstances(runId, { reason: 'run-deleted' }).catch(() => [])
@@ -1742,7 +1750,13 @@ export function createSupervisor ({
         await fs.rm(store.runDir(issue.path, runId), { recursive: true, force: true })
         // What its drives told the classification of unstable selftests goes with them.
         await forgetRunDrives(issue.path, runId)
-        return { runId, deleted: true, steps: [...folders].sort() }
+        let refs = { retired: [], kept: refPlan.eligible ? null : refPlan.reason, changed: [], error: refPlan.error?.message ?? null }
+        if (refPlan.eligible && refPlan.refs.length) {
+          refs = await retireRefs({ repository: refPlan.repository, selected: refPlan.refs })
+            .then((r) => ({ retired: r.retired, kept: null, changed: r.changed, error: null }), (error) => ({ retired: [], kept: null, changed: [], error: error.message }))
+        }
+        if (refs.error) console.warn(`deleteRun ${project}/${issueId}/${runId}: its refs/devpanel/* were kept: ${refs.error}`)
+        return { runId, deleted: true, steps: [...folders].sort(), refs }
       })
     } catch (error) {
       if (error.code === 'ENOENT') throw err(404, 'No such run')

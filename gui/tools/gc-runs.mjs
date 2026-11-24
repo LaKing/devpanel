@@ -19,8 +19,9 @@
  * Retained worktrees are only reported, with why they are kept, unless named
  * with --remove-worktree: a worktree can hold the only copy of undelivered work.
  * A run that can still be resumed, recovered, finalized or given an integrity
- * disposition is refused unless --force. Base snapshot refs are listed, never
- * removed: checks and patch application rebuild candidates from them.
+ * disposition is refused unless --force. refs/devpanel/* are not this tool's:
+ * tools/retire-refs.mjs lists and retires them under their own rule
+ * (execution-contract.md "Retiring refs/devpanel/*").
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'

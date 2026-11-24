@@ -38,14 +38,26 @@ export async function undeliveredApproval (issuePath, runId) {
   const runs = []
   for (const id of ids) {
     const prior = await readRun(issuePath, id).catch(() => null)
-    // A run that produced no candidate (refused start, failed preflight) says
-    // nothing about the work; the latest one that did decides.
-    if (!prior || ['running', 'pending', 'paused'].includes(prior.status) || !prior.revisions?.length) continue
+    if (!eligibleSeed(prior)) continue
     const written = (await fs.stat(path.join(runDir(issuePath, id), 'run.json')).catch(() => null))?.mtimeMs ?? 0
-    runs.push({ id, prior, order: [prior.startedAt ?? '', written] })
+    runs.push({ id, prior, written })
   }
+  return selectUndeliveredApproval(issuePath, runs)
+}
+
+// A run that produced no candidate (refused start, failed preflight) says
+// nothing about the work; the latest one that did decides.
+const eligibleSeed = (prior) => Boolean(prior) && !['running', 'pending', 'paused'].includes(prior.status) && Boolean(prior.revisions?.length)
+
+/**
+ * Of an issue's runs ({ id, prior: run record, written: run.json mtime }), the one
+ * the next run would be seeded from, as undeliveredApproval says. Pure: the
+ * retirement of refs (ref-retention.mjs) feeds it its own strict inventory.
+ */
+export function selectUndeliveredApproval (issuePath, runs) {
   // Start time first; the record's write time breaks ties (a manual clock, one second).
-  const latest = runs.sort((a, b) => a.order[0].localeCompare(b.order[0]) || a.order[1] - b.order[1]).at(-1)
+  const latest = runs.filter((r) => eligibleSeed(r.prior)).map((r) => ({ ...r, order: [r.prior.startedAt ?? '', r.written ?? 0] }))
+    .sort((a, b) => a.order[0].localeCompare(b.order[0]) || a.order[1] - b.order[1]).at(-1)
   if (!latest) return null
   const { id, prior } = latest
   const c = prior.closure?.conditions

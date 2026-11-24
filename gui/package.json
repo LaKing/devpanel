@@ -23,6 +23,7 @@
     "supervisor-calls": "node tools/supervisor-calls.mjs",
     "selftest-history": "node tools/selftest-history.mjs",
     "drive-records": "node tools/drive-records.mjs",
+    "retire-refs": "node tools/retire-refs.mjs",
     "live": "node live/check.mjs",
     "contract": "node live/cli-contract.mjs",
     "policy:gemini": "node live/gemini-policy-check.mjs",

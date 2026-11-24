@@ -2153,6 +2153,100 @@ section's owner identity, plus the module, project and issue.
   information prerequisite in preview) and on the project page
   (`GET /api/projects/:project/module-locks`).
 
+## Retiring refs/devpanel/*
+
+A run writes refs into its source repository (the panel's Git store when the host
+keeps one, else the project's repository): `refs/devpanel/base/<run>` (its snapshot),
+`reviewed/<run>` and `candidates/<run>` (publication), `reconciled/<run>-<n>[-source]`
+and `delivery-return/<run>-<n>[-source]`. They keep objects reachable that a run may
+still read: its own checks, finalize, reconcile and delivery return while it can act,
+and afterwards carry-forward (an approved, undelivered patch merged onto the next run),
+the approved check patch, and `applyRunArtifact` (completed `worktree-diff` and
+`commit` deliveries, rebuilt from the recorded base). Nothing removed them; now
+`runtime/ref-retention.mjs` does, under one principle: **when in doubt, keep the ref**.
+A leaked ref costs a few objects; a wrongly retired one loses evidence.
+
+**What may go.** Only refs of a run in an **open** (unpacked, unarchived) issue — a folder the panel itself takes for an
+issue (`issues.js` `isIssueId`) — whose
+record is **readable** and **settled** and whose retention is **proven unneeded**, in
+one of two ways:
+
+- **delivered and committed:** an exact `apply-to-source` delivery (completed and
+  verified; not merged, composed or owner-routed; the delivered revision the closure's;
+  no hand landing or later artifact application) whose bytes are committed. The patch
+  must be the delivered one (its bytes hash to `delivery.application.patchHash`) and the
+  whole delivery (its paths are exactly `delivery.changedPaths`); the destination must
+  be the recorded checkout and Git common directory; and the original tree of that
+  checkout's HEAD must hold every post-image, mode and full blob id, with nothing at all
+  (no file, no directory) at a deleted path. A path changed by a later commit keeps the refs (not proven).
+- **the run was deleted:** `deleteRun` reads the gates below before it removes
+  anything, from the inventory of every open issue (a run of the same id anywhere else
+  keeps the refs) and captures the run's refs with their oids; once the record is gone it
+  retires exactly those. A run that fails a gate is deleted all the same and keeps its
+  refs (`refs` on the result says why).
+
+**What keeps its refs**, each named in the listing:
+
+| Case | Reason |
+|---|---|
+| live: running, pending, preflighting, stopping, or a run lock whose owner is alive or unknown | `live` |
+| paused | `paused` |
+| in recovery: `recovery.required`, an invocation pending or in recovery, Recover offered | `recovery` |
+| resumable (Resume offered, a service-shutdown cancel included) | `resumable` |
+| finalize-able (Finalize or Reconcile delivery offered) | `finalize-able` |
+| reconcile-pending (`autoReconcile` pending) | `reconcile-pending` |
+| integration-pending: Integrate offered, `integration.phase` publishing/published, `publication.json` publishing | `integration-pending` |
+| a delivery return in flight | `delivery-return-pending` |
+| the carry-forward seed (the run the next run of the issue would start from) | `carry-forward-seed` |
+| an unreadable record: `run.json` that does not parse, a damaged journal or a recovery finding on record | `unreadable-record` |
+| a sibling run in the issue unreadable (the seed cannot be judged) | `issue-has-unreadable-record` |
+| an ambiguous record: its `runId`, `issue.project` or `issue.id` not its folder's; a run id in two open issues | `ambiguous-record`, `ambiguous` |
+| a packed issue, or a run found in no open issue (deleted run, run home) | `unattributed` |
+| an archived, not yet packed folder | `archived-issue` |
+| a project folder the panel does not take for an issue (its name not `<YYYY-MM-DD>-…`, the rule `getIssue` uses: a backup, a copy); a run id it holds still counts as a holder | `not-an-issue` |
+| any other offered action, or not completed, failed or cancelled | `still-actionable:…`, `blocked`, `not-settled` |
+| an active or retained worktree | `worktree-retained` |
+| no delivery, `worktree-diff`, `commit`, a hand landing, an artifact application | `not-delivered` |
+| a merged, composed or owner-routed delivery | `not-exact-delivery` |
+| the patch not the delivered or not the whole one | `patch-unverified` |
+| the destination not the recorded checkout and repository | `destination-mismatch` |
+| delivered bytes not at HEAD | `not-committed` |
+| refs written in another repository than the one scanned | `repository-mismatch` |
+| a symbolic ref, or a ref of no known shape | `symbolic`, `other-shape` |
+| a repository whose ref format is not `files` (reftable) | `unsupported-ref-format` |
+
+Packed issues are never read, so their refs are never retired; that is a known gap.
+
+**Reading.** Nothing in a listing writes: records are read raw (never through
+`store.readRun`, which persists a journal recovery finding), the journal through
+`store.inspectJournalReadOnly`, the seed through carry-forward's pure
+`selectUndeliveredApproval` over the same strict inventory. Every Git call runs with
+`--no-replace-objects` (a replacement tree cannot make an uncommitted tree look
+committed) and `GIT_NO_LAZY_FETCH=1` (a partial clone answers a missing object with an
+error, so a read never fetches into it), and strictly: a non-zero exit (`git-failed`) or anything on stderr beside
+exit 0 (`git-warning`: an ambiguous `HEAD`, a broken ref, the grafts hint) aborts the
+pass, as does a directory of the issues tree that cannot be listed (`enumeration`). An
+aborted pass reports what failed and never a count of zero.
+
+**Removing.** Per repository, one transaction under its delivery lock
+(`runtime/source-lock.mjs`, with the destination repository's): the ref format is read
+again (only `files`), the refs listed again (a name no longer direct at its captured oid
+stays, `changed`), the proofs made again (the destination's path, repository and HEAD
+equal to the listing's, else `destination-mismatch`), then
+`git update-ref --no-deref --stdin` with `start`, `delete <ref> <oid>` per ref,
+`prepare`. While prepared Git holds every ref's lock; the refs are read once more and
+any that moved, vanished or turned symbolic aborts the transaction (`changed`, nothing
+deleted); anything the `update-ref` child itself wrote to stderr by then aborts it too, as
+`git-warning`; else `commit`. A refusal of an expected oid at `prepare` is `changed` too;
+any other Git message is an error. A process killed between `prepare` and `commit`
+leaves Git's `.lock` behind and the ref in place.
+
+**Where.** `deleteRun`, and an operator's `npm run --silent retire-refs -- --apply`. The
+same command without `--apply` (`gui/tools/retire-refs.mjs`) lists per repository what
+would go and what stays and why, takes no lock and writes nothing; `--project <id>`
+scopes it; an unknown argument or a `--project` without a name is refused before anything
+is read. It exits 1 on an aborted pass or a refused argument.
+
 ## Escaped descendants
 
 Every agent turn runs with `reap`: when it ends, its process group is stopped

@@ -246,6 +246,27 @@ export async function inspectRunJournal (issuePath, runId) {
 
 export const readEvents = inspectRunJournal
 
+/**
+ * Whether a run's journal is clean, read without writing anything: the same
+ * reading as inspectRunJournal, which persists a recovery finding when it finds
+ * damage. A read-only reader (ref-retention.mjs) takes damage, a finding already
+ * on disk, an unreadable finding or a retired legacy journal all as "not clean".
+ */
+export async function inspectJournalReadOnly (issuePath, runId) {
+  const { events, ...journal } = await parseEvents(issuePath, runId)
+  if (journal.recoveryRequired) return { clean: false, reason: journal.message }
+  try {
+    if (await legacyJournalDisposition(issuePath, runId)) return { clean: false, reason: 'legacy journal retired' }
+  } catch (error) { return { clean: false, reason: error.message } }
+  try {
+    await fs.access(path.join(runDir(issuePath, runId), 'journal-recovery.json'))
+    return { clean: false, reason: 'a journal recovery finding is on record' }
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { clean: false, reason: `journal recovery record unreadable: ${error.code ?? error.message}` }
+  }
+  return { clean: true, reason: null }
+}
+
 export async function requireCompleteEvents (issuePath, runId) {
   const journal = await inspectRunJournal(issuePath, runId)
   if (journal.recoveryRequired || journal.retired) {
