@@ -172,7 +172,15 @@ export async function probeModels (result, { invoke, models, profile = 'default'
  * it would be part of the candidate: every turn would change the revision
  * fingerprint, and `git add -A` at delivery would ship the transcript.
  */
-export function createLedger (fileName) {
+/** Ledger phases written by harness/config-guard.mjs, never a runtime outcome. */
+export const GUARD_PHASES = new Set(['guarded', 'config-inherited', 'quarantine-intent', 'config-checked', 'config-resolved'])
+
+/**
+ * `guarded`: the ledger is shared with harness/config-guard.mjs (codex, gemini).
+ * Only then are its phases left out of the outcome and a torn non-final line
+ * skipped; any other ledger (claude) is read strictly, exactly as before.
+ */
+export function createLedger (fileName, { guarded = false } = {}) {
   const ledgerFile = (ledgerDir) => path.join(ledgerDir, fileName)
 
   async function record (ledgerDir, entry) {
@@ -191,13 +199,20 @@ export function createLedger (fileName) {
     if (!ledgerDir) return { phase: 'uncertain', reason: 'no ledger location supplied' }
     let lines = []
     try {
-      lines = (await fs.readFile(ledgerFile(ledgerDir), 'utf8')).split(NL).filter(Boolean).map((l) => JSON.parse(l))
+      const raw = (await fs.readFile(ledgerFile(ledgerDir), 'utf8')).split(NL).filter(Boolean)
+      // Guarded: a malformed line followed by valid records is a torn write that a
+      // later append closed (config-guard.mjs appendLine): skipped. A malformed final
+      // line is an interrupted write: the whole ledger stays uncertain, as before.
+      if (!guarded) lines = raw.map((l) => JSON.parse(l))
+      else raw.forEach((l, i) => { try { lines.push(JSON.parse(l)) } catch (error) { if (i === raw.length - 1) throw error } })
     } catch {
       // No ledger at all is not evidence of absence.
       return { phase: 'uncertain', reason: 'no adapter ledger available' }
     }
 
-    const tied = lines.filter((e) => e.invocationId === invocationId)
+    // The configuration guard's lines (config-guard.mjs) share the ledger and
+    // say nothing about whether the runtime finished.
+    const tied = lines.filter((e) => e.invocationId === invocationId && !(guarded && GUARD_PHASES.has(e.phase)))
     if (tied.length) {
       const last = tied[tied.length - 1]
       if (last.phase === 'not-started') return { phase: 'not-started', reason: last.error }

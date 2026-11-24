@@ -100,6 +100,60 @@ export default async (t) => {
     try { await askCoordinator(fresh, { text: 'Hello?', actor: 'op', harnesses: { [harness]: fake } }) } catch (error) { refused = error }
     t.eq('without a session there is nothing to ask', refused?.status, 409)
     t.eq('…and nothing was recorded for it', (await readChat(f.issuePath, engine.runId)).filter((e) => e.text === 'Hello?').length, 0)
+
+    // The fork touched the operator's CLI configuration (harness/config-guard.mjs).
+    const integrity = (id) => ({ kind: 'cli-config', invocationId: id, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/q/hooks.json.abc' }] })
+    const resolved = []
+    let liveId = null
+    const touching = {
+      invoke: async (a) => { liveId = a.meta.invocationId; throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: integrity(a.meta.invocationId) }) },
+      recoverPending: async () => [],
+      resolveConfig: async (id) => { resolved.push({ id, recorded: (await readChat(f.issuePath, engine.runId)).some((e) => e.invocationId === id && e.integrity) }) }
+    }
+    const touched = await askCoordinator(engine, { text: 'And now?', actor: 'Alice', harnesses: { [harness]: touching } })
+    t.eq('the answer records the structured integrity', [touched.answer.status, touched.answer.integrity?.violations[0].change], ['failed', 'created'])
+    t.eq('the adapter is acknowledged after the answer is on disk', resolved, [{ id: liveId, recorded: true }])
+
+    // An interrupted earlier ask: its failure goes to that question, never to the new one.
+    const oldQuestion = touched.question.id
+    let recoveries = 0
+    // The adapter calls afterFence only once its fence is proved (codex.mjs / gemini.mjs).
+    let proved = true
+    const replays = []
+    const recovering = {
+      invoke: async (a) => { if (a.fence && proved) replays.push(await a.afterFence?.()); return fake.invoke(a) },
+      recoverPending: async () => { recoveries++; return [{ invocationId: 'ask-interrupted', context: { questionId: oldQuestion }, integrity: integrity('ask-interrupted') }] },
+      resolveConfig: async (id) => { resolved.push({ id }) }
+    }
+    // Unfenced (the suite runs with DEVPANEL_FENCE=off): nothing is replayed, as before.
+    await askCoordinator(engine, { text: 'Unfenced?', actor: 'Alice', harnesses: { [harness]: recovering } })
+    t.eq('an unfenced ask never replays the guard (AC5)', recoveries, 0)
+    t.eq('the fixture run is fenced by policy, so only the switch makes the ask unfenced', engine.snapshot.fence?.namespace, 1)
+    const savedFence = process.env.DEVPANEL_FENCE
+    delete process.env.DEVPANEL_FENCE
+    let next
+    try {
+      // A requested fence that is not proved (the DEVPANEL_FENCE_UNPROVED=run fallback): no replay either.
+      proved = false
+      await askCoordinator(engine, { text: 'Unproved?', actor: 'Alice', harnesses: { [harness]: recovering } })
+      t.eq('a requested but unproved fence never replays the guard (AC5)', recoveries, 0)
+      proved = true
+      next = await askCoordinator(engine, { text: 'One more?', actor: 'Alice', harnesses: { [harness]: recovering } })
+    } finally { if (savedFence === undefined) delete process.env.DEVPANEL_FENCE; else process.env.DEVPANEL_FENCE = savedFence }
+    t.eq('a proved fence replays it first', recoveries, 1)
+    t.eq('the replay ran once, inside the adapter\'s fence (fence.mjs applyFence replay)', replays.length, 1)
+    // A replay that fails is not swallowed: the adapter's applyFence treats it as possibly moved (rebuilds or refuses).
+    const throwing = { ...recovering, recoverPending: async () => { throw new Error('config-checked could not be persisted') } }
+    let surfaced = null
+    const probing = { ...throwing, invoke: async (a) => { try { await a.afterFence?.() } catch (error) { surfaced = error.message } return fake.invoke(a) } }
+    delete process.env.DEVPANEL_FENCE
+    try { await askCoordinator(engine, { text: 'Throwing?', actor: 'Alice', harnesses: { [harness]: probing } }) } finally { if (savedFence === undefined) delete process.env.DEVPANEL_FENCE; else process.env.DEVPANEL_FENCE = savedFence }
+    t.eq('a replay that throws reaches the adapter instead of reading as "nothing moved"', surfaced, 'config-checked could not be persisted')
+    const chat = await readChat(f.issuePath, engine.runId)
+    const recovered = chat.find((e) => e.invocationId === 'ask-interrupted')
+    t.eq('the recovered failure is recorded on the original question', [recovered?.replyTo, recovered?.status, Boolean(recovered?.integrity)], [oldQuestion, 'failed', true])
+    t.eq('the new question is answered normally, without it', [next.answer.replyTo, next.answer.status, next.answer.integrity], [next.question.id, 'answered', undefined])
+    t.eq('the interrupted invocation is acknowledged', resolved.at(-1)?.id, 'ask-interrupted')
     await releaseWorkspace(engine)
   }
 

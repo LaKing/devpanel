@@ -249,7 +249,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
   }
 
   // Every module in harness/ except the shared helpers, which are not a runtime.
-  const harnesses = (await listFiles(path.join(root, 'harness'), '.mjs')).map((f) => f.replace(/\.mjs$/, '')).filter((id) => !['shared', 'fence', 'mcp-devpanel'].includes(id))  // helpers and the broker's MCP shim, not adapters
+  const harnesses = (await listFiles(path.join(root, 'harness'), '.mjs')).map((f) => f.replace(/\.mjs$/, '')).filter((id) => !['shared', 'fence', 'config-guard', 'mcp-devpanel'].includes(id))  // helpers and the broker's MCP shim, not adapters
 
   // Per-project source and integration settings, optional.
   const projects = new Map()

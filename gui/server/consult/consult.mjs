@@ -12,6 +12,7 @@ import { canonical } from '../decisions/index.mjs'
 import { estimateCallCost } from '../runtime/call-cost.mjs'
 import { fencePolicy } from '../runtime/confinement-policy.mjs'
 import { classifyFailure } from '../runtime/failure.mjs'
+import { writeAtomic, writeJson } from '../runtime/persistence.mjs'
 import { bareObjects, fencedObjects } from '../runtime/structured-output.mjs'
 import { loadPanel, resolveSeats } from './panel.mjs'
 import { briefPrompt, decidePrompt, reconcilePrompt, repairPrompt } from './prompt.mjs'
@@ -42,11 +43,6 @@ const SEAT_INSTRUCTIONS = 'You are a read-only consultant. You may read files an
 
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex')
 const readJson = (file) => fs.readFile(file, 'utf8').then(JSON.parse, (error) => { if (error.code === 'ENOENT') return null; throw error })
-async function writeJson (file, value) {
-  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
-  await fs.writeFile(temp, JSON.stringify(value, null, 2) + NL)
-  await fs.rename(temp, file)
-}
 
 export const consultId = ({ key, question, mode = 'decide' }) => sha(canonical({ key: key ?? null, question, mode })).slice(0, 16)
 
@@ -119,7 +115,7 @@ export function createConsult ({
   }
 
   /** One adapter call of one seat, on the ledger, never throwing: `{ response, session, usage, costUsd }` or `{ error }`. */
-  async function invoke ({ seat, prompt, session, dir, roots, scratchDir, panel, signal, tag }) {
+  async function invoke ({ seat, prompt, session, dir, roots, scratchDir, panel, signal, tag, invocationId = `consult-${tag}-${crypto.randomUUID()}` }) {
     const fence = buildFence({ roots, scratchDir })
     if (!fence) return { error: { class: 'environment', message: 'this host runs no seat fence, so read-only access cannot be proved' } }
     const gate = spending()
@@ -143,7 +139,7 @@ export function createConsult ({
         instructions: SEAT_INSTRUCTIONS, prompt, marker: `consult-${tag}`,
         signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
         observe: { onOutput: (chunk) => { fs.appendFile(live, JSON.stringify({ seq: seq++, at: clock.iso(), ...chunk }) + NL).catch(() => {}) } },
-        meta: { invocationId: `consult-${tag}-${crypto.randomUUID()}`, role: seat.seat, stepId: 'consult' }
+        meta: { invocationId, role: seat.seat, stepId: 'consult' }
       })
       const usage = result.usage ?? null
       const costUsd = typeof usage?.costUsd === 'number' ? usage.costUsd
@@ -153,8 +149,9 @@ export function createConsult ({
       if (result.diagnostics?.access !== 'read') return { error: { class: 'environment', message: `the seat had no read access (${result.diagnostics?.fence?.reason ?? result.diagnostics?.access ?? 'fence not proved'})` }, costUsd, usage }
       return { response: String(result.response ?? ''), session: result.session ?? null, usage, costUsd }
     } catch (error) {
-      const cancelled = signal?.aborted
-      const failure = cancelled ? { class: 'cancelled' } : deadline.aborted ? { class: 'timeout' } : classifyFailure(error)
+      // A seat that touched the operator's CLI configuration fails as that, cancelled or not.
+      const cancelled = signal?.aborted && !error?.integrity
+      const failure = cancelled ? { class: 'cancelled' } : deadline.aborted && !error?.integrity ? { class: 'timeout' } : classifyFailure(error)
       // A failed turn that reports its cost is settled at it; one that provably never started is released;
       // anything else stays reserved, the ledger's rule for a charge nobody can state.
       const failedCost = typeof error?.usage?.costUsd === 'number' ? error.usage.costUsd : null
@@ -163,7 +160,7 @@ export function createConsult ({
       if (failure.class === 'quota' && availability) {
         await availability.recordExhausted({ modelId: seat.model.id, harness: seat.model.harness, reason: `consult: ${error.message}`, retryAfterMs: failure.retryAfterMs ?? null, role: seat.seat }).catch(() => {})
       }
-      return { error: { class: failure.class ?? 'runtime', message: cancelled ? 'the consult was cancelled' : deadline.aborted ? `no answer within ${panel.turnTimeoutMinutes} minutes` : String(error.message ?? error).slice(0, 600) }, ...(failedCost != null ? { costUsd: failedCost } : {}) }
+      return { error: { class: failure.class ?? 'runtime', message: cancelled ? 'the consult was cancelled' : failure.class === 'timeout' ? `no answer within ${panel.turnTimeoutMinutes} minutes` : String(error.message ?? error).slice(0, 600), ...(error?.integrity ? { integrity: error.integrity } : {}) }, ...(failedCost != null ? { costUsd: failedCost } : {}) }
     }
   }
 
@@ -174,22 +171,67 @@ export function createConsult ({
   async function seatTurn ({ seat, round, prompt, session, options, brief, dir, roots, panel, signal }) {
     const base = path.join(dir, `round-${round}`, seat.seat)
     const recorded = await readJson(`${base}.turn.json`)
-    if (recorded) return recorded
-    await fs.mkdir(path.dirname(base), { recursive: true })
-    await fs.writeFile(`${base}.prompt.md`, prompt)
+    // The copy settlement persisted (it may hold a replayed verdict), so turn.json,
+    // the result and its cache say the same.
+    if (recorded) { await settleRecorded(base); return (await readJson(`${base}.turn.json`)) ?? recorded }
+    const turn = { seat: seat.seat, model: seat.model.id, effort: seat.effort, round, opinion: null, session: session ?? null, costUsd: null, costUnknown: false, startedAt: clock.iso() }
+    const ledgerDir = path.join(dir, 'ledger')
+    const adapter = await loadAdapter(seat.model.harness).catch(() => null)
+    // An earlier attempt of this seat turn was interrupted (the panel stopped):
+    // its own guarded invocations, by id, are checked before anything is asked
+    // again. A violation is this turn's answer.
+    const interrupted = await readJson(`${base}.pending.json`)
+    // Through the adapter that took those snapshots (recorded with the ids),
+    // never the one the seat resolves to now. Until that recovery has run, the
+    // pending file is not overwritten: the turn is refused instead.
+    const recovering = interrupted ? (interrupted.harness ? await loadAdapter(interrupted.harness).catch(() => null) : adapter) : null
+    if (interrupted && !recovering) {
+      turn.error = { class: 'environment', message: `an interrupted turn of this seat ran on ${interrupted.harness ?? 'an unrecorded harness'}, which cannot be loaded to check it; the seat is not asked again until it can` }
+      // Not an answer: nothing is recorded, and the consult's result is not
+      // either, so a later consult() checks this seat again (consultOnce finish).
+      turn.pendingRecovery = true
+      return turn
+    }
+    // An adapter without the guard (claude) took no snapshot: nothing to check.
+    if (interrupted && typeof recovering.recoverPending === 'function') {
+      const found = []
+      for (const id of [interrupted.initial, interrupted.repair].filter(Boolean)) {
+        let r
+        try { r = await recovering.recoverPending({ ledgerDir, invocationId: id }) } catch (error) {
+          // The check itself failed (a verdict that could not be persisted): not an
+          // answer, nothing recorded, the seat stays pending for the next consult().
+          turn.error = { class: 'environment', message: `the check of interrupted invocation ${id} of this seat failed: ${error.message}` }
+          turn.pendingRecovery = true
+          return turn
+        }
+        if (r?.active) { turn.error = { class: 'environment', message: `invocation ${id} of this seat is still running` }; turn.pendingRecovery = true; return turn }
+        if (r?.integrity?.violations?.length) found.push(r.integrity)
+      }
+      if (found.length) {
+        turn.error = { class: 'environment', message: `an interrupted turn of this seat touched the operator's CLI configuration: ${found.flatMap((i) => i.violations.map((v) => `${v.change} ${v.path}`)).join('; ')}`, integrity: found.length === 1 ? found[0] : { kind: 'cli-config', violations: found.flatMap((i) => i.violations), invocations: found } }
+        turn.durationMs = 0
+        await writeJson(`${base}.turn.json`, turn)
+        await acknowledgeSeat(base, recovering, found.map((i) => i.invocationId), ledgerDir)
+        return turn
+      }
+    }
+    await writeAtomic(`${base}.prompt.md`, prompt)
     const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), `devpanel-consult-${seat.seat}-`))
     const started = clock.now()
-    const turn = { seat: seat.seat, model: seat.model.id, effort: seat.effort, round, opinion: null, session: session ?? null, costUsd: null, costUnknown: false, startedAt: clock.iso() }
+    const ids = { harness: seat.model.harness, initial: `consult-r${round}-${seat.seat}-${crypto.randomUUID()}` }
     const add = (r) => { if (typeof r.costUsd === 'number') turn.costUsd = (turn.costUsd ?? 0) + r.costUsd; else turn.costUnknown = true }
     try {
-      let reply = await invoke({ seat, prompt, session, dir, roots, scratchDir, panel, signal, tag: `r${round}-${seat.seat}` })
+      await writeJson(`${base}.pending.json`, ids)
+      let reply = await invoke({ seat, prompt, session, dir, roots, scratchDir, panel, signal, tag: `r${round}-${seat.seat}`, invocationId: ids.initial })
       add(reply)
       if (!reply.error) {
         await fs.writeFile(`${base}.response.md`, reply.response)
         turn.session = reply.session
         let read = await readOpinion(reply.response, { options, brief })
         if (read.problem && !signal?.aborted) {
-          reply = await invoke({ seat, prompt: repairPrompt(read.problem), session: reply.session, dir, roots, scratchDir, panel, signal, tag: `r${round}-${seat.seat}-repair` })
+          ids.repair = `consult-r${round}-${seat.seat}-repair-${crypto.randomUUID()}`
+          await writeJson(`${base}.pending.json`, ids)
+          reply = await invoke({ seat, prompt: repairPrompt(read.problem), session: reply.session, dir, roots, scratchDir, panel, signal, tag: `r${round}-${seat.seat}-repair`, invocationId: ids.repair })
           add(reply)
           if (!reply.error) {
             await fs.writeFile(`${base}.repair.response.md`, reply.response)
@@ -207,8 +249,100 @@ export function createConsult ({
     turn.durationMs = clock.now() - started
     // A cancelled turn is not an answer about the question: it is asked again when the caller resumes.
     if (turn.error?.class !== 'cancelled') await writeJson(`${base}.turn.json`, turn)
+    // Recorded durably above: the adapter stops replaying the violation.
+    if (turn.error?.integrity) await acknowledgeSeat(base, adapter, [ids.initial, ids.repair].filter(Boolean), ledgerDir)
     return turn
   }
+
+  /**
+   * A seat turn whose violation is recorded counts as settled only once its
+   * adapter acknowledged every invocation (resolveConfig returned true): then
+   * `<seat>.settled.json` says so. A false, rejected or missing acknowledgement
+   * leaves it unsettled (unsettledSeats), so the consult stays open.
+   */
+  async function acknowledgeSeat (base, adapter, invocationIds, ledgerDir) {
+    if (typeof adapter?.resolveConfig !== 'function') return false
+    for (const id of invocationIds) {
+      // Exactly true: undefined, null, false or a rejection acknowledges nothing.
+      if (!await adapter.resolveConfig(id, { ledgerDir }).then((v) => v === true, () => false)) return false
+    }
+    await writeJson(`${base}.settled.json`, { invocations: invocationIds, at: clock.iso() })
+    return true
+  }
+
+  /**
+   * A recorded seat turn whose violation the adapter has not yet acknowledged
+   * (a move still unsynced): replay it from the adapter's ledger and
+   * acknowledge it once that verdict is recorded. The turn record already
+   * names the violation; this only keeps the route to the replay open.
+   */
+  async function settleRecorded (base) {
+    const turn = await readJson(`${base}.turn.json`)
+    const ids = await readJson(`${base}.pending.json`)
+    if (!turn?.error?.integrity || !ids?.harness || await readJson(`${base}.settled.json`)) return
+    const adapter = await loadAdapter(ids.harness).catch(() => null)
+    if (typeof adapter?.resolveConfig !== 'function') return
+    const ledgerDir = path.join(path.dirname(path.dirname(base)), 'ledger')
+    const invocationIds = [ids.initial, ids.repair].filter(Boolean)
+    for (const id of invocationIds) {
+      let r = null
+      // A replay that throws settles nothing: the seat stays unsettled.
+      try { r = await adapter.recoverPending?.({ ledgerDir, invocationId: id }) } catch { return }
+      // The replayed verdict (it may have found or moved more) is recorded on
+      // the turn before the adapter is told to stop replaying it.
+      if (r?.integrity?.violations?.length) {
+        turn.error.integrity = turn.error.integrity?.invocationId === id || !turn.error.integrity?.invocations ? r.integrity
+          : { ...turn.error.integrity, invocations: turn.error.integrity.invocations.map((i) => (i.invocationId === id ? r.integrity : i)) }
+        await writeJson(`${base}.turn.json`, turn)
+      }
+    }
+    await acknowledgeSeat(base, adapter, invocationIds, ledgerDir)
+  }
+
+  /**
+   * Seat turns not settled: started (pending ids written) and never recorded,
+   * an interrupted guarded turn whose check has not run yet; or recorded with a
+   * violation its adapter has not acknowledged (no settled marker, acknowledgeSeat).
+   * While any exists the consult is not finished, whatever path ends this
+   * attempt (consultOnce finish).
+   */
+  async function unsettledSeats (dir) {
+    const open = []
+    // Fail closed: what cannot be read counts as unsettled, never as settled.
+    let rounds = []
+    try { rounds = (await fs.readdir(dir)).filter((n) => /^round-\d+$/.test(n)) } catch (error) { return error.code === 'ENOENT' ? open : [`(consult record unreadable: ${error.code ?? error.message})`] }
+    for (const r of rounds) {
+      let names
+      try { names = await fs.readdir(path.join(dir, r)) } catch (error) { open.push(`${r} (unreadable: ${error.code ?? error.message})`); continue }
+      for (const f of names) {
+        if (!f.endsWith('.pending.json')) continue
+        const seat = f.slice(0, -'.pending.json'.length)
+        if (!names.includes(`${seat}.turn.json`)) { open.push(`${r}/${seat}`); continue }
+        if (names.includes(`${seat}.settled.json`)) continue
+        const turn = await readJson(path.join(dir, r, `${seat}.turn.json`)).catch(() => undefined)
+        if (turn === undefined || turn === null || turn.error?.integrity) open.push(`${r}/${seat}`)
+      }
+    }
+    return open
+  }
+
+  /** Every recorded seat turn of a consult, for settleRecorded. */
+  async function settleConsult (dir) {
+    let rounds = []
+    try { rounds = (await fs.readdir(dir)).filter((n) => /^round-\d+$/.test(n)) } catch { return }
+    for (const r of rounds) {
+      for (const f of await fs.readdir(path.join(dir, r)).catch(() => [])) {
+        if (f.endsWith('.pending.json')) await settleRecorded(path.join(dir, r, f.slice(0, -'.pending.json'.length)))
+      }
+    }
+  }
+
+  /**
+   * The round's directory, created and made durable along its whole chain
+   * once, before any seat of the round starts: no seat writes or acknowledges
+   * inside a directory whose entry is not yet synced (persistence.mjs prepare).
+   */
+  const ensureRound = (dir, round) => writeAtomic(path.join(dir, `round-${round}`, 'round.json'), JSON.stringify({ round }) + NL)
 
   /** Consults in flight in this process, by their record directory. */
   const running = new Map()
@@ -222,9 +356,19 @@ export function createConsult ({
     /** The panel as configured now, or null. */
     panel: loadPanelConfig,
 
+    /** The seats of this request's consult not yet settled (unsettledSeats): a caller never finalizes past them. */
+    async unsettled (request, { callerDir }) {
+      return unsettledSeats(path.join(callerDir, 'consults', consultId(request)))
+    },
+
     /** A recorded result for this request, or null: what a caller reads before deciding whether to ask. */
     async recorded (request, { callerDir }) {
-      return readJson(path.join(callerDir, 'consults', consultId(request), 'result.json'))
+      const dir = path.join(callerDir, 'consults', consultId(request))
+      const result = await readJson(path.join(dir, 'result.json'))
+      // A caller that reads the record instead of consulting (the engine) still
+      // keeps the route open to a seat violation not yet acknowledged.
+      if (result) await settleConsult(dir)
+      return result
     },
 
     /**
@@ -253,17 +397,22 @@ export function createConsult ({
       const id = consultId({ ...request, mode })
       const dir = path.join(callerDir, 'consults', id)
       const existing = await readJson(path.join(dir, 'result.json'))
-      if (existing) return { ...existing, replayed: true }
+      if (existing) { await settleConsult(dir); return { ...existing, replayed: true } }
 
       const started = clock.now()
       const base = { id, mode, key: request.key ?? null, question: request.question, project: request.project, askedAt: clock.iso() }
       const turns = []
       const finish = async (result, { record = true } = {}) => {
         const priced = turns.filter((t) => typeof t.costUsd === 'number')
+        // A seat whose interrupted turn could not be checked yet keeps the consult
+        // open, however this attempt ends (a seat turn, or an early return such as
+        // the roster failing): nothing is cached, and the caller is told so.
+        const unsettled = await unsettledSeats(dir)
+        const pendingRecovery = turns.some((t) => t.pendingRecovery) || unsettled.length > 0
         const full = { ...base, ...result, opinions: summary(turns), rounds: Math.max(0, ...turns.map((t) => t.round)),
           costUsd: priced.length ? priced.reduce((s, t) => s + t.costUsd, 0) : null, costUnknown: turns.some((t) => t.costUnknown),
-          durationMs: clock.now() - started, recordedAt: clock.iso() }
-        if (record) await writeJson(path.join(dir, 'result.json'), full)
+          durationMs: clock.now() - started, recordedAt: clock.iso(), ...(pendingRecovery ? { pendingRecovery: true, unsettled } : {}) }
+        if (record && !pendingRecovery) await writeJson(path.join(dir, 'result.json'), full)
         return { ...full, replayed: false }
       }
       const unavailable = (reason, options) => finish({ outcome: 'unavailable', reason }, options)
@@ -275,7 +424,6 @@ export function createConsult ({
       if (!panel) return unavailable('no consult panel is configured', { record: false })
       if (!panel.enabled) return unavailable('the consult panel is switched off', { record: false })
 
-      await fs.mkdir(dir, { recursive: true })
       if (!await readJson(path.join(dir, 'request.json'))) await writeJson(path.join(dir, 'request.json'), { ...request, mode, id, panel: { hash: panel.hash, seats: panel.seats } })
 
       const { seats, problems } = await resolveSeats(panel, { roster: await loadRoster(), availability })
@@ -294,6 +442,7 @@ export function createConsult ({
       const promptArgs = { request, roots: roots.roots, scratchDir: scratchNote, language: language() }
 
       if (mode === 'brief') {
+        await ensureRound(dir, 1)
         const turn = await seatTurn({ ...common, seat: needed[0], round: 1, prompt: briefPrompt({ ...promptArgs, options }), session: null, options, brief: true })
         turns.push(turn)
         if (signal?.aborted) throw Object.assign(new Error('the consult was cancelled'), { name: 'AbortError' })
@@ -303,6 +452,7 @@ export function createConsult ({
 
       let previous = null
       for (let round = 1; round <= panel.maxRounds; round++) {
+        await ensureRound(dir, round)
         const current = await Promise.all(needed.map((seat) => {
           const mine = previous?.find((t) => t.seat === seat.seat)
           const other = previous?.find((t) => t.seat !== seat.seat)

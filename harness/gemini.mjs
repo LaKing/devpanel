@@ -10,6 +10,7 @@ import { runProcess, ProcessError } from '../gui/server/runtime/process.mjs'
 import { NL, installationProbe, probeModels, createLedger, lineObserver, cancelledError, runtimeError, childEnvironment, withReap } from './shared.mjs'
 import { hostPlatform } from '../gui/server/runtime/platform.mjs'
 import { applyFence, assertFenced } from './fence.mjs'
+import { configGuard, guardLabel, runGuarded, configViolation, configDiagnostics, recoverPending as recoverGuard, resolveConfig as resolveGuard } from './config-guard.mjs'
 import { harnessRefusal } from '../gui/server/runtime/confinement-policy.mjs'
 
 /*
@@ -97,6 +98,32 @@ export async function fenceManifest ({ binary, env, writable = [] }) {
       { path: env.GEMINI_CLI_HOME ?? path.join(home, '.gemini'), writable: true }, { path: path.join(home, '.gitconfig'), writable: false }],
     writable
   }
+}
+
+/*
+ * The operator's configuration in that home (config-guard.mjs, harness/README.md
+ * "Seat hygiene"). It lives in `.gemini` under `GEMINI_CLI_HOME`, else in
+ * `~/.gemini` (paths.ts homedir(), v0.60.0: the note under resolveConnection);
+ * that directory itself stays writable (OAuth credentials, session transcripts).
+ * Before a fenced seat turn the missing directories and the empty-safe file are
+ * created and bound read-only; the JSON and .env files cannot be empty
+ * placeholders and are integrity-checked. settings.json is the settings file
+ * this adapter already reasons about (pinAuthentication); extensions, policies,
+ * agents and skills exist in the runtime (the denied tools, the system policy
+ * directory); their user directories, `commands`, GEMINI.md, trustedFolders.json
+ * and .env are taken from the CLI's published behaviour, not verified from its
+ * source.
+ */
+export const CONFIGURATION_DIRS = Object.freeze(['extensions', 'commands', 'policies', 'agents', 'skills'])
+export const EMPTY_SAFE_FILES = Object.freeze(['GEMINI.md'])
+export const CHECKED_FILES = Object.freeze(['settings.json', 'trustedFolders.json', '.env'])
+const LEDGER_FILE = 'gemini-ledger.jsonl'
+
+/** The configuration guard for the home a connection resolves to. */
+export function configGuardFor (env) {
+  const bindRoot = env.GEMINI_CLI_HOME ?? path.join(os.homedir(), '.gemini')
+  const base = env.GEMINI_CLI_HOME ? path.join(env.GEMINI_CLI_HOME, '.gemini') : bindRoot
+  return configGuard({ bindRoot, base, ensureBase: Boolean(env.GEMINI_CLI_HOME), dirs: CONFIGURATION_DIRS, emptyFiles: EMPTY_SAFE_FILES, checkedFiles: CHECKED_FILES })
 }
 const CONFIG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -655,8 +682,17 @@ export async function probe ({ depth = 'installation', models = [], profile = 'd
   return probeModels(result, { invoke: probeInvoke, models, profile, endpointRef, credentialRef, account, signal, timeoutMs, costKnown: false })
 }
 
-const { record, reconcile } = createLedger('gemini-ledger.jsonl')
-export { reconcile }
+const { record, reconcile: reconcileLedger } = createLedger(LEDGER_FILE, { guarded: true })
+
+/** The ledger's answer, plus what the configuration guard left pending (codex.mjs reconcile). */
+export async function reconcile (invocationId, options = {}) {
+  const evidence = await reconcileLedger(invocationId, options)
+  if (!options.ledgerDir) return evidence
+  const pending = await recoverGuard({ ledgerFile: path.join(options.ledgerDir, LEDGER_FILE), invocationId })
+  return pending?.integrity?.violations?.length ? { ...evidence, integrity: pending.integrity } : evidence
+}
+export const recoverPending = ({ ledgerDir, invocationId = null }) => recoverGuard({ ledgerFile: path.join(ledgerDir, LEDGER_FILE), invocationId })
+export const resolveConfig = (invocationId, { ledgerDir }) => resolveGuard({ ledgerFile: path.join(ledgerDir, LEDGER_FILE), invocationId })
 
 /**
  * One turn. An error raised after the runtime ran carries its descendant scan
@@ -695,7 +731,9 @@ async function invokeOnce ({
   // (read tools, no shell) when a fence is requested, tool-free otherwise.
   readOnlyTools = false,
   // The host's OS (platform.mjs); injectable so a test can be darwin.
-  platform = hostPlatform()
+  platform = hostPlatform(),
+  // Called once the seat fence is proved, before the launch (codex.mjs).
+  afterFence = null
 } = {}, ran = {}) {
   const invocationId = meta.invocationId ?? crypto.randomUUID()
   // Before anything is written, probed or launched: every Gemini seat is
@@ -719,6 +757,7 @@ async function invokeOnce ({
   const policyFile = path.join(policyDir, policyName)
   let runtimeTemp = null
   let fenced = null
+  let config = null
 
   try {
     /*
@@ -892,20 +931,37 @@ async function invokeOnce ({
     const invocationSignal = signal ? AbortSignal.any([signal, environmentAbort.signal]) : environmentAbort.signal
     // The outer seat fence wraps everything, the adapter's own read-only
     // sandbox included (it then binds within the fenced view).
-    fenced = fenceSpec ? await applyFence({ spec: { ...fenceSpec, cwd }, command: COMMAND(), signal,
+    // afterFence (chat's replay) runs inside applyFence, after the first proof and before preparation.
+    fenced = fenceSpec ? await applyFence({ spec: { ...fenceSpec, cwd }, command: COMMAND(), signal, guard: configGuardFor(env), replay: afterFence,
       manifest: await fenceManifest({ binary: COMMAND(), env, writable: [policyDir, ...(runtimeTemp ? [runtimeTemp] : [])] }) }) : null
     assertFenced(fenced, { turn: 'a fenced Gemini turn', mounts: fenceSpec?.mounts ?? [] })
     const inner = { command: sandboxArgv ? BWRAP() : COMMAND(), args: sandboxArgv ? [...sandboxArgv, '--', COMMAND(), ...args] : args }
     const launch = fenced?.applied ? fenced.wrap(inner.command, inner.args) : inner
-    let run
+    // The operator's configuration (config-guard.mjs): checked after the turn
+    // whatever its ending; a violation fails it before anything else.
+    config = fenced?.applied ? fenced.config ?? null : null
+    let guarded
     try {
-      run = await runProcess({
-        command: launch.command,
-        args: launch.args,
-        cwd, env, stdin: body, signal: invocationSignal, graceMs, maxBuffer, observe: events.hooks, reap: true, reapTag: meta.reapTag ?? null
-      })
-      ran.run = run
+      guarded = await runGuarded({ config, label: guardLabel(meta, invocationId), ledgerFile: ledgerDir ? path.join(ledgerDir, LEDGER_FILE) : null, invocationId, context: meta.questionId ? { questionId: meta.questionId } : null },
+        () => runProcess({
+          command: launch.command,
+          args: launch.args,
+          cwd, env, stdin: body, signal: invocationSignal, graceMs, maxBuffer, observe: events.hooks, reap: true, reapTag: meta.reapTag ?? null
+        }))
     } catch (error) {
+      // Only a guard refusal before the launch is "not started"; the check
+      // after the launch is returned with the run, never thrown.
+      if (error.started === false) await record(ledgerDir, { invocationId, marker, phase: 'not-started', error: error.message, at: new Date().toISOString() })
+      throw error
+    }
+    const run = guarded.run
+    if (run) ran.run = run
+    if (guarded.integrity?.violations.length) {
+      await record(ledgerDir, { invocationId, marker, phase: 'failed', sessionId, error: 'cli-config-integrity', at: new Date().toISOString() })
+      throw configViolation(guarded.integrity, { cli: 'gemini', run, thrown: guarded.thrown ?? (policyFailure ? new Error(`the permission policy was not loaded: ${policyFailure}`) : null), invocationId })
+    }
+    if (guarded.thrown) {
+      const error = guarded.thrown
       if (error.kind === 'spawn-error' && error.started === false) {
         await record(ledgerDir, { invocationId, marker, phase: 'not-started', error: error.message, code: error.code, at: new Date().toISOString() })
       }
@@ -1009,7 +1065,7 @@ async function invokeOnce ({
         reap: run.leftovers?.scan ?? null,
         events: events.count,
         hygiene: Boolean(hygiene),
-        fence: fenceSpec ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null } : null,
+        fence: fenceSpec ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null, config: configDiagnostics(config) } : null,
         tooling: supervisorOnly || tooling ? enforcement : null,
         // Every tool the runtime reported running, with what the policy said.
         // This is what a fence check reads: an attempt that was DENIED is

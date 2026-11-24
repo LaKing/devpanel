@@ -8,6 +8,7 @@ import { resolveCommand } from '../gui/server/runtime/command.mjs'
 import { runProcess, ProcessError } from '../gui/server/runtime/process.mjs'
 import { NL, installationProbe, probeModels, createLedger, lineObserver, assertScratchOutsideWorktree, cancelledError, runtimeError, cumulativeDelta, childEnvironment, withReap } from './shared.mjs'
 import { applyFence, assertFenced } from './fence.mjs'
+import { configGuard, guardLabel, runGuarded, configViolation, configDiagnostics, recoverPending as recoverGuard, resolveConfig as resolveGuard } from './config-guard.mjs'
 
 /*
  * Codex adapter.
@@ -62,6 +63,24 @@ export async function fenceManifest ({ binary, env, lastMessageDir = null }) {
 /** What the operator's own Codex executes or obeys from its home; never seat-writable. */
 export const CONFIGURATION_FILES = Object.freeze(['config.toml', 'AGENTS.md', 'hooks.json', 'requirements.toml'])
 export const CONFIGURATION_DIRS = Object.freeze(['rules', 'skills', 'hooks', 'plugins', 'prompts'])
+/*
+ * Before a fenced seat turn (config-guard.mjs) the missing directories above
+ * and these files are created empty, so the binds above cover them: empty TOML
+ * is an empty table (every setting at its default) and empty Markdown gives no
+ * instructions. The rest cannot be empty placeholders (an empty hooks.json is
+ * invalid JSON) and are integrity-checked instead: hooks.json, and the global
+ * AGENTS.override.md (read before AGENTS.md) and .env — those two from Codex's
+ * published behaviour, not verified from its source.
+ */
+export const EMPTY_SAFE_FILES = Object.freeze(['config.toml', 'requirements.toml', 'AGENTS.md'])
+export const CHECKED_FILES = Object.freeze(['hooks.json', 'AGENTS.override.md', '.env'])
+const LEDGER_FILE = 'codex-ledger.jsonl'
+
+/** The configuration guard for the home a connection resolves to. */
+export function configGuardFor (env) {
+  const codexHome = env.CODEX_HOME ?? path.join(os.homedir(), '.codex')
+  return configGuard({ bindRoot: codexHome, dirs: CONFIGURATION_DIRS, emptyFiles: EMPTY_SAFE_FILES, checkedFiles: CHECKED_FILES })
+}
 
 export const WORKER_SETTINGS = Object.freeze([
   'approval_policy="never"', 'mcp_servers={}', 'features.apps=false', 'features.plugins=false',
@@ -173,8 +192,23 @@ export async function probe ({ depth = 'installation', models = [], profile = 'd
  * through the marker the engine embedded in the turn. Anything we cannot tie to
  * this invocation is uncertain — "the most recent session" is not evidence.
  */
-const { record, reconcile } = createLedger('codex-ledger.jsonl')
-export { reconcile }
+const { record, reconcile: reconcileLedger } = createLedger(LEDGER_FILE, { guarded: true })
+
+/**
+ * The ledger's answer, plus what the configuration guard left pending for this
+ * invocation (checked now if the turn was interrupted before its own check).
+ */
+export async function reconcile (invocationId, options = {}) {
+  const evidence = await reconcileLedger(invocationId, options)
+  if (!options.ledgerDir) return evidence
+  const pending = await recoverGuard({ ledgerFile: path.join(options.ledgerDir, LEDGER_FILE), invocationId })
+  return pending?.integrity?.violations?.length ? { ...evidence, integrity: pending.integrity } : evidence
+}
+
+/** Interrupted guarded invocations in a ledger (one, or all when no id). */
+export const recoverPending = ({ ledgerDir, invocationId = null }) => recoverGuard({ ledgerFile: path.join(ledgerDir, LEDGER_FILE), invocationId })
+/** The caller persisted its record of an integrity failure: stop replaying it. */
+export const resolveConfig = (invocationId, { ledgerDir }) => resolveGuard({ ledgerFile: path.join(ledgerDir, LEDGER_FILE), invocationId })
 
 /** codex exec --json emits a JSONL event stream; the pieces we need are scattered. */
 function parseEvents (stdout) {
@@ -274,7 +308,11 @@ async function invokeOnce ({
   readOnlyTools = false,
   // Continue a COPY of `session` (`exec fork`): the side conversation with a
   // run's coordinator, which must never add a turn to the session it resumes.
-  fork = false
+  fork = false,
+  // Called once the seat fence is proved, before the launch, never on an
+  // unfenced or fallback turn (coordinator chat replays the configuration
+  // guard's pending checks there).
+  afterFence = null
 } = {}, ran = {}) {
   const invocationId = meta.invocationId ?? crypto.randomUUID()
   if (fork && !session?.id) throw new ProcessError('a fork needs the session it copies', { kind: 'configuration-error', started: false, invocationId })
@@ -292,7 +330,9 @@ async function invokeOnce ({
   if (fence) {
     const early = resolveConnection({ profile, endpointRef, credentialRef, account, hygiene })
     fenced = early.error ? { applied: false, reason: early.error }
-      : await applyFence({ spec: { ...fence, cwd: readOnlySource ? scratchDir : cwd }, manifest: await fenceManifest({ binary: COMMAND(), env: early.env, lastMessageDir: path.dirname(lastMessage) }), command: COMMAND(), signal })
+      // afterFence (chat's replay) runs inside applyFence, after the first proof and before preparation.
+      : await applyFence({ spec: { ...fence, cwd: readOnlySource ? scratchDir : cwd }, manifest: await fenceManifest({ binary: COMMAND(), env: early.env, lastMessageDir: path.dirname(lastMessage) }),
+        guard: configGuardFor(early.env), replay: afterFence, command: COMMAND(), signal }).catch(async (error) => { await fs.rm(path.dirname(lastMessage), { recursive: true, force: true }).catch(() => {}); throw error })
     if (!fenced.applied) { await fs.rm(path.dirname(lastMessage), { recursive: true, force: true }).catch(() => {}); assertFenced(fenced, { turn: 'a fenced Codex turn', mounts: fence.mounts ?? [] }) }
   }
   const readSeat = readOnlyTools && fenced?.applied === true
@@ -394,11 +434,28 @@ async function invokeOnce ({
   if (scratchDir) { env.DEVPANEL_SCRATCH_DIR = scratchDir; env.TMPDIR = scratchDir }
   const events = streamObserver(observe)
   const launch = fenced?.applied ? fenced.wrap(COMMAND(), args) : { command: COMMAND(), args }
-  let run
+  // The operator's configuration (config-guard.mjs): snapshotted before the
+  // launch, checked after it whatever the ending. A violation fails the turn,
+  // cancelled or not, before anything else is read from it.
+  const config = fenced?.applied ? fenced.config ?? null : null
+  let guarded
   try {
-    run = await runProcess({ command: launch.command, args: launch.args, cwd: readOnlySource ? scratchDir : cwd, env, stdin: body, signal, graceMs, maxBuffer, observe: events.hooks, reap: true, reapTag: meta.reapTag ?? null })
-    ran.run = run
+    guarded = await runGuarded({ config, label: guardLabel(meta, invocationId), ledgerFile: ledgerDir ? path.join(ledgerDir, LEDGER_FILE) : null, invocationId, context: meta.questionId ? { questionId: meta.questionId } : null },
+      () => runProcess({ command: launch.command, args: launch.args, cwd: readOnlySource ? scratchDir : cwd, env, stdin: body, signal, graceMs, maxBuffer, observe: events.hooks, reap: true, reapTag: meta.reapTag ?? null }))
   } catch (error) {
+    // Only a guard refusal before the launch is "not started"; the check after
+    // the launch is returned with the run, never thrown.
+    if (error.started === false) await record(ledgerDir, { invocationId, marker, phase: 'not-started', error: error.message, at: new Date().toISOString() })
+    throw error
+  }
+  const run = guarded.run
+  if (run) ran.run = run
+  if (guarded.integrity?.violations.length) {
+    await record(ledgerDir, { invocationId, marker, phase: 'failed', error: 'cli-config-integrity', at: new Date().toISOString() })
+    throw configViolation(guarded.integrity, { cli: 'codex', run, thrown: guarded.thrown, invocationId })
+  }
+  if (guarded.thrown) {
+    const error = guarded.thrown
     if (error.kind === 'spawn-error' && error.started === false) {
       await record(ledgerDir, { invocationId, marker, phase: 'not-started', error: error.message, code: error.code, at: new Date().toISOString() })
     }
@@ -490,7 +547,7 @@ async function invokeOnce ({
     outcome: 'completed',
     diagnostics: { durationMs: run.durationMs, reap: run.leftovers?.scan ?? null, events: parsed.events.length, tooling: enforcement, hygiene: Boolean(hygiene),
       ...(ignored.length ? { ignoredSettings: ignored } : {}),
-      fence: fence ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null } : null,
+      fence: fence ? { namespace: fenced?.applied ? 1 : 0, reason: fenced?.reason ?? null, proof: fenced?.proof ?? null, mounts: fenced?.mounts ?? null, config: configDiagnostics(config) } : null,
       ...(readOnlyTools ? { access: readSeat ? 'read' : 'none (fence not proved)' } : {}) }
   }
   } finally { await fs.rm(path.dirname(lastMessage), { recursive: true, force: true }) }

@@ -3,6 +3,8 @@ import path from 'node:path'
 
 import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
+import { ownerLossRecoverable } from '../server/runtime/run-control.mjs'
+import { supportedActions } from '../server/supervisor.mjs'
 
 export const name = 'engine — a question goes to the consult panel before a person is asked'
 
@@ -128,6 +130,90 @@ export default async (t) => {
     const { engine } = await planRun({ plan: () => plan([hold(), hold({ id: 'H2', question: 'A second one?' })]) }, { consult: panel })
     const run = await engine.drive()
     t.eq('past the run\'s bound the next question goes to the owner', [run.status, panel.asked.length, run.pause.key], ['paused', 1, 'owner-hold:planner:H2'])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('3b. a consult with a seat whose interrupted guarded turn cannot be checked yet decides nothing (consult.mjs pendingRecovery; config-guard.mjs)')
+  {
+    let pending = true
+    const asked = []
+    const panel = {
+      asked,
+      panel: async () => PANEL,
+      recorded: async () => null,   // the service caches nothing while a seat is pending
+      consult: async (r) => {
+        asked.push(r)
+        if (pending) return { id: 'c1', outcome: 'unavailable', reason: 'consultant-1: an interrupted turn ran on fake-old, which cannot be loaded', pendingRecovery: true, unsettled: ['round-1/consultant-1'], rounds: 1, costUsd: null, costUnknown: false, durationMs: 10, opinions: [] }
+        return { id: 'c1', rounds: 1, costUsd: 1, costUnknown: false, durationMs: 1000, opinions, ...resolved() }
+      }
+    }
+    const { engine, f } = await planRun({ plan: () => plan([hold()]) }, { consult: panel })
+    let run = await engine.drive()
+    const stored = async () => JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+    run = await stored()
+    t.eq('no decision is recorded and no consult is finished on the run', [decisions(run).length, Object.keys(run.consults ?? {}).length], [0, 0])
+    t.eq('the consult marker stays, and nothing went on', [run.consulting?.key, ran(run, 'implement')], ['owner-hold:planner:H1', 0])
+    t.ok('the run waits on the public recovery action', ownerLossRecoverable(run) && run.recovery?.consultPending === true, JSON.stringify({ status: run.status, recovery: run.recovery }))
+    t.eq('the supervisor offers recover', supportedActions(run), ['recover', 'abandon'])
+    pending = false
+    const out = await engine.recoverOwnerLoss()
+    t.ok('recover resumes it', out.resumed, out.reason)
+    run = await engine.drive()
+    t.eq('it consults again, and the settled answer is the decision', [asked.length, `${run.status}/${run.outcome}`, decisions(run)[0]?.consult?.id], [2, 'completed/resolved', 'c1'])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('3d. a panel preflight refusal never drops a consult with an unsettled seat (audit 088)')
+  for (const [label, panelConfig, unsettled] of [
+    ['disabled panel', { ...PANEL, enabled: false }, async () => ['round-1/consultant-1']],
+    ['lowered cap', { ...PANEL, maxPerRun: 0, maxTechnicalPerRun: 0 }, async () => ['round-1/consultant-1']],
+    ['unreadable pending check', { ...PANEL, enabled: false }, async () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }) }]
+  ]) {
+    let consulted = 0
+    const panel = { panel: async () => panelConfig, recorded: async () => null, unsettled, consult: async () => { consulted++; throw new Error('not asked') } }
+    const { engine, f } = await planRun({}, { consult: panel, operatorRequest: { stepId: 'brief-implement', request: request('technical') } })
+    await engine.drive()
+    const run = JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+    t.eq(`${label}: no fallback decision, no consult call, the run waits on recover`, [decisions(run).length, consulted, run.recovery?.consultPending, supportedActions(run)], [0, 0, true, ['recover', 'abandon']])
+    await releaseWorkspace(engine)
+  }
+  {
+    // A marker from a consult cut short is kept, not dropped, when the refusal meets an unsettled seat.
+    const panel = { panel: async () => ({ ...PANEL, enabled: false }), recorded: async () => null, unsettled: async () => ['round-1/consultant-1'], consult: async () => { throw new Error('not asked') } }
+    const { engine, f } = await planRun({}, { consult: panel })
+    const ask = { key: 'operator-request:k', question: 'Which layer?', askedBy: { role: 'coordinator' }, request: { reason: 'r', recommendation: 'x', category: 'technical' }, at: f.clock.iso() }
+    engine.run.consulting = { key: ask.key, mode: 'decide', startedAt: ask.at }
+    t.eq('cut marker: the outcome is stopped and the marker stays', [await engine.consultFirst(ask, { category: 'technical' }), engine.run.consulting?.key], ['stopped', 'operator-request:k'])
+    await releaseWorkspace(engine)
+  }
+
+  t.section('3c. a technical request whose consult has an unsettled seat commits no fallback decision (audit 085)')
+  for (const path_ of ['replay throws', 'unacknowledged verdict']) {
+    // The engine sees what the service gives it on these paths: a fault while the
+    // seat is open (a replay that throws past the seat turn), or a pendingRecovery result.
+    let open = ['round-1/consultant-1']
+    const asked = []
+    const panel = {
+      asked,
+      panel: async () => PANEL,
+      recorded: async () => null,
+      unsettled: async () => open,
+      consult: async (r) => {
+        asked.push(r)
+        if (open.length && path_ === 'replay throws') throw new Error('config-checked could not be persisted')
+        if (open.length) return { id: 'c1', outcome: 'unavailable', reason: 'consultant-1: not acknowledged', pendingRecovery: true, unsettled: open, rounds: 1, costUsd: null, costUnknown: false, durationMs: 10, opinions: [] }
+        return { id: 'c1', rounds: 1, costUsd: 1, costUnknown: false, durationMs: 1000, opinions, ...resolved() }
+      }
+    }
+    const { engine, f } = await planRun({}, { consult: panel, operatorRequest: { stepId: 'brief-implement', request: request('technical') } })
+    await engine.drive()
+    let run = JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+    t.eq(`${path_}: no decision of any kind is committed, the marker stays`, [decisions(run).length, Boolean(run.consulting), run.recovery?.consultPending], [0, true, true])
+    t.eq(`${path_}: the run waits on recover`, supportedActions(run), ['recover', 'abandon'])
+    open = []
+    const out = await engine.recoverOwnerLoss()
+    run = await engine.drive()
+    t.eq(`${path_}: once settled, recover consults again and the panel\'s answer is the decision`, [out.resumed, asked.length, decisions(run)[0]?.consult?.id], [true, 2, 'c1'])
     await releaseWorkspace(engine)
   }
 

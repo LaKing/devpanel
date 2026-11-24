@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises'
+import path from 'node:path'
+
 import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { readOutputs } from '../server/runtime/store.mjs'
 import { engineFixture, scriptFor, blocking, cleanupFixtures, simulateProcessDeath } from './fakes/fixture.mjs'
@@ -150,6 +153,78 @@ export default async function (t) {
   }
 
   // ------------------------------------------------------------ no evidence
+  // ------------------------------------------------------------ CLI configuration
+  t.section('an interrupted invocation that touched the operator\'s CLI configuration is neither adopted nor retried (config-guard.mjs)')
+  {
+    const reopenWith = (f, runId, extra) => simulateProcessDeath(f.issuePath).then(() => resumeRun({
+      issuePath: f.issuePath, runId, harnesses: { fake: { ...f.fake, ...extra } }, stepStore: f.stepStore, clock: f.clock,
+      configRoot: f.configRoot, deliveryProvider: f.delivery, workspaceProvider: f.workspaceProvider, projectPath: f.projectPath
+    }))
+    const integrity = (invocationId) => ({ kind: 'cli-config', home: '/h/.codex', invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/q/hooks.json.abc' }] })
+
+    const f = await engineFixture()
+    const { crashed, runId } = await crashAt(f, 'afterInvokeBeforePersist', (e) => e.run.steps.length === 2)
+    t.ok('the crash fired after the agent finished', crashed)
+    const resolved = []
+    const resumed = await reopenWith(f, runId, {
+      reconcile: async (id, opts) => ({ ...await f.fake.reconcile(id, opts), integrity: integrity(id) }),
+      resolveConfig: async (id) => { resolved.push(id) }
+    })
+    const pending = Object.values(resumed.run.participants).find((p) => p.pendingInvocation)?.pendingInvocation
+    await resumed.recover()
+    t.eq('the completed work was NOT adopted', resumed.run.steps.filter((s) => s.stepId === 'implement').length, 0)
+    t.eq('the run is blocked for a person', [resumed.run.status, resumed.run.blockedReason], ['blocked', 'recovery-required'])
+    t.ok('the reason names the configuration and the quarantine', /operator's CLI configuration/.test(resumed.run.recovery?.reason ?? '') && /hooks\.json/.test(resumed.run.recovery.reason), resumed.run.recovery?.reason)
+    t.eq('run.configIntegrity records it as interrupted', [resumed.run.configIntegrity?.length, resumed.run.configIntegrity?.[0].outcome, resumed.run.configIntegrity?.[0].invocationId], [1, 'interrupted', pending?.invocationId])
+    t.eq('the adapter was acknowledged after the block was persisted', resolved, [pending?.invocationId])
+
+    // The uncertain retry: never for an invocation already on run.configIntegrity.
+    const uncertainRetry = async ({ recorded }) => {
+      const g = await engineFixture()
+      const crash = await crashAt(g, 'afterInvokeBeforePersist', (e) => e.run.steps.length === 0)
+      const again = await reopenWith(g, crash.runId, { reconcile: async () => ({ phase: 'uncertain', reason: 'invocation recorded as started' }) })
+      const p = Object.values(again.run.participants).find((x) => x.pendingInvocation)
+      if (recorded) again.run.configIntegrity = [{ invocationId: p.pendingInvocation.invocationId, outcome: 'failed', violations: [] }]
+      await again.recover({ retryUncertain: true })
+      return again
+    }
+    const control = await uncertainRetry({ recorded: false })
+    t.eq('control: a clean uncertain invocation is retried as before', [control.run.status === 'blocked', Object.values(control.run.participants).some((x) => x.pendingInvocation)], [false, false])
+    const guarded = await uncertainRetry({ recorded: true })
+    t.eq('with a recorded violation it is blocked instead', [guarded.run.status, guarded.run.blockedReason], ['blocked', 'recovery-required'])
+
+    // An unacknowledged violation (the adapter's move is still unsynced) stays reachable by recovery.
+    const h = await engineFixture()
+    let implementId = null
+    let runIdRef = null
+    const onDisk = async () => JSON.parse(await fs.readFile(path.join(h.issuePath, 'runs', runIdRef, 'run.json'), 'utf8'))
+    let atAcknowledgement = null
+    const failing = start(h, { harnesses: { fake: { ...h.fake,
+      invoke: async (args) => {
+        if (args.meta.stepId === 'implement') { implementId = args.meta.invocationId; throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: integrity(args.meta.invocationId), invocationId: args.meta.invocationId }) }
+        return h.fake.invoke(args)
+      },
+      // Called right after the failure persist: a stop here must leave the invocation pending on disk.
+      resolveConfig: async () => { const run = await onDisk(); atAcknowledgement = Object.values(run.participants).find((p) => p.pendingInvocation)?.pendingInvocation ?? null; return false } } } })
+    const first = await failing
+    runIdRef = first.runId
+    await first.drive().catch(() => {})
+    t.eq('a stop right after the failure persist leaves the invocation pending on disk', [atAcknowledgement?.invocationId, atAcknowledgement?.configUnresolved], [implementId, true])
+    const kept = Object.values(first.run.participants).find((p) => p.pendingInvocation)
+    t.eq('…and it stays pending while the adapter cannot acknowledge it', [kept?.pendingInvocation?.invocationId, kept?.pendingInvocation?.configUnresolved], [implementId, true])
+    const acknowledged = []
+    const larger = (id) => ({ ...integrity(id), violations: [...integrity(id).violations, { path: '/h/.codex/.env', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/q/.env.abc' }] })
+    const later = await reopenWith(h, first.runId, {
+      reconcile: async (id) => ({ phase: 'uncertain', reason: 'invocation recorded as failed', integrity: larger(id) }),
+      resolveConfig: async (id) => { acknowledged.push({ id, recorded: (await onDisk()).configIntegrity?.find((e) => e.invocationId === id)?.violations?.length }); return true }
+    })
+    await later.recover({ retryUncertain: true })
+    t.eq('the next recovery replays it and acknowledges it only after the larger verdict is on disk', acknowledged, [{ id: implementId, recorded: 2 }])
+    t.eq('run.configIntegrity keeps one entry, updated with the replayed verdict', [later.run.configIntegrity.length, later.run.configIntegrity[0].violations.length], [1, 2])
+    // Its failure was already on record: once acknowledged, the run is failed as it was (audit 079).
+    t.eq('…and the invocation is not retried: the run is failed with its recorded failure, nothing pending, no pointer', [later.run.status, later.run.failure?.class, Object.values(later.run.participants).some((p) => p.pendingInvocation), later.run.configUnresolved?.length, later.run.steps.filter((s) => s.stepId === 'implement').length], ['failed', 'environment', false, 0, 0])
+  }
+
   t.section('missing recovery evidence: refuse to guess')
   {
     // A runtime whose ledger cannot be tied back to the invocation.

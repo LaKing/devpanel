@@ -252,5 +252,223 @@ export default async function (t) {
     t.eq('a denied path inside a root is masked', got.masks.map((m) => path.relative(base, m)), ['srv/demo-project/private'])
   }
 
+  t.section('the operator\'s CLI configuration (config-guard.mjs): an interrupted seat is checked by id before it is asked again')
+  {
+    const dir = await callerDir()
+    const req = request({ key: 'cfg-guard:repair' })
+    const round = path.join(dir, 'consults', consultId(req), 'round-1')
+    await fs.mkdir(round, { recursive: true })
+    // The panel died during consultant-1's repair call: both of its ids were persisted before their calls.
+    await fs.writeFile(path.join(round, 'consultant-1.pending.json'), JSON.stringify({ initial: 'I-1', repair: 'R-1' }))
+    const asked = []
+    const recovered = []
+    const resolved = []
+    const integrity = { kind: 'cli-config', invocationId: 'R-1', violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/q/hooks.json.abc' }] }
+    const service = fakePanel({}, {
+      loadAdapter: async (harness) => ({
+        invoke: async (args) => { asked.push(harness); return { outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } } },
+        recoverPending: async ({ invocationId }) => { recovered.push(invocationId); return invocationId === 'R-1' ? { invocationId, integrity } : null },
+        resolveConfig: async (id) => { resolved.push(id) }
+      })
+    })
+    await service.consult(req, { callerDir: dir })
+    const turn = JSON.parse(await fs.readFile(path.join(round, 'consultant-1.turn.json'), 'utf8'))
+    t.eq('both of the seat\'s own ids were checked, and only those', recovered.slice(0, 2), ['I-1', 'R-1'])
+    t.eq('the interrupted seat was not asked again', asked.filter((h) => h === 'fake-a').length, 0)
+    t.eq('its turn records the violation of the repair call', [turn.error?.class, turn.error?.integrity?.invocationId], ['environment', 'R-1'])
+    t.eq('the adapter is acknowledged once the turn is recorded', resolved, ['R-1'])
+
+    // The round's directory chain is durable before either seat writes or is asked.
+    const fresh = await callerDir()
+    const original = fs.open
+    const events = []
+    fs.open = async (p, ...rest) => {
+      const handle = await original(p, ...rest)
+      events.push(['open', String(p)])
+      const sync = handle.sync.bind(handle)
+      handle.sync = async () => { events.push(['sync', String(p)]); return sync() }
+      return handle
+    }
+    let barrier
+    try {
+      const watched = fakePanel({ 'fake-a': [(a) => { events.push(['invoke', 'fake-a']); return opinion() }], 'fake-b': [(a) => { events.push(['invoke', 'fake-b']); return opinion() }] })
+      await watched.consult(request({ key: 'cfg-guard:barrier' }), { callerDir: fresh })
+      const roundDir = path.join(fresh, 'consults', consultId(request({ key: 'cfg-guard:barrier' })), 'round-1')
+      const lastBarrierSync = events.findLastIndex((e, i) => e[0] === 'sync' && e[1] === roundDir && events.slice(0, i).every((x) => !(x[0] === 'open' && x[1].startsWith(path.join(roundDir, 'consultant-')))))
+      const firstSeatWrite = events.findIndex((e) => e[0] === 'open' && e[1].startsWith(path.join(roundDir, 'consultant-')))
+      const firstInvoke = events.findIndex((e) => e[0] === 'invoke')
+      barrier = { lastBarrierSync, firstSeatWrite, firstInvoke, parentSynced: events.slice(0, firstSeatWrite).some((e) => e[0] === 'sync' && e[1] === path.dirname(roundDir)) }
+    } finally { fs.open = original }
+    t.ok('round-1/ and its parent are synced before either seat\'s first write or call', barrier.lastBarrierSync >= 0 && barrier.parentSynced && barrier.lastBarrierSync < barrier.firstSeatWrite && barrier.lastBarrierSync < barrier.firstInvoke, JSON.stringify(barrier))
+
+    // The brief path (a single seat) passes the same barrier.
+    const briefDir = await callerDir()
+    const briefEvents = []
+    fs.open = async (p, ...rest) => {
+      const handle = await original(p, ...rest)
+      briefEvents.push(['open', String(p)])
+      const sync = handle.sync.bind(handle)
+      handle.sync = async () => { briefEvents.push(['sync', String(p)]); return sync() }
+      return handle
+    }
+    let briefBarrier
+    try {
+      const briefReq = request({ key: 'cfg-guard:brief', mode: 'brief' })
+      await fakePanel({ 'fake-a': [() => { briefEvents.push(['invoke', 'fake-a']); return opinion() }] }).consult(briefReq, { callerDir: briefDir })
+      const roundDir = path.join(briefDir, 'consults', consultId(briefReq), 'round-1')
+      const firstSeatWrite = briefEvents.findIndex((e) => e[0] === 'open' && e[1].startsWith(path.join(roundDir, 'consultant-')))
+      const firstInvoke = briefEvents.findIndex((e) => e[0] === 'invoke')
+      const roundSync = briefEvents.findIndex((e) => e[0] === 'sync' && e[1] === roundDir)
+      briefBarrier = { roundSync, firstSeatWrite, firstInvoke, parentSynced: briefEvents.slice(0, firstSeatWrite).some((e) => e[0] === 'sync' && e[1] === path.dirname(roundDir)) }
+    } finally { fs.open = original }
+    t.ok('the brief seat waits for the same barrier', briefBarrier.roundSync >= 0 && briefBarrier.parentSynced && briefBarrier.roundSync < briefBarrier.firstSeatWrite && briefBarrier.roundSync < briefBarrier.firstInvoke, JSON.stringify(briefBarrier))
+
+    // A recorded seat turn whose violation the adapter could not yet acknowledge is returned to on replay.
+    const unackDir = await callerDir()
+    let acknowledge = false
+    const unackIds = []
+    const unackRecovered = []
+    const unackAdapter = {
+      invoke: async (args) => { unackIds.push(args.meta.invocationId); throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: { kind: 'cli-config', invocationId: args.meta.invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantine-unsynced' }] } }) },
+      recoverPending: async ({ invocationId }) => { unackRecovered.push(invocationId); return null },
+      resolveConfig: async () => acknowledge
+    }
+    const unackService = fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? unackAdapter : { invoke: async () => ({ outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } }) }) })
+    const unackReq = request({ key: 'cfg-guard:unacknowledged' })
+    const unackFirst = await unackService.consult(unackReq, { callerDir: unackDir })
+    const unackResult = path.join(unackDir, 'consults', consultId(unackReq), 'result.json')
+    t.eq('the seat\'s violation was recorded and not acknowledged: the consult stays open (audit 085)', [unackIds.length, unackFirst.pendingRecovery, await fs.readFile(unackResult, 'utf8').then(() => 'written', () => 'absent')], [1, true, 'absent'])
+    const stillUnack = await unackService.consult(unackReq, { callerDir: unackDir })
+    t.eq('asked again while resolveConfig still says false: still pending, still uncached', [stillUnack.pendingRecovery, await fs.readFile(unackResult, 'utf8').then(() => 'written', () => 'absent')], [true, 'absent'])
+    acknowledge = true
+    const replayed = await unackService.consult(unackReq, { callerDir: unackDir })
+    t.eq('once acknowledged, the consult returns to the adapter for that invocation, settles and is recorded', [replayed.pendingRecovery ?? false, unackRecovered.includes(unackIds[0]), await fs.readFile(unackResult, 'utf8').then(() => 'written', () => 'absent'), unackIds.length], [false, true, 'written', 1])
+
+    // The engine reads a recorded consult through recorded() (engine.mjs consultFirst): that path settles too,
+    // and a replayed verdict that found more is saved on the turn before the adapter is acknowledged.
+    const engineDir = await callerDir()
+    let ack = false
+    const seen = []
+    const engineIds = []
+    const engineAdapter = {
+      invoke: async (args) => { engineIds.push(args.meta.invocationId); throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: { kind: 'cli-config', invocationId: args.meta.invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantine-unsynced' }] } }) },
+      recoverPending: async ({ invocationId }) => ({ invocationId, integrity: { kind: 'cli-config', invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined' }, { path: '/h/.codex/.env', change: 'created', status: 'quarantined' }] } }),
+      resolveConfig: async (id) => { seen.push(id); return ack }
+    }
+    const engineService = fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? engineAdapter : { invoke: async () => ({ outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } }) }) })
+    const engineReq = request({ key: 'cfg-guard:engine-recorded' })
+    await engineService.consult(engineReq, { callerDir: engineDir })
+    const turnFile = path.join(engineDir, 'consults', consultId(engineReq), 'round-1', 'consultant-1.turn.json')
+    ack = true
+    seen.length = 0
+    engineAdapter.resolveConfig = async (id) => { seen.push({ id, recorded: JSON.parse(await fs.readFile(turnFile, 'utf8')).error.integrity.violations.length }); return true }
+    t.eq('recorded() has nothing for an unsettled consult, so the engine consults again', await engineService.recorded(engineReq, { callerDir: engineDir }), null)
+    const viaConsult = await engineService.consult(engineReq, { callerDir: engineDir })
+    t.ok('that consult returns to the adapter for the unacknowledged seat turn and settles', !viaConsult.pendingRecovery && seen.some((s) => s.id === engineIds[0]), JSON.stringify(seen))
+    t.eq('the replayed verdict (two paths) is on the turn before it is acknowledged', seen.find((s) => s.id === engineIds[0])?.recorded, 2)
+    t.ok('recorded() now returns the result', Boolean(await engineService.recorded(engineReq, { callerDir: engineDir })))
+
+    // Audit 088, acknowledgment contract: a seat settles only when resolveConfig returns exactly true.
+    const violating = (resolved) => ({
+      invoke: async (args) => { throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: { kind: 'cli-config', invocationId: args.meta.invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined' }] } }) },
+      recoverPending: async () => null,
+      resolveConfig: async () => resolved
+    })
+    const other = { invoke: async () => ({ outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } }) }
+    for (const [label, value] of [['undefined', undefined], ['null', null], ['false', false], ['true', true]]) {
+      const d = await callerDir()
+      const r = request({ key: `cfg-guard:ack-${label}` })
+      const out = await fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? violating(value) : other) }).consult(r, { callerDir: d })
+      const c = path.join(d, 'consults', consultId(r))
+      const settled = await fs.readFile(path.join(c, 'round-1', 'consultant-1.settled.json'), 'utf8').then(() => true, () => false)
+      const cached = await fs.readFile(path.join(c, 'result.json'), 'utf8').then(() => true, () => false)
+      t.eq(`resolveConfig returning ${label}: ${value === true ? 'settled and recorded' : 'not settled, pending, nothing cached'}`, [Boolean(out.pendingRecovery), settled, cached], value === true ? [false, true, true] : [true, false, false])
+    }
+
+    // Audit 088, scan errors: a round that cannot be read counts as pending, never as none.
+    const eioDir = await callerDir()
+    const eioReq = request({ key: 'cfg-guard:scan-eio' })
+    const eioRound = path.join(eioDir, 'consults', consultId(eioReq), 'round-1')
+    await fs.mkdir(eioRound, { recursive: true })
+    await fs.writeFile(path.join(eioRound, 'consultant-1.pending.json'), JSON.stringify({ harness: 'fake-old', initial: 'EIO-1' }))
+    const readdir = fs.readdir
+    fs.readdir = async (p, ...rest) => { if (p === eioRound) throw Object.assign(new Error('EIO: i/o error, scandir'), { code: 'EIO' }); return readdir.call(fs, p, ...rest) }
+    let eioOut, eioOpen
+    try {
+      const svc = fakePanel({}, { loadRoster: async () => new Map() })
+      eioOut = await svc.consult(eioReq, { callerDir: eioDir })
+      eioOpen = await svc.unsettled(eioReq, { callerDir: eioDir })
+    } finally { fs.readdir = readdir }
+    t.eq('an injected EIO reading a round: the early return is pendingRecovery and unsettled() names the round', [eioOut.pendingRecovery, eioOpen.length > 0 && /round-1.*EIO/.test(eioOpen[0])], [true, true])
+    t.eq('…and no result.json is written', await fs.readFile(path.join(eioDir, 'consults', consultId(eioReq), 'result.json'), 'utf8').then(() => 'written', () => 'absent'), 'absent')
+
+    // Audit 088, stale integrity: after a successful sync retry, turn.json, the result and the cache agree.
+    const staleDir = await callerDir()
+    const staleReq = request({ key: 'cfg-guard:stale' })
+    let staleAck = false
+    const staleAdapter = {
+      invoke: async (args) => { throw Object.assign(new Error('integrity violation: …'), { kind: 'environment-error', integrity: { kind: 'cli-config', invocationId: args.meta.invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantine-unsynced' }] } }) },
+      recoverPending: async ({ invocationId }) => ({ invocationId, integrity: { kind: 'cli-config', invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/q/hooks.json.x' }] } }),
+      resolveConfig: async () => staleAck
+    }
+    const staleSvc = fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? staleAdapter : other) })
+    t.eq('the unsynced verdict leaves the consult pending', (await staleSvc.consult(staleReq, { callerDir: staleDir })).pendingRecovery, true)
+    staleAck = true
+    const staleFresh = await staleSvc.consult(staleReq, { callerDir: staleDir })
+    const staleTurn = JSON.parse(await fs.readFile(path.join(staleDir, 'consults', consultId(staleReq), 'round-1', 'consultant-1.turn.json'), 'utf8'))
+    const staleCache = JSON.parse(await fs.readFile(path.join(staleDir, 'consults', consultId(staleReq), 'result.json'), 'utf8'))
+    const statusOf = (opinions) => opinions.find((o) => o.seat === 'consultant-1')?.error?.integrity?.violations?.[0]?.status
+    t.eq('after the sync retry: turn.json, the returned result and the cached result all say quarantined', [staleTurn.error.integrity.violations[0].status, statusOf(staleFresh.opinions), statusOf(staleCache.opinions)], ['quarantined', 'quarantined', 'quarantined'])
+
+    // A replay that throws (the verdict could not be persisted) settles nothing: pending, uncached.
+    const throwDir = await callerDir()
+    const throwReq = request({ key: 'cfg-guard:replay-throws' })
+    const throwRound = path.join(throwDir, 'consults', consultId(throwReq), 'round-1')
+    await fs.mkdir(throwRound, { recursive: true })
+    await fs.writeFile(path.join(throwRound, 'consultant-1.pending.json'), JSON.stringify({ harness: 'fake-a', initial: 'THROW-1' }))
+    const throwing = { invoke: async () => { throw new Error('not asked') }, recoverPending: async () => { throw new Error('config-checked could not be persisted') }, resolveConfig: async () => true }
+    const thrown = await fakePanel({}, { loadAdapter: async (harness) => (harness === 'fake-a' ? throwing : { invoke: async () => ({ outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } }) }) }).consult(throwReq, { callerDir: throwDir })
+    t.eq('a replay that throws leaves the seat pending: pendingRecovery, no turn, no result', [thrown.pendingRecovery, await fs.readFile(path.join(throwRound, 'consultant-1.turn.json'), 'utf8').then(() => 'written', () => 'absent'), await fs.readFile(path.join(throwDir, 'consults', consultId(throwReq), 'result.json'), 'utf8').then(() => 'written', () => 'absent')], [true, 'absent', 'absent'])
+
+    // An interrupted seat turn is replayed through the harness recorded with its ids, not the one the seat resolves to now.
+    const movedDir = await callerDir()
+    const movedReq = request({ key: 'cfg-guard:moved-harness' })
+    const movedRound = path.join(movedDir, 'consults', consultId(movedReq), 'round-1')
+    await fs.mkdir(movedRound, { recursive: true })
+    const pendingFile = path.join(movedRound, 'consultant-1.pending.json')
+    await fs.writeFile(pendingFile, JSON.stringify({ harness: 'fake-old', initial: 'OLD-1' }))
+    const calls = { old: [], current: [] }
+    const loader = (oldAvailable) => async (harness) => {
+      if (harness === 'fake-old') { if (!oldAvailable) throw new Error('no such harness'); return { recoverPending: async ({ invocationId }) => { calls.old.push(invocationId); return { invocationId, integrity: { kind: 'cli-config', invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined' }] } } }, resolveConfig: async () => true } }
+      return { invoke: async () => { calls.current.push('invoke'); return { outcome: 'completed', response: reply(opinion()), session: { id: 's' }, usage: { costUsd: 0 }, diagnostics: { access: 'read' } } }, recoverPending: async () => { calls.current.push('recover'); return null }, resolveConfig: async () => true }
+    }
+    await fakePanel({}, { loadAdapter: loader(false) }).consult(movedReq, { callerDir: movedDir }).catch(() => null)
+    const notAsked = await fs.readFile(path.join(movedRound, 'consultant-1.turn.json'), 'utf8').then(() => false, () => true)
+    t.eq('with the recorded harness unavailable that seat is not asked, nothing is recorded for it, and its pending ids are kept', [notAsked, JSON.parse(await fs.readFile(pendingFile, 'utf8')).initial], [true, 'OLD-1'])
+    const resultFile = path.join(movedDir, 'consults', consultId(movedReq), 'result.json')
+    t.eq('and the consult caches no result that would hide the pending seat', await fs.readFile(resultFile, 'utf8').then(() => 'written', () => 'absent'), 'absent')
+    t.eq('recorded() has nothing to return yet, so the caller consults again', await fakePanel({}, { loadAdapter: loader(false) }).recorded(movedReq, { callerDir: movedDir }), null)
+    const stillOut = await fakePanel({}, { loadAdapter: loader(false) }).consult(movedReq, { callerDir: movedDir })
+    t.eq('asked again while the harness is still out: not replayed, still unrecorded, ids kept', [stillOut.replayed, await fs.readFile(resultFile, 'utf8').then(() => 'written', () => 'absent'), JSON.parse(await fs.readFile(pendingFile, 'utf8')).initial], [false, 'absent', 'OLD-1'])
+    calls.current.length = 0
+    // The adapter is back: the next consult() settles the seat (no file removed by hand).
+    await fakePanel({}, { loadAdapter: loader(true) }).consult(movedReq, { callerDir: movedDir })
+    const movedTurn = JSON.parse(await fs.readFile(path.join(movedRound, 'consultant-1.turn.json'), 'utf8'))
+
+    // An early return before any seat turn (the roster failing) caches nothing while pending ids exist.
+    const earlyDir = await callerDir()
+    const earlyReq = request({ key: 'cfg-guard:early-return' })
+    const earlyRound = path.join(earlyDir, 'consults', consultId(earlyReq), 'round-1')
+    await fs.mkdir(earlyRound, { recursive: true })
+    await fs.writeFile(path.join(earlyRound, 'consultant-1.pending.json'), JSON.stringify({ harness: 'fake-old', initial: 'EARLY-1' }))
+    const noRoster = await fakePanel({}, { loadRoster: async () => new Map() }).consult(earlyReq, { callerDir: earlyDir })
+    t.eq('a roster failure with a seat still pending: unavailable, marked pendingRecovery, naming the seat', [noRoster.outcome, noRoster.pendingRecovery, noRoster.unsettled], ['unavailable', true, ['round-1/consultant-1']])
+    t.eq('…and no result.json is cached, so the seat stays reachable', await fs.readFile(path.join(earlyDir, 'consults', consultId(earlyReq), 'result.json'), 'utf8').then(() => 'written', () => 'absent'), 'absent')
+    t.eq('the seat-turn path says pendingRecovery too', stillOut.pendingRecovery, true)
+    t.eq('recovery went through the recorded harness, by id', calls.old, ['OLD-1'])
+    t.eq('the seat\'s current harness was not used for that recovery', calls.current.includes('recover'), false)
+    t.eq('the violation is the turn\'s answer', movedTurn.error?.integrity?.invocationId, 'OLD-1')
+  }
+
   for (const d of dirs) await fs.rm(d, { recursive: true, force: true })
 }

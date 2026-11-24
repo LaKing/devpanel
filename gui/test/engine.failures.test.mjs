@@ -6,8 +6,9 @@ import { classifyFailure, backoffMs, parseRetryAfter, createAvailabilityStore } 
 import { codexErrors } from '../../harness/codex.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { ProcessError } from '../server/runtime/process.mjs'
-import { resumeUnavailable } from '../server/runtime/run-control.mjs'
+import { resumeUnavailable, ownerLossRecoverable } from '../server/runtime/run-control.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
+import { supportedActions, workspaceDisposition } from '../server/supervisor.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 
@@ -149,6 +150,179 @@ export default async (t) => {
     t.eq('with the class on the run', engine.run.failure?.class, 'transient')
     t.eq('and the retry count', engine.run.failure?.retries, 3)
     await releaseWorkspace(engine)
+  }
+
+  t.section('5b. a seat that touched the operator\'s CLI configuration fails the turn; the adapter is acknowledged only after the failure is persisted (config-guard.mjs)')
+  {
+    const integrity = { kind: 'cli-config', home: '/h/.codex', label: 'run', violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantined', quarantinedTo: '/h/.codex/hooks.json.devpanel-quarantine-run-x/hooks.json.abc' }] }
+    t.eq('the classification carries the integrity through', classifyFailure(new ProcessError('integrity violation: …', { kind: 'environment-error', integrity })).integrity, integrity)
+    const attempt = async ({ failPersist }) => {
+      const f = await engineFixture()
+      const resolved = []
+      let implementCalls = 0
+      const invoke = async (args) => {
+        if (args.meta.stepId === 'implement') {
+          implementCalls++
+          throw new ProcessError('integrity violation: during the codex seat turn …', { kind: 'environment-error', integrity: { ...integrity, invocationId: args.meta.invocationId }, invocationId: args.meta.invocationId })
+        }
+        return f.fake.invoke(args)
+      }
+      let engine
+      const resolveConfig = async (invocationId) => {
+        const onDisk = JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+        resolved.push({ invocationId, persistedFailure: onDisk.failure?.integrity?.invocationId === invocationId })
+        return true
+      }
+      engine = await startRun({
+        playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+        issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake: { ...f.fake, invoke, resolveConfig } }, stepStore: f.stepStore,
+        workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+      })
+      if (failPersist) {
+        const persist = engine.persist.bind(engine)
+        engine.persist = async (event) => { if (event?.type === 'invocation-failed') throw new Error('disk full'); return persist(event) }
+      }
+      let thrown = null
+      try { await engine.drive() } catch (error) { thrown = error }
+      return { f, engine, thrown, resolved, implementCalls }
+    }
+    const ok = await attempt({ failPersist: false })
+    t.ok('the run stops on the integrity failure', /integrity violation/.test(ok.thrown?.message ?? ''), ok.thrown?.message)
+    t.eq('not retried', [ok.implementCalls, ok.engine.run.failures.filter((x) => x.retried).length], [1, 0])
+    t.eq('classified environment, with the integrity on the run\'s failure', [ok.engine.run.failure?.class, ok.engine.run.failure?.integrity?.violations[0].change], ['environment', 'created'])
+    t.eq('and on the failure record', ok.engine.run.failures.at(-1)?.integrity?.violations[0].status, 'quarantined')
+    t.eq('run.configIntegrity names the invocation, kept apart from run.integrity', [ok.engine.run.configIntegrity?.length, ok.engine.run.configIntegrity?.[0].outcome], [1, 'failed'])
+    t.eq('the adapter was acknowledged once, after run.json held the failure', ok.resolved.map((r) => r.persistedFailure), [true])
+    await releaseWorkspace(ok.engine)
+    const broken = await attempt({ failPersist: true })
+    t.ok('a persist error propagates', /disk full/.test(broken.thrown?.message ?? ''), broken.thrown?.message)
+    t.eq('and the adapter is not acknowledged: the violation keeps replaying', broken.resolved.length, 0)
+    await releaseWorkspace(broken.engine)
+  }
+
+  t.section('5c. while the adapter cannot acknowledge a violation (a sync failed), the run stays on the public recovery path (config-guard.mjs)')
+  {
+    const integrity = { kind: 'cli-config', home: '/h/.codex', label: 'run', violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantine-unsynced', quarantinedTo: '/h/.codex/hooks.json.devpanel-quarantine-run-x/hooks.json.abc' }] }
+    const make = async ({ partial }) => {
+      const f = await engineFixture()
+      const calls = { resolve: [], reconcile: 0, recover: 0 }
+      const state = { acknowledge: false }
+      const invoke = async (args) => {
+        if (args.meta.stepId === 'implement' && !state.done) {
+          state.done = true
+          if (partial) await fs.writeFile(path.join(args.cwd, 'partial.txt'), 'half done\n')
+          throw new ProcessError('integrity violation: during the codex seat turn …', { kind: 'environment-error', integrity: { ...integrity, invocationId: args.meta.invocationId }, invocationId: args.meta.invocationId })
+        }
+        return f.fake.invoke(args)
+      }
+      const fake = {
+        ...f.fake, invoke,
+        resolveConfig: async (id) => { calls.resolve.push(id); return typeof state.acknowledge === 'function' ? state.acknowledge(id) : state.acknowledge },
+        reconcile: async (id) => { calls.reconcile++; return { phase: 'failed', integrity: { ...integrity, invocationId: id } } },
+        recoverPending: async ({ invocationId }) => { calls.recover++; return { integrity: { ...integrity, invocationId } } }
+      }
+      const engine = await startRun({
+        playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id },
+        issuePath: f.issuePath, projectPath: f.projectPath, harnesses: { fake }, stepStore: f.stepStore,
+        workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery
+      })
+      let thrown = null
+      try { await engine.drive() } catch (error) { thrown = error }
+      const onDisk = async () => JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'run.json'), 'utf8'))
+      return { f, engine, thrown, calls, state, onDisk }
+    }
+
+    // A live failure: the turn failed, the move did not sync, resolveConfig says no.
+    {
+      const { engine, thrown, calls, state, onDisk } = await make({ partial: false })
+      t.ok('the turn failed on the violation', /integrity violation/.test(thrown?.message ?? ''), thrown?.message)
+      let run = await onDisk()
+      const pending = Object.values(run.participants).find((p) => p.pendingInvocation)?.pendingInvocation
+      t.ok('the pending invocation is kept on disk', Boolean(pending?.configUnresolved))
+      t.eq('the pointer names it', run.configUnresolved?.map((e) => e.invocationId), [pending?.invocationId])
+      t.ok('the persisted run is recoverable by the public action', ownerLossRecoverable(run), JSON.stringify(run.recovery))
+      t.eq('the supervisor offers recover', supportedActions(run), ['recover', 'abandon'])
+      t.ok('marked so the supervisor\'s failed-save leaves it (failRecord)', run.recovery?.configUnresolved === true)
+
+      // A second sync failure, through the public recovery path.
+      const second = await engine.recoverOwnerLoss()
+      t.eq('a second failure does not resume', second.resumed, false)
+      run = await onDisk()
+      t.eq('it replayed through reconcile and asked again', [calls.reconcile >= 1, calls.resolve.length], [true, 2])
+      t.ok('still recoverable, still pending', ownerLossRecoverable(run) && Boolean(Object.values(run.participants).find((p) => p.pendingInvocation)?.pendingInvocation?.configUnresolved))
+      t.eq('the pointer kept', run.configUnresolved?.length, 1)
+
+      // The sync holds now: acknowledged, the run is failed as it was, never resumed.
+      state.acknowledge = true
+      const third = await engine.recoverOwnerLoss()
+      run = await onDisk()
+      t.eq('acknowledged: not resumed, failed with its failure', [third.resumed, run.status, run.failure?.class], [false, 'failed', 'environment'])
+      t.eq('nothing pending, no pointer', [Object.values(run.participants).some((p) => p.pendingInvocation), run.configUnresolved?.length], [false, 0])
+      t.eq('the violation stays on record', run.configIntegrity?.length, 1)
+      await releaseWorkspace(engine)
+    }
+
+    // A writer left edits too: the source quarantine and its disposition.
+    {
+      const { engine, calls, state, onDisk } = await make({ partial: true })
+      let run = await onDisk()
+      t.eq('the source quarantine ends it', `${run.status}:${run.integrity?.status}`, 'blocked:quarantined')
+      t.eq('the pointer survives the quarantine', [run.configUnresolved?.length, run.recovery?.configUnresolved], [1, true])
+      await engine.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: engine.run.integrity.latest.stateHash, reason: 'inspected', actor: 'operator' })
+      run = await onDisk()
+      t.eq('the disposition clears the pending invocation, never the pointer', [Object.values(run.participants).some((p) => p.pendingInvocation), run.configUnresolved?.length], [false, 1])
+      t.ok('and leaves the run on the public recovery path', ownerLossRecoverable(run), JSON.stringify({ status: run.status, recovery: run.recovery }))
+      t.eq('the supervisor offers recover', supportedActions(run), ['recover', 'abandon'])
+
+      const second = await engine.recoverOwnerLoss()
+      run = await onDisk()
+      t.eq('a second sync failure through recover: replayed, still recoverable', [second.resumed, calls.recover, ownerLossRecoverable(run), run.configUnresolved?.length], [false, 1, true, 1])
+
+      state.acknowledge = true
+      const third = await engine.recoverOwnerLoss()
+      run = await onDisk()
+      t.ok('acknowledged: the pointer is gone and the run resumes as the disposition allowed', third.resumed && !run.configUnresolved?.length, third.reason)
+      await releaseWorkspace(engine)
+    }
+
+    // Audit 082: several pointers. One participant's acknowledgement never clears the
+    // state another pointer still needs, and the worktree is kept for it.
+    {
+      const { engine, state, onDisk } = await make({ partial: false })
+      const mine = engine.run.configUnresolved[0].invocationId
+      const otherRole = Object.keys(engine.run.participants).find((r) => r !== engine.run.configUnresolved[0].role)
+      engine.run.configUnresolved.push({ role: otherRole, harness: 'fake', invocationId: 'OTHER-SEAT' })
+      await engine.saveRun()
+      state.acknowledge = (id) => id === mine
+      const out = await engine.recoverOwnerLoss()
+      let run = await onDisk()
+      t.eq('the pending participant was acknowledged, the other pointer was not', [Object.values(run.participants).some((p) => p.pendingInvocation), run.configUnresolved.map((e) => e.invocationId)], [false, ['OTHER-SEAT']])
+      t.ok('so the run is not failed, not resumed, and stays on the public recovery path', !out.resumed && run.status === 'blocked' && ownerLossRecoverable(run), JSON.stringify({ out, status: run.status, recovery: run.recovery }))
+      t.eq('the supervisor keeps its worktree, even one proved unchanged', workspaceDisposition(run, { unchanged: true, proven: true, reason: 'unchanged' }).discard, false)
+      state.acknowledge = true
+      const last = await engine.recoverOwnerLoss()
+      run = await onDisk()
+      t.eq('the last pointer acknowledged: nothing open, and the run is failed as its recorded failure left it (not resumed)', [last.resumed, run.configUnresolved.length, run.status, run.failure?.class], [false, 0, 'failed', 'environment'])
+      await releaseWorkspace(engine)
+    }
+
+    // Audit 082: an originating adapter that is missing, or cannot reconcile, never acknowledges.
+    {
+      const { engine, calls, onDisk } = await make({ partial: false })
+      engine.run.configUnresolved.push({ role: engine.run.configUnresolved[0].role, harness: 'unloadable', invocationId: 'GONE-HARNESS' })
+      await engine.saveRun()
+      const before = calls.resolve.length
+      engine.harnesses.fake = { ...engine.harnesses.fake, reconcile: undefined }
+      await engine.recoverOwnerLoss()
+      let run = await onDisk()
+      t.eq('both pointers kept; nothing was acknowledged for them', [run.configUnresolved.map((e) => e.invocationId).includes('GONE-HARNESS'), run.configUnresolved.length, calls.resolve.length - before], [true, 2, 0])
+      t.ok('the pending invocation is kept, and the generic missing-adapter block did not replace the recoverable state', Boolean(Object.values(run.participants).find((p) => p.pendingInvocation)?.pendingInvocation?.configUnresolved) && ownerLossRecoverable(run) && run.recovery?.configUnresolved === true, JSON.stringify(run.recovery))
+      engine.harnesses.fake = { ...engine.harnesses.fake, reconcile: async () => { throw new Error('ledger unreadable') } }
+      await engine.recoverOwnerLoss()
+      run = await onDisk()
+      t.ok('a reconciliation error keeps it too', ownerLossRecoverable(run) && run.recovery?.configUnresolved === true && run.configUnresolved.length === 2, JSON.stringify(run.recovery))
+      await releaseWorkspace(engine)
+    }
   }
 
   t.section('5a. a refusal is recorded once and stops the run; the next move is a person\'s')

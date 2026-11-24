@@ -274,6 +274,26 @@ export default async function (t) {
       t.ok('sessions stay writable', out.includes('sessions/rollout.jsonl:WRITTEN'), out)
       t.eq('the real file is untouched', await fs.readFile(path.join(codexHome, 'config.toml'), 'utf8'), 'model = "m"\n')
     }
+
+    t.section('8. the guarded Codex fence: missing configuration is created and cannot be written from inside (config-guard.mjs, AC1)')
+    {
+      const home = path.join(root, 'codex-home-guarded')
+      await fs.mkdir(path.join(home, 'sessions'), { recursive: true })
+      const manifest = await codex.fenceManifest({ binary: RECORDER, env: { CODEX_HOME: home } })
+      const f = await applyFence({ spec, manifest, guard: codex.configGuardFor({ CODEX_HOME: home }) })
+      t.ok('the guarded fence is proved and applied', f.applied === true && f.config?.created?.length === 8, f.reason)
+      const w = f.wrap('/bin/sh', ['-c', [
+        ...['hooks/x', 'rules/x', 'skills/x', 'config.toml', 'AGENTS.md', 'requirements.toml'].map((p) => `(echo planted >> ${home}/${p}) 2>/dev/null && echo "${p}:WRITTEN" || echo "${p}:refused"`),
+        `(echo '{}' > ${home}/hooks.json) 2>/dev/null && echo "hooks.json:WRITTEN" || echo "hooks.json:refused"`,
+        `(echo s > ${home}/sessions/rollout.jsonl) 2>/dev/null && echo "sessions:WRITTEN" || echo "sessions:refused"`
+      ].join('; ')])
+      const r = await runProcess({ command: w.command, args: w.args, env: { PATH: '/usr/bin:/bin', HOME: os.homedir() }, stdin: '' })
+      for (const p of ['hooks/x', 'rules/x', 'skills/x', 'config.toml', 'AGENTS.md', 'requirements.toml']) t.ok(`${p} cannot be written from inside`, r.stdout.includes(`${p}:refused`), r.stdout)
+      t.ok('hooks.json can be created (it is integrity-checked after the turn, not bound)', r.stdout.includes('hooks.json:WRITTEN'), r.stdout)
+      t.ok('sessions stay writable', r.stdout.includes('sessions:WRITTEN'), r.stdout)
+      const sup = await applyFence({ spec: { ...spec, seat: false }, manifest: await codex.fenceManifest({ binary: RECORDER, env: { CODEX_HOME: path.join(root, 'codex-home-runless') } }), guard: codex.configGuardFor({ CODEX_HOME: path.join(root, 'codex-home-runless') }) })
+      t.eq('a runless fence (supervisor) prepares nothing', sup.config, null)
+    }
   } finally {
     await fs.rm(root, { recursive: true, force: true })
     await fs.rm(secret, { recursive: true, force: true })

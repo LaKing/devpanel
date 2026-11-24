@@ -9,6 +9,7 @@ import { readBarrier } from '../server/runtime/cleanup-barrier.mjs'
 import { alive } from '../server/runtime/process.mjs'
 import { hostPlatform, platformFor, REAP_TAG } from '../server/runtime/platform.mjs'
 import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
+import { ownerLossRecoverable } from '../server/runtime/run-control.mjs'
 import { engineFixture, scriptFor, cleanupFixtures, simulateProcessDeath } from './fakes/fixture.mjs'
 
 /*
@@ -170,6 +171,41 @@ export default async function (t) {
         survivor.kill('SIGKILL')
         await releaseOwnership(resumed)
       }
+    }
+  }
+
+  t.section('B6. a cleanup hold delays configuration recovery, never removes it (config-guard.mjs; audit 085)')
+  for (const [label, failing] of [['single turn', (id) => id === 'implement'], ['concurrent review', (id) => id === 'audit-implement-1']]) {
+    for (const settle of ['prove', 'acknowledge']) {
+      const h = await engineFixture()
+      let failed = false
+      const invoke = async (args) => {
+        if (!failed && failing(args.meta.stepId)) {
+          failed = true
+          throw Object.assign(new Error('integrity violation: during the codex seat turn …'), { kind: 'environment-error', invocationId: args.meta.invocationId, reap: scan('unavailable'),
+            integrity: { kind: 'cli-config', invocationId: args.meta.invocationId, violations: [{ path: '/h/.codex/hooks.json', change: 'created', status: 'quarantine-unsynced' }] } })
+        }
+        return h.fake.invoke(args)
+      }
+      // Two occupied auditors: their review round runs as a concurrent batch (engine runConcurrently).
+      const seats = label === 'concurrent review' ? { participants: { 'auditor-1': { model: 'gpt-6-astra' }, 'auditor-2': { model: 'gpt-6-astra' } } } : null
+      const engine = await startRun({ ...h, issue: { ...h.issue, project: P }, harnesses: { fake: { ...h.fake, invoke, resolveConfig: async () => false } }, deliveryProvider: h.delivery,
+        ...(seats ? { runOptions: seats, expectConfigHash: (await resolvePlaybook(h.playbookId, { root: h.configRoot, runOptions: seats, projectId: P })).resolved.configHash } : {}) })
+      await engine.drive().catch(() => {})
+      await releaseOwnership(engine)
+      const runFile = path.join(h.issuePath, 'runs', engine.runId, 'run.json')
+      let run = JSON.parse(await fs.readFile(runFile, 'utf8'))
+      const tag = `${label}, ${settle}`
+      if (label === 'concurrent review') t.ok(`${tag}: the failure came from a concurrent review batch`, (await fs.readFile(path.join(h.issuePath, 'runs', engine.runId, 'events.jsonl'), 'utf8')).includes('"concurrent-reviews"'))
+      t.eq(`${tag}: the cleanup hold blocks the run, with the configuration pointer kept`, [run.blockedReason, run.configUnresolved?.length], ['cleanup-unproved', 1])
+      t.ok(`${tag}: recover is not offered while the hold stands`, !supportedActions(run).includes('recover'), JSON.stringify(supportedActions(run)))
+      const sup = createSupervisor({ issues: h.issues, harnessDir: path.join(h.configRoot, 'harness'), projectsDir: path.dirname(h.projectPath), configRoot: h.configRoot, platform: proving() })
+      if (settle === 'prove') await sup.proveCleanup({ project: P, issueId: h.issue.id, runId: engine.runId, actor: 'tester' })
+      else await sup.acknowledgeCleanup({ project: P, issueId: h.issue.id, runId: engine.runId, reason: 'checked: nothing left running', actor: 'tester' })
+      run = JSON.parse(await fs.readFile(runFile, 'utf8'))
+      t.ok(`${tag}: once the cleanup is settled the run is back on configuration recovery`, run.blockedReason === 'recovery-required' && run.recovery?.configUnresolved === true && ownerLossRecoverable(run), JSON.stringify({ blockedReason: run.blockedReason, recovery: run.recovery }))
+      t.eq(`${tag}: and recover is offered again`, supportedActions(run), ['recover', 'abandon'])
+      await releaseWorkspace(engine).catch(() => {})
     }
   }
 

@@ -228,6 +228,24 @@ export function ownerLost (run) {
     (run.recovery.ownerLost === true || /when its owner disappeared/.test(run.recovery.reason ?? ''))
 }
 
+/**
+ * A configuration violation the adapter has not acknowledged (config-guard.mjs,
+ * run.configUnresolved) keeps the run on the public recovery action, which
+ * replays it. Applied by the engine when an acknowledgement fails, and again
+ * whenever a cleanup hold that took its place is proved or acknowledged: the
+ * hold only delays the recovery, it never removes the route to it. Returns
+ * whether it changed the record. A quarantined workspace keeps its own state.
+ */
+export function restoreConfigRecovery (run, at) {
+  if (!run?.configUnresolved?.length) return false
+  if (run.integrity?.status === 'quarantined') { run.recovery = { ...(run.recovery ?? {}), configUnresolved: true }; return true }
+  run.status = 'blocked'
+  run.blockedReason = 'recovery-required'
+  run.recovery = { required: true, ownerLost: true, configUnresolved: true, detectedAt: at,
+    reason: `the operator's CLI configuration guard has not recorded invocation ${run.configUnresolved[0].invocationId}'s quarantine yet (a directory sync failed); recover to replay it` }
+  return true
+}
+
 /** Owner loss that `recover` may continue: nothing else about the run needs a person. */
 export function ownerLossRecoverable (run) {
   return ownerLost(run) && !run.abandonment && !run.release && !run.journal?.recoveryRequired &&

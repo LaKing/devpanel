@@ -22,7 +22,7 @@ import { alive, ProcessError, terminatePids } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { openCleanup, unprovedScan, cleanupEntry, proveEntries, cleanupRefusal, noteLostTags, addBarrierEntries, syncBarrier, readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
-import { ownerLost } from './run-control.mjs'
+import { ownerLost, restoreConfigRecovery } from './run-control.mjs'
 import { fenceStubSet, fingerprint, gitIdentity, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity, writeIntegrity } from './integrity.mjs'
 import * as store from './store.mjs'
@@ -1340,6 +1340,9 @@ export class Engine {
     this.run.blockedReason = disposition === 'abandon' ? 'integrity-abandoned' : null
     if (disposition !== 'abandon') { this.run.endedAt = null; this.run.failure = null }
     await this.persist({ type: 'integrity-disposition', ...record })
+    // A configuration violation the adapter has not acknowledged survives the
+    // disposition (run.configUnresolved): the run goes to the recovery that replays it.
+    if (disposition !== 'abandon' && this.run.configUnresolved?.length) await this.markConfigUnresolved()
     return this.run
   }
 
@@ -1469,6 +1472,7 @@ export class Engine {
    */
   async recover ({ retryUncertain = false } = {}) {
     await this.assertJournal()
+    await this.replayConfigPointers()
     if (this.run.integrity?.status === 'quarantined' || this.run.integrity?.status === 'abandoned') return this.run
     for (const [role, p] of Object.entries(this.run.participants)) {
       if (!p.pendingInvocation) continue
@@ -1500,6 +1504,24 @@ export class Engine {
 
       const adapter = this.harnesses[p.harness]
 
+      // A failed turn whose configuration violation the adapter has not yet
+      // acknowledged (handleRuntimeFailure): its failure is already on record,
+      // only the acknowledgement is missing. Handled before the generic
+      // missing-adapter and reconciliation-error blocks, which would replace
+      // the recoverable state: an adapter that cannot answer keeps the pointer.
+      if (p.pendingInvocation.configUnresolved) {
+        const pending = p.pendingInvocation
+        const evidence = typeof adapter?.reconcile === 'function' ? await adapter.reconcile(pending.invocationId, { ledgerDir: this.ledgerDir() }).catch(() => null) : null
+        if (evidence?.integrity?.violations?.length) await this.recordConfigIntegrity({ role, stepId: pending.stepId ?? null, round: pending.round ?? null, invocationId: pending.invocationId, outcome: 'interrupted', integrity: evidence.integrity })
+        if (!evidence || !await this.resolveConfigIntegrity(role, pending.invocationId)) continue
+        p.pendingInvocation = null
+        p.state = p.session ? 'ready' : 'uninitialised'
+        // Remembered on the run: another pointer may keep it recoverable first.
+        this.run.configFailureAcknowledged = true
+        await this.persist({ type: 'recovery', role, invocationId: pending.invocationId, resolution: 'config-violation-acknowledged' })
+        continue
+      }
+
       // An adapter that cannot answer is not evidence of absence. Without an
       // authoritative "not started" the invocation may already have changed the
       // workspace, so the only safe answer is to stop and ask a human.
@@ -1514,6 +1536,16 @@ export class Engine {
         evidence = await adapter.reconcile(p.pendingInvocation.invocationId, { ledgerDir: this.ledgerDir() })
       } catch (error) {
         if (await this.endIntegrity(role, p.pendingInvocation, 'uncertain', error.message)) await this.blockForRecovery(role, `${role}: reconciliation failed: ${error.message}`)
+        continue
+      }
+      // The seat touched the operator's CLI configuration: neither adopted nor
+      // retried, whatever the ledger says about its ending.
+      if (evidence?.integrity?.violations?.length) {
+        const pending = p.pendingInvocation
+        await this.recordConfigIntegrity({ role, stepId: pending.stepId ?? null, round: pending.round ?? null, invocationId: pending.invocationId, outcome: 'interrupted', integrity: evidence.integrity })
+        if (!await this.endIntegrity(role, pending, 'uncertain')) continue
+        await this.blockForRecovery(role, `${role}: invocation ${pending.invocationId} touched the operator's CLI configuration (${evidence.integrity.violations.map((v) => `${v.change} ${v.path}${v.quarantinedTo ? ` -> ${v.quarantinedTo}` : v.status ? ` (${v.status})` : ''}`).join('; ')})`)
+        await this.resolveConfigIntegrity(role, pending.invocationId)
         continue
       }
       if (!await this.endIntegrity(role, p.pendingInvocation, evidence?.phase === 'completed' ? 'completed' : 'uncertain')) continue
@@ -1548,7 +1580,7 @@ export class Engine {
       // workspace exactly as the turn received it, the turn left no durable
       // effect here: it is retried as a fresh session, never adopted. Otherwise
       // refuse to guess.
-      if (retryUncertain && this.run.integrity?.status === 'clear') {
+      if (retryUncertain && this.run.integrity?.status === 'clear' && !(this.run.configIntegrity ?? []).some((e) => e.invocationId === p.pendingInvocation.invocationId)) {
         const invocationId = p.pendingInvocation.invocationId
         this.recordInterruptedTurn(role, p.pendingInvocation, 'lost')
         p.pendingInvocation = null
@@ -1559,7 +1591,26 @@ export class Engine {
       }
       await this.blockForRecovery(role, `${role}: invocation ${p.pendingInvocation.invocationId} is uncertain`)
     }
+    await this.settleConfigState()
     return this.run
+  }
+
+  /**
+   * After a recovery pass, for the run as a whole: while any configuration
+   * pointer is open the run stays on the public recovery path, whatever one
+   * participant's acknowledgement did; once none is and an acknowledged
+   * failure leaves nothing else to recover, the run is failed as it was.
+   */
+  async settleConfigState () {
+    if (this.run.configUnresolved?.length) return this.markConfigUnresolved()
+    if (!this.run.configFailureAcknowledged || Object.values(this.run.participants).some((p) => p.pendingInvocation || p.state === 'recovery-required')) return
+    this.run.status = 'failed'
+    this.run.blockedReason = this.run.failure?.message ?? 'a seat touched the operator\'s CLI configuration'
+    this.run.outcome = 'unresolved'
+    this.run.endedAt ??= this.clock.iso()
+    this.run.recovery = { required: false, reason: null, detectedAt: null }
+    delete this.run.configFailureAcknowledged
+    await this.saveRun()
   }
 
   /**
@@ -1593,6 +1644,11 @@ export class Engine {
     }
     await this.recover({ retryUncertain: true })
     const unresolved = Object.entries(this.run.participants).filter(([, p]) => p.pendingInvocation || p.state === 'recovery-required').map(([role]) => role)
+    // Every configuration pointer, whichever participant it came from.
+    if (this.run.configUnresolved?.length) unresolved.push(...this.run.configUnresolved.map((e) => `${e.role} (configuration ${e.invocationId})`))
+    if (unresolved.length && this.run.configUnresolved?.length) return { resumed: false, reason: this.run.recovery?.reason ?? `still uncertain: ${unresolved.join(', ')}` }
+    // A failure whose configuration violation recovery has just acknowledged stays failed.
+    if (this.run.status === 'failed') return { resumed: false, reason: this.run.blockedReason }
     if (this.run.integrity?.status !== 'clear' || unresolved.length) {
       return { resumed: false, reason: this.run.recovery?.reason ?? `still uncertain: ${unresolved.join(', ')}` }
     }
@@ -1605,6 +1661,65 @@ export class Engine {
     // turn cut at the deadline blocks into the guarded Resume.
     const entry = await this.resumeExecution({ budgets, stoppedAt: lostAt ?? detectedAt, actor, origin, guardShortWallClock: false })
     return { resumed: true, entry }
+  }
+
+  /**
+   * A seat's violation of the operator's CLI configuration (config-guard.mjs),
+   * kept apart from the worktree's run.integrity. One entry per invocation; a
+   * later verdict (a replay that found or moved more) replaces its content.
+   */
+  async recordConfigIntegrity ({ role, stepId, round, invocationId, outcome, integrity }) {
+    this.run.configIntegrity = this.run.configIntegrity ?? []
+    const existing = this.run.configIntegrity.find((e) => e.invocationId === invocationId)
+    if (existing) Object.assign(existing, integrity, { updatedAt: this.clock.iso(), outcome: existing.outcome === outcome ? outcome : `${existing.outcome}, then ${outcome}` })
+    else this.run.configIntegrity.push({ at: this.clock.iso(), role, stepId, round, invocationId, outcome, ...integrity })
+    // The pointer recovery follows until the adapter has acknowledged it. Kept
+    // apart from pendingInvocation, which a source-integrity disposition clears.
+    if (!(this.run.configUnresolved ??= []).some((e) => e.invocationId === invocationId)) this.run.configUnresolved.push({ role, harness: this.run.participants[role]?.harness ?? null, invocationId })
+    await this.saveRun()
+  }
+
+  /**
+   * Called only once the failure disposition that names the violation has been
+   * persisted: the adapter stops replaying it. A failure here is harmless (the
+   * next replay is deduplicated by invocation).
+   */
+  async resolveConfigIntegrity (role, invocationId, harness = this.run.participants[role]?.harness) {
+    const adapter = this.harnesses[harness]
+    // A missing or unloadable originating adapter never acknowledges; one
+    // without the guard (claude) never recorded a violation to acknowledge.
+    let acknowledged = Boolean(adapter) && typeof adapter.resolveConfig !== 'function'
+    if (!acknowledged && adapter) { try { acknowledged = await adapter.resolveConfig(invocationId, { ledgerDir: this.ledgerDir() }) !== false } catch { acknowledged = false } }
+    if (acknowledged && this.run.configUnresolved?.some((e) => e.invocationId === invocationId)) {
+      this.run.configUnresolved = this.run.configUnresolved.filter((e) => e.invocationId !== invocationId)
+      await this.saveRun()
+    }
+    return acknowledged
+  }
+
+  /**
+   * The adapter could not acknowledge a violation (a move still unsynced). The
+   * run stays reachable by the public recovery action (run-control.mjs
+   * ownerLossRecoverable), which replays it; a quarantined workspace keeps its
+   * own state, and its disposition restores this one (resolveIntegrity).
+   */
+  async replayConfigPointers () {
+    const pendingIds = new Set(Object.values(this.run.participants).map((p) => p.pendingInvocation?.invocationId).filter(Boolean))
+    for (const entry of [...(this.run.configUnresolved ?? [])]) {
+      if (pendingIds.has(entry.invocationId)) continue   // reconciled with its pending invocation below
+      const adapter = this.harnesses[entry.harness]
+      const replay = typeof adapter?.recoverPending === 'function' ? await adapter.recoverPending({ ledgerDir: this.ledgerDir(), invocationId: entry.invocationId }).catch(() => null) : null
+      if (replay?.integrity?.violations?.length) await this.recordConfigIntegrity({ role: entry.role, stepId: null, round: null, invocationId: entry.invocationId, outcome: 'interrupted', integrity: replay.integrity })
+      if (!await this.resolveConfigIntegrity(entry.role, entry.invocationId, entry.harness)) await this.markConfigUnresolved()
+    }
+    if (!this.run.configUnresolved?.length && this.run.recovery?.configUnresolved && this.run.recovery.ownerLost) {
+      this.run.recovery = { ...this.run.recovery, configUnresolved: false }
+      await this.saveRun()
+    }
+  }
+
+  async markConfigUnresolved () {
+    if (restoreConfigRecovery(this.run, this.clock.iso())) await this.saveRun()
   }
 
   async blockForRecovery (role, reason) {
@@ -3129,11 +3244,15 @@ export class Engine {
         outputSchema: step.output ?? null,
         signal: this.controller.signal,
         observe: { onActivity, onOutput, onSpawn },
-        meta: { invocationId, role, stepId: step.id, round, attempt, reapTag: pending.reapTag }
+        meta: { invocationId, role, stepId: step.id, round, attempt, reapTag: pending.reapTag, runId: this.runId }
       }) } finally { await brokerTurn?.close().catch(() => {}) }
     } catch (error) {
       // When the seat stopped working, before any scan or advice that follows.
       pending.stoppedAt = this.clock.iso()
+      // The seat touched the operator's CLI configuration (config-guard.mjs):
+      // on the run first, so a crash before the failure is recorded still blocks
+      // a retry of this invocation (recover).
+      if (error?.integrity) await this.recordConfigIntegrity({ role, stepId: step.id, round, invocationId, outcome: 'failed', integrity: error.integrity })
       // A runtime whose escaped descendants were not proved gone leaves the
       // workspace unproved, whatever else went wrong (P3-3).
       const lost = unprovedScan(error?.reap) ? error.reap : null
@@ -3365,6 +3484,12 @@ export class Engine {
     // or a person acknowledged them, nor onto a checkout another run bars
     // (in the barrier file, or held by the supervisor when it could not be written).
     await this.proveCleanup({ by: 'resume' })
+    // The cleanup is settled; a configuration pointer still open goes back to
+    // the recovery that replays it rather than being resumed past.
+    if (this.run.configUnresolved?.length) {
+      await this.markConfigUnresolved()
+      throw Object.assign(new Error('An interrupted guarded turn still has to be settled: recover the run first.'), { status: 409 })
+    }
     if (this.run.workspace?.isolation === 'in-place') {
       const barred = barrierRefusal(await readBarrier(path.dirname(this.issuePath)), { exceptRunId: this.runId, unrecorded: unrecordedBarrier })
       if (barred) throw barred
@@ -3744,6 +3869,10 @@ export class Engine {
         : asked.length >= panel.maxPerRun || (technical && asked.filter((c) => c.category === 'technical').length >= panel.maxTechnicalPerRun)
           ? `this run has used its consults (${asked.length} of ${panel.maxPerRun}, technical at most ${panel.maxTechnicalPerRun})` : null
       if (refusal) {
+        // Checked before anything is dropped or decided: a consult with a seat
+        // still unsettled stays pending, whatever today's panel would allow.
+        const open = await this.unsettledSeats(base, mode, runDir)
+        if (open.length) return this.blockForConsultRecovery(ask, open, refusal)
         if (cut) { this.run.consulting = null; await this.persist({ type: 'consult-dropped', key: ask.key, reason: refusal }) }
         return technical ? this.technicalUnasked(ask, refusal) : 'ask'
       }
@@ -3762,6 +3891,10 @@ export class Engine {
       } catch (error) {
         credit()
         if (error.name !== 'AbortError' && !this.controller.signal.aborted) {
+          // A fault with a seat of this consult still unsettled (an interrupted
+          // guarded turn): no fallback is decided past it; the run waits on recovery.
+          const open = await this.unsettledSeats(base, mode, runDir)
+          if (open.length) return this.blockForConsultRecovery(ask, open, error.message)
           // The panel is advice: a fault in it never fails the run, the question goes to a person.
           this.run.consulting = null
           await this.persist({ type: 'consult-failed', key: ask.key, error: String(error.message).slice(0, 400) })
@@ -3772,6 +3905,11 @@ export class Engine {
         return 'stopped'
       }
     }
+    // A seat of this consult was interrupted inside a guarded turn and could not
+    // be checked yet (consult.mjs pendingRecovery): nothing is decided or
+    // recorded. The marker stays, and the run waits on the public recovery
+    // action, which drives back here and consults again.
+    if (result.pendingRecovery) return this.blockForConsultRecovery(ask, result.unsettled ?? [], result.reason)
     // The decision step spans the question from when it was first raised.
     if (this.run.consulting?.key === ask.key) ask.at = this.run.consulting.startedAt
     this.run.consulting = null
@@ -3798,6 +3936,29 @@ export class Engine {
     // The wait for a person starts now; the panel's time is already credited.
     ask.at = this.clock.iso()
     return 'ask'
+  }
+
+  /**
+   * The consult's seats not yet settled (consult.mjs unsettled), for the mode it
+   * ran in, else either. A check that fails counts as pending, never as none.
+   */
+  async unsettledSeats (base, mode, runDir) {
+    if (typeof this.consult?.unsettled !== 'function') return []
+    const open = []
+    for (const m of mode ? [mode] : ['decide', 'brief']) {
+      try { open.push(...(await this.consult.unsettled({ ...base, mode: m }, { callerDir: runDir }) ?? [])) } catch (error) { open.push(`(pending seats could not be read: ${error.message})`) }
+    }
+    return open
+  }
+
+  /** Nothing decided: the consult's marker stays and the run waits on the public recovery action, which consults again. */
+  async blockForConsultRecovery (ask, unsettled, why = null) {
+    this.run.status = 'blocked'
+    this.run.blockedReason = 'recovery-required'
+    this.run.recovery = { required: true, ownerLost: true, consultPending: true, detectedAt: this.clock.iso(),
+      reason: `the consult panel has a seat turn that was interrupted and is not settled yet (${unsettled.join(', ') || why || 'pending'}); recover to consult again` }
+    await this.persist({ type: 'consult-pending', key: ask.key, unsettled })
+    return 'stopped'
   }
 
   /** A technical question the panel could not be asked: the coordinator is told, and decides as before. */
@@ -3843,6 +4004,7 @@ export class Engine {
       at: this.clock.iso(), role, stepId: step.id, round, attempt, invocationId: pending.invocationId, cursorKey: cursorKeyOf(step.id, round, attempt, pending.cursor?.diagnosticOf),
       class: classified.class, retryable: classified.retryable, message: classified.message, evidence: classified.evidence,
       ...(classified.credentials ? { credentials: classified.credentials } : {}),
+      ...(classified.integrity ? { integrity: classified.integrity } : {}),
       model: spec?.model?.id ?? null, retried: false, retryInMs: null, availability: null, quarantined: true,
       costUsd: typeof error?.payload?.total_cost_usd === 'number' ? error.payload.total_cost_usd : null
     }
@@ -3875,6 +4037,7 @@ export class Engine {
       this.run.endedAt ??= this.clock.iso()
     }
     await this.persist({ type: 'invocation-failed', ...record })
+    if (record.integrity && !await this.resolveConfigIntegrity(role, pending.invocationId)) await this.markConfigUnresolved()
   }
 
   async handleRuntimeFailure ({ error, role, step, round, attempt, pending }) {
@@ -3915,6 +4078,7 @@ export class Engine {
       at: this.clock.iso(), role, stepId: step.id, round, attempt, invocationId: pending.invocationId, cursorKey,
       class: classified.class, retryable: classified.retryable, message: classified.message, evidence: classified.evidence,
       ...(classified.credentials ? { credentials: classified.credentials } : {}),
+      ...(classified.integrity ? { integrity: classified.integrity } : {}),
       model: spec?.model?.id ?? null, retried: willRetry, retryInMs: null, availability: null,
       ...(reclassification ? { reclassification } : {}),
       ...(cleanupBlocked ? { cleanupUnproved: true } : {}),
@@ -3927,10 +4091,17 @@ export class Engine {
         record.availability = { error: storeError.message }
       }
     }
-    // The verified-failed invocation is over either way: nothing pending remains.
+    // The verified-failed invocation is over either way: nothing pending remains,
+    // unless the adapter still has to acknowledge a configuration violation
+    // (config-guard.mjs): then it stays pending on disk until it has.
     this.recordInterruptedTurn(role, pending, 'failed')
-    p.pendingInvocation = null
-    p.state = p.session ? 'ready' : 'uninitialised'
+    if (record.integrity) {
+      p.pendingInvocation = { ...pending, configUnresolved: true }
+      p.state = 'recovery-required'
+    } else {
+      p.pendingInvocation = null
+      p.state = p.session ? 'ready' : 'uninitialised'
+    }
     if (classified.class === 'quota' && this.quotaFallback && !cleanupBlocked && !this.controller.signal.aborted) {
       this.run.failures.push(record)
       await this.persist({ type: 'invocation-failed', ...record })
@@ -3958,9 +4129,18 @@ export class Engine {
       this.run.failures.pop() // The terminal branch below records the same attempt once.
     }
     if (!willRetry) {
-      this.run.failure = { class: classified.class, message: classified.message, role, stepId: step.id, invocationId: pending.invocationId, retries: priorRetries, availability: record.availability, ...(record.credentials ? { credentials: record.credentials } : {}) }
+      this.run.failure = { class: classified.class, message: classified.message, role, stepId: step.id, invocationId: pending.invocationId, retries: priorRetries, availability: record.availability, ...(record.credentials ? { credentials: record.credentials } : {}), ...(record.integrity ? { integrity: record.integrity } : {}) }
       this.run.failures.push(record)
       await this.persist({ type: 'invocation-failed', ...record })
+      // Only after that persist returned: a persist that throws leaves the
+      // adapter replaying the violation, and the invocation pending.
+      if (record.integrity) {
+        if (await this.resolveConfigIntegrity(role, pending.invocationId)) {
+          p.pendingInvocation = null
+          p.state = p.session ? 'ready' : 'uninitialised'
+          await this.saveRun()
+        } else await this.markConfigUnresolved()
+      }
       if (cleanupBlocked) {
         if (!this.concurrentBatch) await this.blockForCleanup()
         return { blocked: true }

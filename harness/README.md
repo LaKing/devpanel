@@ -211,6 +211,138 @@ supervisor, model oracle, performance probe) always pass `hygiene: true`.
   `diagnostics.ignoredSettings`.
 - **Gemini:** the allow-listed environment; its admin policy already states
   everything else.
+- **Operator configuration in the shared CLI homes** (`config-guard.mjs`). The
+  Codex and Gemini homes stay writable for the login, the sessions and resume,
+  but a seat must not leave configuration the operator's own CLI would obey
+  later. Before each fenced seat turn, and only once the unchanged fence is
+  proved (`applyFence`, so a namespace-0 or `DEVPANEL_FENCE_UNPROVED` launch
+  finds the home exactly as it was):
+
+  | Home | Created empty if missing, then bound read-only over itself | Integrity-checked (bound read-only if it exists) |
+  |---|---|---|
+  | Codex `CODEX_HOME` (else `~/.codex`) | `rules/`, `skills/`, `hooks/`, `plugins/`, `prompts/`; `config.toml`, `requirements.toml`, `AGENTS.md` | `hooks.json`, `AGENTS.override.md`, `.env` |
+  | Gemini `GEMINI_CLI_HOME/.gemini` (else `~/.gemini`) | `extensions/`, `commands/`, `policies/`, `agents/`, `skills/`; `GEMINI.md` | `settings.json`, `trustedFolders.json`, `.env` |
+
+  Empty directories list nothing, empty TOML is an empty table and empty
+  Markdown gives no instructions; an empty JSON or hooks file is invalid, so
+  those are checked instead. `.gemini` itself stays writable (OAuth
+  credentials, transcripts). The Gemini names other than `settings.json`, and
+  Codex's `AGENTS.override.md` and `.env`, come from each CLI's published
+  behaviour, not from its source.
+  - **Scope.** Every fenced seat: run turns, consult seats, coordinator chat.
+    Not runless turns (`runlessFence` marks `seat: false`: the top-level
+    supervisor, model oracle, performance probe), whose manifest and fence
+    arguments are unchanged; not unfenced turns; not Claude. An absent home is
+    not bound, so nothing is created in it and the turn runs without binds.
+  - **Refusals before launch.** A CLI home that exists but is not a plain
+    directory (a symlinked `~/.codex` included: the fence would bind its target
+    writable); a checked file whose content cannot be read, so no baseline can
+    be taken; a symlink or a wrong type at any listed name
+    (a dotfiles symlink at `AGENTS.md` included: make it a plain file); an
+    entry the final fence arguments do not bind read-only after the writable
+    home; a second proof (with the binds) that fails. Placeholders already
+    created stay (they are harmless, nothing is deleted); the turn is refused
+    and never falls back to running unfenced. An abort during that
+    preparation is a cancellation.
+  - **The check.** The checked files' snapshot (exists, type, size, mtime,
+    sha256) is written durably to the adapter's ledger before launch (a
+    failed write refuses the turn) and compared after the turn, whatever its
+    ending: exit, failure or cancellation. A file that appeared, changed or
+    was removed fails the turn as an integrity violation (`environment`
+    class, not retried; a cancelled turn fails too, so a shutdown or deadline
+    stop of that turn ends the run instead of pausing it), recorded on
+    `run.failures[].integrity`, `run.failure.integrity` and
+    `run.configIntegrity`; a completed turn's `diagnostics.fence.config` says
+    what was created and watched. A checked file that appears or changes and
+    cannot be read is still moved aside (rename needs no read access). A guard
+    error after the launch (a ledger write, a move) never turns the turn into
+    "not started": the run's result is kept and the turn fails with an
+    incomplete-check integrity record. Every guard ledger line is durable,
+    closes a torn tail before it, and the baseline is read back before launch.
+  - **The move.** An exclusive `mkdir` claims
+    `<name>.devpanel-quarantine-<runId>-<ts>[-n]` next to the file, so no
+    existing path is ever claimed; the file is renamed into it under a random
+    inner name, and the claim and the source directory are synced before the
+    move counts as done. Nothing is unlinked or deleted. A move that fails
+    leaves the file in place (`quarantine-failed`), a failed sync is
+    `quarantine-unsynced`: both still fail the turn.
+  - **Recovery.** Each move's intent (the claim actually made, the file's
+    identity) is durable before the rename. After a crash the adapter's
+    `reconcile` (and consult or chat, before they ask again) replays the
+    invocation by id: a destination whose identity matches is reported only
+    after both directory syncs are retried; a mismatch is
+    `quarantine-unverified` (and a file still at the original path is moved
+    anew); a turn never checked is checked against its snapshot. A violation
+    keeps replaying until the caller has persisted its own record and
+    acknowledged it (`resolveConfig`); an invocation still running is never
+    touched. Recovery replays every intent for a path, oldest first: each
+    move still in its claim must have both syncs succeed (an older unsynced
+    one stays replayable even after a newer intent), and one read of each
+    path decides both what is published to overlapping turns and what is
+    moved, including anything newer at the original path. The engine blocks
+    such an invocation for recovery and never retries one already on
+    `run.configIntegrity`, whose entry a replayed verdict updates before the
+    adapter is acknowledged; the invocation stays pending on disk from the
+    failure record until the adapter acknowledges it. Until then
+    `run.configUnresolved` names it (a source-integrity disposition clears
+    pending invocations, never this), and while any pointer is open, from any
+    participant, the run stays on the public `recover` action (blocked
+    `recovery-required` with `recovery.ownerLost`, settled after the whole
+    recovery pass), which the supervisor's failed-save leaves alone and whose
+    worktree it keeps. A cleanup hold (unproved escaped descendants) only
+    delays this: once the cleanup is proved or acknowledged, an open pointer
+    puts the run back on `recover` (run-control.mjs `restoreConfigRecovery`),
+    and Resume refuses while one is open. Each recovery replays and asks again; a missing or
+    unloadable originating adapter, or one whose reconciliation fails, never
+    counts as an acknowledgement. Once every pointer is acknowledged, a run
+    whose failure was already recorded is failed as it was, never resumed from
+    there. A consult replays an interrupted seat through the harness recorded
+    with its ids; while that harness cannot be loaded (or the turn is still
+    running, or its check throws), or while any seat is unsettled (pending ids
+    with no recorded turn, or a recorded violation its adapter has not
+    acknowledged with `resolveConfig` returning true, the `<seat>.settled.json`
+    marker; an early return such as a roster failure included), the consult
+    caches no result and says `pendingRecovery`. The engine then records no
+    consult and no decision, a fallback included (a consult fault with a seat
+    unsettled is treated the same), keeps its consulting marker and waits on
+    the public `recover` action, which consults again. Unacknowledged seat turns are settled (the
+    replayed verdict saved on the turn first) whenever the record is read, by
+    `consult()` or `recorded()`. Coordinator chat replays through the
+    adapter's `afterFence` hook, which `applyFence` runs as its `replay` once
+    the unchanged fence is proved and before the home is prepared: never on an
+    unfenced, namespace-0 or `DEVPANEL_FENCE_UNPROVED` fallback turn. What an
+    interrupted fork left, a wrong-type entry included, is quarantined before
+    preparation judges it, and the binds the ask launches with are built and
+    proved after the replay. A replay that throws counts as possibly having
+    moved files: the same rebuild and proof follow, and where none would (an
+    absent home) the turn is refused; a failed proof refuses it too. The
+    Codex and Gemini ledger reader (`createLedger(…, { guarded:
+    true })`) skips a torn line that later records follow, and a torn final
+    line still makes it uncertain; Claude's reader is unchanged and strict.
+  - **Overlapping turns.** A change found by any turn's check fails every
+    guarded turn on that home whose window it overlaps, the one that created
+    it included, and is written into their ledgers before anything moves; a
+    recovery that moves a file publishes it to live turns on the home the same
+    way first.
+  - **Residual risks.** An operator CLI started *during* a seat turn could read
+    a file the seat created before the post-turn check moves it aside. A
+    same-uid process that guessed the 128-bit inner name within the
+    microseconds between the claim and the rename could have a file it planted
+    there replaced (Node has no no-replace rename, and no dependency was
+    added). If a host crash interrupts the fan-out to overlapping turns, an
+    overlapping turn whose own snapshot already held the file (so did not
+    create it) may replay clean; the creating turn's verdict is durable. A
+    descendant that escaped the process group could write after the check. An
+    operator's own edit of a checked file during a seat turn is quarantined
+    too (nothing lost). Consult recovery fails closed where named (an
+    unreadable pending scan counts as pending, only `resolveConfig` returning
+    exactly `true` settles a seat, a preflight refusal never drops a consult
+    with an unsettled seat), but other consult crash and interrupt edge cases
+    were left out of scope (scope freeze, 2026-11-24): for example a crash
+    between a seat's `turn.json` and its `settled.json`, or a run deleted or
+    abandoned with a consult seat still pending, leave the quarantined file
+    in place and its ledger replaying, with no run left to settle it. The paid confirmation is
+    `npm run live -- --harness codex|gemini --fence` (not run for this change).
 - **Project tooling** (`workspace.tooling.mounts` / `commands` in
   `projects/<id>.yaml`, docs/project-infrastructure.md "Seat tooling"). The
   engine's fence spec carries `mounts: [{ source, target }]`: each source is

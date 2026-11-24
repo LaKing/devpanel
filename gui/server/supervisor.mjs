@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
+import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, restoreConfigRecovery, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { resumeArchivedCoverageNotes, resumeCoverageNotes, stagingRunCoverage, writeRunCoverageNotes } from './staging-coverage.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
@@ -287,7 +287,7 @@ export function createSupervisor ({
     }
     for (const file of files) {
       const id = file.slice(0, -4)
-      if (['shared', 'fence', 'mcp-devpanel'].includes(id)) continue   // helpers and the broker's MCP shim, not runtimes
+      if (['shared', 'fence', 'config-guard', 'mcp-devpanel'].includes(id)) continue   // helpers and the broker's MCP shim, not runtimes
       const fullPath = path.join(harnessDir, file)
       try {
         const mtimeMs = (await fs.stat(fullPath)).mtimeMs
@@ -917,6 +917,8 @@ export function createSupervisor ({
     try {
       if (engine) {
         if (engine.run.integrity?.status === 'quarantined') return
+        // An unacknowledged configuration violation keeps the recoverable state (engine markConfigUnresolved).
+        if (engine.run.recovery?.configUnresolved || engine.run.configUnresolved?.length || engine.run.recovery?.consultPending) return
         engine.run.status = 'failed'
         engine.run.blockedReason = error.message
         engine.run.outcome = 'unresolved'
@@ -1296,6 +1298,8 @@ export function createSupervisor ({
         const open = openCleanup(current)
         for (const entry of open) Object.assign(entry, { acknowledgedAt: at, acknowledgement })
         if (open.length) {
+          // Configuration recovery takes precedence over the settled hold (run-control.mjs).
+          if (current.blockedReason === 'cleanup-unproved') restoreConfigRecovery(current, at)
           await store.writeRun(issuePath, runId, current)
           await store.appendEvent(issuePath, runId, { type: 'cleanup-acknowledged', by: actor, reason: text, tags: open.map((e) => e.tag) })
         }
@@ -1341,7 +1345,10 @@ export function createSupervisor ({
         const current = await store.readRun(issuePath, runId)
         const open = openCleanup(current)
         let outcome
-        try { outcome = await settle(open) } finally { await store.writeRun(issuePath, runId, current) }
+        try {
+          outcome = await settle(open)
+          if (!outcome.still.length && current.blockedReason === 'cleanup-unproved') restoreConfigRecovery(current, at)
+        } finally { await store.writeRun(issuePath, runId, current) }
         // Barrier entries of tags the record has settled (proved before, or
         // written ahead of a record a crash lost) are lifted too.
         await keepOnBarrier(projectDir, current)
@@ -2236,6 +2243,9 @@ export function createSupervisor ({
 export function workspaceDisposition (run, verdict) {
   if (run.workspace?.isolation === 'in-place') return { discard: false, reason: 'the workspace is the project checkout itself and is never removed' }
   if (openCleanup(run).length) return { discard: false, reason: 'processes a turn started were not proved gone; the workspace is kept until the cleanup is proved or acknowledged' }
+  // A configuration violation not yet acknowledged, or a consult seat not yet
+  // settled: the public recovery action needs the workspace (engine markConfigUnresolved).
+  if (run.configUnresolved?.length || run.recovery?.consultPending) return { discard: false, reason: 'an interrupted guarded turn is still to be settled through recovery; the workspace is kept for it' }
   if (run.delivery?.action === 'apply-to-source' && (!run.delivery.completedAt || run.delivery.application?.verified !== true)) {
     return { discard: false, reason: 'source delivery is not verified; retain the candidate for finalization or manual application' }
   }

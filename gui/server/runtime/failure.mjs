@@ -121,6 +121,8 @@ export function classifyFailure (error, { now = Date.now() } = {}) {
     retryAfterMs,
     ...(maxRetries != null ? { maxRetries } : {}),
     ...(credentials ? { credentials } : {}),
+    // A seat that touched the operator's CLI configuration (config-guard.mjs).
+    ...(error?.integrity ? { integrity: error.integrity } : {}),
     // A refusal's words are the failure; the first line of the error is only `codex exited 1`.
     message: refusal ?? error?.message ?? String(error),
     evidence: text.slice(0, 1000)

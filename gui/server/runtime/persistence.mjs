@@ -47,7 +47,7 @@ export function persistence (io = fs) {
     await use(handle, async h => { await h.writeFile(data); await h.sync() })
     await syncDir(dir)
   }
-  return { writeAtomic, appendDurable }
+  return { writeAtomic, appendDurable, syncDir }
 }
-export const { writeAtomic, appendDurable } = persistence()
+export const { writeAtomic, appendDurable, syncDir } = persistence()
 export const writeJson = (file, value, options) => writeAtomic(file, JSON.stringify(value, null, 2) + '\n', options)

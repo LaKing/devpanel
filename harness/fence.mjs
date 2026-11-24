@@ -8,6 +8,7 @@ import { hostSettings } from '../gui/server/config/host-settings.mjs'
 import { panelDataHit, privateHomeHit } from '../gui/server/runtime/private-paths.mjs'
 import { fencePolicy } from '../gui/server/runtime/confinement-policy.mjs'
 import { hostPlatform } from '../gui/server/runtime/platform.mjs'
+import { missingBind } from './config-guard.mjs'
 
 /*
  * The seat fence (harness/README.md "Seat hygiene",
@@ -50,7 +51,9 @@ export const PANEL_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pat
  */
 export function runlessFence ({ cwd, writable = [] }) {
   if (['off', 'unfenced'].includes(fencePolicy().mode)) return null
-  return { cwd, writable: [...new Set([cwd, ...writable])], readOnly: [], entries: [], panelRoot: PANEL_ROOT }
+  // seat: false — no configuration guard (config-guard.mjs): these turns are
+  // tool-free and runless, and the top-level supervisor keeps today's behaviour.
+  return { cwd, writable: [...new Set([cwd, ...writable])], readOnly: [], entries: [], panelRoot: PANEL_ROOT, seat: false }
 }
 
 /** Where the panel's harness/tooling (offline wrapper, launchers) appears inside the fence. */
@@ -277,6 +280,11 @@ export async function defaultCanaries ({ home = os.homedir(), granted = [], proj
  */
 export function assertFenced (fenced, { turn = 'this turn', mounts = [], platform = hostPlatform() } = {}) {
   if (!fenced || fenced.applied) return
+  // The operator's configuration was prepared (config-guard.mjs) and the
+  // guarded fence then failed: never an unfenced fallback after that.
+  if (fenced.refused) {
+    throw new ProcessError(`${turn} was refused: ${fenced.reason}`, { kind: 'environment-error', started: false })
+  }
   // A declared tooling mount is bound only by the fence: unfenced, its target
   // would be an empty directory the prompt calls read-only (P3-1).
   if (mounts.length) {
@@ -320,9 +328,13 @@ export async function hostReadOnly ({ home = os.homedir(), dirs = hostSettings()
  * that cannot be built or proved comes back `applied: false` with the reason,
  * and the caller runs the turn unfenced and says so (decision 8).
  */
-export async function applyFence ({ spec, manifest = {}, command = null, signal = null, platform = hostPlatform() }) {
+export async function applyFence ({ spec, manifest = {}, guard = null, replay = null, command = null, signal = null, platform = hostPlatform(), prove = proveFence }) {
   if (!spec) return { applied: false, reason: 'no fence requested for this turn', wrap: null }
   if (!platform.bubblewrap) return { applied: false, reason: `${platform.id === 'darwin' ? 'macOS (darwin)' : platform.id} has no seat fence (bubblewrap is Linux-only)`, wrap: null }
+  // Set once the guard may have changed the operator's home: from then on a
+  // failure refuses the turn rather than letting it run unfenced.
+  let prepared = null
+  const refused = (reason) => ({ applied: false, refused: true, reason, wrap: null })
   try {
     const full = {
       cwd: spec.cwd,
@@ -336,18 +348,64 @@ export async function applyFence ({ spec, manifest = {}, command = null, signal 
       toolingBin: spec.toolingBin ?? null,
       masks: spec.masks ?? []
     }
-    const fence = await fenceArgs(full)
+    let fence = await fenceArgs(full)
     const granted = [...full.writable, ...full.readOnly, ...full.homeBinds.map((b) => b.path), ...full.entries, full.cwd]
     const canaries = [...await defaultCanaries({ home: full.home, granted, projectsDir: projectsRoot(), panelRoot: spec.panelRoot ?? null }), ...(spec.canaries ?? [])]
-    const proof = await proveFence({ fence, spec: full, canaries, command, signal })
+    let proof = await prove({ fence, spec: full, canaries, command, signal })
     if (!proof.proved) return { applied: false, reason: `the fence could not be proved: ${proof.reason}`, wrap: null }
+    // The operator's configuration in the CLI home (config-guard.mjs), only
+    // for a seat and only now that the unchanged fence is proved: a turn that
+    // will not run fenced finds the home exactly as it was.
+    let config = null
+    if (guard && spec.seat !== false) {
+      if (signal?.aborted) throw abortError()
+      prepared = {}
+      // `replay` (coordinator-chat's replay of interrupted guarded forks) runs
+      // here: after the unchanged fence is proved, before the home is prepared,
+      // so what an interrupted turn left (a wrong-type entry included) is
+      // quarantined before preparation judges it, and the binds the turn
+      // launches with are built and proved after it, whatever it moved. A replay
+      // that throws may have moved something: the same rebuild and proof cover
+      // it, and without them (an absent home) the turn is refused.
+      let replayError = null
+      if (typeof replay === 'function') {
+        try { await replay() } catch (error) { if (error.name === 'AbortError') throw error; replayError = error }
+        if (signal?.aborted) throw abortError()
+      }
+      try { prepared = await guard.prepare() } catch (error) { return refused(`the operator's CLI configuration could not be prepared: ${error.message}`) }
+      if (replayError && prepared.skipped) return refused(`the recovery of an interrupted guarded turn failed and the fence was not rebuilt after it: ${replayError.message}`)
+      if (signal?.aborted) throw abortError()
+      if (!prepared.skipped) {
+        const guarded = { ...full, readOnly: [...full.readOnly, ...prepared.readOnly], entries: [...full.entries, ...prepared.entries] }
+        const guardedFence = await fenceArgs(guarded)
+        const missing = await missingBind(guardedFence, prepared)
+        if (missing) return refused(`configuration entry ${missing} is not bound read-only in the final fence`)
+        const second = await prove({ fence: guardedFence, spec: guarded, canaries, command, signal })
+        if (!second.proved) {
+          if (signal?.aborted) throw abortError()
+          return refused(`the fence with the configuration bound read-only could not be proved: ${second.reason}`)
+        }
+        Object.assign(full, guarded)
+        fence = guardedFence
+        proof = second
+      }
+      config = prepared
+    }
     return {
-      applied: true, reason: null, proof: proof.checked,
+      applied: true, reason: null, proof: proof.checked, config,
       mounts: { writable: full.writable.length, readOnly: full.readOnly.length, home: full.homeBinds.map((b) => `${b.writable ? 'rw' : 'ro'}:${b.path}`),
         ...(full.mounts.length ? { tooling: full.mounts.map((m) => ({ target: m.target, source: m.source })) } : {}) },
       wrap: (command, args) => fencedCommand({ command, args, fence })
     }
   } catch (error) {
+    if (error.name === 'AbortError') throw error
+    if (prepared) return refused(`the fence could not be built: ${error.message}`)
     return { applied: false, reason: `the fence could not be built: ${error.message}`, wrap: null }
   }
+}
+
+function abortError () {
+  const error = new Error('cancelled')
+  error.name = 'AbortError'
+  return error
 }

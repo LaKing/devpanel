@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 import * as store from './store.mjs'
 import { classifyFailure } from './failure.mjs'
+import { appendDurable } from './persistence.mjs'
 
 /*
  * The operator's conversation with a run's coordinator.
@@ -56,10 +57,9 @@ export async function readChat (issuePath, runId) {
 
 export async function appendChat (issuePath, runId, entry) {
   const file = chatFile(issuePath, runId)
-  await serial(file, async () => {
-    await fs.mkdir(path.dirname(file), { recursive: true })
-    await fs.appendFile(file, JSON.stringify(entry) + NL)
-  })
+  // Durable before anything acknowledges what it records (an integrity
+  // failure, harness/config-guard.mjs resolveConfig).
+  await serial(file, () => appendDurable(file, JSON.stringify(entry) + NL))
   return entry
 }
 
@@ -188,6 +188,25 @@ export async function askCoordinator (engine, { text, actor, harnesses, emit = n
   const fence = fenced ? { cwd, writable: [scratchDir], readOnly: readScope && ws.path ? [ws.path] : [], entries: [], panelRoot } : null
 
   const invocationId = `ask-${crypto.randomUUID()}`
+  const chatLedger = path.join(runDirectory, 'chat-adapters')
+  // An earlier ask was interrupted after its fork touched the operator's CLI
+  // configuration (harness/config-guard.mjs): the failure is recorded on the
+  // question it belonged to, never on this one. Run by the adapter only once
+  // this ask's fence is proved (afterFence): an unfenced ask (namespace 0,
+  // fence off, an unproved fence's fallback) keeps today's behaviour and
+  // touches nothing in the CLI home.
+  // Run by the adapter inside applyFence, after the first proof and before the
+  // home is prepared; the binds the ask launches with are built after it. A
+  // throw is not swallowed: applyFence treats it as possibly having moved files.
+  const replayGuard = typeof adapter.recoverPending !== 'function' ? null : async () => {
+    for (const r of await adapter.recoverPending({ ledgerDir: chatLedger })) {
+      if (!r.integrity?.violations?.length) continue
+      const failed = await appendChat(issuePath, runId, { id: `a-${crypto.randomUUID()}`, kind: 'answer', replyTo: r.context?.questionId ?? null, at: new Date().toISOString(), role, model: spec.model.id ?? null, invocationId: r.invocationId, status: 'failed', text: null,
+        error: `environment: the interrupted fork touched the operator's CLI configuration (${r.integrity.violations.map((v) => `${v.change} ${v.path}`).join('; ')})`, integrity: r.integrity, usage: null, costUsd: null })
+      emit?.({ type: 'chat', entry: failed })
+      await adapter.resolveConfig?.(r.invocationId, { ledgerDir: chatLedger }).catch(() => {})
+    }
+  }
   let seq = 0
   let liveWrite = Promise.resolve()
   const sizes = new Map()
@@ -205,22 +224,23 @@ export async function askCoordinator (engine, { text, actor, harnesses, emit = n
       session, fork: true,
       model: spec.model.wire, effort: spec.effort,
       cwd, scratchDir, supervisorOnly: true, tooling: null,
-      hygiene: snapshot.fence?.hygiene === 1, fence,
+      hygiene: snapshot.fence?.hygiene === 1, fence, afterFence: fence ? replayGuard : null,
       cliHome: path.join(runDirectory, 'cli-homes', readScope ? `${role}-read` : role),
       profile: spec.model.profile, endpointRef: spec.model.endpointRef, credentialRef: spec.model.credentialRef, account: spec.model.account ?? null,
-      ledgerDir: path.join(runDirectory, 'chat-adapters'),
+      ledgerDir: chatLedger,
       prompt: askPrompt({ question, actor: who, run }),
       signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
       observe: { onOutput: (stream, chunk) => forward(stream, chunk) },
-      meta: { invocationId, role: `${role}-ask` }
+      meta: { invocationId, role: `${role}-ask`, runId, questionId: entry.id }
     })
     answer = { status: 'answered', text: String(result.response ?? '').trim(), usage: result.usage ?? null, costUsd: typeof result.usage?.costUsd === 'number' ? result.usage.costUsd : null }
   } catch (error) {
     const failure = classifyFailure(error)
-    answer = { status: 'failed', text: null, error: `${failure.class}: ${failure.message}`.slice(0, 2000), usage: null, costUsd: null }
+    answer = { status: 'failed', text: null, error: `${failure.class}: ${failure.message}`.slice(0, 2000), usage: null, costUsd: null, ...(failure.integrity ? { integrity: failure.integrity } : {}) }
   }
   await liveWrite
   const reply = await appendChat(issuePath, runId, { id: `a-${crypto.randomUUID()}`, kind: 'answer', replyTo: entry.id, at: new Date().toISOString(), role, model: spec.model.id ?? null, effort: spec.effort ?? null, invocationId, forkedFrom: session.id, durationMs: Date.now() - started, ...answer })
   emit?.({ type: 'chat', entry: reply })
+  if (answer.integrity) await adapter.resolveConfig?.(invocationId, { ledgerDir: chatLedger }).catch(() => {})
   return { question: entry, answer: reply }
 }
