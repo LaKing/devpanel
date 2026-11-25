@@ -257,13 +257,13 @@ export default async function (t) {
       const fp = await fingerprint(ws.path, { baseCommit: ws.baseCommit, baseline })
       const slotsDir = await temp('fg-slots-')
       const ssh = (host) => ({ hostRef: `ssh-config:${host}`, workdir: '/tmp' })
-      const drive = async (host = HOST, extra = {}) => runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp,
+      const drive = async (host = HOST, extra = {}, options = {}) => runChecks({ baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, revision: fp.fingerprint, fingerprint: fp,
         runDir: await temp('fg-run-'), clock: f.clock, signal: engine.controller.signal, onDriveWait: (wait) => engine.noteDriveWait(wait),
-        driveGate: engine.gateForDrives(), beforeCycleWait: (token) => engine.releaseHeld('full-verification-wait', { hosts: token?.host ? [token.host] : null }), onRemovalPending: (entry) => engine.keepPendingRemoval(entry),
+        driveGate: engine.gateForDrives(), beforeCycleWait: (token) => engine.releaseHeld('full-verification-wait', { hosts: engine.cycleWaitHosts(token) }), onRemovalPending: (entry) => engine.keepPendingRemoval(entry),
         target: { kind: 'ssh', ssh: { ...ssh(host), workdir: await temp('fg-remote-') }, commands: [{ id: 'run', run: 'true' }], ...extra },
-        driveTiming: { slotsDir, pollMs: 10, retryMs: 10, attemptMs: 5000, windowMs: 30000 } })
+        driveTiming: { slotsDir, pollMs: 10, retryMs: 10, attemptMs: 5000, windowMs: 30000 }, ...options })
       const slots = (host = HOST) => Promise.all([0, 1].map((n) => acquire(path.join(slotDirectory(host, slotsDir), `slot-${n}.lock`), { purpose: 'test' })))
-      return { f, engine, drive, slots, ssh, gates, slotsDir }
+      return { f, engine, drive, slots, ssh, gates, slotsDir, ws }
     }
 
     t.section('G5/G13 AC2/AC5/AC6 a contained run\'s drive on a cycle host waits for the thaw, holds no slot, and the wait does not count against its time')
@@ -431,6 +431,46 @@ export default async function (t) {
       gates.thaw('h1')
       t.eq('and after the thaw it passes', (await second).result, 'passed')
       t.ok('the instance on the other host was kept throughout', holdsInstance(elsewhere))
+      await destroyInstance(elsewhere, { reason: 'test' })
+      await releaseWorkspace(engine)
+    }
+
+    t.section('reconstruction-wait-keeps-smoke-instance: a drive whose reconstruction write waits for the cycle first removes what the run holds on the cycle\'s hosts, confirmed; a removal that fails means no wait')
+    {
+      const { engine, drive, ssh, gates, ws } = await driveSetup()
+      const resolved = await resolveDriveHost(ssh(HOST))
+      // The repository the reconstruction registers its worktree in is one the cycle snapshots: the write waits.
+      const common = (await exec('git', ['-C', ws.path, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim()
+      const flag = path.join(await temp('fg-rflag-'), 'removable')
+      const held = `fg-rheld-${engine.runId.slice(-8)}`
+      await holdInstance({ instance: { name: held, root: await temp('fg-rheld-'), max: 4, destroy: { run: `test -e '${flag}'` } }, host: resolved.host, kind: 'local', runId: engine.runId })
+      const elsewhere = `fg-relsewhere-${engine.runId.slice(-8)}`
+      await holdInstance({ instance: { name: elsewhere, root: await temp('fg-relsewhere-'), max: 4, destroy: { run: 'true' } }, host: 'fg-other-host', kind: 'local', runId: engine.runId })
+      gates.setFreeze({ cycleId: 'w1', projects: ['devpanel-project'], hosts: [{ hostRef: `ssh-config:${HOST}`, host: resolved.host, pinned: resolved.pinned }], snapshotted: { repositories: [common], worktrees: [] } })
+      const writeGate = engine.writeGate('check-reconstruction')
+      // The drive's answer, or that it began waiting for the cycle (what it must not do while its removal fails).
+      const answerOrWait = async (running) => {
+        let done = false
+        const settled = running.finally(() => { done = true })
+        for (;;) {
+          if (done) return settled
+          if (engine.run.cycleWait?.cycleId === 'w1') return { result: 'waited', running: settled }
+          await tick()
+        }
+      }
+      const first = await answerOrWait(drive(HOST, {}, { writeGate }))
+      if (first.running) { gates.thaw('w1'); await first.running }
+      t.eq('the removal failed: unavailable, no retry, nothing waited', [first.result, first.retrySkipped?.reason, (engine.run.cycleWaits ?? []).length], ['unavailable', 'held-instance-not-removed', 0], first.error)
+      t.eq('the failed removal stays on the record', (engine.run.pendingRemovals ?? []).map((e) => [e.kind, e.host]), [['stage-instance', resolved.host]])
+      await fs.writeFile(flag, '')
+      const second = drive(HOST, {}, { writeGate })
+      await until('the reconstruction write to wait for the cycle', () => engine.run.cycleWait?.cycleId === 'w1')
+      t.eq('it waits at the reconstruction write, for this cycle', [engine.run.cycleWait.kind, engine.run.cycleWait.action], ['write', 'check-reconstruction'])
+      t.eq('the removal was retried and confirmed before the wait began: nothing pending, the instance no longer held', [engine.run.pendingRemovals ?? [], holdsInstance(held)], [[], false])
+      t.ok('the instance on a host the cycle does not drive on is kept', holdsInstance(elsewhere))
+      gates.thaw('w1')
+      const result = await second
+      t.eq('after the thaw it passes, the write wait on the record', [result.result, engine.run.cycleWaits.map((w) => [w.kind, w.action, w.outcome])], ['passed', [['write', 'check-reconstruction', 'thawed']]], result.error)
       await destroyInstance(elsewhere, { reason: 'test' })
       await releaseWorkspace(engine)
     }

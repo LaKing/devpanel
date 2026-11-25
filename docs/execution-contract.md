@@ -3735,16 +3735,29 @@ approval of any outstanding finding or automatic resolution of the issue.
 ### Full verification freeze
 
 The full verification (tactical-playbooks.md "Full verification cycles",
-`server/full-verification.mjs`; started after `fullVerification.afterDeliveries` deliveries on
-a stage, on request, or at `fullVerification.at`) closes admission to *writing* runs while it
+`server/full-verification.mjs`) closes admission to *writing* runs while it
 runs, and only for the projects it verifies. A run writes when what it can do to the checkout says so (run-exclusivity.mjs
 `writesCheckout`): its playbook delivers anything (`completion.delivery.action` other than
 `none`), it releases (staging, deployment), or it works in place; a run whose snapshot cannot
 be read is taken to write. Analysis, Triage and inquiries only read: the freeze neither asks,
 refuses nor waits for them, and they may start.
 
-A cycle started by the Full verification playbook (`server/full-verification-run.mjs`, tactical-playbooks.md "Full
-verification cycles") is the same cycle: its record carries `run: {project, issueId, runId}` and `trigger: 'playbook'`.
+**How a cycle starts.** Only as a run of the Full verification playbook (`server/full-verification-run.mjs`,
+tactical-playbooks.md "Full verification cycles"): `startCycle` refuses a start that names no run
+(`FULL_VERIFICATION_NEEDS_RUN`). The entrances each start that run: "Full verification now" (the dashboard's button,
+`POST /api/verification/start`, answering 202 with the `run` it started); the delivery check once
+`fullVerification.afterDeliveries` deliveries no cycle covered happened on one stage; the top-level supervisor's
+`start_verification {previewId}` on a `preview_verification` preview, bound to its configHash; and an issue's start
+dialog. The first three hold the run in the day's cycle home `issues/<project>/.verification-<date>-cycle/` (never an
+issue; read by the run routes, the issue page and the startup reconcile, which settles one whose owner died as
+`cancelled` like any Full verification run). With `afterDeliveries: 0` the engine never starts a cycle on its own: the
+timing is people's and the top-level supervisor's. There is no daily cycle (`fullVerification.at` starts nothing). One
+cycle at a time: an entrance while a cycle or a Full verification run is live is refused `FULL_VERIFICATION_RUNNING`
+before anything is reserved, and the delivery check waits while such a run is being started or previews; after a refused
+start it asks again for that stage host only once more deliveries came (kept in the process).
+
+Every cycle is therefore a playbook run's: its record carries `run: {project, issueId, runId}` and a `trigger` naming the
+entrance (`hand`, `deliveries`, `supervisor`, `playbook`).
 The wrapping run writes no checkout (`writes: false`), so the freeze neither asks it nor waits for it. Its Stop interrupts
 the cycle with `interruption: {reason: 'stopped', label, at, by}`; the bound's interruption keeps `{reason: 'wait-bound',
 label, at, boundMinutes}`. Both then end the same way (settleInterruption, thaw, resume of the scope's pauses). A service
@@ -3802,7 +3815,9 @@ integrate with the canonical Git common directory of the declared source, before
 the temporary worktree); a linked worktree's `commit` before its first object; a checkout path inside an S work tree
 counts as S. A standalone `worktree-diff` of a legacy linked worktree and a check's reconstruction (its patch and registered
 worktree, and their removal) ask the write gate for the repository owning the workspace before writing; a private run's
-engine directory is never in S. Operator operations that wait (finalize, reconcile, integrate, integration recovery, apply-artifact)
+engine directory is never in S. Before a check's reconstruction waits, the run gives up what it holds on the cycle's hosts
+as before a drive's own wait (the claimed smoke instance, its stage instances, every pending removal), removed and confirmed,
+else the drive does not wait and ends `unavailable` (`held-instance-not-removed`). Operator operations that wait (finalize, reconcile, integrate, integration recovery, apply-artifact)
 put the wait on the run's record (`run.cycleWait`, then `run.cycleWaits`), through its engine when it has one, and
 its explanation says so whatever the run's status; the panel offers Finalize, Reconcile and continuations of a
 contained run during a cycle (`admission.whole` on the run read, `admissionFrozen.confined` on the issue read for a

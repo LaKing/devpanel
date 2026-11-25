@@ -33,9 +33,12 @@ import { CHANGE_PATHS, checkoutsOf, committedBeyond, followedViews, forgetRef, M
  * The full verification (docs/tactical-playbooks.md "Full verification cycles",
  * execution-contract.md "Full verification freeze").
  *
- * On request (POST /api/verification/start), once `fullVerification.afterDeliveries`
- * deliveries happened on one stage (verification-trigger.mjs), and at the host settings'
- * `fullVerification.at` in its `timeZone` when given, a cycle:
+ * A cycle starts only as a Full verification playbook run (full-verification-run.mjs): startCycle refuses
+ * without the run it belongs to. The entrances that start that run are POST /api/verification/start (the
+ * dashboard's button), the delivery check below once `fullVerification.afterDeliveries` deliveries happened on
+ * one stage (verification-trigger.mjs; 0 turns it off, and the engine then never starts a cycle on its own),
+ * the top-level supervisor's start_verification and an issue's start dialog. The host settings'
+ * `fullVerification.at` starts nothing any more; its `timeZone` still dates the record. A cycle:
  *   1. decides its scope from one reading of the configuration (readCycleConfig, cycleScope:
  *      the projects with infrastructure.staging and their whole module pools; a listing or
  *      configuration it cannot read refuses the cycle, FULL_VERIFICATION_SCOPE_UNREADABLE,
@@ -124,31 +127,6 @@ export function localDate (ms, timeZone) {
   return `${String(p.year).padStart(4, '0')}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
 }
 
-const offsetAt = (ms, timeZone) => {
-  const p = localParts(ms, timeZone)
-  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000
-}
-
-/** The instant a local date and HH:MM name in the zone: the earlier of an ambiguous time, the shifted one of a skipped time. */
-function zonedInstant (year, month, day, hour, minute, timeZone) {
-  const wall = Date.UTC(year, month - 1, day, hour, minute)
-  const candidates = [...new Set([offsetAt(wall - 12 * HOUR, timeZone), offsetAt(wall + 12 * HOUR, timeZone)])].map((o) => wall - o)
-  const exact = candidates.filter((t) => { const p = localParts(t, timeZone); return p.hour === hour && p.minute === minute && p.day === day })
-  return exact.length ? Math.min(...exact) : Math.max(...candidates)
-}
-
-/** The first instant after `nowMs` at which the zone's clock reads `at`. */
-export function nextTrigger ({ at, timeZone }, nowMs) {
-  const [hour, minute] = at.split(':').map(Number)
-  const today = localParts(nowMs, timeZone)
-  for (let day = 0; day < 3; day++) {
-    const d = new Date(Date.UTC(today.year, today.month - 1, today.day + day))
-    const t = zonedInstant(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), hour, minute, timeZone)
-    if (t > nowMs) return t
-  }
-  throw new Error(`no ${at} in ${timeZone} within three days of ${new Date(nowMs).toISOString()}`)
-}
-
 /**
  * What a project is to the cycle: a stage to release to, a stage verified on a dynamic
  * instance of the cycle's own (`mode: 'instance'`, its staging declares
@@ -213,7 +191,7 @@ export async function readCycleConfig ({ root, projectsDir = projectsRoot(), dis
 const targetMissing = (infra) => releasePlan({ tactic: 'deployment', infrastructure: infra, runOptions: { environment: 'staging' } }).blockers.some((b) => b.reason === TARGET_MISSING)
 
 /** The refusal of a cycle whose scope cannot be decided: nothing is frozen, nothing recorded. */
-const scopeUnreadable = (unreadable) => Object.assign(new Error(`the full verification cannot decide which projects it verifies, so it does not start: ${unreadable.map((u) => u.message ?? `${u.path} could not be read (${u.code ?? 'error'})`).join('; ')}`), { status: 503, code: 'FULL_VERIFICATION_SCOPE_UNREADABLE', unreadable })
+export const scopeUnreadable = (unreadable) => Object.assign(new Error(`the full verification cannot decide which projects it verifies, so it does not start: ${unreadable.map((u) => u.message ?? `${u.path} could not be read (${u.code ?? 'error'})`).join('; ')}`), { status: 503, code: 'FULL_VERIFICATION_SCOPE_UNREADABLE', unreadable })
 
 /**
  * The staging hosts that have dynamic instances, each with the projects that declare them: no cycle releases there.
@@ -735,15 +713,17 @@ export function createFullVerification ({
     : () => readCycleConfig({ root: configRoot, projectsDir: projectsDir ?? projectsRoot(), discovery: discovery === undefined ? projectDiscovery() : discovery, env }))
   // The inputs of the cycle running now (one at a time): its stages and its checkpoint chain read them, never a later reading.
   let activeInputs = null
-  let cancel = null
   let cancelDeliveries = null
+  // The entrance that starts the Full verification run (setEntrance), the delivery check's refused hosts
+  // ({host -> count}) and the runs it started ({runId -> {host, count}}).
+  let entrance = null
+  const refusedAt = new Map()
+  const entranceRuns = new Map()
   let deliveryCheckRunning = null
   let lastDeliveryCheck = null
   let current = null
   let running = null
   let stopped = false
-  // Per project, how its entry's snapshot was taken (checkout, policy, where): the recheck before the chain takes it again.
-  const snapshotInputs = new Map()
   // The cycle running now: each stage host's pinned connection (by hostRef), and its interruption.
   let pinnedHosts = new Map()
   // Each cycle's own cancellation, interruption and pinned hosts (controlOf), bound to its record: a task of an earlier
@@ -754,6 +734,10 @@ export function createFullVerification ({
   const controlOf = (record) => controls.get(record) ?? { abort: null, interrupted: NEVER, notify: null, tasks: new Map(), pinned: new Map() }
   const signalOf = (record) => controlOf(record).abort?.signal ?? null
   const pinOf = (record, hostRef) => controlOf(record).pinned.get(hostRef) ?? null
+  // Per project, how this cycle's entry snapshot was taken (checkout, policy, where): the recheck before the chain takes it
+  // again. The cycle's own (cross-cycle-checkpoint-input): a stage of an earlier cycle that sets its input after the bound
+  // writes into its own cycle's map, never into the one a later cycle's recheck reads.
+  const snapshotInputsOf = (record) => controls.get(record)?.snapshotInputs ?? null
   /** An await the frozen cycle races against its interruption only (no bound of its own: what it waits for is bounded elsewhere). */
   const orInterrupted = (record, promise) => Promise.race([promise, controlOf(record).interrupted])
   const maxWait = () => maxWaitMs ?? (hostSettings().verificationTrigger?.maxWaitMinutes ?? 240) * 60_000
@@ -896,43 +880,10 @@ export function createFullVerification ({
     return null
   }
 
-  /** Whether a scheduled cycle already ran for this local date (once per date). */
-  async function scheduledOn (date) {
-    const names = await fs.readdir(path.join(verificationDir, date)).catch(() => [])
-    for (const n of names.filter((x) => /^cycle(\.\d+)?\.json$/.test(x))) {
-      const record = await fs.readFile(path.join(verificationDir, date, n), 'utf8').then(JSON.parse, () => null)
-      if (record?.trigger === 'schedule') return true
-    }
-    return false
-  }
-
-  // ------------------------------------------------------------ the schedule
+  // ------------------------------------------------------------ the settings
 
   function readSettings () {
     try { return settings() } catch (error) { log.warn?.(`[devpanel] full verification: the host settings could not be read: ${error.message}`); return null }
-  }
-
-  /** Arm the next wake: the trigger when it is within the hour, else an hour from now to read the settings again. */
-  function arm () {
-    cancel?.()
-    cancel = null
-    if (stopped) return
-    const s = readSettings()
-    if (!s) { cancel = clock.after(HOUR, arm); return }
-    const next = nextTrigger(s, clock.now())
-    const delay = next - clock.now()
-    cancel = delay <= HOUR ? clock.after(delay, () => fire(s, next)) : clock.after(HOUR, arm)
-  }
-
-  async function fire (armed, at) {
-    const s = readSettings()
-    // Edited since it was armed: the next wake follows the new block, or none.
-    if (!s || s.at !== armed.at || s.timeZone !== armed.timeZone) return arm()
-    arm()
-    const date = localDate(at, s.timeZone)
-    if (await scheduledOn(date)) return
-    await startCycle({ trigger: 'schedule', by: 'schedule', scheduledFor: new Date(at).toISOString() })
-      .catch((error) => log.warn?.(`[devpanel] the scheduled full verification did not start: ${error.message}`))
   }
 
   // ----------------------------------------------------- the delivery trigger
@@ -972,12 +923,27 @@ export function createFullVerification ({
     if (deliveryCheckRunning) return deliveryCheckRunning
     deliveryCheckRunning = (async () => {
       const threshold = afterDeliveries()
-      if (!threshold || running || supervisor.frozen?.()) return lastDeliveryCheck
+      // 0: the engine never starts a cycle on its own; the timing is people's and the top-level supervisor's.
+      // A Full verification run being started or driven (still previewing, before its cycle runs) is waited for.
+      if (!threshold || running || supervisor.frozen?.() || entrance?.busy?.()) return lastDeliveryCheck
       const counts = await deliveryCounts({ stages: await countableStages(), deliveriesOf, records: await cycleRecords(verificationDir), threshold })
       lastDeliveryCheck = { at: clock.iso(), threshold, stages: counts.map(({ runs, ...c }) => ({ ...c, runs: runs.map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, at: r.at })) })) }
-      const due = counts.find((c) => c.due)
-      if (due && !running) {
-        await startCycle({ trigger: 'deliveries', by: 'deliveries', deliveries: { host: due.host, stage: due.stage, count: due.count, threshold, runs: due.runs.map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, at: r.at })) } })
+      // A host whose last start was refused is asked again only once its count grew. Kept in this process only:
+      // a restart forgets it and allows one more attempt.
+      const due = counts.find((c) => c.due && !(refusedAt.has(c.host) && refusedAt.get(c.host) >= c.count))
+      if (!due || running) return lastDeliveryCheck
+      // The cycle starts only as a Full verification playbook run (full-verification-run.mjs startEntrance).
+      if (!entrance?.start) { log.warn?.('[devpanel] the full verification is due, but no entrance to start its run is set; nothing started'); return lastDeliveryCheck }
+      const deliveries = { host: due.host, stage: due.stage, count: due.count, threshold, runs: due.runs.map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, at: r.at })) }
+      try {
+        const started = await entrance.start({ trigger: 'deliveries', by: 'deliveries', deliveries })
+        refusedAt.delete(due.host)
+        if (started?.run) entranceRuns.set(started.run.runId, { host: due.host, count: due.count })
+      } catch (error) {
+        // Already running, or the holder already has a live run: nothing to remember, the next poll looks again.
+        if (error.code === 'FULL_VERIFICATION_RUNNING' || (error.status === 409 && error.retryable)) { log.info?.(`[devpanel] the full verification is due on ${due.host} and already starting or running: ${error.message}`); return lastDeliveryCheck }
+        refusedAt.set(due.host, due.count)
+        log.warn?.(`[devpanel] the full verification due on ${due.host} was not started: ${error.message}`)
       }
       return lastDeliveryCheck
     })().catch((error) => { log.warn?.(`[devpanel] the full verification's delivery check failed: ${error.message}`); return null })
@@ -996,7 +962,9 @@ export function createFullVerification ({
   // --------------------------------------------------------------- the cycle
 
   /** Start a cycle and return a copy of its record as frozen; the cycle goes on in the background. */
-  async function startCycle ({ trigger, by = null, scheduledFor = null, deliveries = null, run = null, signal = null }) {
+  async function startCycle ({ trigger, by = null, deliveries = null, run = null, signal = null }) {
+    // Every cycle is a Full verification playbook run's: no code path starts one without its run.
+    if (!run?.runId) throw Object.assign(new Error('a full verification cycle starts only as a Full verification playbook run'), { status: 409, code: 'FULL_VERIFICATION_NEEDS_RUN' })
     if (running) throw Object.assign(new Error(`a full verification cycle is already running (${current.id})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: current.id })
     // The scope, decided before anything is frozen or recorded: inputs that cannot be read refuse the cycle.
     let inputs
@@ -1007,16 +975,16 @@ export function createFullVerification ({
     const timeZone = s?.timeZone ?? 'UTC'
     const date = localDate(clock.now(), timeZone)
     const record = {
-      id: null, date, trigger, by, scheduledFor, ...(deliveries ? { deliveries } : {}), schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
-      // The run that wraps this cycle (a Full verification playbook start, full-verification-run.mjs), when there is one.
-      ...(run ? { run: { project: run.project, issueId: run.issueId, runId: run.runId } } : {}),
+      id: null, date, trigger, by, ...(deliveries ? { deliveries } : {}), timeZone,
+      // The run that wraps this cycle (a Full verification playbook run, full-verification-run.mjs).
+      run: { project: run.project, issueId: run.issueId, runId: run.runId },
       state: 'frozen', verdict: null, frozenAt: clock.iso(), seatsIdleAt: null, startedAt: null, endedAt: null,
       scope: { projects: cycleScope(inputs), decidedAt: clock.iso() },
       asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], leftPaused: [], refused: [], outcome: null, error: null
     }
     running = true
     current = record
-    const control = { abort: new AbortController(), interrupted: null, notify: null, tasks: new Map(), pinned: null }
+    const control = { abort: new AbortController(), interrupted: null, notify: null, tasks: new Map(), pinned: null, snapshotInputs: new Map() }
     control.interrupted = new Promise((resolve, reject) => { control.notify = () => reject(new CycleInterrupted(record.interruption?.reason === 'stopped' ? 'the full verification was stopped' : 'the full verification reached its wait bound')) })
     control.interrupted.catch(() => {})
     controls.set(record, control)
@@ -1113,7 +1081,6 @@ export function createFullVerification ({
   }
 
   async function cycle (record, inputs) {
-    snapshotInputs.clear()
     try {
       // No write into a checkout it snapshots in flight, and no drive in flight on a host it drives on: a seat turn of a
       // contained run is not waited for (cycle-gates.mjs). Bounded from the freeze (note 001).
@@ -1450,7 +1417,7 @@ export function createFullVerification ({
       noteMotion(entry, before, after)
       await noteSnapshotState(entry, after)
       Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: await snapshotOf({ workspace, policy, projectDir }), snapshotAt: clock.iso(), state: 'running' })
-      snapshotInputs.set(entry.project, { projectDir, policy, root: home, runId: driveId })
+      snapshotInputsOf(record)?.set(entry.project, { projectDir, policy, root: home, runId: driveId })
       await write(record)
       const records = await cycleRecords(verificationDir)
       const counting = (await deliveryCounts({ stages: [{ host: entry.host, stage: entry.stage, projects: [entry.project] }], deliveriesOf, records, threshold: 0 }).catch(() => [{ runs: null }]))[0].runs
@@ -1618,7 +1585,7 @@ export function createFullVerification ({
       await noteSnapshotState(entry, after ?? { error: before.error ?? 'the run recorded no workspace, so there is no reading after its snapshot' })
       if (run.workspace?.baseCommit && projectDir) {
         entry.snapshot = await snapshotOf({ workspace: run.workspace, policy, projectDir })
-        snapshotInputs.set(entry.project, { projectDir, policy, root: path.join(verificationDir, record.date, record.id, entry.project), runId: driveIdOf(record.id, entry.project) })
+        snapshotInputsOf(record)?.set(entry.project, { projectDir, policy, root: path.join(verificationDir, record.date, record.id, entry.project), runId: driveIdOf(record.id, entry.project) })
       }
       const check = run.fullVerification?.check ?? null
       // The failures each failed command's own output names (the parser the baseline comparison uses),
@@ -1814,10 +1781,12 @@ export function createFullVerification ({
    * that cannot be made counts as moved (failed). An entry that took no snapshot has nothing to compare (no-snapshot).
    */
   async function recheck (record, entry) {
-    const input = snapshotInputs.get(entry.project)
+    const input = snapshotInputsOf(record)?.get(entry.project)
     const at = clock.iso()
     if (!entry.snapshot?.baseCommit) { entry.recheck = { at, state: 'no-snapshot', reason: 'the entry recorded no snapshot of its own; its commits are still compared with every tested view' }; return }
     if (!input) { entry.recheck = { at, state: 'failed', error: 'how the snapshot was taken is not known in this process' }; return }
+    // Only this cycle's own cut of this entry is taken again (cross-cycle-checkpoint-input): anything else counts as moved.
+    if (input.runId !== driveIdOf(record.id, entry.project)) { entry.recheck = { at, state: 'failed', error: `the snapshot input is not the one this cycle took for this entry (${input.runId})` }; return }
     const checkouts = await Promise.all(checkoutsOf(input.projectDir, entry.snapshot).map((c) => fs.realpath(c).catch(() => c)))
     let workspace = null
     const runId = `${input.runId}-recheck`
@@ -2009,19 +1978,36 @@ export function createFullVerification ({
   }
 
   return {
-    /** Arm the schedule and the delivery trigger. Absent `fullVerification.at`: the timer only reads the settings again hourly. */
-    start () { stopped = false; arm(); armDeliveries() },
-    stop () { stopped = true; cancel?.(); cancel = null; cancelDeliveries?.(); cancelDeliveries = null },
-    /** "Full verification now": the same freeze, stages and record as the other triggers. */
-    startNow: ({ by = 'operator' } = {}) => startCycle({ trigger: 'hand', by }),
+    /** Arm the delivery trigger. `fullVerification.at` starts nothing any more: said once when it is set. */
+    start () {
+      stopped = false
+      if (readSettings()?.at) log.warn?.('[devpanel] the host settings name fullVerification.at: a cycle no longer starts at a daily time; it starts after afterDeliveries deliveries, by hand or by the top-level supervisor')
+      armDeliveries()
+    },
+    stop () { stopped = true; cancelDeliveries?.(); cancelDeliveries = null },
     /**
-     * A Full verification playbook run (full-verification-run.mjs): the same cycle, its record naming the run, and
-     * interrupted as a stopped cycle when `signal` aborts. `done` settles with the cycle's record once it ended.
+     * What starts the Full verification playbook run when the delivery count is reached (full-verification-run.mjs
+     * startEntrance), and whether such a run is being started or driven now (`busy`).
      */
-    async startForRun ({ by = 'operator', run, signal = null }) {
-      const cycle = await startCycle({ trigger: 'playbook', by, run, signal })
+    setEntrance (e) { entrance = e },
+    /**
+     * The only start of a cycle: a Full verification playbook run's (full-verification-run.mjs), the record naming the
+     * run and its entrance (`trigger`: hand, deliveries, supervisor, playbook), interrupted as a stopped cycle when
+     * `signal` aborts. `done` settles with the cycle's record once it ended.
+     */
+    async startForRun ({ by = 'operator', trigger = 'playbook', deliveries = null, run, signal = null }) {
+      const cycle = await startCycle({ trigger, by, deliveries, run, signal })
       const record = current?.id === cycle.id ? current : null
       return { cycle, done: Promise.resolve(running).then(() => record ?? cycle) }
+    },
+    /**
+     * A Full verification run an entrance started ended (full-verification-run.mjs): one the delivery check started that
+     * the cycle refused makes its host wait for more deliveries (refusedAt), so a refusal never repeats each poll.
+     */
+    noteEntranceRunEnded ({ runId, refused = false }) {
+      const started = entranceRuns.get(runId)
+      entranceRuns.delete(runId)
+      if (started && refused) refusedAt.set(started.host, started.count)
     },
     /** The projects a cycle started now would verify, from the same reading a start decides from (cycleInputs, cycleScope). */
     async scope () {
@@ -2087,10 +2073,10 @@ export function createFullVerification ({
       return resumed
     },
     async latest () {
-      const s = readSettings()
       const cycle = running ? current : await latestRecord({ strict: true })
       return {
-        schedule: s ? { at: s.at, timeZone: s.timeZone, next: new Date(nextTrigger(s, clock.now())).toISOString() } : null,
+        // Deliveries per stage after which the engine starts a cycle itself; 0: never (people and the supervisor decide).
+        afterDeliveries: afterDeliveries(),
         active: Boolean(running),
         frozen: supervisor.frozen?.() ?? null,
         deliveries: lastDeliveryCheck,

@@ -326,6 +326,66 @@ export default async function (t) {
       await done(again)
     }
 
+    // A contained run (cycle-gates.mjs) as the supervisor admits it during a cycle, and the cycle's snapshot of its source.
+    const cycleOf = async (f, engine) => {
+      const gates = createCycleGates()
+      engine.cycleGate = gates.gateFor({ project: 'devpanel-project', runId: engine.runId, writes: true, whole: false })
+      const common = await fs.realpath((await git(f.projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir')).trim())
+      const snapshotted = { repositories: [...new Set([common, ...engine.sourceRepositories()])], worktrees: [] }
+      return { gates, freeze: (cycleId) => gates.setFreeze({ cycleId, projects: ['devpanel-project'], snapshotted }) }
+    }
+    const waitFor = async (label, check) => { for (let i = 0; i < 2000; i++) { if (await check()) return; await new Promise((resolve) => setTimeout(resolve, 10)) } throw new Error(`timed out waiting for ${label}`) }
+
+    t.section('continuation-crosses-thaw: a contained run\'s finalize admitted during a cycle waits at its protected writes, waits again for a cycle frozen in the thaw\'s own tick, then goes on by itself')
+    {
+      const s = await scenario({ policy: null, author: resolve() })
+      t.eq('blocked at delivery, nothing returned', [`${s.engine.run.status} ${s.engine.run.blockedReason}`, s.engine.run.deliveryReturns ?? null], ['blocked source-delivery-blocked', null])
+      const again = await s.reopen()
+      again.reconcilePolicy = () => ({})
+      const { gates, freeze } = await cycleOf(s.f, again)
+      const base = again.run.workspace.baseCommit
+      freeze('c1')
+      let answered = false
+      const finalizing = again.finalize({ mayReturnDelivery: true }).finally(() => { answered = true })
+      await waitFor('the finalize to wait for c1', () => again.run.cycleWait?.cycleId === 'c1' || answered)
+      t.eq('it waits for c1 before writing the source: base unmoved, source untouched, nothing returned', [again.run.cycleWait?.kind, answered, again.run.workspace.baseCommit === base, await source(s.f), again.run.deliveryReturns?.length ?? 0], ['write', false, true, SOURCE, 0])
+      // The thaw and the next cycle's freeze in one synchronous block: the waiter asks again only after both.
+      gates.thaw('c1')
+      freeze('c2')
+      await waitFor('the finalize to wait for c2', () => again.run.cycleWait?.cycleId === 'c2' || answered)
+      t.eq('it waits again, for c2, still having written nothing', [again.run.cycleWait?.cycleId, answered, again.run.workspace.baseCommit === base, await source(s.f)], ['c2', false, true, SOURCE])
+      gates.thaw('c2')
+      t.eq('after the thaw it goes on with no further call: the delivery return is made', await finalizing, 'returned')
+      t.eq('both waits are on the record, each ended by its own thaw', (again.run.cycleWaits ?? []).map((w) => [w.kind, w.cycleId, w.outcome]), [['write', 'c1', 'thawed'], ['write', 'c2', 'thawed']])
+      await again.drive()
+      t.eq('driven on, the reconciled revision is delivered', [`${again.run.status} ${again.run.outcome}`, await source(s.f)], ['completed resolved', RECONCILED], `${again.run.blockedReason} ${again.run.delivery?.error}`)
+      await done(again)
+    }
+
+    t.section('reconcile-refusal: a contained run\'s reconcile during a cycle writes nothing (no merge ref, no source change, no attempt) until the thaw, then merges, revalidates and delivers by itself')
+    {
+      // A whole run's reconcile is refused (operator) or deferred to the thaw (automatic) before it reads or writes anything,
+      // as documented: full-verification-instance.test.mjs section 7 asserts that nothing is delivered while it is frozen.
+      const s = await scenario({ policy: null, author: resolve() })
+      const again = await s.reopen()
+      again.reconcilePolicy = () => ({})
+      // The conflicting line is put back: what is left is drift on the patch's own path that merges cleanly.
+      await fs.writeFile(path.join(s.f.projectPath, 'server.mjs'), lines(10, { 1: 'line 1 elsewhere' }))
+      const { gates, freeze } = await cycleOf(s.f, again)
+      freeze('k1')
+      let answered = false
+      const reconciling = again.reconcileDelivery({ policy: {}, actor: 'tester' }).finally(() => { answered = true })
+      await waitFor('the reconcile to wait for k1', () => again.run.cycleWait?.cycleId === 'k1' || answered)
+      const refs = async () => (await git(s.f.projectPath, 'for-each-ref', '--format=%(refname)', 'refs/devpanel/reconciled')).trim()
+      t.eq('it waits for the cycle before any write: no attempt recorded, no merge ref, the source as it was', [again.run.cycleWait?.action, answered, again.run.reconciliations?.length ?? 0, await refs(), await source(s.f)], ['reconcile', false, 0, '', lines(10, { 1: 'line 1 elsewhere' })])
+      gates.thaw('k1')
+      await reconciling
+      t.eq('after the thaw it merged and was accepted', again.run.reconciliations?.at(-1)?.state, 'accepted', JSON.stringify(again.run.reconciliations?.at(-1)?.error ?? null))
+      t.eq('and delivered the merge to the source', [again.run.status, await source(s.f)], ['completed', lines(10, { 1: 'line 1 elsewhere', 5: 'line 5 by the candidate', 9: 'line 9 fixed' })], `${again.run.blockedReason} ${again.run.delivery?.error}`)
+      t.eq('the wait is on the record, ended by the thaw', (again.run.cycleWaits ?? []).map((w) => [w.kind, w.action, w.cycleId, w.outcome]), [['write', 'reconcile', 'k1', 'thawed']])
+      await done(again)
+    }
+
     t.section('9. an earlier round that only a failed check had kept from passing does not end the loop after a return')
     {
       // Round 0 is approved by the reviewer while its check fails (a marker line in the file); round 1 fixes it and is

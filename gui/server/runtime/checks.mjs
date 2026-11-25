@@ -135,6 +135,13 @@ export async function runChecks ({
     result.continuation = { continued: false, reason: 'full-verification-wait', detail: 'the kept smoke instance was removed before the drive waited for the full verification' }
     return true
   }
+  // Before any wait for the full verification (a drive's, or its reconstruction's write) the drive gives up a kept smoke
+  // instance it was to continue, then everything else the run holds on staging (beforeCycleWait): removed and confirmed,
+  // else it does not wait (AC6). It then runs from scratch after the thaw.
+  const releaseHeld = (driveGate || beforeCycleWait) ? async (token) => {
+    if (!(await dropContinued())) return false
+    return beforeCycleWait ? beforeCycleWait(token) : true
+  } : null
   const ownerRepository = async () => {
     const out = await runProcess({ command: 'git', args: [...repositoryGitArgs(workspacePath, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'] }).catch(() => null)
     return String(out?.stdout ?? '').trim() || (gitDir ?? workspacePath)
@@ -155,8 +162,10 @@ export async function runChecks ({
     else {
       // Asked before the first shared Git write and given back once the reconstruction is registered: a drive never holds a
       // write ticket while it waits for a slot or the cycle (the drive gate would take it for a drained write). Before it
-      // may wait, the smoke instance this drive claimed to continue is removed and confirmed (AC6), else it does not wait.
-      const ticket = writeGate ? await writeGate([await ownerRepository()], { beforeWait: () => dropContinued() }) : null
+      // may wait, everything the run holds on staging goes, as before a drive's own wait (reconstruction-wait-keeps-smoke-instance):
+      // the smoke instance this drive claimed to continue, the run's stage instances and every removal still pending,
+      // each removed and confirmed (AC6), else it does not wait.
+      const ticket = writeGate ? await writeGate([await ownerRepository()], { beforeWait: (token) => releaseHeld ? releaseHeld(token) : dropContinued() }) : null
       try {
         if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
         else {
@@ -195,12 +204,6 @@ export async function runChecks ({
 
     // 2. Commands, in the isolated candidate, or on the target host.
     // A tier on a stage instance (instance-drive.mjs) runs between taking the instance and settling what the drive left of it.
-    // Before any wait for the full verification the drive gives up a kept smoke instance it was to continue: removed
-    // and confirmed, else it does not wait (AC6). It then runs from scratch after the thaw.
-    const releaseHeld = (driveGate || beforeCycleWait) ? async (token) => {
-      if (!(await dropContinued())) return false
-      return beforeCycleWait ? beforeCycleWait(token) : true
-    } : null
     const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming, entries: changedEntries, gate: driveGate, beforeCycleWait: releaseHeld }
     if (target.kind === 'local') {
       await withStageInstance({ ...instanced, host: LOCAL_HOST }, (driven) => runCommandsLocally({ target: driven, cwd: rebuilt, dir, result, clock, signal, platform, runId, onDriveWait }))

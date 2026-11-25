@@ -9,6 +9,7 @@ import { classifyAll, readDrives } from '../server/runtime/selftest-history.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { instanceName } from '../server/runtime/instance-drive.mjs'
 import { modulesErrors } from '../server/infrastructure.mjs'
+import { startCycleByHand } from './helpers.mjs'
 
 // The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
 const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
@@ -122,7 +123,7 @@ export default async function (t) {
   const cycle = async (s, at = clock()) => {
     const verificationDir = path.join(s.options.issues.ISSUES_DIR, '.verification')
     const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock: at, verificationDir })
-    const started = await fv.startNow({ by: 'tester' })
+    const started = await startCycleByHand(fv, { by: 'tester' })
     await fv.settle()
     return { fv, verificationDir, record: await readJson(path.join(verificationDir, started.date, 'cycle.json')) }
   }
@@ -328,7 +329,7 @@ export default async function (t) {
       const s = seams({ issuesDir, infra: { 'app-project': instanceInfra({ rerun: named }) }, suite: () => suiteFails(['b: breaks', 'c: wobbles']), rerun: (target) => { at.advance(5_001); return answers(target) } })
       const verificationDir = path.join(issuesDir, '.verification')
       const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock: at, verificationDir, maxWaitMs: 5_000, graceMs: 30_000 })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       const file = path.join(verificationDir, started.date, 'cycle.json')
       let record = null
       // Nothing on the clock moves until the first rerun drive passes the bound itself; then the grace runs out on the clock.

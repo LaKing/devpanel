@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 
 import { CHANGES_MS, changeList, changesSection, createFullVerification, cycleChanges, redIssueReport } from '../server/full-verification.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
+import { startCycleByHand } from './helpers.mjs'
 
 export const name = 'full verification — what changed since the last verification: range, attribution by content, the list, the red issue, information only'
 
@@ -224,7 +225,7 @@ export default async function (t) {
           projectPathOf: async () => { throw new Error('no checkout in this fixture') },
           changesOf
         })
-        const started = await fv.startNow({ by: 'tester' })
+        const started = await startCycleByHand(fv, { by: 'tester' })
         await fv.settle()
         const record = JSON.parse(await fs.readFile(path.join(verificationDir, started.date, 'cycle.json'), 'utf8'))
         return { record, calls, clock, latest: await fv.latest() }

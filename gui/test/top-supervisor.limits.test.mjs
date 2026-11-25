@@ -141,4 +141,54 @@ export default async function (t) {
       await fs.rm(dir3, { recursive: true, force: true })
     }
   }
+
+  t.section('AC6: start_verification starts a cycle only from a preview_verification preview; every other reader of a preview refuses that kind')
+  {
+    const dir4 = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-supervisor-limits-'))
+    const seen = []
+    let at = 0, starts = 0
+    const entrances = []
+    const steps = [
+      { type: 'start_verification', previewId: 'none' },
+      { type: 'preview_verification' },
+      (e) => ({ type: 'start_run', project: 'p', issueId: 'a', previewId: e.result?.previewId ?? 'none' }),
+      (e, all) => ({ type: 'ask_release_authorization', previewId: all.find((x) => x.result?.kind === 'engine-only')?.result?.previewId ?? 'none' }),
+      { type: 'preview', project: 'p', issueId: 'a', playbook: 'x' },
+      (e) => ({ type: 'start_verification', previewId: e.result?.previewId ?? 'none' }),
+      (e, all) => ({ type: 'start_verification', previewId: all.find((x) => x.result?.kind === 'engine-only')?.result?.previewId ?? 'none' }),
+      (e, all) => ({ type: 'start_verification', previewId: all.find((x) => x.result?.kind === 'engine-only')?.result?.previewId ?? 'none' })
+    ]
+    const invoke = async (a) => {
+      const event = JSON.parse(a.prompt).event
+      seen.push(event)
+      const next = event.type === 'user' || event.result !== undefined || event.error !== undefined ? steps[at++] : null
+      const action = typeof next === 'function' ? next(event, seen.filter((x) => x.type === 'tool-result')) : next ?? null
+      return { session: a.session ?? { id: 's' }, response: JSON.stringify({ message: 'ok', action }), usage: { costUsd: 0 } }
+    }
+    const withVerification = { ...tools,
+      start: async () => { starts++; return { runId: 'r1', status: 'running' } },
+      previewVerification: async () => ({ ok: true, kind: 'engine-only', configHash: 'fv-hash', liveEligible: true, cycle: { scope: ['p'], wouldPause: [] } }),
+      startVerification: async (a) => { entrances.push(a); return { run: { project: 'p', issueId: 'verification-2026-11-25-cycle', runId: 'fv-run' }, status: 'running' } } }
+    const agent4 = await createTopSupervisor({ dir: dir4, models, adapter: { invoke }, tools: withVerification, pollMs: 20 })
+    try {
+      await agent4.start({ model: 'test-model', projects: ['p'], message: 'go', limits: { maxCalls: 50, maxRuns: 5, maxConcurrent: 1, maxStartsPerIssue: 2 } })
+      await wait(() => at >= steps.length && seen.filter((e) => e.type === 'tool-result').length >= steps.length && agent4.get().status === 'active')
+      const results = seen.filter((e) => e.type === 'tool-result')
+      const text = (r) => JSON.stringify(r ?? {})
+      t.ok('a start naming no preview is refused', /A Full verification preview is required/.test(text(results[0])), text(results[0]))
+      t.eq('preview_verification gives a previewId with the cycle reading', [typeof results[1]?.result?.previewId, results[1]?.result?.cycle?.scope], ['string', ['p']])
+      t.ok('start_run refuses a Full verification preview', /start_verification starts it/.test(text(results[2])), text(results[2]))
+      t.ok('ask_release_authorization refuses it too', /needs no release authorization/.test(text(results[3])), text(results[3]))
+      t.ok('an issue preview is not a Full verification preview', /A Full verification preview is required/.test(text(results[5])), text(results[5]))
+      t.eq('the Full verification preview starts the run, bound to its configHash, by the supervisor', [results[6]?.result?.run?.runId, entrances.length, entrances[0]?.expectConfigHash, /^top-level supervisor/.test(entrances[0]?.by ?? '')], ['fv-run', 1, 'fv-hash', true])
+      t.ok('the preview is used once', /A Full verification preview is required/.test(text(results[7])), text(results[7]))
+      const state = agent4.get()
+      t.eq('outside the start gate: no start counted, no launch, no issue start; the start is recorded for accounting', [state.starts, state.launches?.length ?? 0, starts, (state.verificationStarts ?? []).map((v) => v.runId)], [0, 0, 0, ['fv-run']])
+      const ledger = (await fs.readFile(path.join(dir4, 'ledger.jsonl'), 'utf8').catch(() => '')).split('\n').filter((l) => l.includes('run-start'))
+      t.eq('and nothing reserved on the ledger', ledger, [])
+      await agent4.stop()
+    } finally {
+      await fs.rm(dir4, { recursive: true, force: true })
+    }
+  }
 }

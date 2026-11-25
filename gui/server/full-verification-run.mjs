@@ -5,7 +5,7 @@ import { systemClock } from './runtime/clock.mjs'
 import * as store from './runtime/store.mjs'
 import { LockHeld, acquire } from './runtime/lock.mjs'
 import { SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
-import { CHANGES_MS, changeList, cycleChanges } from './full-verification.mjs'
+import { CHANGES_MS, changeList, cycleChanges, scopeUnreadable } from './full-verification.mjs'
 import { cycleRecords } from './runtime/full-verification-drive.mjs'
 import { CHANGE_PATHS, readCheckouts, readGit } from './runtime/full-verification-snapshot.mjs'
 import { resolveProjectPath } from './project-path.mjs'
@@ -17,6 +17,11 @@ import { resolveProjectPath } from './project-path.mjs'
  * (`record.run`), and the run mirrors the record into `run.cycleRun` (status, a timeline of the playbook's phases,
  * what each phase holds) on every write of the record (`verification:changed`).
  *
+ * - Entrances: every cycle is this playbook's run. POST /api/verification/start (the dashboard's button), the delivery
+ *   check at fullVerification.afterDeliveries and the top-level supervisor's start_verification call startEntrance(),
+ *   which holds the run in the day's cycle home (issues.js ensureCycleHome) of the first project of the cycle's scope
+ *   (else of the first project); an issue's start dialog starts it on that issue. The cycle's `trigger` names the
+ *   entrance (hand, deliveries, supervisor; playbook for the start dialog).
  * - Start: supervisor.start reserves the run (one live run per issue, its run lock) and hands it to drive().
  *   Before the cycle freezes, drive() records the preview on the first phase: the change list read now (part 1's
  *   list, full-verification.mjs cycleChanges/changeList) and the live runs the freeze would pause.
@@ -24,6 +29,8 @@ import { resolveProjectPath } from './project-path.mjs'
  *   the cycle ends as an interrupted cycle ends (settleInterruption, thaw, resume, instances destroyed by their drives).
  *   A service shutdown is not a Stop: the cycle is left to recover() at the next start, as before, and the run record
  *   is left `stopping` (never cancelled with stoppedBy service-shutdown, which resumeInterrupted would resume).
+ * - A runner failure after the start: the cycle is interrupted with the run (stopped by `engine`), and the run stays live,
+ *   reachable by Stop, until the cycle settled; only then does it read failed.
  * - Recovery: supervisor.reconcile settles a live run with a dead owner as cancelled (markUnownedHeld); after the
  *   cycle's own recover(), recover() here mirrors the record recover() left onto the run.
  * - Live output: the verification output feed (GET /api/verification/output?cycle=<id>), as on /verification.
@@ -153,6 +160,11 @@ export function createCycleRuns ({
 } = {}) {
   /** Runs this process drives, by cycle id: told of every write of their cycle's record. */
   const watching = new Map()
+  /** Runs this process drives now, from their reservation to their end (a run still previewing has no cycle yet). */
+  const driving = new Set()
+  /** An entrance being admitted (startEntrance), and what each entrance-started run's cycle records: by holder key. */
+  let starting = 0
+  const entrances = new Map()
 
   async function changesNow (projects) {
     const entries = []
@@ -202,17 +214,74 @@ export function createCycleRuns ({
     return { readAt, basis: 'read now, before any snapshot: the cycle reads what changed again when it snapshots each checkout', scope, changes, ...freeze }
   }
 
-  /** Refused before anything is reserved: one cycle at a time. */
+  /** Refused before anything is reserved: one cycle at a time, and one Full verification run at a time in this process. */
   async function admit () {
+    if (driving.size) throw Object.assign(new Error(`a Full verification run is already being driven (${[...driving].join(', ')})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', started: false, retryable: true })
     const latest = await fullVerification.latest().catch(() => null)
     if (latest?.active) throw Object.assign(new Error(`a full verification cycle is already running (${latest.cycle?.id ?? 'unknown'})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: latest.cycle?.id ?? null, started: false, retryable: true })
+  }
+
+  /** Whether a Full verification run is being started or driven by this process (the delivery check waits for it). */
+  // An entrance's note stands from before its run is reserved until drive() takes it: a run reserved but not yet driven
+  // counts while the supervisor holds it live (a reservation whose launch failed holds nothing).
+  const handedOver = () => [...entrances.keys()].some((k) => { const i = k.indexOf('/'); return supervisor.isActive?.(k.slice(0, i), k.slice(i + 1)) ?? false })
+  const busy = () => starting > 0 || driving.size > 0 || handedOver()
+
+  /**
+   * An entrance (POST /api/verification/start, the delivery check, the top-level supervisor): start the Full verification
+   * playbook run in the day's cycle home. Refused before anything is reserved when a cycle or such a run is live or the
+   * scope cannot be read. Returns the run.
+   */
+  async function startEntrance ({ trigger, by, deliveries = null, expectConfigHash = null }) {
+    // Another entrance being admitted, or its run reserved and not yet driven: this one is refused before it touches
+    // anything, so it can never overwrite or remove that entrance's note (and with it the cycle's trigger).
+    if (busy()) throw Object.assign(new Error('a Full verification run is already being started'), { status: 409, code: 'FULL_VERIFICATION_RUNNING', started: false, retryable: true })
+    starting++
+    try {
+      await admit()
+      const read = await fullVerification.scope()
+      // The cycle's own refusal (503, as startCycle gives it): the configuration cannot be read now, which may pass.
+      if (read.unreadable?.length) throw Object.assign(scopeUnreadable(read.unreadable), { started: false, retryable: true })
+      // The holder's project: the first of the scope, else the first project (a cycle with an empty scope still runs).
+      const ids = (list) => list.map((p) => p?.id ?? p).filter((id) => typeof id === 'string').sort()
+      const project = ids(read.projects ?? [])[0] ?? ids(await issues.listProjects())[0]
+      if (!project) throw Object.assign(new Error('there is no project to hold the Full verification run'), { status: 409, code: 'FULL_VERIFICATION_NO_PROJECT', started: false, retryable: false })
+      const date = clock.iso().slice(0, 10)
+      const home = await issues.ensureCycleHome(project, date, `# Full verification ${date}\n\nThe Full verification playbook runs this home holds were started by an entrance: by hand (POST /api/verification/start, the dashboard), after the configured number of deliveries per stage, or by the top-level supervisor. Each run is one full verification cycle.\n`)
+      const k = `${project}/${home.id}`
+      const note = { trigger, by, deliveries }
+      entrances.set(k, note)
+      let started
+      try {
+        started = await supervisor.start({ project, issueId: home.id, playbookId: PROGRAM, expectConfigHash, runOptions: {} })
+      } catch (error) {
+        // Only this entrance's own note goes.
+        if (entrances.get(k) === note) entrances.delete(k)
+        throw error
+      }
+      return { run: { project, issueId: home.id, runId: started.runId }, status: started.status }
+    } finally {
+      starting--
+    }
   }
 
   /** The playbook's phases, from the run's own snapshot. */
   const phasesOf = async (issuePath, runId) => (await store.readSnapshot(issuePath, runId).catch(() => null))?.phases ?? []
 
   /** Drive one run (supervisor.mjs launchEngineProgram): start the cycle, mirror it, settle the run. */
-  async function drive ({ project, issueId, runId, issuePath, run, signal, stoppedBy, stopActor, stopping, write, emit }) {
+  async function drive (context) {
+    driving.add(context.runId)
+    const entrance = entrances.get(`${context.project}/${context.issueId}`) ?? null
+    entrances.delete(`${context.project}/${context.issueId}`)
+    try {
+      await driveRun(context, entrance)
+    } finally {
+      driving.delete(context.runId)
+      if (entrance) fullVerification.noteEntranceRunEnded?.({ runId: context.runId, refused: Boolean(context.run.cycleRun?.refused) })
+    }
+  }
+
+  async function driveRun ({ project, issueId, runId, issuePath, run, signal, stoppedBy, stopActor, stopping, write, emit }, entrance) {
     const phases = await phasesOf(issuePath, runId)
     const observed = {}
     const started = run.startedAt
@@ -241,7 +310,11 @@ export function createCycleRuns ({
 
     let begun
     try {
-      begun = await fullVerification.startForRun({ by: 'operator', run: { project, issueId, runId }, signal: stopCycle.signal })
+      // The entrance that started the run names the cycle's trigger; an issue's start dialog is `playbook`.
+      begun = await fullVerification.startForRun({
+        by: entrance?.by ?? 'operator', trigger: entrance?.trigger ?? 'playbook', deliveries: entrance?.deliveries ?? null,
+        run: { project, issueId, runId }, signal: stopCycle.signal
+      })
     } catch (error) {
       if (detached) return
       // Nothing was frozen: the cycle refused (one already running, a scope that cannot be read).
@@ -256,12 +329,14 @@ export function createCycleRuns ({
     let latest = begun.cycle
     let chain = Promise.resolve()
     let queued = false
+    // The runner itself failed after the start: nothing more is mirrored onto the run (the supervisor records the failure).
+    let failed = false
     const mirror = () => {
       if (queued) return chain
       queued = true
       chain = chain.then(async () => {
         queued = false
-        if (detached) return
+        if (detached || failed) return
         applyView(run, shown(latest), clock.iso())
         await write()
         progress()
@@ -280,6 +355,20 @@ export function createCycleRuns ({
       applyView(run, shown(latest), clock.iso())
       await write()
       progress()
+    } catch (error) {
+      if (detached) throw error
+      // risk-7460361803f8: a run that fails while its cycle is live would leave the cycle frozen and out of Stop's reach. The
+      // cycle is interrupted with the run (stopped by the engine) and the run stays live, with Stop's listener, until the cycle
+      // settled; only then does the failure reach the supervisor, which records it. A service shutdown meanwhile lets go as
+      // before (the cycle is left to the next start's recovery, and the shutdown is not made a failure).
+      failed = true
+      stopCycle.abort({ by: 'engine' })
+      await Promise.race([begun.done.catch(() => null), leaving])
+      const settled = async () => { const record = await fullVerification.recordOf(begun.cycle.id).catch(() => null); return !record || SETTLED.includes(record.state) }
+      while (!detached && !(await settled())) await Promise.race([new Promise((resolve) => clock.after(1000, resolve)), leaving])
+      if (detached) return
+      await chain
+      throw error
     } finally {
       watching.delete(begun.cycle.id)
       signal.removeEventListener('abort', onAbort)
@@ -336,5 +425,5 @@ export function createCycleRuns ({
       .map((r) => ({ cycleId: r.id, date: r.date, state: r.state, verdict: r.verdict ?? null, run: r.run }))
   }
 
-  return { admit, drive, preview, noteChanged, recover, forProject }
+  return { admit, busy, startEntrance, drive, preview, noteChanged, recover, forProject }
 }

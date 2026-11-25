@@ -18,6 +18,8 @@ const fields = {
   // A prompt block in full, read now (supervisor-context.mjs): what a marker stands for.
   get_context: ['block'],
   preview: ['project','issueId','playbook'], start_run: ['project','issueId','previewId'],
+  // A full verification cycle: the Full verification playbook's preview (held by no issue), then its start.
+  preview_verification: [], start_verification: ['previewId'],
   stop_run: ['project','issueId','runId'], add_note: ['project','issueId','text'],
   create_issue: ['project','input'], archive_issue: ['project','issueId'],
   // Inquiries (Phase 4): a technical question answered by an analysis run that

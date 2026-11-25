@@ -9,6 +9,7 @@ import { deliveryCounts } from '../server/verification-trigger.mjs'
 import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
 import { readVerificationFile, VERIFICATION_PAGE_CHARS } from '../server/runtime/check-log.mjs'
 import { engineFixture } from './fakes/fixture.mjs'
+import { startCycleByHand } from './helpers.mjs'
 
 // The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
 const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
@@ -131,7 +132,7 @@ export default async function (t) {
   const temp = async (p) => { const d = await fs.mkdtemp(path.join(os.tmpdir(), p)); temps.push(d); return d }
   const cycle = async (s, verificationDir, clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))) => {
     const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock, verificationDir })
-    return { fv, run: async () => { const started = await fv.startNow({ by: 'tester' }); await fv.settle(); return readJson(path.join(verificationDir, started.date, 'cycle.json')) } }
+    return { fv, run: async () => { const started = await startCycleByHand(fv, { by: 'tester' }); await fv.settle(); return readJson(path.join(verificationDir, started.date, 'cycle.json')) } }
   }
   try {
     t.section('1. a stage host with dynamic instances: no release run, an instance of the cycle\'s own, no command names the base instance; another project on that host is refused')
@@ -208,6 +209,21 @@ export default async function (t) {
         covered: (project, candidates) => ({ covered: (candidates ?? []).filter((r) => !indeterminate.has(r)), indeterminate: (candidates ?? []).filter((r) => indeterminate.has(r)) }) })
       const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock, verificationDir, afterDeliveries: () => threshold })
+      // AC3: the delivery check starts its cycle only through the entrance (full-verification-run.mjs startEntrance), which
+      // starts the Full verification playbook run; here a stand-in that starts the cycle as that run would.
+      const entered = []
+      let busyNow = false
+      let refuse = null
+      fv.setEntrance({
+        busy: () => busyNow,
+        start: async (o) => {
+          entered.push(o)
+          if (refuse) throw refuse
+          const run = { project: 'app-project', issueId: 'verification-2026-11-14-cycle', runId: `r-entrance-${entered.length}` }
+          await fv.startForRun({ ...o, run })
+          return { run, status: 'running' }
+        }
+      })
       const check = async () => { const c = await fv.deliveryCheck(); await fv.settle(); return c?.stages?.[0] }
       delivered('app-project', 6, '2026-11-14T08:00:00.000Z')
       delivered('shop-project', 3, '2026-11-14T08:00:00.000Z')
@@ -217,10 +233,11 @@ export default async function (t) {
       await check()
       const first = await readJson(path.join(verificationDir, '2026-11-14', 'cycle.json'))
       t.eq('the tenth starts a cycle by itself, naming the stage and the deliveries', [s.calls.freezes.length, first.trigger, first.deliveries.host, first.deliveries.count, first.deliveries.threshold], [1, 'deliveries', HOST, 10, 10])
+      t.eq('AC3: through the entrance, as a Full verification playbook run the record names', [entered.length, entered[0].trigger, first.run?.runId], [1, 'deliveries', 'r-entrance-1'])
       t.eq('readiness failed, so the suite never ran: the drive is failed and nothing was proved', [first.projects[0].check.result, first.projects[0].suiteRan, first.projects[0].coverageEstablished], ['failed', null, false])
       const held = await check()
       t.eq('its deliveries still count, and the stage is held back instead of starting again at once', [held.count, held.due, held.suppressed?.sinceCycle, held.suppressed?.needs, s.calls.freezes.length], [10, false, first.id, 10, 1])
-      t.eq('a hand start is never held', (await fv.startNow({ by: 'tester' }).then((r) => r.trigger)), 'hand')
+      t.eq('a hand start is never held', (await startCycleByHand(fv, { by: 'tester' }).then((r) => r.trigger)), 'hand')
       await fv.settle()
       // The hand cycle above tested nothing either: the back-off stays with the latest automatic cycle.
       outcome = passing(1)
@@ -236,8 +253,32 @@ export default async function (t) {
       t.eq('the record still says which was which', [second.projects[0].coverage.indeterminate.map((c) => c.runId), second.projects[0].coverage.covered.some((c) => c.runId === 'app-project-r2')], [['app-project-r2'], false])
       threshold = 0
       delivered('app-project', 20, '2026-11-14T12:00:00.000Z')
+      const asked = entered.length
       const off = await fv.deliveryCheck()
-      t.eq('afterDeliveries 0: the trigger is off', [s.calls.freezes.length, off?.threshold], [3, 10])
+      t.eq('afterDeliveries 0: the trigger is off, the entrance never asked', [s.calls.freezes.length, off?.threshold, entered.length], [3, 10, asked])
+
+      t.section('4b. auditor-1.delivery-check-during-preview: the check waits while a Full verification run is being started or driven, and a refused start is not repeated each poll')
+      threshold = 10
+      busyNow = true
+      await fv.deliveryCheck()
+      t.eq('a run still previewing (busy): the due check starts nothing and asks nothing', [entered.length, s.calls.freezes.length], [asked, 3])
+      busyNow = false
+      refuse = Object.assign(new Error('the cycle refused'), { status: 422, code: 'SOMETHING_ELSE' })
+      await fv.deliveryCheck()
+      t.eq('a due check asks the entrance once and is refused', entered.length, asked + 1)
+      await fv.deliveryCheck()
+      t.eq('the next poll with the same count does not ask again (kept in this process only)', entered.length, asked + 1)
+      delivered('app-project', 1, '2026-11-14T12:30:00.000Z')
+      await fv.deliveryCheck()
+      t.eq('one more delivery on that host: asked again', entered.length, asked + 2)
+      refuse = Object.assign(new Error('a run is already active for this issue'), { status: 409, retryable: true })
+      delivered('app-project', 1, '2026-11-14T12:40:00.000Z')
+      await fv.deliveryCheck()
+      await fv.deliveryCheck()
+      t.eq('an occupied holder or a running cycle is not remembered: the next poll asks again', entered.length, asked + 4)
+      refuse = null
+      await check()
+      t.eq('once admitted, the cycle starts as before', [s.calls.freezes.length, entered.length], [4, asked + 5])
     }
 
     // 5. What writes the checkout (run-exclusivity.mjs writesCheckout) is tested in run-exclusivity.test.mjs.
@@ -393,7 +434,7 @@ export default async function (t) {
       t.eq('once it exists, it is told', await fv.announcePending(), ['2026-11-13.1'])
       t.eq('as an interrupted cycle, with the record', [told[0].cycleId, told[0].state, told[0].record], ['2026-11-13.1', 'interrupted', path.join(verificationDir, '2026-11-13', 'cycle.json')])
       t.eq('and only once', [await fv.announcePending(), told.length, (await readJson(path.join(verificationDir, '2026-11-13', 'cycle.json'))).announce], [[], 1, 'delivered'])
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       t.eq('a cycle that ends normally is told at its end and recorded as told', [told.length, told.at(-1).cycleId, (await readJson(path.join(verificationDir, started.date, 'cycle.json'))).announce], [2, started.id, 'delivered'])
     }
@@ -407,9 +448,9 @@ export default async function (t) {
       const told = []
       const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, verificationDir, clock: manualClock(Date.parse('2026-11-14T08:00:00.000Z')),
         onEnded: (notice) => { if (!ready) throw new Error('the top-level supervisor is not ready yet'); told.push(notice) } })
-      const a = await fv.startNow({ by: 'tester' })
+      const a = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
-      const b = await fv.startNow({ by: 'tester' })
+      const b = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const day = path.join(verificationDir, a.date)
       t.eq('cycle A was rotated to cycle.1.json by cycle B, both still owed', [(await readJson(path.join(day, 'cycle.1.json'))).id, (await readJson(path.join(day, 'cycle.json'))).id, told.length], [a.id, b.id, 0])
@@ -620,6 +661,45 @@ export default async function (t) {
       t.eq('an automatic cycle that withheld its commit holds the stage back like one that tested nothing', [held[0].due, held[0].suppressed?.sinceCycle, /withheld its commit/.test(held[0].suppressed?.reason ?? '')], [false, record.id, true])
     }
 
+    t.section('13b. cross-cycle-checkpoint-input: a stage of an earlier interrupted cycle that records its snapshot input late never becomes the input a later cycle\'s recheck takes again')
+    {
+      const s = pool()
+      const issuesDir = await temp('devpanel-fvi-cross-cycle-')
+      s.options.issues.ISSUES_DIR = issuesDir
+      const verificationDir = path.join(issuesDir, '.verification')
+      // A's reading of the site checkout just after its snapshot stalls until released; every other reading answers at once.
+      let siteReadings = 0
+      let releaseA = null
+      let aStalled = null
+      const stalledA = new Promise((resolve) => { releaseA = resolve })
+      const aReached = new Promise((resolve) => { aStalled = resolve })
+      const readMotion = s.options.readMotion
+      s.options.readMotion = async (args) => { if (args.projectDir === SITE && ++siteReadings === 2) { aStalled(); await stalledA } return readMotion(args) }
+      // A's stage, once released, records its input and goes on to read its coverage: then its late `set` has happened.
+      let aId = null
+      let aRecorded = null
+      const aSet = new Promise((resolve) => { aRecorded = resolve })
+      const coverageOf = s.options.coverageOf
+      s.options.coverageOf = async (args) => { if (aId && args.snapshotPath.includes(driveIdOf(aId, 'site-project'))) aRecorded(); return coverageOf(args) }
+      // B's drive (the only drive: A is interrupted before its own) lets A's late input land after B recorded B's, then passes.
+      const drive = async (args) => { releaseA(); await aSet; return s.options.drive(args) }
+      const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, drive, clock, verificationDir, maxWaitMs: 5_000, graceMs: 0 })
+      const a = await fv.startForRun({ by: 'tester', trigger: 'hand', run: { project: 'site-project', issueId: 'verification-cycle', runId: 'r-a' } })
+      aId = a.id
+      await aReached
+      clock.advance(5_001)
+      await fv.settle()
+      const b = await fv.startForRun({ by: 'tester', trigger: 'hand', run: { project: 'site-project', issueId: 'verification-cycle', runId: 'r-b' } })
+      await fv.settle()
+      const record = await readJson(path.join(verificationDir, b.date, 'cycle.json'))
+      const site = record.projects.find((p) => p.project === 'site-project')
+      const rechecks = s.calls.provisions.filter((p) => p.runId.endsWith('-recheck'))
+      t.eq('A\'s late input landed while B ran (A read its coverage after B\'s snapshot)', s.calls.provisions.filter((p) => !p.runId.endsWith('-recheck')).map((p) => p.runId), [driveIdOf(a.id, 'site-project'), driveIdOf(b.id, 'site-project')])
+      t.eq('B\'s recheck takes again the checkout B tested, as B took it: B\'s own cut and directory', rechecks.map((p) => [p.runId, p.root]), [[`${driveIdOf(b.id, 'site-project')}-recheck`, path.join(verificationDir, b.date, b.id, 'site-project')]])
+      t.eq('unchanged, so B checkpoints', [site.recheck.state, record.outcome.committed], ['unchanged', true])
+    }
+
     t.section('14. a framework edit seen through an instance\'s link withholds the whole pool, the framework\'s own checkpoint and its instances\'')
     {
       const s = pool({ recheckOf: (project) => project === 'site-project' ? [{ checkout: FRAMEWORK, paths: ['lib/thread.js'], total: 1 }] : null })
@@ -805,7 +885,7 @@ export default async function (t) {
       const covered = s.options.coverageOf
       const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, coverageOf: async (args) => { asked(); await stalled; return covered(args) }, clock, verificationDir, maxWaitMs: 5_000, graceMs: 30_000 })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await askedFor
       clock.advance(5_001)
       release()
@@ -834,14 +914,14 @@ export default async function (t) {
       const drive = async (args) => { if (++drives === 1) { asked(); await stalled } return s.options.drive(args) }
       const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, drive, clock, verificationDir, maxWaitMs: 5_000, graceMs: 0 })
-      const a = await fv.startNow({ by: 'tester' })
+      const a = await startCycleByHand(fv, { by: 'tester' })
       await askedFor
       clock.advance(5_001)
       await fv.settle()
       const day = path.join(verificationDir, a.date)
       const ofA = await readJson(path.join(day, 'cycle.json'))
       t.eq('while A\'s drive is still stalled, A is recorded interrupted and told once', [ofA.id, ofA.state, ofA.projects[0].state, s.calls.ended.length, s.calls.ended[0]?.state], [a.id, 'interrupted', 'interrupted', 1, 'interrupted'])
-      const b = await fv.startNow({ by: 'tester' })
+      const b = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const bBytes = await fs.readFile(path.join(day, 'cycle.json'), 'utf8')
       t.eq('B ran and ended green in cycle.json', [JSON.parse(bBytes).id, JSON.parse(bBytes).verdict], [b.id, 'green'])

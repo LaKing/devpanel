@@ -1884,6 +1884,15 @@ export class Engine {
     return ok && !(this.run.pendingRemovals ?? []).some((e) => on(e.host ?? e.instance?.host))
   }
 
+  /**
+   * The hosts a full verification wait must leave free: a drive's own host, or, for a write (the check reconstruction's,
+   * which names no host), every host the cycle drives on; an instance on another host stays (excess-idle-cleanup).
+   */
+  cycleWaitHosts (token) {
+    if (token?.host) return [token.host]
+    return this.cycleGate?.hosts?.() ?? null
+  }
+
   /** A removal a drive could not confirm (checks.mjs onRemovalPending): on the record until a later attempt confirms it. */
   async keepPendingRemoval (entry) {
     ;(this.run.pendingRemovals ??= []).push({ ...entry, since: this.clock.iso() })
@@ -2731,7 +2740,7 @@ export class Engine {
       onDriveWait: (wait) => this.noteDriveWait(wait),
       // The full verification (cycle-gates.mjs): a drive on a host the cycle drives waits for it, holding nothing.
       driveGate: this.gateForDrives(),
-      beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: token?.host ? [token.host] : null }),
+      beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: this.cycleWaitHosts(token) }),
       onRemovalPending: (entry) => this.keepPendingRemoval(entry),
       writeGate: this.writeGate('check-reconstruction')
     }
@@ -2972,7 +2981,7 @@ export class Engine {
     const target = tier === 'modules' ? this.modulesDriveFor(configured, fp).target : tierTarget(configured, configured.tiers ? tier : null)
     let result
     try {
-      result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), driveGate: this.gateForDrives(), beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: token?.host ? [token.host] : null }), onRemovalPending: (entry) => this.keepPendingRemoval(entry), writeGate: this.writeGate('check-reconstruction'), dirName, variant: { patchFile } }))
+      result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), driveGate: this.gateForDrives(), beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: this.cycleWaitHosts(token) }), onRemovalPending: (entry) => this.keepPendingRemoval(entry), writeGate: this.writeGate('check-reconstruction'), dirName, variant: { patchFile } }))
     } catch (error) {
       result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
     }

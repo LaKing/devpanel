@@ -358,12 +358,17 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operation per project at a time, recorded under `issues/<project>/.actions/<id>/` with output appended before
   its `project:action` socket event. Operators run these from the project page or with
   `project-action-cli.mjs`; the top-level supervisor has no action for them. See `docs/project-infrastructure.md`.
-- `full-verification-run.mjs` — the Full verification playbook: the cycle as one run, held on the issue it was started from
-  (supervisor.mjs `launchEngineProgram`, `setEngineRunner`). The cycle record names the run (`record.run`,
-  `trigger: 'playbook'`), and the run mirrors it into `run.cycleRun` (status and a timeline of the five phases), which the
+- `full-verification-run.mjs` — the Full verification playbook: the cycle as one run (supervisor.mjs `launchEngineProgram`,
+  `setEngineRunner`), held on the issue it was started from, or, from an entrance (`startEntrance`: the button's
+  `POST /api/verification/start`, answering 202 with the `run`; the delivery check; the supervisor's `start_verification`),
+  in the day's cycle home `issues/<project>/.verification-<date>-cycle/` (`issues.js` `ensureCycleHome`, `listCycleHomes`;
+  never an issue; read by `getRunHolder`, the issue GET, and the startup reconcile and `liveAgents` through supervisor.mjs
+  `holdersOf`, while coverage, delivery and release readers keep to `listRunHomes`). One Full verification run at a time
+  (`admit`, 409 `FULL_VERIFICATION_RUNNING`). The cycle record names the run (`record.run`, `trigger`: `hand`, `deliveries`,
+  `supervisor` or `playbook`), and the run mirrors it into `run.cycleRun` (status and a timeline of the five phases), which the
   run list, run detail, explanation and the issue page read. The preview and the first phase carry the change list read now
   and what the freeze would pause (`supervisor.freezeCandidates`). Live output is the verification output feed with
-  `cycle=<id>`. Stop interrupts the cycle (`interruption.reason: stopped`); a shutdown does not. Reconcile settles a run left
+  `cycle=<id>`. Stop interrupts the cycle (`interruption.reason: stopped`); a shutdown does not. A runner that fails after the start interrupts the cycle with the run (stopped by `engine`) and reads failed only once the cycle settled. Reconcile settles a run left
   live as cancelled, and `recover()` here mirrors what the cycle's `recover()` left. `GET /api/projects/:project/verification-runs`
   links each scope project to it. docs/tactical-playbooks.md "Full verification cycles".
 - `verification-output.mjs` — what a full verification's drives print, for the Full verification page (`/verification`, in the drawer; `VerificationView.vue`,
@@ -453,10 +458,14 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operator capability on the project page. An action may declare `effect: commit-checkout` (`projects/<id>.yaml`
   or a `# DEVPANEL effect:` header; the host settings may name another marker word) to state what it does rather than leave it inferred from a filename — a script
   may also version, publish, restart or deploy.
-- `full-verification.mjs` — the full verification: after `fullVerification.afterDeliveries` (default 10, 0 off)
-  deliveries per stage that no cycle covered (`verification-trigger.mjs`: a delivery retires only from an entry whose
-  whole suite ran, `coverageEstablished`; a stage whose last automatic cycle proved nothing waits for as many more), on
-  request (`POST /api/verification/start`), or at the optional `fullVerification {at, timeZone}`, `supervisor.freeze`
+- `full-verification.mjs` — the full verification: every cycle is a Full verification playbook run (`startCycle` refuses
+  without one, `FULL_VERIFICATION_NEEDS_RUN`), started by an entrance (`full-verification-run.mjs startEntrance`): after
+  `fullVerification.afterDeliveries` (default 10; 0: the engine never starts one on its own, the timing is people's and the
+  top-level supervisor's) deliveries per stage that no cycle covered (`verification-trigger.mjs`: a delivery retires only from an entry whose
+  whole suite ran, `coverageEstablished`; a stage whose last automatic cycle proved nothing waits for as many more; the check
+  waits while a Full verification run is being started or previews, `setEntrance`), on
+  request (`POST /api/verification/start`, the dashboard's button), by the supervisor (`start_verification`) or from an issue's
+  start dialog (no daily time: `fullVerification.at` starts nothing), `supervisor.freeze`
   closes admission to the writing runs of the projects it verifies (its scope, `cycleScope`: projects with a stage it drives plus
   each one's whole module pool, a pool with no driven stage outside it, decided from one reading, `readCycleConfig`, kept as `record.scope`; a run of any other
   project is never paused, withheld, refused or waited for; an unreadable listing or configuration refuses the cycle
@@ -621,7 +630,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
 - The top-level supervisor is the **management plane**; coordinators and their agents are the execution plane.
   Its charter is fixed in the prompt and no message replaces it. Visibility is panel-wide and unconditional —
   `projects` is every project, a named one is checked for existence only, and `focus` merely orders attention.
-  It has no direct checkout command. Deliberately, `start_run` with `apply-to-source` authorizes engine-owned
+  It has no direct checkout command. It starts a full verification cycle only from a Full verification preview:
+  `preview_verification {}`, then `start_verification {previewId}` (bound to its configHash; outside the start gate and
+  ledger, since the run has no seats; one cycle at a time; `start_run` and `ask_release_authorization` refuse that kind of
+  preview; docs/top-level-supervisor.md "Starting a full verification cycle"). Deliberately, `start_run` with `apply-to-source` authorizes engine-owned
   application of an approved patch to the destination named in readiness/preview. Patch-only delivery remains
   selectable; this bounded indirect write authority does not authorize commits or arbitrary scripts. Safety is carried by the
   capabilities themselves (budgets, concurrency, per-issue retries, archive policy, action vocabulary).

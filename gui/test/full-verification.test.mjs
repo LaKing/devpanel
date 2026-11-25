@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { createFullVerification, cycleScope, nextTrigger, localDate, readCycleConfig, stageOf } from '../server/full-verification.mjs'
+import { createFullVerification, cycleScope, localDate, readCycleConfig, stageOf } from '../server/full-verification.mjs'
 import { hostConfigDir, hostConfigSelection, overlay } from '../server/config/host-config.mjs'
 import { discoveredProjects, listProjectDirs, readProjectDirs } from '../server/project-path.mjs'
 import { slugify } from '../server/issues.js'
@@ -12,7 +12,7 @@ import { createSupervisor } from '../server/supervisor.mjs'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { resolvePlaybook } from '../server/config/load.mjs'
-import { sandbox } from './helpers.mjs'
+import { sandbox, startCycleByHand } from './helpers.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 import { startRun, worktreeDiffDelivery, releaseWorkspace } from '../server/runtime/launch.mjs'
 import YAML from 'yaml'
@@ -20,7 +20,7 @@ import YAML from 'yaml'
 // The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
 const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
 
-export const name = 'full verification — the schedule on a fake clock, the scoped freeze and its wait, one run per stage, the record, the hand start'
+export const name = 'full verification — only a playbook run starts a cycle, no daily time, the scoped freeze and its wait, one run per stage, the record'
 
 const BERLIN = { at: '06:00', timeZone: 'Europe/Berlin' }
 const iso = (ms) => new Date(ms).toISOString()
@@ -133,17 +133,6 @@ export default async function (t) {
   const temps = []
   const temp = async (p) => { const d = await fs.mkdtemp(path.join(os.tmpdir(), p)); temps.push(d); return d }
   try {
-    t.section('1. the trigger time, in the configured zone, across daylight saving')
-    {
-      t.eq('06:00 in Berlin on 2026-11-07 (CET) is 05:00Z', iso(nextTrigger(BERLIN, Date.parse('2026-11-07T04:00:00.000Z'))), '2026-11-07T05:00:00.000Z')
-      t.eq('after it, the next day', iso(nextTrigger(BERLIN, Date.parse('2026-11-07T05:00:00.000Z'))), '2026-11-08T05:00:00.000Z')
-      t.eq('on the day clocks go forward (2026-03-29) 06:00 is 04:00Z', iso(nextTrigger(BERLIN, Date.parse('2026-03-29T00:00:00.000Z'))), '2026-03-29T04:00:00.000Z')
-      t.eq('on the day clocks go back (2026-10-25) 06:00 is 05:00Z', iso(nextTrigger(BERLIN, Date.parse('2026-10-25T00:00:00.000Z'))), '2026-10-25T05:00:00.000Z')
-      t.eq('an ambiguous time is its earlier instant', iso(nextTrigger({ at: '02:30', timeZone: 'Europe/Berlin' }, Date.parse('2026-10-24T22:00:00.000Z'))), '2026-10-25T00:30:00.000Z')
-      t.eq('a skipped time fires shifted forward', iso(nextTrigger({ at: '02:30', timeZone: 'Europe/Berlin' }, Date.parse('2026-03-28T23:00:00.000Z'))), '2026-03-29T01:30:00.000Z')
-      t.eq('the record date is local', localDate(Date.parse('2026-11-06T23:30:00.000Z'), 'Europe/Berlin'), '2026-11-07')
-    }
-
     t.section('2. the stage rule: staging is a stage unless declared verified through its instances')
     {
       t.eq('no infrastructure', stageOf('p', null).verifiedThrough, 'instances')
@@ -151,22 +140,18 @@ export default async function (t) {
       t.eq('a staging environment is a stage on its host', stageOf('p', { staging: environment('stage', 'h') }), { project: 'p', stage: 'stage', host: 'h' })
     }
 
-    t.section('3. a scheduled cycle on a fake clock: freeze, one run per stage, one per host, the record')
+    t.section('3. a cycle started as a playbook run: freeze, one run per stage, one per host, the record')
     {
       const issuesDir = await temp('devpanel-fv-issues-')
       const verificationDir = path.join(issuesDir, '.verification')
       const w = world({ issuesDir })
       const clock = manualClock(Date.parse('2026-11-07T04:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => BERLIN, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
-      fv.start()
-      clock.advance(60 * 60 * 1000 - 1)
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      t.eq('nothing before 06:00 local', w.calls.freezes.length, 0)
-      clock.advance(1)
-      await until(() => w.calls.freezes.length === 1, 'the freeze')
-      t.eq('at 06:00 local admission closes for the day\'s first cycle', w.calls.freezes, ['2026-11-07.1'])
+      const wrapping = { project: 'app-project', issueId: 'verification-2026-11-07-cycle', runId: 'run-fv-1' }
+      await startCycleByHand(fv, { by: 'tester', trigger: 'deliveries', run: wrapping })
+      t.eq('admission closes for the day\'s first cycle', w.calls.freezes, ['2026-11-07.1'])
       const record = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.state === 'ended' ? r : null }, 'the cycle to end')
-      t.eq('the record names the trigger and the schedule', [record.id, record.trigger, record.schedule], ['2026-11-07.1', 'schedule', BERLIN])
+      t.eq('the record names its entrance and the run it belongs to, with no schedule', [record.id, record.trigger, record.run, record.schedule ?? null], ['2026-11-07.1', 'deliveries', wrapping, null])
       t.eq('one Deployment run per stage that could start, in environment staging, as the full verification', w.calls.starts.map((s) => [s.project, s.playbookId, s.issueId, s.runOptions, s.cycle, s.expectConfigHash]).sort(), [
         ['app-project', 'deployment', 'verification-2026-11-07', { environment: 'staging', fullVerification: true }, '2026-11-07.1', 'hash-app-project'],
         ['shop-project', 'deployment', 'verification-2026-11-07', { environment: 'staging', fullVerification: true }, '2026-11-07.1', 'hash-shop-project']
@@ -187,19 +172,18 @@ export default async function (t) {
       t.eq('the record lists it', record.outcome.issues.map((i) => [i.project, i.issueId, i.name]), [['lib-project', 'issue-1', 'Full verification 2026-11-07: lib-project red on stage']])
       t.ok('the issue says why: the refusal', w.calls.issues[0].input.includes('TARGET_MISSING'))
       t.eq('the issue was opened before admission reopened', w.calls.order, ['issue:lib-project', 'thaw'])
-      t.eq('the schedule armed the next day', (await fv.latest()).schedule.next, '2026-11-08T05:00:00.000Z')
 
       t.section('4. "Full verification now": the same freeze, runs and record, the earlier cycle kept')
       // The record says 'ended' before the cycle's promise lets go of the slot: wait for the cycle itself.
       await fv.settle()
-      const hand = await fv.startNow({ by: 'tester' })
-      t.eq('a hand start returns the frozen record', [hand.id, hand.trigger, hand.by, hand.state], ['2026-11-07.2', 'hand', 'tester', 'frozen'])
+      const hand = await startCycleByHand(fv, { by: 'tester' })
+      t.eq('a hand start returns the frozen record', [hand.id, hand.trigger, hand.by, hand.state, typeof hand.run?.runId], ['2026-11-07.2', 'hand', 'tester', 'frozen', 'string'])
       const second = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.id === '2026-11-07.2' && r.state === 'ended' ? r : null }, 'the hand cycle')
       t.eq('the same freeze', w.calls.freezes, ['2026-11-07.1', '2026-11-07.2'])
       t.eq('the same runs', w.calls.starts.filter((s) => s.cycle === '2026-11-07.2').length, 2)
       t.eq('the same record shape', second.projects.map((p) => p.project).sort(), record.projects.map((p) => p.project).sort())
       t.eq('a later cycle of the date opens its own issue, named with its id', [w.calls.issues.length, w.calls.issues[1].input.split('\n')[0], w.calls.issues[1].openedBy.from.cycle], [2, '# Full verification 2026-11-07.2: lib-project red on stage', '2026-11-07.2'])
-      t.eq('the scheduled cycle of the day is kept beside it', (await readJson(path.join(verificationDir, '2026-11-07', 'cycle.1.json'))).id, '2026-11-07.1')
+      t.eq('the first cycle of the day is kept beside it', (await readJson(path.join(verificationDir, '2026-11-07', 'cycle.1.json'))).id, '2026-11-07.1')
       fv.stop()
     }
 
@@ -211,11 +195,11 @@ export default async function (t) {
       const w = world({ issuesDir, busy: [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen', phase: 'run' }], paused })
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       const waiting = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.waitingOn?.length ? r : null }, 'the wait to be recorded')
       t.eq('frozen and waiting on the live run, with nothing started', [waiting.state, waiting.waitingOn.map((b) => b.runId), w.calls.starts.length], ['frozen', ['r-frozen'], 0])
       let refused = null
-      try { await fv.startNow() } catch (error) { refused = error.code }
+      try { await startCycleByHand(fv) } catch (error) { refused = error.code }
       t.eq('a second cycle is refused while one runs', refused, 'FULL_VERIFICATION_RUNNING')
       clock.advance(1000)
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -226,7 +210,7 @@ export default async function (t) {
       t.ok('runs started once the seats were idle', w.calls.starts.length === 2 && Boolean(ended.seatsIdleAt))
       t.eq('the run the freeze paused is resumed, by the cycle', w.calls.resumes, [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen', actor: 'service', origin: 'full-verification' }])
       t.eq('a run with an operator pause pending stays paused for that operator', [ended.resumed.map((r) => r.runId), ended.heldForOperator.map((r) => r.runId)], [['r-frozen'], ['r-held']])
-      t.eq('a hand start without a schedule records none and uses UTC dates', [ended.schedule, ended.timeZone], [null, 'UTC'])
+      t.eq('a start without a time zone records no schedule and uses UTC dates', [ended.schedule ?? null, ended.timeZone], [null, 'UTC'])
     }
 
     t.section('5b. the end of a cycle is announced once it is no longer active, whatever its announcement did')
@@ -240,7 +224,7 @@ export default async function (t) {
       const emit = (event) => { order.push({ at: 'emit' }); lastEmit = event }
       const onEnded = async () => { order.push({ at: 'announce-rejected' }); throw new Error('the supervisor is away') }
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, emit, onEnded, log: { warn () {} } })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const rejectedAt = order.findIndex((o) => o.at === 'announce-rejected')
       const lastAt = order.map((o) => o.at).lastIndexOf('emit')
@@ -255,7 +239,7 @@ export default async function (t) {
       const events = []
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: { ...w.supervisor, freeze: async () => { throw new Error('freeze refused') } }, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, emit: (e) => events.push(e), log: { warn () {} } })
       let failed = null
-      try { await fv.startNow({ by: 'tester' }) } catch (error) { failed = error.message }
+      try { await startCycleByHand(fv, { by: 'tester' }) } catch (error) { failed = error.message }
       t.eq('a start that failed after taking an id says so with an event, and is not active', [failed, events.length, events[0]?.type, (await fv.latest()).active], ['freeze refused', 1, 'verification:changed', false])
     }
     {
@@ -276,25 +260,27 @@ export default async function (t) {
       t.eq('an unlistable verification directory is a 503 too', (await listing.latest().then(() => null, (error) => error))?.status, 503)
     }
 
-    t.section('6. off without the block; no catch-up after the time has passed')
+    t.section('6. AC4, AC5: no cycle without its run; no daily time; afterDeliveries 0 starts nothing on its own')
     {
       const issuesDir = await temp('devpanel-fv-off-')
       const w = world({ issuesDir })
       const clock = manualClock(Date.parse('2026-11-07T04:00:00.000Z'))
-      let settings = null
-      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => settings, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const warnings = []
+      const entered = []
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => BERLIN, afterDeliveries: () => 0, deliveryPollMs: 60 * 60 * 1000, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn: (m) => warnings.push(m), info () {} } })
+      let refused = null
+      try { await fv.startForRun({ by: 'tester', trigger: 'hand' }) } catch (error) { refused = error.code }
+      t.eq('a start that names no Full verification run is refused, nothing frozen', [refused, w.calls.freezes.length], ['FULL_VERIFICATION_NEEDS_RUN', 0])
+      t.eq('the old hand start is gone', typeof fv.startNow, 'undefined')
+      fv.setEntrance({ start: async (o) => { entered.push(o); return { run: { project: 'app-project', issueId: 'verification-2026-11-07-cycle', runId: 'r' } } }, busy: () => false })
       fv.start()
+      t.ok('a daily time in the settings is said to start nothing', warnings.some((m) => /fullVerification\.at/.test(m)), JSON.stringify(warnings))
       for (let i = 0; i < 49; i++) clock.advance(60 * 60 * 1000)
       await new Promise((resolve) => setTimeout(resolve, 20))
-      t.eq('no block: no cycle in two days', [w.calls.freezes.length, (await fv.latest()).schedule], [0, null])
-      // The block appears now, 06:00 local on 2026-11-09, and is first read an hour later: that day's cycle is not caught up.
-      settings = BERLIN
-      const now = clock.now()
-      t.eq('it is 06:00 local on 2026-11-09 when the block appears', [localDate(now, 'Europe/Berlin'), iso(now)], ['2026-11-09', '2026-11-09T05:00:00.000Z'])
-      clock.advance(60 * 60 * 1000)
-      await new Promise((resolve) => setTimeout(resolve, 20))
-      t.eq('read again within the hour, no cycle for the time already passed', w.calls.freezes.length, 0)
-      t.eq('the next is tomorrow\'s', (await fv.latest()).schedule.next, '2026-11-10T05:00:00.000Z')
+      await fv.deliveryCheck()
+      t.eq('two days past 06:00 local twice, with afterDeliveries 0: no cycle, no entrance asked', [w.calls.freezes.length, entered.length], [0, 0])
+      t.eq('latest() says the engine starts nothing itself, and carries no schedule', [(await fv.latest()).afterDeliveries, (await fv.latest()).schedule], [0, undefined])
+      t.eq('the zone still dates records', localDate(clock.now(), 'Europe/Berlin'), '2026-11-09')
       fv.stop()
     }
 
@@ -338,6 +324,18 @@ export default async function (t) {
         t.ok('its runs take steps', Boolean(step?.number))
         t.eq('listed as a run home', (await issues.listRunHomes('devpanel-project')).map((h) => h.id), ['verification-2026-11-07'])
         t.eq('the task report is written once', await fs.readFile(path.join(home.path, '000-report', 'response.md'), 'utf8'), '# Full verification\n')
+
+        // The cycle home (entrance-started Full verification runs): beside the Deployment home of the same date, never an issue.
+        const cycleHome = await issues.ensureCycleHome('devpanel-project', '2026-11-07', '# Full verification runs\n')
+        t.eq('the cycle home is issues/<project>/.verification-<date>-cycle, kind verification-cycle', [cycleHome.id, cycleHome.path, cycleHome.kind, cycleHome.home], ['verification-2026-11-07-cycle', path.join(issuesDir, 'devpanel-project', '.verification-2026-11-07-cycle'), 'verification-cycle', true])
+        t.eq('getRunHolder reads it', (await issues.getRunHolder('devpanel-project', cycleHome.id)).path, cycleHome.path)
+        let cycleStatus = null
+        try { await issues.getIssue('devpanel-project', cycleHome.id) } catch (error) { cycleStatus = error.status }
+        t.eq('getIssue does not know it either', cycleStatus, 404)
+        t.eq('listCycleHomes lists it', (await issues.listCycleHomes('devpanel-project')).map((h) => h.id), ['verification-2026-11-07-cycle'])
+        t.eq('listRunHomes (coverage, deliveries, release selection) leaves it out', (await issues.listRunHomes('devpanel-project')).map((h) => h.id), ['verification-2026-11-07'])
+        t.eq('the issue list is still unchanged', (await issues.listIssues('devpanel-project')).map((i) => i.id), listed)
+        t.ok('its runs take steps too', Boolean((await issues.createStep('devpanel-project', cycleHome.id, { name: 'turn', response: 'answered' }))?.number))
       } finally {
         if (before === undefined) delete process.env.DEVPANEL_ISSUES_DIR
         else process.env.DEVPANEL_ISSUES_DIR = before
@@ -352,7 +350,7 @@ export default async function (t) {
       w.issues.listProjects = async () => projects.map((id) => ({ id }))
       const infrastructureOf = async (project) => { if (project === 'bad-project') throw new Error('projects/bad-project.yaml: /infrastructure must have required property staging'); return w.infrastructureOf(project) }
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       const record = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.state === 'ended' ? r : null }, 'the cycle to end')
       t.eq(`${label}: the cycle is ${expected}`, [record.verdict, record.projects.find((p) => p.project === 'bad-project')?.refusal?.code ?? null], [expected, projects.includes('bad-project') ? 'INFRASTRUCTURE_INVALID' : null])
     }
@@ -395,7 +393,7 @@ export default async function (t) {
       w.issues.listIssues = async () => []
       w.issues.listRunHomes = async (project) => paused.filter((p) => p.project === project).map((p) => ({ id: p.issueId, path: `/fixture/${project}/.${p.issueId}`, home: true, latestRun: { runId: p.runId, status: 'paused' } }))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       const record = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.state === 'ended' ? r : null }, 'the cycle to end')
       t.eq('the earlier cycle\'s frozen run is resumed by the cycle', w.calls.resumes, [{ project: 'app-project', issueId: 'verification-2026-11-05', runId: 'old-frozen', actor: 'service', origin: 'full-verification' }])
       t.eq('and recorded; the one with an operator pause pending is held for the operator', [record.resumed.map((r) => r.runId), record.heldForOperator.map((r) => r.runId), record.refused], [['old-frozen'], ['old-held'], []])
@@ -410,7 +408,7 @@ export default async function (t) {
       w.issues.listProjects = async () => projects.map((id) => ({ id }))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} }, ...extra })
       const run = async () => {
-        const started = await fv.startNow({ by: 'tester' })
+        const started = await startCycleByHand(fv, { by: 'tester' })
         await fv.settle()
         return readJson(path.join(verificationDir, started.date, 'cycle.json'))
       }
@@ -758,7 +756,7 @@ export default async function (t) {
           const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
           const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: plainRoot, discovery: null, env, log: { warn () {} } })
           let refused = null
-          try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
+          try { await startCycleByHand(fv, { by: 'tester' }) } catch (error) { refused = error }
           t.eq('the cycle is refused 503 FULL_VERIFICATION_SCOPE_UNREADABLE naming the directory', [refused?.status, refused?.code, refused?.unreadable?.map((u) => u.path)], [503, 'FULL_VERIFICATION_SCOPE_UNREADABLE', [path.join(dataRoot, 'host-config')]])
           t.eq('nothing was frozen and no record written', [w.calls.freezes, await fs.readdir(verificationDir).catch(() => [])], [[], []])
         } finally { await fs.chmod(dataRoot, 0o755) }
@@ -819,7 +817,7 @@ export default async function (t) {
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: file, discovery: null, env: {}, log: { warn () {} } })
       let refused = null
-      try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
+      try { await startCycleByHand(fv, { by: 'tester' }) } catch (error) { refused = error }
       t.eq('through the production path the cycle refuses FULL_VERIFICATION_SCOPE_UNREADABLE, nothing frozen', [refused?.code, refused?.unreadable?.map((u) => u.code), w.calls.freezes], ['FULL_VERIFICATION_SCOPE_UNREADABLE', ['ENOTDIR'], []])
     }
 
@@ -840,7 +838,7 @@ export default async function (t) {
       try {
         const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
         const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, discovery: null, env: {}, log: { warn () {} } })
-        const started = await fv.startNow({ by: 'tester' }).catch((error) => ({ refused: error.code ?? error.message }))
+        const started = await startCycleByHand(fv, { by: 'tester' }).catch((error) => ({ refused: error.code ?? error.message }))
         await fv.settle()
         t.ok('the cycle starts from the issue store\'s root, not refused over the later setting', Boolean(started.id), JSON.stringify(started))
         const record = started.id ? await readJson(path.join(verificationDir, started.date, 'cycle.json')) : null
@@ -896,7 +894,7 @@ export default async function (t) {
       const w = world({ issuesDir: await temp('devpanel-fv-no-target-issues-'), frameworkOf: {} })
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, ...w.seams, projectsConfig: undefined, log: { warn () {} } })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
       t.eq('through the cycle (real loader and resolver): nobody frozen, the stage refused TARGET_MISSING, no start, no checkpoint', [w.calls.scopes, record.projects.find((p) => p.project === 'app-project').refusal?.code, w.calls.starts.length, w.calls.actions], [[[]], 'TARGET_MISSING', 0, []])
@@ -931,7 +929,7 @@ export default async function (t) {
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
       const actions = []
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, versionOf: async () => null, runAction: async (a) => { actions.push(a); return { status: 'completed' } }, log: { warn () {} } })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
       const entry = record.projects.find((p) => p.project === 'app-project')
@@ -955,7 +953,7 @@ export default async function (t) {
       const w = world({ issuesDir, busy: [stuck] })
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 10_000, graceMs: 0, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       await until(async () => (await cycleFile(verificationDir))?.waitingOn?.length, 'the wait to be recorded')
       clock.advance(9_000)
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -976,7 +974,7 @@ export default async function (t) {
       w.supervisor.freeze = function (cycleId) { w.calls.freezes.push(cycleId); this.frozenState = { cycleId }; return new Promise(() => {}) }
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 5_000, graceMs: 0, log: { warn () {} } })
-      const starting = fv.startNow({ by: 'tester' })
+      const starting = startCycleByHand(fv, { by: 'tester' })
       await until(() => w.calls.freezes.length === 1, 'the freeze to be asked')
       clock.advance(5_001)
       await starting
@@ -996,7 +994,7 @@ export default async function (t) {
       w.supervisor.stop = async (args) => { stops.push(args) }
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 5_000, graceMs: 30_000, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       await until(() => w.calls.starts.length === 1, 'the stage start to be asked')
       clock.advance(5_001)
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -1024,7 +1022,7 @@ export default async function (t) {
       const told = []
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 10_000, graceMs: 0, resumeMs: 3_000, onEnded: (n) => { told.push(n) }, log: { warn () {} } })
-      const a = await fv.startNow({ by: 'tester' })
+      const a = await startCycleByHand(fv, { by: 'tester' })
       await until(async () => (await cycleFile(verificationDir))?.waitingOn?.length, 'the wait to be recorded')
       clock.advance(10_500)
       await until(() => w.calls.resumes.length === 1, 'the first resume to be asked')
@@ -1035,7 +1033,7 @@ export default async function (t) {
       t.eq('the end names the resume still pending at the bound', [ended.resume?.timedOut, ended.resume?.boundSeconds, ended.resume?.pending?.runId], [true, 3, 'r-p1'])
       t.eq('and is announced as interrupted', [told.length, told[0].cycleId, told[0].state], [1, a.id, 'interrupted'])
       w.supervisor.busyList = []
-      const b = await fv.startNow({ by: 'tester' })
+      const b = await startCycleByHand(fv, { by: 'tester' })
       t.ok('a new cycle starts, not refused as running', b.id && b.id !== a.id, JSON.stringify(b.id))
       release()
       const older = path.join(verificationDir, a.date, 'cycle.1.json')
@@ -1062,7 +1060,7 @@ export default async function (t) {
       const supervisor = { ...fake, freeze: (...a) => { fake.calls = true; return real.freeze(...a) }, thaw: (id) => { real.thaw(id); return fake.thaw.call(fake, id) }, frozen: () => real.frozen(), busy: () => real.busy(), busyActions: () => real.busyActions(), releaseIdle: () => [] }
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ resolveHost: fakeResolve, supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, snapshottedOf: async () => ({ repositories: [path.join(dir, 'source', '.git')], worktrees: [path.join(dir, 'source')], unknown: false }), pollMs: 1000, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       const waiting = await until(async () => { const r = await cycleFile(verificationDir); return r?.waitingOn?.length ? r : null }, 'the wait to be recorded')
       t.eq('the contained run is neither asked to pause nor waited for', [asked, waiting.asked.map((a) => a.runId)], [[], []])
       t.eq('the cycle waits only for the drive on its host, of a run outside its scope', waiting.waitingOn.map((b) => [b.kind, b.runId, b.host]), [['drive', 'r-drive', 'stage-a']])
@@ -1088,7 +1086,7 @@ export default async function (t) {
       const verificationDir = path.join(issuesDir, '.verification')
       const pinnedRefs = []
       const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: async (ssh) => { pinnedRefs.push(ssh.hostRef); return pinned(ssh) }, snapshottedOf: async () => ({ repositories: [], worktrees: [] }), log: { warn () {} } })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       await fv.settle()
       const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
       t.ok('the framework is in the scope (its pool is verified)', record.scope.projects.includes('framework-project'), JSON.stringify(record.scope.projects))
@@ -1100,7 +1098,7 @@ export default async function (t) {
       w2.issues.listProjects = async () => ['framework-project', 'app-project'].map((id) => ({ id }))
       const infra2 = async (project) => project === 'framework-project' ? { staging: environment('stage', 'ssh-config:stage-x'), testDrive: { modules: { instance: {} } } } : w2.infrastructureOf(project)
       const fv2 = createFullVerification({ supervisor: w2.supervisor, issues: w2.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir2, '.verification'), resolve: w2.resolve, infrastructureOf: infra2, readRun: w2.readRun, ...w2.seams, resolveHost: async (ssh) => { refusedRefs.push(ssh.hostRef); return pinned(ssh) }, snapshottedOf: async () => ({ repositories: [], worktrees: [] }), log: { warn () {} } })
-      const started2 = await fv2.startNow({ by: 'tester' })
+      const started2 = await startCycleByHand(fv2, { by: 'tester' })
       await fv2.settle()
       const record2 = await readJson(path.join(issuesDir2, '.verification', started2.date, 'cycle.json'))
       t.eq('a refused stage\'s own host is neither pinned nor frozen', [refusedRefs.includes('ssh-config:stage-x'), record2.scope.hosts.map((h) => h.hostRef).includes('ssh-config:stage-x')], [false, false])
@@ -1150,7 +1148,7 @@ export default async function (t) {
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
       const fv = createFullVerification({ supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...seams, resolveHost: pinned, snapshottedOf: async () => ({ repositories: [common], worktrees: [src] }), pollMs: 1000, log: { warn () {} } })
-      await fv.startNow({ by: 'tester' })
+      await startCycleByHand(fv, { by: 'tester' })
       // The run's seat turns go on during the cycle; its delivery reaches the write gate and waits there.
       const driving = engine.drive().then(() => order.push('delivered'))
       await until(() => engine.run.cycleWait?.kind === 'write' || ['completed', 'blocked', 'failed'].includes(engine.run.status), 'the delivery to wait for the cycle', 60000)

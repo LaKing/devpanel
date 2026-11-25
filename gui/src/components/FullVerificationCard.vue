@@ -7,10 +7,11 @@ import { connection } from '@/socket'
 
 /*
  * The full verification on the dashboard (server/full-verification.mjs):
- * the latest cycle, one line per project, and "Full verification now", which
- * starts the same cycle the delivery count and the optional schedule do: admission closes
- * for the projects it verifies, their live writing runs pause at their next step boundary,
- * runs of other projects go on, and each stage is verified.
+ * the latest cycle, one line per project, and "Full verification now", which starts a Full
+ * verification playbook run (POST /api/verification/start, server/full-verification-run.mjs), as the
+ * delivery count and the top-level supervisor do: every cycle is such a run. Admission closes for the
+ * projects it verifies, their live writing runs pause at their next step boundary, runs of other
+ * projects go on, and each stage is verified.
  */
 
 const props = defineProps({
@@ -27,6 +28,11 @@ const state = computed(() => (props.latest !== undefined ? props.latest : own.va
 const error = ref('')
 const starting = ref(false)
 const confirming = ref(false)
+/** The run the last start began ({project, issueId, runId}): linked until its cycle is the one shown. */
+const startedRun = ref(null)
+const runLink = (r) => `/projects/${encodeURIComponent(r.project)}/${encodeURIComponent(r.issueId)}?run=${encodeURIComponent(r.runId)}`
+/** Earlier records may carry `schedule` (the daily time, removed); `supervisor` is the top-level supervisor's start. */
+const TRIGGERS = { hand: 'started by hand', schedule: 'scheduled', deliveries: 'after deliveries', playbook: 'started as a playbook run', supervisor: 'started by the top-level supervisor' }
 
 /*
  * On the dashboard the card reads for itself: only its newest read applies, and a
@@ -83,6 +89,7 @@ async function startNow () {
     const r = await (props.guard ?? ownGuard)(spec, () => api.startVerification())
     confirming.value = false
     if (!r.sent) { error.value = r.notice; return }
+    startedRun.value = r.value?.run ?? null
     await (props.reload ?? load)()
   } catch (err) { error.value = err.message } finally { starting.value = false }
 }
@@ -128,16 +135,20 @@ const outcome = computed(() => {
       <div class="fv__summary">
         <template v-if="cycle">
           <strong>{{ cycle.id }}</strong>
-          <span>· {{ { hand: 'started by hand', schedule: 'scheduled', deliveries: 'after deliveries', playbook: 'started as a playbook run' }[cycle.trigger] ?? cycle.trigger }}</span>
+          <span>· {{ TRIGGERS[cycle.trigger] ?? cycle.trigger }}</span>
           <!-- A cycle a Full verification playbook run wraps (server/full-verification-run.mjs): its run. -->
-          <router-link v-if="cycle.run" data-test="cycle-run-link" :to="`/projects/${encodeURIComponent(cycle.run.project)}/${encodeURIComponent(cycle.run.issueId)}?run=${encodeURIComponent(cycle.run.runId)}`">· its run</router-link>
+          <router-link v-if="cycle.run" data-test="cycle-run-link" :to="runLink(cycle.run)">· its run</router-link>
           <span>· {{ cycle.state }}</span>
           <v-chip v-if="cycle.verdict" size="x-small" :color="verdictColor(cycle.verdict)" variant="tonal" class="ml-1">{{ cycle.verdict }}</v-chip>
         </template>
         <span v-else>No cycle has run yet.</span>
+        <!-- A run just started previews before its cycle begins: linked until its cycle is shown. -->
+        <div v-if="startedRun && cycle?.run?.runId !== startedRun.runId" class="fv__started">
+          Started a Full verification run <router-link data-test="started-run-link" :to="runLink(startedRun)">{{ startedRun.runId }}</router-link>; its cycle begins after its preview.
+        </div>
         <div class="fv__schedule">
-          <template v-if="state?.schedule">Scheduled at {{ state.schedule.at }} ({{ state.schedule.timeZone }}), next {{ new Date(state.schedule.next).toLocaleString() }}</template>
-          <template v-else>No schedule: host settings have no fullVerification block.</template>
+          <template v-if="state?.afterDeliveries">Starts by itself after {{ state.afterDeliveries }} deliveries per stage; by hand or by the top-level supervisor any time</template>
+          <template v-else-if="state">Never starts by itself (afterDeliveries 0): started by hand or by the top-level supervisor</template>
           <template v-if="state?.frozen"> · admission closed since {{ new Date(state.frozen.at).toLocaleTimeString() }}</template>
         </div>
         <div v-if="outcome" class="fv__outcome">{{ outcome }}</div>
@@ -164,8 +175,9 @@ const outcome = computed(() => {
       <v-card>
         <v-card-title>Full verification now</v-card-title>
         <v-card-text>
-          Admission closes: no run starts, live runs pause at their next step boundary, and once no seat turn is running
-          one staging Deployment run starts for every configured stage. Paused runs resume when the cycle ends.
+          Starts a Full verification playbook run. Its cycle closes admission for the projects it verifies: their writing
+          runs do not start, live ones pause at their next step boundary, and once nothing is in flight every configured
+          stage is verified. Paused runs resume when the cycle ends.
         </v-card-text>
         <v-card-actions>
           <v-spacer />
@@ -182,6 +194,7 @@ const outcome = computed(() => {
 .fv__head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .fv__summary { font-size: 0.875rem; }
 .fv__schedule { margin-top: 2px; opacity: 0.7; font-size: 0.8125rem; }
+.fv__started { margin-top: 2px; font-size: 0.8125rem; }
 .fv__outcome { margin-top: 2px; font-size: 0.8125rem; overflow-wrap: anywhere; }
 .fv__actions { display: flex; gap: 6px; }
 .fv__rows { list-style: none; margin: 10px 0 0; padding: 0; }

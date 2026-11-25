@@ -16,6 +16,7 @@ import { destroyInstance, destroyRunInstances, holdInstance, holdsInstance, inst
 import { createSupervisor } from '../server/supervisor.mjs'
 import { createFullVerification, driveIdOf } from '../server/full-verification.mjs'
 import { runChecks } from '../server/runtime/checks.mjs'
+import { startCycleByHand } from './helpers.mjs'
 
 // The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
 const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
@@ -370,7 +371,7 @@ export default async function (t) {
         deliveriesOf: async () => [{ issueId: 'i', runId: 'delivered-1', at: '2026-01-01T00:00:00.000Z' }],
         projectsConfig: async () => new Map(), versionOf: async () => null, runAction: async () => ({ status: 'completed' })
       })
-      const started = await fv.startNow({ by: 'tester' })
+      const started = await startCycleByHand(fv, { by: 'tester' })
       const recordFile = path.join(verificationDir, started.date, 'cycle.json')
       const entryOf = async () => (await fs.readFile(recordFile, 'utf8').then(JSON.parse).catch(() => null))?.projects?.[0]
       await until('the cycle to wait for a free instance slot', async () => (await entryOf())?.waiting?.reason === 'instances-full')

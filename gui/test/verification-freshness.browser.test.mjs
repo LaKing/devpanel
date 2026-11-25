@@ -73,7 +73,15 @@ export default async function (t) {
     net.once(LATEST, async (go) => { const response = await go(); await oldHeld; return response })
     browser.window.document.dispatchEvent(new browser.window.Event('visibilitychange'))
     await sleep(200)
-    const { body: startedCycle } = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
+    // The answer names the Full verification run; its cycle is the one whose record names that run.
+    const { body: startedRun } = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
+    let startedCycle = null
+    for (const end = Date.now() + 30000; !startedCycle;) {
+      const cycle = (await stage.request('/api/verification/latest')).body?.cycle
+      if (cycle?.run?.runId === startedRun.run?.runId) startedCycle = { cycleId: cycle.id }
+      else if (Date.now() > end) throw new Error('timed out waiting for the run to start its cycle')
+      else await sleep(100)
+    }
     await browser.until(() => cycleShown(browser) === startedCycle.cycleId && freshState(browser) === 'current', { label: 'the newer cycle shown' })
     releaseOld()
     await sleep(500)

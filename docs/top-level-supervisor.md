@@ -913,10 +913,41 @@ so both arrive in one call. A run's status is written before its lock is release
 ending can also wake first and the release be told by the next poll: one more call, when no
 prompt in between showed it.
 
+### Starting a full verification cycle
+
+Every cycle is a run of the Full verification playbook (tactical-playbooks.md "Full verification cycles"). Its
+entrances are "Full verification now" (the dashboard's button, `POST /api/verification/start`), the engine's delivery
+check after `fullVerification.afterDeliveries` deliveries per stage, an issue's start dialog, and the supervisor. With
+`afterDeliveries: 0` the engine never starts one on its own: when a cycle runs is then decided by people and by the
+supervisor.
+
+The supervisor starts one from a preview, in two actions:
+
+- `preview_verification {}` returns the Full verification playbook's preview: its configHash, its phases, and `cycle`
+  (the projects it would verify, what changed since the last verification, which live runs its freeze would pause).
+  It is stored with its kind and a `previewId`. It names no project or issue.
+- `start_verification {previewId}` starts that run through the same entrance as the button
+  (`full-verification-run.mjs startEntrance`, `trigger: 'supervisor'`, `by: 'top-level supervisor (<model>)'`), bound to
+  the preview's configHash, and returns `{run: {project, issueId, runId}, status}`. The run is held in the day's cycle home
+  (`verification-<date>-cycle`, never an issue). A preview is used once.
+
+A start that names no such preview is refused ("A Full verification preview is required"), and so is one naming an issue
+preview. The other readers of a stored preview refuse a Full verification one: `start_run` ("start_verification starts
+it") and `ask_release_authorization`. The plain `preview` of the playbook on an issue still carries no previewId and
+points to this pair.
+
+The start does not go through the start gate or the spending ledger, and is not an owned run (`stop_run` does not reach
+it): the run has no seats and spends nothing on models, and the button and the delivery check are not charged either.
+What bounds it is the preview binding and one cycle at a time: while a cycle or a Full verification run is live, the start
+is refused `FULL_VERIFICATION_RUNNING` before anything is reserved. Each start is recorded in `state.verificationStarts`
+(the last 20) for accounting. A cycle closes admission to the writing runs of the projects it verifies until it ends, so
+the supervisor starts one when what was delivered needs verifying together, not by routine. Its end arrives as the
+`verification-ended` event below.
+
 ### When a full verification cycle ends
 
-A cycle (tactical-playbooks.md "Full verification cycles": after ten deliveries per stage,
-on request, or at an optional configured time) freezes only the projects it verifies: those
+A cycle (tactical-playbooks.md "Full verification cycles": a Full verification playbook run, started after
+`afterDeliveries` deliveries per stage, by hand, by the supervisor or from an issue) freezes only the projects it verifies: those
 with a stage it drives (`infrastructure.staging`, not `fullVerification: instances`) and the whole
 module pool of each (framework and instances; a pool with no driven stage stays outside),
 decided when it starts and kept as `scope` in its record. Within the scope, writing runs pause

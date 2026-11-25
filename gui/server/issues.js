@@ -671,7 +671,7 @@ export async function fillPackedReceipt (project, id, { rel, ref, read }) {
 
 // Where a receipt's run or operation is recorded: a full verification's run home lives in its dot-prefixed
 // directory (as issueDir resolves it), an issue under its id.
-const receiptFolder = (project, id) => HOME_PATTERN.test(id) ? homePath(project, id) : path.join(ISSUES_DIR, project, id)
+const receiptFolder = (project, id) => isRunHomeId(id) ? homePath(project, id) : path.join(ISSUES_DIR, project, id)
 
 async function recordedInFolder (folder, source) {
   if (source?.kind === 'run') return fs.stat(path.join(folder, 'runs', source.runId, 'run.json')).then(() => true, () => false)
@@ -953,8 +953,8 @@ export async function setInquiryClosure (project, id, closure, { reopenedBy = nu
 async function issueDir (project, id) {
   await requireProject(project)
 
-  // A full verification run home holds runs and their steps, never an issue.
-  if (typeof id === 'string' && HOME_PATTERN.test(id)) {
+  // A full verification run home (or cycle home) holds runs and their steps, never an issue.
+  if (isRunHomeId(id)) {
     const home = homePath(project, id)
     if (!(await fs.stat(home).catch(() => null))?.isDirectory()) throw new IssueError('no such run home', 404)
     return home
@@ -1096,6 +1096,17 @@ async function stepOwners (dir) {
  */
 export const HOME_PATTERN = /^verification-(\d{4}-\d{2}-\d{2})$/
 export const homeIdFor = (date) => `verification-${date}`
+/*
+ * A cycle home, issues/<project>/.verification-<date>-cycle/, id verification-<date>-cycle, holds the Full
+ * verification playbook runs an entrance started (POST /api/verification/start, the dashboard button, the
+ * afterDeliveries trigger, the top-level supervisor's start_verification; full-verification-run.mjs startEntrance).
+ * Apart from the Deployment home of the same date, whose runs are the cycle's own: one live run per holder would
+ * otherwise set the playbook run against the cycle's Deployment runs. Not an issue either, for the same reasons.
+ */
+export const CYCLE_HOME_PATTERN = /^verification-(\d{4}-\d{2}-\d{2})-cycle$/
+export const cycleHomeIdFor = (date) => `verification-${date}-cycle`
+/** Whether an id names a run home (the Deployment home or the cycle home of a date). */
+export const isRunHomeId = (id) => typeof id === 'string' && (HOME_PATTERN.test(id) || CYCLE_HOME_PATTERN.test(id))
 const homePath = (project, id) => {
   const dir = path.join(ISSUES_DIR, project, `.${id}`)
   if (path.dirname(path.resolve(dir)) !== path.resolve(path.join(ISSUES_DIR, project))) throw new IssueError('no such run home', 404)
@@ -1103,33 +1114,55 @@ const homePath = (project, id) => {
 }
 
 function describeHome (project, id, dir, runs = []) {
-  const date = HOME_PATTERN.exec(id)[1]
-  return { id, project, name: `Full verification ${date}`, openedOn: date, kind: 'verification', home: true, packed: false, archived: false,
+  const cycle = CYCLE_HOME_PATTERN.exec(id)
+  const date = (cycle ?? HOME_PATTERN.exec(id))[1]
+  return { id, project, name: `Full verification ${date}`, openedOn: date, kind: cycle ? 'verification-cycle' : 'verification', home: true, packed: false, archived: false,
     path: dir, location: dir, latestRun: runs[0] ?? null, runCount: runs.length }
 }
 
 /** A run home, as the run routes and the supervisor read an issue; 404 when absent. */
 export async function getRunHome (project, id) {
   const dir = await issueDir(project, id)
-  if (!HOME_PATTERN.test(id)) throw new IssueError('no such run home', 404)
+  if (!isRunHomeId(id)) throw new IssueError('no such run home', 404)
   return { ...describeHome(project, id, dir, await runSummaries(dir)), steps: await listSteps(project, id) }
 }
 
-/** What holds a run: an issue, or a full verification run home. */
-export const getRunHolder = (project, id) => (typeof id === 'string' && HOME_PATTERN.test(id) ? getRunHome(project, id) : getIssue(project, id))
+/** What holds a run: an issue, a full verification run home, or a cycle home. */
+export const getRunHolder = (project, id) => (isRunHomeId(id) ? getRunHome(project, id) : getIssue(project, id))
 
-/** Every run home of a project, newest first, each with its latest run as listIssues gives one. */
-export async function listRunHomes (project) {
+async function listHomesMatching (project, pattern) {
   await requireProject(project)
   const entries = await fs.readdir(path.join(ISSUES_DIR, project), { withFileTypes: true }).catch(() => [])
   const homes = []
   for (const e of entries) {
-    if (!e.isDirectory() || !e.name.startsWith('.') || !HOME_PATTERN.test(e.name.slice(1))) continue
+    if (!e.isDirectory() || !e.name.startsWith('.') || !pattern.test(e.name.slice(1))) continue
     const dir = path.join(ISSUES_DIR, project, e.name)
     homes.push(describeHome(project, e.name.slice(1), dir, await runSummaries(dir)))
   }
   return homes.sort((a, b) => (a.id < b.id ? 1 : -1))
 }
+
+/**
+ * Every cycle home of a project, newest first: read only where a live run must be found or settled (the startup
+ * reconcile, liveAgents); a Full verification run delivers and releases nothing, so the coverage, delivery and
+ * release readers keep to listRunHomes.
+ */
+export const listCycleHomes = (project) => listHomesMatching(project, CYCLE_HOME_PATTERN)
+
+/** Create the cycle home of a date once, with the task report its runs read; returns it. */
+export async function ensureCycleHome (project, date, report) {
+  await requireProject(project)
+  const id = cycleHomeIdFor(date)
+  if (!CYCLE_HOME_PATTERN.test(id)) throw new IssueError('invalid cycle home date', 400)
+  const dir = homePath(project, id)
+  const reportDir = path.join(dir, '000-report')
+  await fs.mkdir(reportDir, { recursive: true })
+  if (!(await fs.stat(path.join(reportDir, 'response.md')).catch(() => null))) await writeAtomic(path.join(reportDir, 'response.md'), report)
+  return getRunHome(project, id)
+}
+
+/** Every run home of a project, newest first, each with its latest run as listIssues gives one (Deployment homes only). */
+export const listRunHomes = (project) => listHomesMatching(project, HOME_PATTERN)
 
 /** Create the run home of a date once, with the task report its runs read; returns it. */
 export async function ensureRunHome (project, date, report) {

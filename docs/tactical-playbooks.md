@@ -437,10 +437,11 @@ below). Any other sequence resolves with one `engine-only-unsupported` blocker, 
 a start is refused with `ENGINE_ONLY_NOT_RUNNABLE` before anything is locked,
 reserved or probed (`supervisor.start`, and again in `reserveRun`). Preflight
 never probes a harness for an engine-only playbook. The top-level supervisor's
-preview of one carries no previewId, so `start_run` never reaches the start gate
-or the spending ledger. The supervisor does not start engine-only playbooks; an
-operator starts the Full verification playbook from the panel (start dialog or
-start API).
+`preview` of one carries no previewId, so `start_run` never reaches the start gate
+or the spending ledger. The Full verification playbook is the one engine-only
+playbook the supervisor starts, by its own pair of actions: `preview_verification {}`
+gives its preview with a previewId and `start_verification {previewId}` starts that
+run ("Full verification cycles" below); an operator starts it from the panel.
 
 ## Configuring releases
 
@@ -605,19 +606,33 @@ inspections do not deploy either instance.
 ## Full verification cycles
 
 A full verification cycle verifies every project on its stage with its whole suite: the
-changes delivered since the last cycle, together. It starts in three ways:
+changes delivered since the last cycle, together. **Every cycle is a run of the Full verification playbook**
+(`playbooks/full-verification.yaml`, `server/full-verification-run.mjs`): no code path starts a cycle without one
+(`startCycle` refuses `FULL_VERIFICATION_NEEDS_RUN`). These are the entrances, and each starts that playbook's run:
 
-- **After every ten deliveries** to the source on one stage since the last cycle that covered
-  them (the host settings' `fullVerification.afterDeliveries`, default 10; 0 turns this off).
-- **On request**: "Full verification now", `POST /api/verification/start`.
-- **At a configured time**, once a day, when the host settings name one (`fullVerification.at` and `timeZone`); optional.
-- **As a run**: starting the **Full verification** playbook (`playbooks/full-verification.yaml`) from an issue's start
-  dialog or its start API (below).
+- **"Full verification now"**: the dashboard's and `/verification`'s button, which is `POST /api/verification/start`.
+  The answer (202) names the run it started, `{run: {project, issueId, runId}, status}`; the cycle begins once the
+  run has read its preview, and its record names the run (`record.run`).
+- **After every ten deliveries** to the source on one stage since the last cycle that covered them (the host settings'
+  `fullVerification.afterDeliveries`, default 10). **0 means the engine never starts a cycle on its own**: the timing is
+  then left to people (the button) and the top-level supervisor.
+- **The top-level supervisor**: `preview_verification {}` returns the playbook's preview (what the cycle would verify,
+  what changed, which runs its freeze would pause) with a previewId; `start_verification {previewId}` starts that run,
+  bound to the preview's configHash. A start that names no such preview is refused, and `start_run` refuses this kind of
+  preview (docs/top-level-supervisor.md "Starting a full verification cycle").
+- **An issue's start dialog** or its start API: the run is then held on that issue.
 
-**The Full verification playbook** (`server/full-verification-run.mjs`) runs the same cycle as one run, held on the
-issue it was started from. The cycle's code is unchanged; its record names the run (`run`) and its `trigger` is
-`playbook`. While the cycle runs, that issue holds a live run like any other. The three triggers above start cycles
-exactly as before, with no run.
+The first three hold the run in the day's **cycle home**, `issues/<project>/.verification-<UTC date>-cycle/` (id
+`verification-<date>-cycle`; `issues.js` `ensureCycleHome`), of the first project of the cycle's scope (else the first
+project): like the Deployment run home beside it, it holds runs and is never an issue, and the issue page, the run routes
+and the startup reconcile read it. The cycle's `trigger` names the entrance: `hand`, `deliveries`, `supervisor`, or
+`playbook` for the start dialog (older records may say `schedule`). One cycle runs at a time: an entrance while a cycle
+or a Full verification run is live is refused (409 `FULL_VERIFICATION_RUNNING`) before anything is reserved, and the
+delivery check waits while such a run is being started or still previewing. There is no daily cycle any more:
+`fullVerification.at` and `timeZone` are still accepted and start nothing.
+
+**The Full verification playbook** runs the cycle as one run. While the cycle runs, its holder holds a live run like any
+other.
 
 - The run mirrors the record into `run.cycleRun`: the cycle's status, and a timeline of the playbook's five phases
   (close admission, wait for writes and drives, verify every stage, record changes and handle the outcome, open admission
@@ -643,14 +658,12 @@ exactly as before, with no run.
 **Configure it** in the host settings (docs/host-config.md "Host settings"); every key is optional:
 
 ```json
-{ "fullVerification": { "afterDeliveries": 10, "at": "06:00", "timeZone": "Europe/Berlin" } }
+{ "fullVerification": { "afterDeliveries": 10 } }
 ```
 
-`at` is HH:MM local to `timeZone`, an IANA zone the runtime must know; the two go together.
-Without them there is no scheduled cycle; the other triggers still work. The schedule fires once per local
-date, when the clock reaches `at`; a service that starts after that time waits for the
-next day (no catch-up). On a daylight-saving change an ambiguous time is its earlier
-instant and a skipped one fires shifted forward.
+`afterDeliveries: 0` leaves the timing entirely to people and the top-level supervisor. `at` and `timeZone` (HH:MM and
+an IANA zone, given together) are still accepted so existing settings load, but start nothing: the panel logs a warning at
+start when `at` is set, and `timeZone` only dates the cycle record.
 
 **The delivery count** is per stage (a staging host, summing the projects that stage there)
 and counts the deliveries to the source since `COVERAGE_BASELINE` (staging-coverage.mjs) that
@@ -802,5 +815,5 @@ and `outcome`: `bump` (`chain` with each step's project, args, operation, status
 versions, `versions`, `failed`, `notRun`, or the `reason` nothing ran) or `issues` (per red
 project: `name`, `issueId`, `runId`, `failingCount`, `attachments`, any `error`), or a
 `reason`. An earlier cycle of the same date is kept as `cycle.<n>.json`. The dashboard and
-`/verification` show the latest cycle with its outcome (`GET /api/verification/latest`); "Full verification
-now" is `POST /api/verification/start`.
+`/verification` show the latest cycle with its outcome (`GET /api/verification/latest`, with `afterDeliveries`); "Full verification
+now" is `POST /api/verification/start`, which starts the Full verification playbook run.

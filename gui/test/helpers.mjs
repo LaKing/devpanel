@@ -166,3 +166,12 @@ export function asVerified (resolved) {
   clone.liveExecution = { eligible: true, blockers: [] }
   return clone
 }
+
+/**
+ * A cycle started as a Full verification playbook run would start it (full-verification.mjs startForRun): the only start
+ * there is. For suites that drive the cycle directly, with a fake run standing for the playbook's; resolves with the
+ * cycle's record as frozen, as "Full verification now" once did.
+ */
+let fakeCycleRuns = 0
+export const startCycleByHand = (fv, { by = 'operator', trigger = 'hand', run = null } = {}) =>
+  fv.startForRun({ by, trigger, run: run ?? { project: 'cycle-test-project', issueId: 'verification-2000-01-01-cycle', runId: `cycle-test-run-${++fakeCycleRuns}` } }).then((b) => b.cycle)

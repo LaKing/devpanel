@@ -25,6 +25,16 @@ export default async function(t){
   ['mark_landed without handChanges',{...landed.action,handChanges:undefined}],
   ['mark_landed with an unknown argument',{...landed.action,outcome:'resolved'}]
  ]){let refused=false;try{parseSupervisorResponse(JSON.stringify({message:'x',action}))}catch{refused=true}t.ok(label+' refused',refused)}
+ // A full verification cycle (AC6): the playbook's preview, held by no issue, then its start by previewId only.
+ const previewVerification={message:'Preview the cycle',action:{type:'preview_verification'}}
+ t.eq('preview_verification with no arguments accepted',parseSupervisorResponse(JSON.stringify(previewVerification)),previewVerification)
+ const startVerification={message:'Start the cycle',action:{type:'start_verification',previewId:'pv-1'}}
+ t.eq('start_verification with a previewId accepted',parseSupervisorResponse(JSON.stringify(startVerification)),startVerification)
+ for(const [label,action]of [
+  ['start_verification without a previewId',{type:'start_verification'}],
+  ['start_verification naming an issue',{type:'start_verification',previewId:'pv-1',project:'p',issueId:'i'}],
+  ['preview_verification with run options',{type:'preview_verification',runOptions:{}}]
+ ]){let refused=false;try{parseSupervisorResponse(JSON.stringify({message:'x',action}))}catch{refused=true}t.ok(label+' refused',refused)}
  const actual=JSON.parse(await fs.readFile(new URL('../../issues/.supervisor/state.json',import.meta.url),'utf8').catch(()=>'{"messages":[]}')).messages?.findLast(m=>m.rawResponse?.startsWith('Five open issues, and my limits'))
  if(actual)t.eq('recorded live failure now parses',parseSupervisorResponse(actual.rawResponse).action.type,'get_issue')
  async function scenario(replies,maxCalls=5){

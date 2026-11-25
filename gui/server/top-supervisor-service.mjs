@@ -29,7 +29,7 @@ import { standingSyncs } from './runtime/sync-records.mjs'
 import { latestRefusal } from './runtime/refused-seat.mjs'
 
 // pollMs: only a test passes it (top-supervisor.idle-reads.test.mjs); the service polls at createTopSupervisor's default.
-export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null, pollMs }) {
+export async function topSupervisorService ({ issues, supervisor, modelPerformance = null, emit, changed, decisions = null, consult = null, verification = null, pollMs }) {
  const configRoot=process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT
  const models=async()=>[...(await loadConfig({root:configRoot})).roster.values()].filter(m=>['claude','codex'].includes(m.harness))
  // Which models a run's SEATS may be filled with — a different question from
@@ -213,6 +213,15 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
      moduleLocks:()=>supervisor.moduleLockReading({project:a.project,issueId:a.issueId}),
      modulesCoverage:target=>supervisor.modulesCoverage({project:a.project,projectPath:projectPath(a.project),issueId:a.issueId,issuePath:issue.path,target})}))
    },
+   // The Full verification playbook (full-verification-run.mjs): its preview with what the cycle would verify, what
+   // changed and what its freeze would pause, and its start through the same entrance as POST /api/verification/start.
+   ...(verification?{
+    previewVerification:async()=>{
+     const result=await preview('full-verification',{configRoot,cyclePreview:()=>verification.preview()})
+     return result?.ok?{...summarisePreview(result),cycle:result.cycle??null}:result
+    },
+    startVerification:a=>verification.startEntrance({trigger:'supervisor',by:a.by,expectConfigHash:a.expectConfigHash})
+   }:{}),
    launchState:async p=>{
     const resolved=await resolveWithRelease(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project},()=>selectStagedRelease({project:p.project,projectPath:projectPath(p.project),listIssues:(q,o)=>issues.listIssues(q,o)}))
     if(!resolved.ok)return {blockedReason:resolved.errors.map(e=>e.message).join('; ')}

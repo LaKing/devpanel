@@ -61,6 +61,7 @@ When your work is done, call finish: no more starts, owned runs are allowed to c
 Tool results are SUMMARIES: get_run lists a run's steps with verdicts and one-line gists; get_step returns one turn's full prompt, response and output; get_file returns an issue file in full. A run notification is a compact DELTA: status, phase, checks (the latest drive's verdict), blockedReason, actions, from (what the moved fields were), and pause, failure, ownerInput, acceptCheck, reconciliation, landed and delivery when the run has them. That is enough to act on: pause.id is the one answer_run copies. Call get_run only when a decision depends on more than the delta. Ask for detail when a decision depends on it.
 "readyQueue" is the engine's own reading of what you could start: the issues of your declared campaign (the whole panel, ordered by focus, when none is declared; "outside" counts what it leaves out, and you can still see and act on those) with each prerequisite before what waits for it. A row's state is ready (no run on record, nothing in the way), blocked, running, or decide (an earlier run ended, so another is a judgement, not the next thing in line). blockedBy says what stands in the way and until says what ends it; until.at is a time only when one is known, and null means no time is known, never soon. A module-lock block (until.event module-lock) names modules the issue's triage listed that another live run of the same module pool holds — a framework and its instances share one pool — with the holder; such a start waits, it never fails the issue. On a running row, module-lock with waiting:true is that run waiting for a module its revision needs; it takes it itself. canStartNow and because are what stops every start. "next" is the first issue offered. {unchanged:true} means the reading you were last given still stands. Do not try a start the queue shows blocked, and do not read runs or issues to work out what it already says. It is an observation: start_run re-checks everything and can still refuse. Issues still need a preview, and the queue chooses no playbook.
 A capacity-freed event, or capacityFreed on another event, says capacity freed for an issue that was waiting: freed names why (checkout-released, dependency-settled, module-lock-released, concurrency-freed, spending-window-rolled), next is the issue. It is an offer, not an order: your mission decides, and action:null is a fine answer. You are told once per release, and it is never held, so you need not try starts to find out.
+A full verification cycle starts only as a Full verification playbook run: after fullVerification.afterDeliveries deliveries per stage (when that is 0 the engine never starts one on its own, and the timing is yours and the operator's), when an operator starts it, or when you do: preview_verification {} returns the playbook's preview (what the cycle would verify, what changed since the last one, which live runs its freeze would pause) with a previewId, and start_verification {previewId} starts that run in the day's cycle home (a holder named verification-<date>-cycle, not an issue) and returns {run}. Only a preview_verification preview starts a cycle; start_run refuses it. A cycle closes admission to the writing runs of the projects it verifies until it ends, and only one runs at a time: start one when what was delivered needs verifying together, not by routine. It spends nothing on models and is not charged to your starts or budget.
 A verification-ended event says a full verification cycle ended: its verdict, what its outcome did (the checkpoint chain, or the issues it opened), the record path, and per project its stage, instance, evidence directory (the selftest report, the project log and the browser-check report the instance produced, kept after the instance was destroyed), the delivered runs it covered and those still counting toward the next cycle, its flaky tests (failed in the whole suite, passed when rerun alone on the same instance; they did not make it red, and the cycle opened or noted a flaky-test issue for them) and why a red entry's failed tests were not rerun. A green cycle may report outcome.committed false: a checkout moved after its snapshot, so its pool's checkpoints were withheld (outcome.withheld names the checkouts and paths; the entries stay green), and outcome.untestedCommitted names paths a checkpoint committed that no snapshot tested; an entry with snapshotDuringEdits was snapshotted while its checkouts were being edited (movingPaths), which may explain a red one. The cycle resolves no issue. An issue whose only open item is a pending live verification of a covered run is yours to settle from that evidence: read it (get_verification_file: the record, the evidence directory, its files), and record a disposition that names it; never on a red or incomplete entry's word alone.
 Every prompt carries "remaining": authoritative counts with explicit scopes (its history, earlier sessions' accounting, may be a marker). Calls, run starts and starts per issue are per SESSION: they accumulate across activations and server restarts and reset only when an operator begins a New session. Never infer budgets from run history.
 A preview result supplies previewId; start_run uses that exact configuration.
@@ -435,10 +436,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         if (a.runOptions?.inquiry !== undefined) throw fail('An inquiry is opened with inquire, not by a preview option')
         const result = await tools.preview(a)
         if (!result.ok) return result
-        // An engine-only playbook is not started by the supervisor: no preview is stored and no previewId given, so
-        // start_run is refused at its first check, before admission, the start gate, the ledger and every counter.
-        // The Full verification playbook is started by an operator from the panel (its engine program runs there).
-        if (result.kind === 'engine-only') return { ...result, startable: false, notStartable: result.liveEligible ? 'engine-only: an operator starts this playbook from the panel; the supervisor does not start engine-only playbooks' : 'engine-only: the engine does not execute these engine steps; this playbook can be previewed, not started' }
+        // An engine-only playbook is not started by start_run: no preview is stored and no previewId given, so start_run is
+        // refused at its first check, before admission, the start gate, the ledger and every counter. The Full verification
+        // playbook has its own pair: preview_verification, then start_verification with that previewId.
+        if (result.kind === 'engine-only') return { ...result, startable: false, notStartable: result.liveEligible ? 'engine-only: start_run does not start engine-only playbooks; a full verification cycle is started with preview_verification {} and then start_verification {previewId}' : 'engine-only: the engine does not execute these engine steps; this playbook can be previewed, not started' }
         const previewId = crypto.randomUUID()
         // A triage starts the playbook its sizing recommends when it closes
         // autonomous, unless the preview asked otherwise (autoStart: false). It is
@@ -451,8 +452,32 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           ...(result.releasePlan ? { release: { mode: result.releasePlan.mode, environment: result.releasePlan.environment, releaseId: result.releasePlan.releaseId ?? null, releaseIdSource: result.releasePlan.releaseIdSource ?? null } } : {}) }
         return { ...result, runOptions, previewId }
       }
+      // The Full verification playbook's preview, held by no issue: its run goes into the day's cycle home
+      // (full-verification-run.mjs startEntrance). Stored with its kind, so only start_verification takes it.
+      case 'preview_verification': {
+        if (!tools.previewVerification) throw fail('The full verification is not available in this service')
+        const result = await tools.previewVerification()
+        if (!result.ok) return result
+        if (!result.liveEligible) return { ...result, startable: false, notStartable: 'the Full verification playbook cannot be started on this panel' }
+        const previewId = crypto.randomUUID()
+        state.previews[previewId] = { kind: 'full-verification', playbook: 'full-verification', runOptions: {}, configHash: result.configHash }
+        return { ...result, previewId }
+      }
+      // Starts the run of a preview_verification preview, bound to its configHash. Outside the start gate and the ledger:
+      // the run has no seats and spends nothing on models, as the hand and delivery entrances are not charged either; one
+      // cycle (and one Full verification run) at a time is the bound, refused by the runner's admission.
+      case 'start_verification': {
+        const p = state.previews[a.previewId]
+        if (!p || p.kind !== 'full-verification') throw fail('A Full verification preview is required: preview_verification gives one')
+        if (!tools.startVerification) throw fail('The full verification is not available in this service')
+        const r = await tools.startVerification({ by: `top-level supervisor (${state.model?.id ?? 'model'})`, expectConfigHash: p.configHash })
+        delete state.previews[a.previewId]
+        state.verificationStarts = [...(state.verificationStarts ?? []), { ...r.run, at: new Date().toISOString() }].slice(-20)
+        return r
+      }
       case 'start_run': {
         const p = state.previews[a.previewId]
+        if (p?.kind === 'full-verification') throw fail('This is a Full verification preview: start_verification starts it')
         if (!p || p.project !== a.project || p.issueId !== a.issueId) throw fail('A matching preview is required')
         // An open prerequisite, or a reported issue whose trust does not reach this
         // playbook: the same admission an automatic start after a triage passes
@@ -560,6 +585,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       case 'ask_release_authorization': {
         const p = state.previews[a.previewId]
         if (!p) throw fail('A matching preview is required')
+        if (p.kind === 'full-verification') throw fail('A Full verification preview needs no release authorization: start_verification starts it')
         if (!PRODUCTION_MODES.includes(p.release?.mode)) throw fail('Only a production or staging-then-production release needs the operator\'s authorization; start this preview with start_run')
         state.questions ??= []
         const r = p.release

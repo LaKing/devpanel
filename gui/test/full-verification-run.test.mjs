@@ -13,7 +13,7 @@ import { runResult } from '../server/runtime/run-result.mjs'
 import { awaitsAutoResume } from '../server/runtime/run-control.mjs'
 import { instanceName } from '../server/runtime/instance-drive.mjs'
 import { listRuns, getRun } from '../server/runs-api.mjs'
-import { sandbox, cleanupSandboxes } from './helpers.mjs'
+import { sandbox, cleanupSandboxes, startCycleByHand } from './helpers.mjs'
 
 export const name = 'full verification playbook — the engine program starts the existing cycle as one run: its timeline, explanation, preview, Stop as an interrupted cycle, recovery at start, the projects it verifies'
 
@@ -37,6 +37,11 @@ async function until (fn, label, ms = 20000) {
   }
 }
 const readJson = (file) => fs.readFile(file, 'utf8').then(JSON.parse)
+/**
+ * A run is released only after run.json reads its end: the runner leaves `driving` in drive()'s finally and the supervisor
+ * lets go of the holder in launchEngineProgram's finally. Waited for before anything that needs the holder free again.
+ */
+const released = (w, run) => until(() => !w.supervisor.isActive(run.project, run.issueId) && !w.cycleRuns.busy(), 'the run to be released by the supervisor and the runner')
 
 /** A project on a stage host with dynamic instances, verified by the cycle on an instance of its own. */
 const infra = {
@@ -70,7 +75,7 @@ const CHANGES = { computedAt: '2026-11-25T10:00:00.000Z', limits: [], repositori
  * runs until it is aborted or released, and the run wrapper. `fvSupervisor` is the supervisor as the cycle sees it,
  * its resume of paused runs recorded instead of driven.
  */
-async function panel ({ root, dir, issueIds, paused = [], harnessDir }) {
+async function panel ({ root, dir, issueIds, paused = [], harnessDir, changesOf = async () => CHANGES }) {
   const issuesDir = path.join(dir, 'issues')
   const verificationDir = path.join(issuesDir, '.verification')
   const issuePath = (id) => path.join(issuesDir, P, id)
@@ -84,11 +89,27 @@ async function panel ({ root, dir, issueIds, paused = [], harnessDir }) {
     }
     return null
   }
-  const holder = (project, id) => ({ id, project, name: id, openedOn: '2026-11-25', path: issuePath(id), packed: false, home: false, steps: [] })
+  // A cycle home (issues.js CYCLE_HOME_PATTERN) and a Deployment home read as the real store reads them.
+  const CYCLE_HOME = /^verification-\d{4}-\d{2}-\d{2}-cycle$/
+  const DEPLOYMENT_HOME = /^verification-\d{4}-\d{2}-\d{2}$/
+  const holderPath = (project, id) => (CYCLE_HOME.test(id) || DEPLOYMENT_HOME.test(id) ? path.join(issuesDir, project, `.${id}`) : issuePath(id))
+  const holder = (project, id) => ({ id, project, name: id, openedOn: '2026-11-25', path: holderPath(project, id), packed: false,
+    home: CYCLE_HOME.test(id) || DEPLOYMENT_HOME.test(id), ...(CYCLE_HOME.test(id) ? { kind: 'verification-cycle' } : DEPLOYMENT_HOME.test(id) ? { kind: 'verification' } : {}), steps: [] })
+  const latestIn = async (dirPath) => {
+    const names = await fs.readdir(path.join(dirPath, 'runs')).catch(() => [])
+    for (const n of names.sort().reverse()) {
+      const run = await readJson(path.join(dirPath, 'runs', n, 'run.json')).catch(() => null)
+      if (run) return { runId: run.runId, status: run.status, live: ['pending', 'preflighting', 'running', 'stopping'].includes(run.status) }
+    }
+    return null
+  }
   const issues = {
     listProjects: async () => [{ id: P }],
     getIssue: async (project, id) => holder(project, id),
     getRunHolder: async (project, id) => holder(project, id),
+    ensureCycleHome: async (project, date) => { const h = holder(project, `verification-${date}-cycle`); await fs.mkdir(h.path, { recursive: true }); return h },
+    listCycleHomes: async (project) => Promise.all((await fs.readdir(path.join(issuesDir, project)).catch(() => []))
+      .filter((n) => n.startsWith('.') && CYCLE_HOME.test(n.slice(1))).map(async (n) => ({ ...holder(project, n.slice(1)), latestRun: await latestIn(holderPath(project, n.slice(1))) }))),
     listIssues: async (project) => Promise.all([...issueIds, ...paused.map((p) => p.issueId)].map(async (id) => ({ ...holder(project, id), latestRun: await latestOf(id) })))
   }
   const supervisor = createSupervisor({ issues, availabilityFile: path.join(dir, 'availability.json'), harnessDir, projectsDir: path.join(dir, 'projects'), configRoot: root })
@@ -141,7 +162,7 @@ async function panel ({ root, dir, issueIds, paused = [], harnessDir }) {
     emit: (event) => cycleRuns?.noteChanged(event),
     onEnded: (notice) => { calls.ended.push(notice) }
   })
-  cycleRuns = createCycleRuns({ fullVerification: fv, supervisor, issues, verificationDir, changesOf: async () => CHANGES, log: { warn () {} } })
+  cycleRuns = createCycleRuns({ fullVerification: fv, supervisor, issues, verificationDir, changesOf, log: { warn () {} } })
   supervisor.setEngineRunner('full-verification', cycleRuns)
   return { supervisor, fv, cycleRuns, calls, release, issuePath, verificationDir, issues }
 }
@@ -292,17 +313,155 @@ export default async function (t) {
       await a.fv.settle()
     }
 
-    t.section('AC8: a trigger cycle is unchanged: no run, its own trigger')
+    t.section('Entrances (AC1, AC3, AC6): startEntrance starts the playbook run in the day\'s cycle home; its cycle names the run and the entrance')
     {
-      const dir = await temp('devpanel-fvrun-hand-')
+      const dir = await temp('devpanel-fvrun-entrance-')
       const w = await panel({ root, dir, issueIds: [], harnessDir })
+      const started = await w.cycleRuns.startEntrance({ trigger: 'hand', by: 'tester' })
+      t.ok('held in the cycle home of the first project of the scope', started.run.project === P && /^verification-\d{4}-\d{2}-\d{2}-cycle$/.test(started.run.issueId), JSON.stringify(started))
+      t.eq('the answer names the run, reserved as running', [typeof started.run.runId, started.status], ['string', 'running'])
+      const runFile = path.join(w.issuePath('x'), '..', `.${started.run.issueId}`, 'runs', started.run.runId, 'run.json')
+      const live = await until(async () => { const r = await readJson(runFile).catch(() => null); return r?.cycleRun?.cycleId ? r : null }, 'the run to start its cycle')
+      const record = await w.fv.recordOf(live.cycleRun.cycleId)
+      t.eq('its cycle names the run and the entrance that started it', [record.trigger, record.by, record.run], ['hand', 'tester', started.run])
+      t.eq('the run is the Full verification playbook\'s engine program', live.engineProgram, 'full-verification')
+      let again = null
+      try { await w.cycleRuns.startEntrance({ trigger: 'supervisor', by: 'top-level supervisor (m)' }) } catch (error) { again = error.code }
+      t.eq('a second entrance while one runs is refused before anything is reserved', again, 'FULL_VERIFICATION_RUNNING')
+      t.eq('the project in its scope links to it', (await w.cycleRuns.forProject(P)).map((l) => l.run.runId), [started.run.runId])
       w.release()
-      const hand = await w.fv.startNow({ by: 'tester' })
+      await until(async () => { const r = await readJson(runFile).catch(() => null); return r?.status === 'completed' ? r : null }, 'the run to complete')
       await w.fv.settle()
-      const record = await w.fv.recordOf(hand.id)
-      t.eq('a hand start names no run', [record.trigger, record.run ?? null], ['hand', null])
-      t.eq('and lists on no project', await w.cycleRuns.forProject(P), [])
+      await released(w, started.run)
+      t.eq('once the supervisor let go of the run, busy() is false', [w.supervisor.isActive(started.run.project, started.run.issueId), w.cycleRuns.busy()], [false, false])
+
+      t.section('auditor-1.starting-flag-finally: a refused entrance leaves busy() false, so the delivery check is not silenced')
+      const scope = w.fv.scope
+      w.fv.scope = async () => ({ projects: [], unreadable: [{ path: '/projects', code: 'EACCES', message: 'the projects root cannot be read' }] })
+      let unreadable = null
+      try { await w.cycleRuns.startEntrance({ trigger: 'deliveries', by: 'deliveries' }) } catch (error) { unreadable = [error.code, error.status] }
+      w.fv.scope = scope
+      t.eq('an unreadable scope refuses the entrance with the cycle\'s own 503, nothing reserved, and busy() is false again', [unreadable, w.cycleRuns.busy(), w.supervisor.isActive(started.run.project, started.run.issueId)], [['FULL_VERIFICATION_SCOPE_UNREADABLE', 503], false, false])
+
+      t.section('Holder rules: a cycle home takes only the Full verification playbook; a Deployment home never takes it')
+      const date = started.run.issueId.replace(/^verification-|-cycle$/g, '')
+      let other = null
+      try { await w.supervisor.start({ project: P, issueId: started.run.issueId, playbookId: 'analysis', configRoot: root }) } catch (error) { other = error.message }
+      t.ok('another playbook in a cycle home is refused', /cycle home takes only the Full verification playbook/.test(other ?? ''), other)
+      let cycleOwn = null
+      try { await w.supervisor.start({ project: P, issueId: started.run.issueId, playbookId: 'deployment', configRoot: root, cycle: 'c-1', runOptions: { fullVerification: true } }) } catch (error) { cycleOwn = error.message }
+      t.ok('the cycle\'s own runs never go into a cycle home', /never the cycle's own runs/.test(cycleOwn ?? ''), cycleOwn)
+      await fs.mkdir(path.join(w.issuePath('x'), '..', `.verification-${date}`), { recursive: true })
+      let deployment = null
+      try { await w.supervisor.start({ project: P, issueId: `verification-${date}`, playbookId: 'full-verification', configRoot: root }) } catch (error) { deployment = error.message }
+      t.ok('the Full verification playbook in a Deployment home is refused', /run home takes runs only from the cycle/.test(deployment ?? ''), deployment)
+
+      t.section('auditor-1.entrance-note-erased-by-refused-second: a second entrance while the first is being admitted is refused and leaves the first one\'s trigger')
+      const [first, second] = await Promise.allSettled([
+        w.cycleRuns.startEntrance({ trigger: 'deliveries', by: 'deliveries', deliveries: { host: HOST, count: 10, threshold: 10, runs: [] } }),
+        w.cycleRuns.startEntrance({ trigger: 'hand', by: 'someone' })
+      ])
+      t.eq('the first is started, the second refused as running, before anything is reserved', [first.status, second.status, second.reason?.code], ['fulfilled', 'rejected', 'FULL_VERIFICATION_RUNNING'])
+      const firstFile = path.join(w.issuePath('x'), '..', `.${first.value.run.issueId}`, 'runs', first.value.run.runId, 'run.json')
+      const firstLive = await until(async () => { const r = await readJson(firstFile).catch(() => null); return r?.cycleRun?.cycleId ? r : null }, 'the first run to start its cycle')
+      const firstRecord = await w.fv.recordOf(firstLive.cycleRun.cycleId)
+      t.eq('its cycle keeps the first entrance\'s trigger, by and deliveries', [firstRecord.trigger, firstRecord.by, firstRecord.deliveries?.count, firstRecord.run.runId], ['deliveries', 'deliveries', 10, first.value.run.runId])
+      w.release()
+      await until(async () => { const r = await readJson(firstFile).catch(() => null); return ['completed', 'incomplete', 'cancelled', 'failed'].includes(r?.status) ? r : null }, 'the first run to end')
+      await w.fv.settle()
+      await released(w, first.value.run)
+    }
+
+    t.section('auditor-1.cycle-home-not-reconciled: a cycle-home run whose owner went away during its preview, before any cycle, is settled at the next start')
+    {
+      const dir = await temp('devpanel-fvrun-entrance-crash-')
+      let finishPreview = null
+      const previewing = new Promise((resolve) => { finishPreview = resolve })
+      const a = await panel({ root, dir, issueIds: [], harnessDir, changesOf: () => previewing.then(() => CHANGES) })
+      const started = await a.cycleRuns.startEntrance({ trigger: 'hand', by: 'tester' })
+      const runFile = path.join(a.issuePath('x'), '..', `.${started.run.issueId}`, 'runs', started.run.runId, 'run.json')
+      await until(async () => (await readJson(runFile).catch(() => null))?.status === 'running', 'the run to be recorded running')
+      t.eq('still previewing: busy, no cycle yet', [a.cycleRuns.busy(), (await readJson(runFile)).cycleRun?.cycleId ?? null], [true, null])
+      const stopping = a.supervisor.shutdown({ graceMs: 5000 })
+      finishPreview()
+      await stopping
+      const leftBehind = await readJson(runFile)
+      t.ok('the shutdown left it live, with no cycle record', ['running', 'stopping'].includes(leftBehind.status) && !leftBehind.cycleRun?.cycleId, JSON.stringify({ status: leftBehind.status, cycleRun: leftBehind.cycleRun }))
+      t.eq('no cycle was ever started', await a.fv.recordOf('none'), null)
+
+      const b = await panel({ root, dir, issueIds: [], harnessDir })
+      await b.supervisor.reconcile()
+      const settled = await readJson(runFile)
+      t.eq('reconcile finds it in the cycle home and settles it cancelled, owner lost, never recovery-required', [settled.status, settled.blockedReason ?? null, Boolean(settled.cycleRun?.ownerLost)], ['cancelled', null, true])
+      t.eq('it offers no recover', supportedActions(settled), [])
+      t.eq('the next entrance is admitted', (await b.cycleRuns.startEntrance({ trigger: 'hand', by: 'tester' })).status, 'running')
+      b.release()
+      await until(async () => (await b.fv.latest()).cycle?.state === 'ended', 'the next cycle to end')
+      await b.fv.settle()
+      await released(b, (await b.fv.latest()).cycle.run)
+    }
+
+    t.section('recordOf reads an earlier cycle')
+    {
       t.eq('recordOf finds an earlier cycle on disk too', (await firstRun.fv.recordOf(firstCycle))?.id, firstCycle)
+    }
+
+    t.section('risk-7460361803f8: a runner that throws after the cycle started interrupts the cycle with the run; the run reads failed only once the cycle settled, and a shutdown meanwhile is not made a failure')
+    {
+      const dir = await temp('devpanel-fvrun-throw-')
+      const quick = { iso: () => new Date().toISOString(), now: () => Date.now(), after: (ms, fn) => { const h = setTimeout(fn, 10); return () => clearTimeout(h) } }
+      // A cycle whose `done` rejects (the runner's own wait fails) while the cycle itself is still frozen; it settles as an
+      // interrupted cycle once asked to stop, when `settleOnAbort`.
+      const fake = ({ settleOnAbort }) => {
+        const record = { id: 'c-throw', state: 'frozen', frozenAt: quick.iso(), scope: { projects: [P] }, projects: [] }
+        const seen = { aborted: null }
+        const fullVerification = {
+          scope: async () => ({ projects: [P], unreadable: [] }),
+          latest: async () => ({ active: !['ended', 'interrupted', 'failed'].includes(record.state) }),
+          recordOf: async () => record,
+          async startForRun ({ signal }) {
+            signal.addEventListener('abort', () => {
+              seen.aborted = signal.reason ?? null
+              if (settleOnAbort) setTimeout(() => Object.assign(record, { state: 'interrupted', interruption: { reason: 'stopped', by: signal.reason?.by ?? null }, endedAt: quick.iso() }), 50)
+            }, { once: true })
+            const done = Promise.reject(new Error('runner boom'))
+            done.catch(() => {})
+            return { cycle: { ...record }, done }
+          }
+        }
+        const runs = createCycleRuns({ fullVerification, supervisor: { freezeCandidates: () => ({ wouldPause: [], mayContinue: [], pending: [] }) }, issues: { ISSUES_DIR: dir, listIssues: async () => [] }, verificationDir: dir, clock: quick, changesOf: async () => ({}), log: { warn () {} } })
+        return { record, seen, runs }
+      }
+      const driveOf = (runs, { stoppedBy = () => null } = {}) => {
+        const controller = new AbortController()
+        const run = { runId: 'r-throw', status: 'running', startedAt: quick.iso() }
+        const writes = []
+        let settled = false
+        const outcome = runs.drive({ project: P, issueId: 'wrapper', runId: 'r-throw', issuePath: dir, run, signal: controller.signal, stoppedBy, stopActor: () => null, stopping: () => false,
+          write: async () => { writes.push(run.status) }, emit: () => {} })
+          .then(() => ({ resolved: true }), (error) => ({ error: error.message }))
+          .finally(() => { settled = true })
+        return { controller, run, writes, outcome, settled: () => settled }
+      }
+
+      const one = fake({ settleOnAbort: true })
+      const a = driveOf(one.runs)
+      await until(() => one.seen.aborted, 'the cycle to be asked to stop')
+      t.eq('the cycle is asked to stop by the engine, and while it is still live the runner has not given up the run', [one.seen.aborted?.by, one.record.state, a.settled()], ['engine', 'frozen', false])
+      const ended = await a.outcome
+      t.eq('the runner fails only after the cycle settled, interrupted as stopped by the engine', [ended.error, one.record.state, one.record.interruption?.by], ['runner boom', 'interrupted', 'engine'])
+      t.ok('the run never read failed meanwhile: the supervisor records the failure after the runner returns', !a.writes.includes('failed'), JSON.stringify(a.writes))
+
+      const two = fake({ settleOnAbort: false })
+      let shutdown = false
+      const b = driveOf(two.runs, { stoppedBy: () => shutdown ? 'service-shutdown' : null })
+      await until(() => two.seen.aborted, 'the cycle to be asked to stop')
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      t.eq('a cycle that does not settle keeps the run bound to it', [two.record.state, b.settled()], ['frozen', false])
+      shutdown = true
+      b.controller.abort()
+      t.eq('a service shutdown during that wait still reaches the runner and lets go, with no failure', await b.outcome, { resolved: true })
+      t.ok('nothing wrote it failed', !b.writes.includes('failed'), JSON.stringify(b.writes))
     }
   } finally {
     await cleanupSandboxes()

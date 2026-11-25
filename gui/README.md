@@ -846,8 +846,28 @@ repositories}`, each repository `{checkout, project, readBy, range, commits: {sh
 sections}` (or `{checkout, error}`) with `sections` in this order: `delivered` (the issues
 delivered, each `{project, issueId, issueName, runId, at, commits}`, `commits` empty while
 uncommitted), `by-hand` (commits `{sha, author, authoredAt, subject, handPaths}`, `mixed` with its
-`runs` when it also carries deliveries) and `uncommitted` (`{paths, total}`). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
-while one runs). The socket event `verification:changed` names the cycle and its state; the
+`runs` when it also carries deliveries) and `uncommitted` (`{paths, total}`). `afterDeliveries` is the number of
+deliveries per stage after which the engine starts a cycle itself (0: never; the timing is then people's and the
+top-level supervisor's).
+
+Every cycle is a Full verification playbook run (`server/full-verification-run.mjs`); these are the entrances, and each
+starts that run:
+
+- `POST /api/verification/start` ("Full verification now", the button on the dashboard and on `/verification`) answers
+  202 `{run: {project, issueId, runId}, status}`: the run it started. Its cycle begins once the run has read its preview;
+  the cycle's record names the run (`cycle.run`) and `trigger: 'hand'`. Refused 409 `FULL_VERIFICATION_RUNNING` while a
+  cycle or a Full verification run is live or being started, 503 `FULL_VERIFICATION_SCOPE_UNREADABLE` (the cycle's own
+  refusal) when the projects to verify cannot be decided, before anything is reserved.
+- The delivery check, after `afterDeliveries` deliveries per stage (`trigger: 'deliveries'`).
+- The top-level supervisor's `preview_verification {}` and then `start_verification {previewId}` (`trigger: 'supervisor'`;
+  docs/top-level-supervisor.md "Starting a full verification cycle").
+- An issue's start dialog or `POST /api/projects/:project/issues/:id/runs` with `playbook: 'full-verification'`
+  (`trigger: 'playbook'`), held on that issue.
+
+The first three hold the run in the day's cycle home, id `verification-<date>-cycle` (`issues/<project>/.verification-<date>-cycle/`,
+`issues.js` `ensureCycleHome`), in the first project of the cycle's scope (else the first project). It is not an issue:
+the issue lists never show it, but `GET /api/projects/:project/issues/:id` and every run route read it by that id (`getRunHolder`),
+so the dashboard's run link opens. The socket event `verification:changed` names the cycle and its state; the
 top-level supervisor is told `verification-ended` once it ended.
 `GET /api/projects/:project/verification-runs` lists the Full verification runs whose cycle verifies the project (its
 scope), newest ten, `{cycleId, date, state, verdict, run: {project, issueId, runId}}` (`server/full-verification-run.mjs`).

@@ -117,7 +117,9 @@ export function createCycleGates ({ clock = { iso: () => new Date().toISOString(
       cancel,
       // The whole pinned record ({hostRef, host, pinned}), so a drive connects to the host the gate protects.
       pinned: (hostRef) => { const h = freeze?.hosts.find((x) => x.hostRef === hostRef); return h?.host && h?.pinned ? { host: h.host, pinned: h.pinned } : null },
-      cycleId: () => freeze?.cycleId ?? null
+      cycleId: () => freeze?.cycleId ?? null,
+      // The resolved HostNames the cycle drives on (a write's wait has no host of its own).
+      hosts: () => [...(freeze?.hostNames ?? [])]
     }
   }
 

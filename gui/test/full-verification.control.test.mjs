@@ -31,7 +31,7 @@ export default async (t) => {
   try {
     t.section('the panel shows no cycle before the first')
     const empty = await stage.request('/api/verification/latest')
-    t.eq('no record, no schedule, admission open', [empty.status, empty.body.cycle, empty.body.schedule, empty.body.frozen], [200, null, null, null])
+    t.eq('no record, no schedule, admission open', [empty.status, empty.body.cycle, empty.body.schedule ?? null, empty.body.frozen], [200, null, null, null])
 
     t.section('a hand start with an empty scope: the run in flight goes on')
     await stage.setControl({ delayMs: 4000 })
@@ -39,8 +39,9 @@ export default async (t) => {
     const started = await stage.request(route(issue.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
     await until(async () => (await stage.run(issue.id, started.body.runId)).active?.length > 0, 'a turn to be in flight')
     const hand = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
-    t.eq('"Full verification now" is accepted with the cycle frozen', [hand.status, hand.body.state], [202, 'frozen'])
-    t.eq('its scope is empty and it asked no run to pause: the project has no infrastructure', [hand.body.cycle?.scope?.projects, hand.body.cycle?.asked], [[], []])
+    t.eq('AC1: "Full verification now" is accepted and names the Full verification run it started, held in the day\'s cycle home', [hand.status, typeof hand.body.run?.runId, /^verification-\d{4}-\d{2}-\d{2}-cycle$/.test(hand.body.run?.issueId ?? ''), hand.body.run?.project], [202, 'string', true, stage.project])
+    const begun = await until(async () => { const r = (await stage.request('/api/verification/latest')).body; return r.cycle?.run?.runId === hand.body.run.runId ? r.cycle : null }, 'the run to start its cycle')
+    t.eq('its cycle names the run; its scope is empty and it asked no run to pause: the project has no infrastructure', [begun.trigger, begun.scope?.projects, begun.asked], ['hand', [], []])
     const other = await stage.createIssue('Started beside the cycle')
     // The cycle has nothing to wait for and may already have ended: the start is admitted either way.
     const beside = await stage.request(route(other.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
@@ -49,7 +50,7 @@ export default async (t) => {
 
     t.section('the cycle records itself and resumes nothing')
     const ended = await until(async () => { const r = (await stage.request('/api/verification/latest')).body; return r.cycle?.state === 'ended' ? r.cycle : null }, 'the cycle to end')
-    t.eq('the record is the hand start\'s', [ended.id, ended.trigger], [hand.body.cycleId, 'hand'])
+    t.eq('the record is the hand start\'s', [ended.id, ended.trigger, ended.run?.runId], [begun.id, 'hand', hand.body.run.runId])
     t.eq('the project without infrastructure is verified through its instances, with no run', ended.projects.map((p) => [p.project, p.verifiedThrough, p.runId ?? null]), [[stage.project, 'instances', null]])
     t.eq('nothing was paused, so nothing is resumed, held or left paused', [ended.resumed, ended.heldForOperator, ended.leftPaused], [[], [], []])
     t.eq('no stage was verified: the outcome bumps nothing and opens nothing', [ended.verdict, ended.outcome?.bump ?? null, ended.outcome?.issues ?? null, typeof ended.outcome?.reason], ['no-stages', null, null, 'string'])

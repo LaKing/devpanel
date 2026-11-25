@@ -264,7 +264,9 @@ app.get('/api/projects/:project/issues/:id', route(async (req, res) => {
   // page refuses before sending what supervisor.mjs refuses while frozen (start :368, answer :770, finalize :1589).
   // Only for a project the cycle verifies; `confined` says whether a new run here could be contained (its turns fenced).
   const frozen = supervisor.frozenFor?.(req.params.project) ? supervisor.frozen() : null
-  res.json({ ...(await getIssue(req.params.project, req.params.id)), admissionFrozen: frozen ? { cycleId: frozen.cycleId ?? null, at: frozen.at ?? null, confined: supervisor.startsConfined() } : null })
+  // A run home or cycle home (issues.getRunHolder) is read as an issue page reads one, so a link to its run opens.
+  const holder = issues.isRunHomeId?.(req.params.id) ? await issues.getRunHolder(req.params.project, req.params.id) : await getIssue(req.params.project, req.params.id)
+  res.json({ ...holder, admissionFrozen: frozen ? { cycleId: frozen.cycleId ?? null, at: frozen.at ?? null, confined: supervisor.startsConfined() } : null })
 }))
 
 // Where the issue came from, what came out of it, and what it waits for or holds up (issue-family.mjs).
@@ -562,7 +564,7 @@ async function unpackedIssue (project, id) {
 }
 
 // The full verification (server/full-verification.mjs): the latest cycle and
-// "Full verification now", which starts the same cycle the schedule does.
+// "Full verification now", which starts the Full verification playbook run (full-verification-run.mjs startEntrance).
 app.get('/api/verification/latest', route(async (_req, res) => res.json(await fullVerification.latest())))
 // What the latest cycle's drives print (verification-output.mjs): an entry's commands, and one command's text from
 // a byte offset on, for the Full verification page's terminal. Read-only; the entry comes from the cycle record.
@@ -578,9 +580,11 @@ app.get('/api/verification/output', route(async (req, res) => {
   res.json(await cycleOutput({ cycle, project, command: typeof command === 'string' && command ? command : null, after }))
 }))
 
+// The run is held in the day's cycle home; its cycle starts once the run has read its preview, so the answer names the
+// run ({run: {project, issueId, runId}, status}), and the cycle is the one whose record names that run.
 app.post('/api/verification/start', route(async (req, res) => {
-  const cycle = await fullVerification.startNow({ by: req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || 'operator') })
-  res.status(202).json({ cycleId: cycle.id, state: cycle.state, cycle })
+  const started = await cycleRuns.startEntrance({ trigger: 'hand', by: req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || 'operator') })
+  res.status(202).json(started)
 }))
 
 const readAttention = () => attentionItems({ listProjects: issues.listProjects, listIssues: issues.listIssues, getTopSupervisor: () => topSupervisor })
@@ -1206,6 +1210,8 @@ await fullVerification.recover().catch((error) => console.warn(`[devpanel] full 
 // was settled by reconcile above; it now carries how recover() left its cycle.
 cycleRuns = createCycleRuns({ fullVerification, supervisor, issues })
 supervisor.setEngineRunner('full-verification', cycleRuns)
+// The delivery check starts its cycle as this playbook's run, and waits while one is being started or driven.
+fullVerification.setEntrance({ start: (o) => cycleRuns.startEntrance(o), busy: () => cycleRuns.busy() })
 await cycleRuns.recover().catch((error) => console.warn(`[devpanel] full verification run recovery: ${error.message}`))
 // What the last shutdown cancelled comes back, before the top-level supervisor or
 // anyone else could take its project's slot. Recovery above is untouched: a run
@@ -1215,7 +1221,7 @@ if (hostSettings().resumeAfterShutdown) {
   if (resumed.length || refused.length) console.log(`              ${resumed.length} run(s) stopped by the last shutdown resumed, ${refused.length} refused and left stopped`)
 }
 let previousSupervisorState = null
-topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformance, consult,
+topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformance, consult, verification: cycleRuns,
   decisions: ({ spending }) => (wakeAdvisor = createAdvisor({ spending, availability: availabilityStore, loadProvider })),
   emit: (event) => {
     // A working call's streamed output: its own channel, so it does not make

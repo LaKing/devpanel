@@ -100,8 +100,9 @@ const err = (status, message, detail = {}) =>
  * It says nothing about the launch's inputs and the identical start can pass once
  * that clears, so the start gate neither guards it nor keeps the attempt's charge.
  */
-// A full verification run home's id (issues.js HOME_PATTERN): runs of the cycle, never an issue.
-const HOME_PATTERN = /^verification-\d{4}-\d{2}-\d{2}$/
+// A full verification run home's id (issues.js HOME_PATTERN, runs of the cycle) or a cycle home's (CYCLE_HOME_PATTERN,
+// the Full verification playbook runs an entrance started): never an issue.
+const HOME_PATTERN = /^verification-\d{4}-\d{2}-\d{2}(-cycle)?$/
 
 const occupied = (message, detail = {}) => err(409, message, { started: false, retryable: true, ...detail })
 
@@ -160,6 +161,12 @@ export function createSupervisor ({
   /** An issue, or a full verification run home (issues.getRunHolder); fakes without homes read issues only. */
   const holderOf = (project, issueId) => (issues.getRunHolder ?? issues.getIssue)(project, issueId)
   const homesOf = async (project) => (issues.listRunHomes ? issues.listRunHomes(project).catch(() => []) : [])
+  /**
+   * Every holder of runs beside the issues: the Deployment homes and the cycle homes (issues.listCycleHomes). Only for
+   * finding or settling live runs (reconcile, liveAgents); a cycle home's run delivers and releases nothing, so
+   * exclusivity, coverage and release readers keep to homesOf.
+   */
+  const holdersOf = async (project) => [...await homesOf(project), ...(issues.listCycleHomes ? await issues.listCycleHomes(project).catch(() => []) : [])]
 
   /*
    * The full verification's admission freeze (server/full-verification.mjs,
@@ -690,13 +697,17 @@ export function createSupervisor ({
     let pregateRecord = null
     let startOverlap = null
     let home = false
+    let cycleHome = false
     let modulePool = null
     let moduleExpected = []
     let startContained = false
     let engineProgram = null
     try { await admission(project, async () => {
       const issue = await holderOf(project, issueId)
-      home = Boolean(issue.home)
+      // A cycle home (issues.js CYCLE_HOME_PATTERN) holds Full verification playbook runs only; checked once resolved.
+      cycleHome = issue.kind === 'verification-cycle'
+      home = Boolean(issue.home) && !cycleHome
+      if (cycleHome && cycle) throw err(409, 'a full verification cycle home takes only Full verification playbook runs, never the cycle\'s own runs')
       if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
       // A run home takes the cycle's own runs and nothing else; only those run as the full verification.
       if (home !== Boolean(cycle)) throw err(409, home ? 'a full verification run home takes runs only from the cycle' : 'only the full verification cycle starts a run in a run home')
@@ -717,6 +728,9 @@ export function createSupervisor ({
       // anything is locked, reserved or probed, so no run and no seat step exist (config/load.mjs).
       const engineOnly = resolution.ok ? engineOnlyRefusal(resolution.resolved) : null
       if (engineOnly) throw engineOnly
+      if (cycleHome && !(resolution.ok && resolution.resolved.kind === ENGINE_ONLY && resolution.resolved.engineProgram === 'full-verification')) {
+        throw err(409, 'a full verification cycle home takes only the Full verification playbook\'s runs')
+      }
       // The full verification's freeze holds back what can write the checkout, nothing else.
       // Only a writing run the freeze holds whole is refused: a contained one starts, its drives and writes wait.
       // Bound to the cycle that classified it; a cycle that thawed meanwhile refuses nothing, a newer one classifies again.
@@ -2596,8 +2610,8 @@ export function createSupervisor ({
       // as live that nothing will ever reconcile.
       let list = []
       try { list = await issues.listIssues(projectId) } catch { unread.push({ project: projectId }); continue }
-      // The full verification's run homes hold runs too, and a crash leaves theirs to recover like any other.
-      list = [...list, ...await homesOf(projectId)]
+      // The full verification's run homes and cycle homes hold runs too, and a crash leaves theirs to recover like any other.
+      list = [...list, ...await holdersOf(projectId)]
       // Notes kept for an archived issue whose restore did not get to them.
       await issues.drainArchivedNotes?.(projectId).catch((error) => console.warn(`[devpanel] could not finish the archived notes of ${projectId}: ${error.message}`))
 
@@ -2770,7 +2784,7 @@ export function createSupervisor ({
       // Active issues only: an archived issue cannot hold a live run, because
       // archiving refuses one.
       try { list = await issues.listIssues(projectId) } catch { continue }
-      list = [...list, ...await homesOf(projectId)]
+      list = [...list, ...await holdersOf(projectId)]
 
       for (const issue of list) {
         let names = []
