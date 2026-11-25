@@ -40,7 +40,7 @@ export default async (t) => {
     await until(async () => (await stage.run(issue.id, started.body.runId)).active?.length > 0, 'a turn to be in flight')
     const hand = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
     t.eq('AC1: "Full verification now" is accepted and names the Full verification run it started, held in the day\'s cycle home', [hand.status, typeof hand.body.run?.runId, /^verification-\d{4}-\d{2}-\d{2}-cycle$/.test(hand.body.run?.issueId ?? ''), hand.body.run?.project], [202, 'string', true, stage.project])
-    const begun = await until(async () => { const r = (await stage.request('/api/verification/latest')).body; return r.cycle?.run?.runId === hand.body.run.runId ? r.cycle : null }, 'the run to start its cycle')
+    const begun = await until(async () => { const r = (await stage.request('/api/verification/latest')).body; return r.cycle?.run?.runId === hand.body.run.runId && r.cycle.id ? r.cycle : null }, 'the run to start its cycle')
     t.eq('its cycle names the run; its scope is empty and it asked no run to pause: the project has no infrastructure', [begun.trigger, begun.scope?.projects, begun.asked], ['hand', [], []])
     const other = await stage.createIssue('Started beside the cycle')
     // The cycle has nothing to wait for and may already have ended: the start is admitted either way.
