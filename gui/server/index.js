@@ -12,7 +12,10 @@ import { Server } from 'socket.io'
 import { hostInfo, metricsSnapshot } from './metrics.js'
 import * as issues from './issues.js'
 import { setIssueDependencies } from './issue-dependencies.mjs'
-import { attentionList } from './attention.mjs'
+import { attentionItems } from './attention.mjs'
+import { createNotifier } from './notifications/notifier.mjs'
+import { webPushTransport } from './notifications/webpush.mjs'
+import { collectWaits, supervisorQuestionHistory } from './notifications/waits.mjs'
 import {
   addStepFile, createIssue, createStep, getIssue, IssueError,
   listIssues, listProjects, MAX_FILE_BYTES, readStepFile
@@ -455,7 +458,7 @@ const emitRunEvent = (event) => {
   if (type !== 'live' && type !== 'activity') console.info('Issue run event:', { type, project, issueId, runId, role, stepId })
   // Output goes only to the sockets watching that invocation (live-rooms.mjs); everything else to all.
   if (type === 'live') deliverRunLive(io, event)
-  else io?.emit('run:event', event)
+  else { io?.emit('run:event', event); if (type !== 'activity') notifier?.nudge() }
 }
 
 // Every agent currently invoked, anywhere. Behind the same token as the rest:
@@ -519,15 +522,43 @@ app.post('/api/verification/start', route(async (req, res) => {
   res.status(202).json({ cycleId: cycle.id, state: cycle.state, cycle })
 }))
 
+const readAttention = () => attentionItems({ listProjects: issues.listProjects, listIssues: issues.listIssues, getTopSupervisor: () => topSupervisor })
 app.get('/api/attention', route(async (_req, res) => {
-  // The supervisor's open questions come first: nothing else can answer them.
-  const questions = (topSupervisor?.questions() ?? []).map((q) => ({
-    kind: 'supervisor-question', questionId: q.id, project: q.project ?? null, issueId: q.issueId ?? null,
-    issueName: q.issueId ?? 'Supervisor', since: q.at, headline: q.question, options: q.options ?? null,
-    // The consult panel's wording for a person and what it said, when the question went through it.
-    ...(q.brief ? { brief: q.brief } : {}), ...(q.consult ? { consult: q.consult } : {})
-  }))
-  res.json([...questions, ...await attentionList({ listProjects: issues.listProjects, listIssues: issues.listIssues })])
+  const { items } = await readAttention()
+  res.json(items)
+}))
+
+// ---- operator alerts (docs/operator-alerts.md) -----------------------------
+// The notifier is created at startup, after the top-level supervisor; until then these answer 503.
+let notifier = null
+// Who a device belongs to: the login, else the name given; with neither, nobody (the device is registered on its own).
+const alertOperator = (req) => req.actor ?? ((typeof req.body?.actor === 'string' && req.body.actor.trim()) || (typeof req.query?.actor === 'string' && req.query.actor.trim()) || null)
+const alertEndpoint = (req) => (typeof req.query?.endpoint === 'string' && req.query.endpoint) || (typeof req.body?.endpoint === 'string' && req.body.endpoint) || null
+const requireNotifier = () => { if (!notifier) throw Object.assign(new Error('alerts are not ready yet'), { status: 503 }); return notifier }
+app.get('/api/notifications', route(async (req, res) => res.json({ publicKey: requireNotifier().publicKey(), operator: alertOperator(req), ...notifier.list(alertOperator(req), { endpoint: alertEndpoint(req) }) })))
+app.post('/api/notifications/subscriptions', route(async (req, res) => res.status(201).json(await requireNotifier().subscribe({ operator: alertOperator(req), subscription: req.body?.subscription, label: req.body?.label }))))
+app.delete('/api/notifications/subscriptions', route(async (req, res) => {
+  const operator = alertOperator(req)
+  if (!operator) return res.status(400).json({ error: 'name whose devices to turn off, or turn off this device' })
+  res.json(await requireNotifier().unsubscribe({ operator }))
+}))
+// This browser's own subscription, found by its push endpoint, whatever name it was registered under.
+app.post('/api/notifications/device/off', route(async (req, res) => {
+  const endpoint = alertEndpoint(req)
+  if (!endpoint) return res.status(400).json({ error: 'endpoint is required' })
+  res.json(await requireNotifier().unsubscribe({ endpoint }))
+}))
+app.delete('/api/notifications/subscriptions/:id', route(async (req, res) => res.json(await requireNotifier().unsubscribe({ operator: alertOperator(req), id: req.params.id }))))
+app.get('/api/notifications/alerts/:alertId', route(async (req, res) => {
+  const found = /^[0-9a-f-]{36}$/.test(req.params.alertId) ? await requireNotifier().alert(req.params.alertId) : null
+  if (!found) return res.status(404).json({ error: 'no such alert' })
+  res.json(found)
+}))
+app.get('/api/notifications/events', route(async (req, res) => {
+  const n = requireNotifier()
+  res.json(await collectWaits({ listProjects: issues.listProjects, listIssues: issues.listIssues, readRunRecords: (p, i, options) => issues.readRunRecords(p, i, { ...options, journal: true }),
+    questions: await supervisorQuestionHistory(process.env.DEVPANEL_SUPERVISOR_DIR ?? path.join(issues.ISSUES_DIR, '.supervisor')), alerted: await n.alertedKeys(), installedAt: n.installedAt(),
+    from: typeof req.query.from === 'string' ? req.query.from : null, to: typeof req.query.to === 'string' ? req.query.to : null }))
 }))
 
 app.get('/api/agents', route(async (_req, res) => {
@@ -1107,13 +1138,27 @@ topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformanc
     // A working call's streamed output: its own channel, so it does not make
     // every open supervisor page re-read the whole state per chunk.
     if (event?.type === 'live') { deliverSupervisorLive(io, event); return }
-    if (event?.type === 'question') { io?.emit('supervisor:changed'); io?.emit('issues:changed', { reason: 'supervisor-question' }); return }
+    if (event?.type === 'question') { io?.emit('supervisor:changed'); io?.emit('issues:changed', { reason: 'supervisor-question' }); notifier?.nudge(); return }
     const key = JSON.stringify(event)
     if (key !== previousSupervisorState) { console.info('Supervisor state:', event); previousSupervisorState = key }
     io?.emit('supervisor:changed')
   },
   changed: () => io?.emit('issues:changed', { reason: 'supervisor-action' })
 })
+// Operator alerts: owned by the server, not by a socket or the supervisor's activation, so they go out with every
+// dashboard closed. Started after the top-level supervisor, whose questions it reads through a getter.
+try {
+  const dir = path.join(issues.ISSUES_DIR, '.notifications')
+  const transport = webPushTransport({ dir })
+  await transport.init()
+  const created = createNotifier({ dir, transport, readItems: readAttention, readRun: issues.readRunForWaits,
+    getQuestion: (id) => topSupervisor?.questionRecord(id) ?? null, log: (line) => console.warn(`[devpanel] ${line}`) })
+  await created.start()
+  notifier = created
+} catch (error) {
+  // The panel runs without alerts rather than not at all; the alert routes answer 503 and say why in the log.
+  console.warn(`[devpanel] operator alerts did not start: ${error.message}`)
+}
 // A full verification cycle recovery marked interrupted above, or whose end could not be told, is told now, once.
 await fullVerification.announcePending().catch((error) => console.warn(`[devpanel] full verification announcements: ${error.message}`))
 if (recovered.length) {
@@ -1215,6 +1260,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
     // Stop accepting new connections immediately, without delaying run shutdown on keep-alive sockets.
     stopTicker()
+    notifier?.stop()
     fullVerification?.stop()
     const closeQuietly = (target) => new Promise((resolve) => {
       const timer = setTimeout(resolve, 1000)

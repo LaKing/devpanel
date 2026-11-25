@@ -6,6 +6,8 @@ const routes = [
   { path: '/supervisor', name: 'supervisor', component: () => import('@/views/SupervisorView.vue'), meta: { title: 'Supervisor' } },
   { path: '/models', name: 'models', component: () => import('@/views/ModelAvailabilityView.vue'), meta: { title: 'Model availability' } },
   { path: '/playbooks', name: 'playbooks', component: () => import('@/views/PlaybooksView.vue'), meta: { title: 'Playbooks' } },
+  // An operator alert's page (docs/operator-alerts.md): behind the same sign-in as every other page.
+  { path: '/alerts/:alertId', name: 'alert', component: () => import('@/views/AlertView.vue'), meta: { title: 'Alert' } },
   { path: '/verification', name: 'verification', component: () => import('@/views/VerificationView.vue'), meta: { title: 'Full verification' } },
   {
     path: '/',

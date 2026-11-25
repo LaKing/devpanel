@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import * as store from '../server/runtime/store.mjs'
+import { writeExclusive } from '../server/runtime/persistence.mjs'
 
 export default async function (t) {
   const issue = await fs.mkdtemp(path.join(os.tmpdir(), 'event-journal-'))
@@ -56,5 +57,13 @@ export default async function (t) {
     t.eq('damaged recovery metadata retains the readable prefix', unreadableFinding.events.length, 1)
     t.eq('damaged recovery metadata cannot clear recovery', unreadableFinding.recoveryRequired, true)
     t.ok('damaged recovery metadata is explicitly identified', unreadableFinding.message.includes('recovery record is unreadable'))
+      // A journal finding is published exclusively, so concurrent first readers agree on one detectedAt.
+    const once = path.join(dir, 'exclusive.json')
+    await writeExclusive(once, 'first')
+    let clash = null
+    try { await writeExclusive(once, 'second') } catch (error) { clash = error.code }
+    t.eq('a second exclusive write is refused', clash, 'EEXIST')
+    t.eq('and the first bytes stay', await fs.readFile(once, 'utf8'), 'first')
+    t.eq('no temporary file is left behind', (await fs.readdir(dir)).filter((n) => n.endsWith('.tmp')).length, 0)
   } finally { await fs.rm(issue, { recursive: true, force: true }) }
 }

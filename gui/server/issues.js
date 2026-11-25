@@ -10,14 +10,14 @@ import { promisify } from 'node:util'
 
 import { runResult } from './runtime/run-result.mjs'
 import { explainRun, limitRaises } from './runtime/run-explanation.mjs'
-import { readOutputs } from './runtime/store.mjs'
-import { reconcilePending } from './runtime/run-control.mjs'
+import { journalOverlay, pauseIdOf, readJournalFinding, readOutputs } from './runtime/store.mjs'
+import { reconcilePending, recoveryOccurrence } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
 import { LockHeld, withLock } from './runtime/lock.mjs'
 import { updateIssueMeta } from './issue-meta.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { ARCHIVE_FILE, archiveState, issueStatus, requireUnarchived } from './issue-archive.mjs'
-import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
+import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedJournals, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
 import { completePendingLookup, findRepeat, folderFingerprint, repeatOutcome, reportFingerprint } from './report-identity.mjs'
 import { findOpenMatch, occurrenceSummary, occurrenceTexts, readOccurrences, recordOccurrence } from './report-occurrences.mjs'
 import { openedBy as openedByRecord, derivedOpenedBy } from './opened-by.mjs'
@@ -231,7 +231,9 @@ async function readIssue (project, dirName) {
     // Records that exist and cannot be read, started after latestRun: the newest
     // run may be one of these, so latestRun alone cannot say the issue's run settled.
     // A run id starts with its time, so string order is start order.
-    unreadableNewerRuns: unreadable.filter((id) => !runs[0] || id > runs[0].runId)
+    unreadableNewerRuns: unreadable.filter((id) => !runs[0] || id > runs[0].runId),
+    // Every record that exists and could not be read or summarised, older ones included (time to response).
+    unreadableRuns: unreadable
   }
 }
 
@@ -258,7 +260,12 @@ async function runSummaries (dir, unreadable = []) {
     names = (await fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }))
       .filter((e) => e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-'))
       .map((e) => e.name)
-  } catch { return [] }
+  } catch (error) {
+    // No runs/ yet is no run. A runs/ that exists and cannot be listed may hold the newest run: it is named
+    // ('runs/') beside unreadable records, so nothing reads this issue as settled (attention, ready queue).
+    if (error.code !== 'ENOENT') unreadable.push('runs/')
+    return []
+  }
   const out = []
   const acceptedRisks = await readAcceptedRisks(dir)
   for (const runId of names) {
@@ -270,53 +277,68 @@ async function runSummaries (dir, unreadable = []) {
       continue
     }
     const accepted = JSON.stringify(acceptedRisks.filter((a) => a.runId === runId))
+    // The journal's finding and legacy retirement are read too (never events.jsonl), so they sign the entry.
+    const journalSig = await signatureOf(journalFiles(dir, runId)).catch(() => null)
     const cached = summaryCache.get(file)
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.accepted === accepted) { out.push(cached.summary); continue }
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.accepted === accepted && journalSig && cached.journalSig === journalSig) { out.push(cached.summary); continue }
     let run
     try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch (error) {
       if (error.code !== 'ENOENT') unreadable.push(runId)
       continue
     }
-    // The disposition the run detail shows, derived the same way: a triage that
-    // judged the playbook unfit is "rejected", not merely unresolved.
-    const last = run.steps?.at?.(-1)
-    const outputs = {}
-    if (last) {
-      try { outputs[last.number] = JSON.parse(await fs.readFile(path.join(dir, 'runs', runId, 'outputs', `${last.number}.json`), 'utf8')) } catch { /* no output */ }
+    // A record that parses but cannot be summarised (a field of the wrong shape) is unreadable like one that
+    // does not parse: named on the issue, never a failure of the whole project's listing.
+    try {
+      journalOverlay(run, await readJournalFinding(dir, runId))
+      // The disposition the run detail shows, derived the same way: a triage that
+      // judged the playbook unfit is "rejected", not merely unresolved.
+      const last = run.steps?.at?.(-1)
+      const outputs = {}
+      if (last) {
+        try { outputs[last.number] = JSON.parse(await fs.readFile(path.join(dir, 'runs', runId, 'outputs', `${last.number}.json`), 'utf8')) } catch { /* no output */ }
+      }
+      const disposition = runResult(run, outputs)
+      const summary = {
+        runId: run.runId ?? runId,
+        status: run.status ?? null,
+        outcome: run.outcome ?? null,
+        result: disposition.result ?? null,
+        resultReason: disposition.resultReason ?? null,
+        resultLabel: disposition.resultLabel ?? null,
+        blockedReason: run.blockedReason ?? null,
+        playbook: run.playbook?.id ?? null,
+        intent: run.playbook?.intent ?? null,
+        live: LIVE_RUN.includes(run.status),
+        reconcilePending: reconcilePending(run),
+        recoveryRequired: run.blockedReason === 'recovery-required' || run.recovery?.required === true,
+        workspaceRetained: run.workspace?.state === 'retained',
+        delivered: Boolean(run.delivery?.completedAt),
+        startedAt: run.startedAt ?? null,
+        endedAt: run.endedAt ?? null,
+        // When the run last changed state: how long something has been waiting.
+        updatedAt: new Date(stat.mtimeMs).toISOString(),
+        pauseQuestion: run.status === 'paused' ? (run.pause?.question ?? null) : null,
+        // When each waiting state began, read from the run's own records (notifications and time-to-response).
+        pauseId: run.status === 'paused' ? pauseIdOf(runId, run.pause) : null,
+        pauseAt: run.status === 'paused' ? (run.pause?.at ?? null) : null,
+        pauseKind: run.status === 'paused' ? (run.pause?.kind ?? null) : null,
+        ownerInputAt: run.ownerInput && !run.ownerInput.answer ? (run.ownerInput.at ?? null) : null,
+        recoveryDetectedAt: (run.blockedReason === 'recovery-required' || run.recovery?.required === true) ? recoveryOccurrence(run) : null,
+        // Triage asked the owner before starting work (runtime/engine.mjs ask-owner).
+        ownerInput: run.ownerInput ? { verdict: run.ownerInput.verdict, questions: (run.ownerInput.questions ?? []).map((q) => q.question), parts: run.ownerInput.split?.length ?? 0, answered: Boolean(run.ownerInput.answer) } : null,
+        recoveryReason: run.recovery?.required ? (run.recovery.reason ?? null) : null,
+        // Only the last output is read here, which is where a closing
+        // confirmation sits; the run page reads them all, and so does a run whose
+        // limits were raised, since its split suggestion reads every review.
+        explanation: explainRun(run, { outputs: limitRaises(run).length ? await readOutputs(dir, runId).catch(() => outputs) : outputs, acceptedRisks }),
+        closed: Boolean(run.closure)
+      }
+      if (summaryCache.size >= SUMMARY_CACHE_LIMIT) summaryCache.delete(summaryCache.keys().next().value)
+      summaryCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, accepted, journalSig, summary })
+      out.push(summary)
+    } catch {
+      unreadable.push(runId)
     }
-    const disposition = runResult(run, outputs)
-    const summary = {
-      runId: run.runId ?? runId,
-      status: run.status ?? null,
-      outcome: run.outcome ?? null,
-      result: disposition.result ?? null,
-      resultReason: disposition.resultReason ?? null,
-      resultLabel: disposition.resultLabel ?? null,
-      blockedReason: run.blockedReason ?? null,
-      playbook: run.playbook?.id ?? null,
-      intent: run.playbook?.intent ?? null,
-      live: LIVE_RUN.includes(run.status),
-      reconcilePending: reconcilePending(run),
-      recoveryRequired: run.blockedReason === 'recovery-required' || run.recovery?.required === true,
-      workspaceRetained: run.workspace?.state === 'retained',
-      delivered: Boolean(run.delivery?.completedAt),
-      startedAt: run.startedAt ?? null,
-      endedAt: run.endedAt ?? null,
-      // When the run last changed state: how long something has been waiting.
-      updatedAt: new Date(stat.mtimeMs).toISOString(),
-      pauseQuestion: run.status === 'paused' ? (run.pause?.question ?? null) : null,
-      // Triage asked the owner before starting work (runtime/engine.mjs ask-owner).
-      ownerInput: run.ownerInput ? { verdict: run.ownerInput.verdict, questions: (run.ownerInput.questions ?? []).map((q) => q.question), parts: run.ownerInput.split?.length ?? 0, answered: Boolean(run.ownerInput.answer) } : null,
-      recoveryReason: run.recovery?.required ? (run.recovery.reason ?? null) : null,
-      // Only the last output is read here, which is where a closing
-      // confirmation sits; the run page reads them all, and so does a run whose
-      // limits were raised, since its split suggestion reads every review.
-      explanation: explainRun(run, { outputs: limitRaises(run).length ? await readOutputs(dir, runId).catch(() => outputs) : outputs, acceptedRisks }),
-      closed: Boolean(run.closure)
-    }
-    if (summaryCache.size >= SUMMARY_CACHE_LIMIT) summaryCache.delete(summaryCache.keys().next().value)
-    summaryCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, accepted, summary })
-    out.push(summary)
   }
   return out.sort((a, b) => ((a.startedAt ?? '') < (b.startedAt ?? '') ? 1 : -1))
 }
@@ -374,7 +396,7 @@ async function listedFiles (project, dirName) {
     fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }).catch((error) => absent(error) ?? [])
   ])
   const files = [dir, path.join(dir, META_FILE), path.join(dir, 'runs')]
-  for (const e of runs) if (e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-')) files.push(path.join(dir, 'runs', e.name, 'run.json'))
+  for (const e of runs) if (e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-')) files.push(path.join(dir, 'runs', e.name, 'run.json'), ...journalFiles(dir, e.name))
   if (entries.includes('occurrences.json')) files.push(path.join(dir, 'occurrences.json'))
   if (entries.includes(ARCHIVE_FILE)) {
     files.push(path.join(dir, ARCHIVE_FILE))
@@ -385,6 +407,9 @@ async function listedFiles (project, dirName) {
   if (meta?.repeatLookup) files.push(bundleFiles(ISSUES_DIR, project, dirName).repeatLookup)
   return files
 }
+
+/** The two journal files a run summary reads besides run.json (store.readJournalFinding). */
+const journalFiles = (dir, runId) => [path.join(dir, 'runs', runId, 'journal-recovery.json'), path.join(dir, 'runs', runId, 'legacy-journal-disposition.json')]
 
 async function signatureOf (files) {
   const stamps = await Promise.all(files.map((file) => fs.stat(file).then((s) => `${s.mtimeMs}:${s.ctimeMs}:${s.size}:${s.ino}`, (error) => {
@@ -491,18 +516,80 @@ export async function readRunRecord (project, issueId, runId) {
   return (await packedRuns(ISSUES_DIR, project, issueId)).find((r) => r?.runId === runId) ?? null
 }
 
-/** Every run record of an issue, wherever it is: its runs/ while unpacked, the bundle's once packed. */
-export async function readRunRecords (project, issueId) {
+/**
+ * One run as the alert page and time to response read it: an unpacked run with its journal finding overlaid
+ * (as the run detail and summary read it) and its pause id derived as everywhere; a packed one from its bundle.
+ */
+export async function readRunForWaits (project, issueId, runId) {
+  if (!ISSUE_PATTERN.test(issueId) || !/^[A-Za-z0-9._-]+$/.test(runId ?? '')) return null
+  const dir = path.join(ISSUES_DIR, project, issueId)
+  const unpacked = await fs.readFile(path.join(dir, 'runs', runId, 'run.json'), 'utf8').then(JSON.parse, () => null)
+  if (unpacked) return { run: await withJournal(dir, runId, unpacked), packed: false }
+  const packed = (await packedRecordsWithJournal(project, issueId)).find((r) => r.runId === runId) ?? null
+  return packed ? { run: packed, packed: true } : null
+}
+
+// A packed run reads its journal from what packing kept (issue-bundle.mjs runRecords `journalTiming`), or, packed
+// before that was kept, from the journal files inside the bundle (packedJournals).
+async function packedRecordsWithJournal (project, issueId, unreadable = null) {
+  const records = (await packedRuns(ISSUES_DIR, project, issueId)).filter(Boolean)
+  const older = records.filter((r) => !Object.hasOwn(r, 'journalTiming')).map((r) => r.runId)
+  const fromBundle = older.length ? await packedJournals(ISSUES_DIR, project, issueId, older).catch(() => new Map()) : new Map()
+  const out = []
+  for (const run of records) {
+    // Per record, as for an unpacked issue: a field of the wrong shape names that run (when asked), never the issue.
+    try {
+      if (run.pause && !run.pause.id) run.pause.id = pauseIdOf(run.runId, run.pause)
+      const journal = run.journalTiming ?? fromBundle.get(run.runId) ?? null
+      out.push(journal ? journalOverlay(run, journal) : run)
+    } catch (error) {
+      if (!unreadable) throw error
+      unreadable.push({ runId: run?.runId ?? null, reason: `run record cannot be read (${error.message})` })
+    }
+  }
+  return out
+}
+
+async function withJournal (dir, runId, run) {
+  if (run.pause && !run.pause.id) run.pause.id = pauseIdOf(runId, run.pause)
+  return journalOverlay(run, await readJournalFinding(dir, runId))
+}
+
+/**
+ * Every run record of an issue, wherever it is: its runs/ while unpacked, the bundle's once packed. With an
+ * `unreadable` array, a record that exists and cannot be read or parsed is named there ({runId, reason}) and the
+ * readable ones are still returned; without one, a record that does not parse rejects the whole reading as before.
+ */
+export async function readRunRecords (project, issueId, { journal = false, unreadable = null } = {}) {
   if (!ISSUE_PATTERN.test(issueId)) return []
   const runsDir = path.join(ISSUES_DIR, project, issueId, 'runs')
   const entries = await fs.readdir(runsDir, { withFileTypes: true }).catch(() => null)
   if (!entries) {
     // A folder with no runs has none, whatever a bundle of its id holds.
     if (await fs.stat(path.join(ISSUES_DIR, project, issueId)).then(() => true, () => false)) return []
-    return (await packedRuns(ISSUES_DIR, project, issueId)).filter(Boolean)
+    return journal ? packedRecordsWithJournal(project, issueId, unreadable) : (await packedRuns(ISSUES_DIR, project, issueId)).filter(Boolean)
   }
-  const records = await Promise.all(entries.filter((e) => e.isDirectory() && !/^(worktree|workspace)-/.test(e.name))
-    .map((e) => fs.readFile(path.join(runsDir, e.name, 'run.json'), 'utf8').then(JSON.parse, () => null)))
+  const read = async (name) => {
+    let text
+    try { text = await fs.readFile(path.join(runsDir, name, 'run.json'), 'utf8') } catch (error) {
+      if (unreadable && error.code !== 'ENOENT') unreadable.push({ runId: name, reason: error.code ?? error.message })
+      return null
+    }
+    let run
+    try { run = JSON.parse(text) } catch (error) {
+      if (!unreadable) throw error
+      unreadable.push({ runId: name, reason: `run.json does not parse (${error.message})` })
+      return null
+    }
+    if (!run || !journal) return run
+    // Enriching it (pause id, journal finding) is a per-record step too: a field of the wrong shape names this run.
+    try { return await withJournal(path.dirname(runsDir), name, run) } catch (error) {
+      if (!unreadable) throw error
+      unreadable.push({ runId: name, reason: `run record cannot be read (${error.message})` })
+      return null
+    }
+  }
+  const records = await Promise.all(entries.filter((e) => e.isDirectory() && !/^(worktree|workspace)-/.test(e.name)).map((e) => read(e.name)))
   return records.filter(Boolean)
 }
 

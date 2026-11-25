@@ -1480,6 +1480,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     },
     /** Open questions, for Needs attention and the issue page. */
     questions: () => structuredClone((state.questions ?? []).filter((q) => !q.answer)),
+    /** One question of this session, answered or not (an alert's destination shows who answered it); null when not in it. */
+    questionRecord: (id) => structuredClone((state.questions ?? []).find((q) => q.id === id) ?? null),
     /** What a call was sent, read from beside the state (keepPrompt); null when it was not kept or has been pruned. */
     prompt: async (invocationId) => {
       if (typeof invocationId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(invocationId)) throw fail('Invalid invocation id')

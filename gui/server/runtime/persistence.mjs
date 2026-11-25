@@ -41,13 +41,29 @@ export function persistence (io = fs) {
       try { await io.rm(tmp, { force: true }) } catch (error) { if (!failure) throw error }
     }
   }
+  // Like writeAtomic, but published with link(), which never replaces a file another writer put there first:
+  // the loser gets EEXIST and reads the winner's bytes (as issue-bundle.mjs publishes a bundle).
+  const writeExclusive = async (file, data, { mode = 0o600, parents = true } = {}) => {
+    const dir = await prepare(file, parents)
+    const tmp = `${file}.${crypto.randomUUID()}.tmp`
+    let failure
+    try {
+      const handle = await io.open(tmp, 'wx', mode)
+      await use(handle, async h => { await h.writeFile(data); await h.sync() })
+      await io.link(tmp, file)
+      await syncDir(dir)
+    } catch (error) { failure = error; throw error } finally {
+      try { await io.rm(tmp, { force: true }) } catch (error) { if (!failure) throw error }
+    }
+  }
   const appendDurable = async (file, data, { flag = 'a' } = {}) => {
     const dir = await prepare(file)
     const handle = await io.open(file, flag, 0o600)
     await use(handle, async h => { await h.writeFile(data); await h.sync() })
     await syncDir(dir)
   }
-  return { writeAtomic, appendDurable, syncDir }
+  return { writeAtomic, writeExclusive, appendDurable, syncDir }
 }
-export const { writeAtomic, appendDurable, syncDir } = persistence()
+export const { writeAtomic, writeExclusive, appendDurable, syncDir } = persistence()
 export const writeJson = (file, value, options) => writeAtomic(file, JSON.stringify(value, null, 2) + '\n', options)
+export const writeJsonExclusive = (file, value, options) => writeExclusive(file, JSON.stringify(value, null, 2) + '\n', options)

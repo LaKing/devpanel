@@ -3,7 +3,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { resumeUnavailable } from './run-control.mjs'
+import { enterRecovery, resumeUnavailable } from './run-control.mjs'
 import { captureIntegrity, readIntegrity, writeIntegrity, integrityChanges } from './integrity.mjs'
 
 export async function amendRetained (engine, { edits = [], target = null, actor, reason }) {
@@ -50,9 +50,7 @@ export async function amendRetained (engine, { edits = [], target = null, actor,
     const reason = 'unexpected changes during operator amendment'
     record.status = 'failed'
     engine.run.integrity = { ...engine.run.integrity, status: 'quarantined', latest: { role: 'operator', invocationId: id, outcome: 'failed', writesCode: false, reason, changes, before: engine.run.integrity.checkpoint, after: id, stateHash: after.hash, at: engine.clock.iso() } }
-    engine.run.status = 'blocked'
-    engine.run.blockedReason = 'recovery-required'
-    engine.run.recovery = { required: true, reason: `Source integrity: ${reason}. Inspect the changes and record a disposition.`, detectedAt: engine.clock.iso() }
+    enterRecovery(engine.run, { reason: `Source integrity: ${reason}. Inspect the changes and record a disposition.` }, engine.run.integrity.latest.at)
     await engine.persist({ type: 'operator-amendment-failed', ...record, reason })
     throw new Error('Unexpected changes during operator amendment')
   }

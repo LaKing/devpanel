@@ -236,14 +236,48 @@ export function ownerLost (run) {
  * hold only delays the recovery, it never removes the route to it. Returns
  * whether it changed the record. A quarantined workspace keeps its own state.
  */
-export function restoreConfigRecovery (run, at) {
+export function restoreConfigRecovery (run, at, { continuesFrom, freshClock = false } = {}) {
   if (!run?.configUnresolved?.length) return false
   if (run.integrity?.status === 'quarantined') { run.recovery = { ...(run.recovery ?? {}), configUnresolved: true }; return true }
-  run.status = 'blocked'
-  run.blockedReason = 'recovery-required'
-  run.recovery = { required: true, ownerLost: true, configUnresolved: true, detectedAt: at,
-    reason: `the operator's CLI configuration guard has not recorded invocation ${run.configUnresolved[0].invocationId}'s quarantine yet (a directory sync failed); recover to replay it` }
+  enterRecovery(run, { ownerLost: true, configUnresolved: true, continuesFrom, freshClock,
+    reason: `the operator's CLI configuration guard has not recorded invocation ${run.configUnresolved[0].invocationId}'s quarantine yet (a directory sync failed); recover to replay it` }, at)
   return true
+}
+
+/*
+ * Entering and leaving the recovery-required state, in one place (docs/operator-alerts.md).
+ *
+ * `detectedAt` is the start of the stretch of time not yet excused from the wall clock (resolveIntegrity and
+ * recoverOwnerLoss read it): a recovery entered afresh is dated `at`; one entered again while it is still
+ * required keeps its date. `continuesFrom` is the recovery's identity when it continues an earlier one (an
+ * accepted partial disposition that leaves configuration pointers open): carried for as long as the recovery
+ * stays required. The prior state is read before anything is changed, so a caller never has to set
+ * status or blockedReason itself.
+ */
+export function enterRecovery (run, { status = 'blocked', continuesFrom, freshClock = false, ...fields } = {}, at) {
+  const wasRequired = run.recovery?.required === true || run.blockedReason === 'recovery-required'
+  const carry = continuesFrom ?? (wasRequired ? run.recovery?.continuesFrom : undefined)
+  const detectedAt = freshClock ? at : wasRequired ? (run.recovery?.detectedAt ?? null) : at
+  run.status = status
+  run.blockedReason = 'recovery-required'
+  run.recovery = { ...fields, required: true, detectedAt, ...(carry ? { continuesFrom: carry } : {}) }
+  return run
+}
+
+/** Which recovery this is, for links, alerts and measurement: the one it continues, else its own first detection. */
+export function recoveryOccurrence (run, finding = null) {
+  const recovery = run?.recovery?.required ? run.recovery : null
+  return recovery?.continuesFrom ?? recovery?.detectedAt ?? finding?.detectedAt ?? null
+}
+
+/** The recovery ends: its interval is kept on run.recoveries[] (entered, handled, how, by), then cleared. */
+export function leaveRecovery (run, { how, by = null, at, clear = { required: false, reason: null, detectedAt: null } }) {
+  if (run.recovery?.required || run.blockedReason === 'recovery-required') {
+    run.recoveries = [...(run.recoveries ?? []), { occurrence: recoveryOccurrence(run) ?? null, detectedAt: run.recovery?.detectedAt ?? null,
+      resolvedAt: at, how, by, reason: run.recovery?.reason ?? null }]
+  }
+  run.recovery = clear
+  return run
 }
 
 /** Owner loss that `recover` may continue: nothing else about the run needs a person. */

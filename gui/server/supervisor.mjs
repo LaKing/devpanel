@@ -1,4 +1,4 @@
-import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, restoreConfigRecovery, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
+import { acceptCheckUnavailable, awaitsAutoResume, awaitsSetup, continueUnavailable, integrateUnavailable, reconcilePending, refreshChecksUnavailable, resumeUnavailable, retryInputUnavailable, ownerLossRecoverable, restoreConfigRecovery, enterRecovery, leaveRecovery, SERVICE_SHUTDOWN } from './runtime/run-control.mjs'
 import { writeRunResultStep } from './run-result-step.mjs'
 import { resumeArchivedCoverageNotes, resumeCoverageNotes, stagingRunCoverage, writeRunCoverageNotes } from './staging-coverage.mjs'
 import { launchPreconditions } from './launch-preconditions.mjs'
@@ -1696,8 +1696,8 @@ export function createSupervisor ({
         run.status = 'cancelled'
         run.endedAt = at
         run.outcome = 'unresolved'
+        leaveRecovery(run, { how: 'abandoned', by: 'operator', at, clear: { required: false, resolution: 'abandoned', resolvedAt: at } })
         run.blockedReason = null
-        run.recovery = { required: false, resolution: 'abandoned', resolvedAt: at }
         for (const participant of Object.values(run.participants ?? {})) {
           participant.pendingInvocation = null
           participant.state = 'abandoned'
@@ -1903,19 +1903,15 @@ export function createSupervisor ({
       ? 'no lock was held for it when this server took over'
       : `the process that owned it (pid ${owner.record?.owner?.pid}) is gone`
 
-    run.status = 'blocked'
     run.outcome = 'unresolved'
-    run.blockedReason = 'recovery-required'
     // When the owner was last seen doing something: the time from then until a
     // recovery is time nobody owned the run, not time the run spent.
     const events = await store.readEvents(issuePath, run.runId).catch(() => null)
-    run.recovery = {
-      required: true,
+    enterRecovery(run, {
       ownerLost: true,
       reason: `the run was ${wasStopping ? 'stopping' : 'live'} when its owner disappeared — ${detail}`,
-      detectedAt: new Date().toISOString(),
       lastActivityAt: events?.events?.at(-1)?.at ?? null
-    }
+    }, new Date().toISOString())
     // No agent is in flight: a durable application intent can be reconciled
     // from the destination by Finalize, without replaying a model invocation.
     const snapshot = await store.readSnapshot(issuePath, run.runId).catch(() => null)

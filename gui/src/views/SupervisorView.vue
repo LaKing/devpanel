@@ -2,6 +2,8 @@
 import { formatHms, formatMTokens, supervisorCost, supervisorUsage } from '@/format'
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { api } from '@/api'
+import { useRoute } from 'vue-router'
+import { questionDestination } from '@/notifications'
 import { socket, connection } from '@/socket'
 import MarkdownText from '@/components/MarkdownText.vue'
 import StructuredBody from '@/components/StructuredBody.vue'
@@ -60,7 +62,12 @@ const reset=()=>run(async()=>{await api.resetSupervisor();following.value=true})
 const send=()=>{if(!text.value.trim()||busy.value||!active.value)return;return run(async()=>{await api.chatSupervisor(text.value);text.value='';following.value=true})}
 const ask=()=>{if(!text.value.trim()||busy.value||!canAsk.value)return;return run(async()=>{await api.askSupervisor(text.value);text.value='';following.value=true})}
 const canAsk=computed(()=>Boolean(state.value?.session?.id)&&!state.value?.asking)
-const openQuestions=computed(()=>(state.value?.questions??[]).filter(q=>!q.answer))
+// An operator alert opens ?question=<id> (docs/operator-alerts.md): that question comes first and is marked, and the
+// page says whether it still waits, was answered, or left with its session.
+const route=useRoute()
+const alertQuestion=computed(()=>state.value?questionDestination(state.value.questions??[],route.query.question):null)
+const openQuestions=computed(()=>{const open=(state.value?.questions??[]).filter(q=>!q.answer);const id=route.query.question;return id?[...open.filter(q=>q.id===id),...open.filter(q=>q.id!==id)]:open})
+watch(()=>alertQuestion.value?.state==='waiting'?route.query.question:null,async(id)=>{if(!id)return;await nextTick();document.querySelector(`[data-question-id="${CSS.escape(id)}"]`)?.scrollIntoView({block:'center'})})
 const reasoningOpen=ref(new Set())
 const toggleReasoning=(id)=>{const next=new Set(reasoningOpen.value);if(next.has(id))next.delete(id);else next.add(id);reasoningOpen.value=next}
 const workingCall=computed(()=>state.value?.status==='working'&&state.value?.pending?.kind==='model'?state.value.pending.invocationId:null)
@@ -152,8 +159,13 @@ const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
   <details v-if="state?.ownedRuns.length" class="owned-runs"><summary>Issue runs · {{state.ownedRuns.length}}</summary><p v-for="r in state.ownedRuns" :key="r.runId"><router-link :to="{path:`/projects/${r.project}/${r.issueId}`,query:{run:r.runId}}">{{r.issueId}}</router-link> · {{r.status}}</p></details>
   </div>
   <button v-if="!following" class="latest" @click="latest">Jump to latest ↓</button>
+  <v-alert v-if="alertQuestion" :type="alertQuestion.state==='waiting'?'info':'success'" variant="tonal" density="compact" data-testid="alert-target">
+   <template v-if="alertQuestion.state==='waiting'">The question the alert named is still open: answer it below.</template>
+   <template v-else-if="alertQuestion.state==='answered'">The question the alert named was already answered by {{ alertQuestion.by }} at {{ alertQuestion.at }}.</template>
+   <template v-else>The question the alert named is no longer open: its supervisor session ended.</template>
+  </v-alert>
   <section v-if="openQuestions.length" class="questions" aria-label="Questions for you">
-   <SupervisorQuestion v-for="q in openQuestions" :key="q.id" :question="q" @answered="refresh" />
+   <div v-for="q in openQuestions" :key="q.id" :data-question-id="q.id" :class="{'alert-focus':alertQuestion?.state==='waiting'&&q.id===route.query.question}"><SupervisorQuestion :question="q" @answered="refresh" /></div>
   </section>
   <form v-if="active || state?.session" @submit.prevent="send" class="composer">
    <v-textarea v-model="text" label="Message the supervisor" rows="1" max-rows="4" auto-grow hide-details density="compact" :disabled="state.status==='stopping'" @keydown.enter.exact.prevent="active ? send() : ask()" @keydown.ctrl.enter.prevent="ask" />
@@ -186,4 +198,5 @@ const saveCampaign=(scope)=>run(()=>api.setSupervisorCampaign(scope))
 .composer{flex:none;display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:10px 0;border-top:1px solid rgba(var(--v-theme-on-surface),.12)}.composer small{grid-column:1/-1;font-size:.7rem;opacity:.65}.latest{position:absolute;bottom:115px;align-self:center;background:rgb(var(--v-theme-surface));border:1px solid rgba(var(--v-theme-on-surface),.2);border-radius:20px;padding:6px 14px;box-shadow:0 2px 8px #0002;font-size:.8rem}.owned-runs{font-size:.85rem;padding:10px}.earlier{align-self:center;font-size:.8rem;opacity:.8;padding:4px 10px;border:1px solid rgba(var(--v-theme-on-surface),.2);border-radius:14px}.truncated{font-size:.75rem;opacity:.75}.truncated button{text-decoration:underline}
 @media(max-width:600px){.supervisor{padding:0 10px}.status-heading{gap:8px}.status-meta{font-size:.7rem}.message{max-width:100%;padding:8px}.message.user{max-width:92%}.message__head{gap:8px}}
 .working{display:flex;flex-direction:column;gap:6px;margin:8px 0}.reasoning-toggle{font-size:.75rem;opacity:.7;text-decoration:underline;margin-top:4px}.questions{display:flex;flex-direction:column;gap:8px;padding:8px 0}
+.alert-focus{outline:2px solid rgb(var(--v-theme-primary));outline-offset:4px;border-radius:6px}
 </style>

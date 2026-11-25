@@ -39,6 +39,8 @@ and `/socket.io` through to the backend, and it is the one that hot-reloads.
 | `DEVPANEL_PROJECTS_DIR` | the host settings' `projectsRoot`, else the directory holding the panel's checkout | the projects root (`<projects-root>`): scanned for `<name>-project` directories (labelled `<name>`) |
 | `DEVPANEL_USERS_DIR` | the host settings' `proxyLogin.usersDir`, else none | the reverse proxy's users directory, where basic-auth logins are verified |
 | `DEVPANEL_HOST_CONFIG_DIR` | `<config root>/host-config` | the installation's own configuration ([docs/host-config.md](../docs/host-config.md)) |
+| `DEVPANEL_PUSH_SUBJECT` | `mailto:devpanel@localhost` | the contact sent to push services with operator alerts ([docs/operator-alerts.md](../docs/operator-alerts.md)) |
+| `DEVPANEL_PUSH_HOSTS` | none | further push service hosts a device may subscribe on, comma-separated |
 
 The projects root and the `-project` naming rule are defined once, in `server/project-path.mjs`, which the
 server and `harness/fence.mjs` (other-project canaries) import. The issue store (`issues.js`) reads
@@ -812,6 +814,15 @@ Three properties this shape exists to hold:
   changed. A comparison that cannot be made is not a licence to delete: being
   wrong that way costs disk, being wrong the other way destroys the only copy.
   The lock always goes back either way.
+
+## Operator alerts
+
+Web Push alerts for new owner questions and runs that newly need recovery, with the dashboard closed
+(`server/notifications/`, docs/operator-alerts.md): opt in and out from the Alerts line of the Needs attention
+card; `GET/POST/DELETE /api/notifications[/subscriptions[/:id]]`, `POST /api/notifications/device/off` (this browser by its push endpoint), `GET /api/notifications/alerts/:id` (the
+`/alerts/:id` page an alert opens), `GET /api/notifications/events` (time to response, also
+`npm run --silent attention-times`). `/sw.js` and `/manifest.webmanifest` are served from `public/` without the
+token; the service worker has no fetch handler. State is `issues/.notifications/`.
 
 ## Full verification
 

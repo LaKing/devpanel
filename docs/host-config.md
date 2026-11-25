@@ -143,6 +143,10 @@ refuses to start, so a typo never weakens a protection. The file is read at call
 and an edit takes effect without a restart (except for values a module reads once at
 load: the projects root).
 
+Operator alerts (docs/operator-alerts.md) add nothing to the host settings: their state and VAPID key live in
+`issues/.notifications/` (moved with the data root), and `DEVPANEL_PUSH_SUBJECT` / `DEVPANEL_PUSH_HOSTS` are
+environment variables of the service.
+
 ## Seat guidance
 
 `CLAUDE.local.md` and `host-config/docs/` are git-ignored, so a run's worktree never

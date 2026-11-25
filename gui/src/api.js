@@ -58,6 +58,14 @@ export const api = {
   askSupervisor: (text) => request('/api/supervisor/ask', { method: 'POST', body: JSON.stringify({ text }) }),
   supervisorLive: (invocationId, query = 0) => request(`/api/supervisor/live/${enc(invocationId)}${liveQuery(query)}`),
   supervisorQuestions: () => request('/api/supervisor/questions'),
+  /** Operator alerts (docs/operator-alerts.md): this operator's devices, opting in and out, one alert's items as they are now. */
+  // `actor` keys the devices on a shared-token install (a proxy login overrides it on the server).
+  notifications: (actor, endpoint) => request(`/api/notifications?actor=${enc(actor ?? '')}&endpoint=${enc(endpoint ?? '')}`),
+  /** Turn off this browser's own subscription, found by its push endpoint whatever name it was registered under. */
+  deviceAlertsOff: (endpoint) => request('/api/notifications/device/off', { method: 'POST', body: JSON.stringify({ endpoint }) }),
+  subscribeAlerts: (subscription, label, actor) => request('/api/notifications/subscriptions', { method: 'POST', body: JSON.stringify({ subscription, label, actor }) }),
+  unsubscribeAlerts: (id = null, actor) => request(`${id ? `/api/notifications/subscriptions/${enc(id)}` : '/api/notifications/subscriptions'}?actor=${enc(actor ?? '')}`, { method: 'DELETE' }),
+  alert: (alertId) => request(`/api/notifications/alerts/${enc(alertId)}`),
   answerSupervisorQuestion: (id, answer, actor) => request(`/api/supervisor/questions/${enc(id)}/answer`, { method: 'POST', body: JSON.stringify({ answer, actor }) }),
   setSupervisorCampaign: (campaign, actor) => request('/api/supervisor/campaign', { method: 'POST', body: JSON.stringify({ campaign, actor }) }),
   chatSupervisor: (text) => request('/api/supervisor/messages', { method: 'POST', body: JSON.stringify({ text }) }),

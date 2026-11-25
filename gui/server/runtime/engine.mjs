@@ -22,7 +22,7 @@ import { alive, ProcessError, terminatePids } from './process.mjs'
 import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { openCleanup, unprovedScan, cleanupEntry, proveEntries, cleanupRefusal, noteLostTags, addBarrierEntries, syncBarrier, readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
-import { ownerLost, restoreConfigRecovery } from './run-control.mjs'
+import { enterRecovery, leaveRecovery, ownerLost, recoveryOccurrence, restoreConfigRecovery } from './run-control.mjs'
 import { fenceStubSet, fingerprint, gitIdentity, FINGERPRINT_RULE, LEGACY_FINGERPRINT_RULE, workspaceProjection } from './fingerprint.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity, writeIntegrity } from './integrity.mjs'
 import * as store from './store.mjs'
@@ -1359,13 +1359,21 @@ export class Engine {
     // stop). Recorded as an interval on resumeHistory, so a check lying inside it is not taken for an unplaced stop
     // (run-metrics.mjs timeSplit). A quarantine found only at a restart is counted from when it was found: less is excused, never more.
     const quarantinedAt = Date.parse(this.run.recovery?.detectedAt ?? this.run.endedAt ?? '')
+    // One instant ends this credited interval and, when configuration recovery continues, starts the next
+    // one (its detectedAt): the integrity write above is counted once.
+    const resumedAtMs = this.clock.now()
     if (disposition !== 'abandon' && Number.isFinite(quarantinedAt)) {
-      record.suspendedMs = Math.max(0, this.clock.now() - quarantinedAt)
+      record.suspendedMs = Math.max(0, resumedAtMs - quarantinedAt)
       this.run.resumeHistory = [...(this.run.resumeHistory ?? []), { at: record.at, actor, origin: 'integrity-disposition', previousStatus: this.run.status, previousReason: this.run.blockedReason, suspendedMs: record.suspendedMs }]
       this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + record.suspendedMs
     }
+    // The occurrence a continuing configuration recovery keeps (no second alert, one waiting interval).
+    const carried = recoveryOccurrence(this.run)
+    const continuing = disposition !== 'abandon' && this.run.configUnresolved?.length > 0
+    record.recoveryDetectedAt = carried
     this.run.integrity = { ...integrity, status: disposition === 'abandon' ? 'abandoned' : 'clear', checkpoint, dispositions: [...(integrity.dispositions ?? []), record] }
-    this.run.recovery = { required: false, reason: null, detectedAt: null }
+    if (continuing) this.run.recovery = { required: false, reason: null, detectedAt: null }
+    else leaveRecovery(this.run, { how: `integrity-${disposition}`, by: actor, at: record.at })
     // Retry the unaccepted step with a fresh session. No response or approval
     // from the quarantined invocation is adopted as successful work.
     for (const [role, p] of Object.entries(this.run.participants)) {
@@ -1378,10 +1386,11 @@ export class Engine {
     this.run.status = disposition === 'abandon' ? 'failed' : 'pending'
     this.run.blockedReason = disposition === 'abandon' ? 'integrity-abandoned' : null
     if (disposition !== 'abandon') { this.run.endedAt = null; this.run.failure = null }
-    await this.persist({ type: 'integrity-disposition', ...record })
     // A configuration violation the adapter has not acknowledged survives the
-    // disposition (run.configUnresolved): the run goes to the recovery that replays it.
-    if (disposition !== 'abandon' && this.run.configUnresolved?.length) await this.markConfigUnresolved()
+    // disposition (run.configUnresolved): the run goes to the recovery that replays it,
+    // written in the same record so no cleared recovery is ever on disk in between.
+    if (continuing) restoreConfigRecovery(this.run, new Date(resumedAtMs).toISOString(), { continuesFrom: carried ?? undefined, freshClock: true })
+    await this.persist({ type: 'integrity-disposition', ...record })
     return this.run
   }
 
@@ -1428,7 +1437,8 @@ export class Engine {
       if (error.journal) {
         const { events, ...journal } = error.journal
         this.run.journal = journal
-        this.run.recovery = { required: true, reason: journal.message, detectedAt: this.clock.iso() }
+        // Dated by the persisted finding when there is one, so a loaded engine names the same occurrence as a read.
+        enterRecovery(this.run, { status: this.run.status, reason: journal.message }, journal.finding?.detectedAt ?? this.clock.iso())
       }
       throw error
     }
@@ -1702,7 +1712,7 @@ export class Engine {
     this.run.blockedReason = this.run.failure?.message ?? 'a seat touched the operator\'s CLI configuration'
     this.run.outcome = 'unresolved'
     this.run.endedAt ??= this.clock.iso()
-    this.run.recovery = { required: false, reason: null, detectedAt: null }
+    leaveRecovery(this.run, { how: 'config-failure-acknowledged', at: this.clock.iso() })
     delete this.run.configFailureAcknowledged
     await this.saveRun()
   }
@@ -1748,7 +1758,7 @@ export class Engine {
     }
     this.run.ownerRecoveries ??= []
     this.run.ownerRecoveries.push({ lostAt, detectedAt, recoveredAt: this.clock.iso() })
-    this.run.recovery = { required: false, reason: null, detectedAt: null }
+    leaveRecovery(this.run, { how: 'recovered', by: actor, at: this.run.ownerRecoveries.at(-1).recoveredAt })
     this.run.status = 'blocked'
     this.run.blockedReason = 'owner-lost'
     // No short-time refusal here: this path has no way to raise the limit, and a
@@ -1812,15 +1822,13 @@ export class Engine {
     }
   }
 
-  async markConfigUnresolved () {
-    if (restoreConfigRecovery(this.run, this.clock.iso())) await this.saveRun()
+  async markConfigUnresolved (options) {
+    if (restoreConfigRecovery(this.run, this.clock.iso(), options)) await this.saveRun()
   }
 
   async blockForRecovery (role, reason) {
     this.run.participants[role].state = 'recovery-required'
-    this.run.status = 'blocked'
-    this.run.blockedReason = 'recovery-required'
-    this.run.recovery = { required: true, reason, detectedAt: this.clock.iso() }
+    enterRecovery(this.run, { reason }, this.clock.iso())
     await this.persist({ type: 'recovery', role, resolution: 'recovery-required' })
   }
 
@@ -4067,10 +4075,8 @@ export class Engine {
 
   /** Nothing decided: the consult's marker stays and the run waits on the public recovery action, which consults again. */
   async blockForConsultRecovery (ask, unsettled, why = null) {
-    this.run.status = 'blocked'
-    this.run.blockedReason = 'recovery-required'
-    this.run.recovery = { required: true, ownerLost: true, consultPending: true, detectedAt: this.clock.iso(),
-      reason: `the consult panel has a seat turn that was interrupted and is not settled yet (${unsettled.join(', ') || why || 'pending'}); recover to consult again` }
+    enterRecovery(this.run, { ownerLost: true, consultPending: true,
+      reason: `the consult panel has a seat turn that was interrupted and is not settled yet (${unsettled.join(', ') || why || 'pending'}); recover to consult again` }, this.clock.iso())
     await this.persist({ type: 'consult-pending', key: ask.key, unsettled })
     return 'stopped'
   }

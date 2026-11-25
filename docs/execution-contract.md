@@ -3390,6 +3390,21 @@ the step carries `derivedFrom`. Without one, or on a repair or later round, the
 brief turn runs as before. A derived brief left pending by a crash is simply
 derived again.
 
+### Entering and leaving recovery
+
+Every entry into `recovery-required` goes through `run-control.mjs enterRecovery`, which reads the prior state first:
+a recovery entered afresh gets `recovery.detectedAt = at`; one entered again while still required keeps its
+`detectedAt`. `detectedAt` is the start of the time not yet excused from the wall clock. `recovery.continuesFrom` is
+the recovery's identity when it continues an earlier one, carried while the recovery stays required. The
+occurrence that alerts and links name is `continuesFrom ?? detectedAt`, and for a journal recovery found on read, the
+persisted finding's `detectedAt`. checkJournal dates by that finding too. An accept-partial (or restored) integrity
+disposition that leaves configuration pointers open does not end the recovery: in the same `run.json` write it
+restores configuration recovery with `continuesFrom` = the quarantine's occurrence and `detectedAt` = the one
+clock instant that also ends the disposition's `suspendedMs`, so the interval is excused once. Every exit
+(`leaveRecovery`: a disposition that ends it, owner recovery, abandonment, an acknowledged configuration failure)
+appends `{occurrence, detectedAt, resolvedAt, how, by, reason}` to `run.recoveries[]`, the record time to response
+reads (docs/operator-alerts.md).
+
 ### Recovery after the owner disappeared
 
 A run marked `recovery-required` by startup reconciliation (`recovery.ownerLost`)

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { wallClockAt, wallClockPrefill, wallClockUsedMinutes } from '@/wall-clock'
@@ -22,14 +22,16 @@ import IssueOccurrences from '@/components/IssueOccurrences.vue'
 import PatchCheck from '@/components/PatchCheck.vue'
 import ContinueRun from '@/components/ContinueRun.vue'
 import { api } from '@/api'
+import { alertDestination, alertSections } from '@/notifications'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
-import { readFolder, readHidden, writeFolder, writeHidden } from '@/issue-sections'
+import { readFolder, readHidden, revealSectionState, sectionShown, toggleSectionState, writeFolder, writeHidden } from '@/issue-sections'
 import { reportTags } from '@/report-tags'
 import { connection, socket } from '@/socket'
 import { formatBytes, formatDuration, formatHms, formatMTokens, formatMillis } from '@/format'
 
 const route = useRoute()
 const router = useRouter()
+
 const archiving = ref(false)
 
 /* Closing an issue without a disposition is always allowed: the dialog offers
@@ -671,11 +673,13 @@ async function loadSupervisorQuestions (location) {
  * (issue-sections.js). A section cannot be toggled while the card it sits in
  * is hidden; the bar itself is outside every card, so nothing is ever lost.
  */
-const hidden = ref(readHidden())
-const shown = (id) => !hidden.value.includes(id)
+// The saved choice, and what an alert link shows on top of it for this visit only (issue-sections.js).
+const sections = ref({ hidden: readHidden(), revealed: [] })
+const shown = (id) => sectionShown(sections.value, id)
 function toggleSection (id) {
-  hidden.value = shown(id) ? [...hidden.value, id] : hidden.value.filter((x) => x !== id)
-  writeHidden(hidden.value)
+  const { save, ...next } = toggleSectionState(sections.value, id)
+  sections.value = next
+  if (save) writeHidden(next.hidden)
 }
 const pageSections = computed(() => {
   const i = issue.value
@@ -703,6 +707,33 @@ const workspaceColumns = computed(() => Number(shown('timeline')) + Number(shown
    status or the workspace), otherwise the issue card does. */
 const runEmpty = computed(() => !issue.value?.packed && !shown('status') && !(run.value && (shown('runbar') || workspaceColumns.value > 0)))
 const runFills = computed(() => shown('run') && (Boolean(issue.value?.packed) || shown('status') || (Boolean(run.value) && workspaceColumns.value > 0)))
+
+/*
+ * An operator alert opens this page at one waiting event of one run (docs/operator-alerts.md): ?run= picks the run,
+ * pause= / recovery= / wait=owner-input say which wait. src/notifications.js alertDestination decides from the run as
+ * it is now: still waiting (the page scrolls to that action), needing recovery instead, or already handled.
+ * Declared after issue, run and the Sections bar, because a watch reads its source at setup. The sections holding
+ * the target are shown for this visit (alertSections), never written to the remembered choice.
+ */
+const alertTarget = computed(() => alertDestination(run.value, route.query))
+function revealSections (ids) {
+  if (ids.some((id) => !shown(id))) sections.value = revealSectionState(sections.value, ids)
+}
+// An archived issue lists its runs from the archive: an alert's ?run= opens and marks the one it named.
+watch(() => (issue.value?.packed && route.query.run ? `${issue.value.id}:${route.query.run}` : null), async (key) => {
+  if (!key) return
+  revealSections(alertSections('packed'))
+  await nextTick()
+  document.querySelector(`[data-packed-run="${CSS.escape(String(route.query.run))}"]`)?.scrollIntoView({ block: 'center' })
+}, { immediate: true })
+// Every alert link shows where it landed: the action while it waits, otherwise the note and the run as it is now.
+watch(() => alertTarget.value ? `${run.value?.runId}:${alertTarget.value.state}:${alertTarget.value.target}` : null, async (key) => {
+  if (!key) return
+  const action = alertTarget.value.state !== 'handled' ? alertTarget.value.target : null
+  revealSections(alertSections(action))
+  await nextTick()
+  document.querySelector(action ? `[data-alert-action="${action}"]` : '[data-testid="alert-target"]')?.scrollIntoView({ block: 'center' })
+}, { immediate: true })
 
 async function load ({ keepSelection = true } = {}) {
   const location = currentIssue()
@@ -1191,7 +1222,7 @@ watch(() => route.query.run, (runId) => {
         </div>
         <div class="packed__list">
           <p v-if="!packedResults.length" class="muted">No run was ever started on this issue.</p>
-          <details v-for="(r, i) in packedResults" :key="r.runId" class="packed__run" :open="i === 0">
+          <details v-for="(r, i) in packedResults" :key="r.runId" class="packed__run" :open="route.query.run ? r.runId === route.query.run : i === 0" :data-packed-run="r.runId" :class="{ 'alert-focus': route.query.run === r.runId }">
             <summary>
               <span class="packed__headline">{{ r.text.split('\n')[0].replace(/^#\s*/, '') }}</span>
               <span class="muted">{{ r.startedAt ? r.startedAt.slice(0, 16).replace('T', ' ') : '' }} · {{ r.status }}</span>
@@ -1214,6 +1245,11 @@ watch(() => route.query.run, (runId) => {
 
 
         <template v-if="run">
+          <v-alert v-if="alertTarget" :type="alertTarget.state === 'handled' ? 'success' : alertTarget.state === 'recovery' ? 'warning' : 'info'" variant="tonal" density="compact" class="mb-2" data-testid="alert-target">
+            <template v-if="alertTarget.state === 'waiting'">This run is still waiting on the {{ alertTarget.what }} the alert named: its action is highlighted below.</template>
+            <template v-else-if="alertTarget.state === 'recovery'">The run now needs recovery, so the {{ alertTarget.what }} the alert named cannot be answered until it is recovered.</template>
+            <template v-else>The {{ alertTarget.what }} the alert named was already handled. The run is now {{ alertTarget.status }}<template v-if="alertTarget.blockedReason"> ({{ alertTarget.blockedReason.replace(/-/g, ' ') }})</template>.</template>
+          </v-alert>
           <div v-show="shown('runbar')" class="runbar">
             <v-select
               v-model="selectedRunId"
@@ -1248,15 +1284,15 @@ watch(() => route.query.run, (runId) => {
             <v-btn v-if="canAcceptCheck" size="small" variant="tonal" color="warning" @click="openAcceptCheck">Accept check result…</v-btn>
             <v-btn v-if="canReconcile" size="small" variant="flat" color="primary" :loading="reconciling" @click="reconcileDelivery">Reconcile with source</v-btn>
             <v-btn v-if="canFinalize" size="small" variant="flat" color="primary" :loading="finalizing" @click="finalizeRun">Finalize run</v-btn>
-            <v-btn v-if="canRecover" size="small" variant="flat" color="primary" :loading="recovering" @click="recoverRun">Recover run</v-btn>
-            <v-btn v-if="canResolveIntegrity" size="small" variant="flat" color="primary" @click="openIntegrity">Inspect changes</v-btn>
+            <v-btn v-if="canRecover" size="small" variant="flat" color="primary" :loading="recovering" data-alert-action="recover" :class="{ 'alert-focus': alertTarget?.target === 'recover' }" @click="recoverRun">Recover run</v-btn>
+            <v-btn v-if="canResolveIntegrity" size="small" variant="flat" color="primary" data-alert-action="resolve-integrity" :class="{ 'alert-focus': alertTarget?.target === 'resolve-integrity' }" @click="openIntegrity">Inspect changes</v-btn>
             <v-btn v-if="canPause" size="small" variant="tonal" :loading="pausing" @click="requestPause">Pause run</v-btn>
             <!-- Stopping is a state, not an instant. It ends when the runtime
                  confirms termination, so the button stays spent until then. -->
             <v-btn v-if="isStopping" size="small" variant="tonal" color="warning" disabled prepend-icon="$stop">Stopping…</v-btn>
             <v-btn v-else-if="canStop" size="small" variant="tonal" color="warning"
-                   prepend-icon="$stop" :loading="stopRequested" @click="requestStop">Stop run</v-btn>
-            <v-btn v-if="(run.supportedActions ?? []).includes('abandon')" size="small" variant="text" color="warning" :loading="abandoning" @click="abandonRun">Abandon run</v-btn>
+                   prepend-icon="$stop" :loading="stopRequested" data-alert-action="stop" :class="{ 'alert-focus': alertTarget?.target === 'stop' }" @click="requestStop">Stop run</v-btn>
+            <v-btn v-if="(run.supportedActions ?? []).includes('abandon')" size="small" variant="text" color="warning" :loading="abandoning" data-alert-action="abandon" :class="{ 'alert-focus': alertTarget?.target === 'abandon' }" @click="abandonRun">Abandon run</v-btn>
             <v-btn v-if="canDeleteRun" icon="$delete" size="small" variant="text" color="error" title="Delete this run (workspace, record and its steps)" aria-label="Delete this run" :loading="deletingRun" @click="deleteRun" />
           </div>
           </div>
@@ -1302,7 +1338,7 @@ watch(() => route.query.run, (runId) => {
 
           <!-- A paused run asked a question. Nothing is in flight; the answer is
                recorded as a step of its own and the run goes on from it. -->
-          <div v-if="run.status === 'paused' && run.pause && !['manual', 'full-verification'].includes(run.pause.kind)" class="answer">
+          <div v-if="run.status === 'paused' && run.pause && !['manual', 'full-verification'].includes(run.pause.kind) && !run.journal?.recoveryRequired" class="answer" data-alert-action="answer" :class="{ 'alert-focus': alertTarget?.target === 'answer' && alertTarget.state === 'waiting' }">
             <!-- The consult panel's wording of the question for a person; an option fills the answer. -->
             <QuestionBrief v-if="run.pause.brief" :brief="run.pause.brief" :consult="run.pause.consult" @choose="answerText = $event" />
             <v-text-field v-if="!proxyUser" v-model="answerActor" label="Your name" density="compact"
@@ -1321,7 +1357,7 @@ watch(() => route.query.run, (runId) => {
           </div>
 
           <!-- Triage asked the owner before starting; the run has ended and holds nothing. -->
-          <OwnerInput v-if="run.ownerInput && !run.ownerInput.answer" :project="project" :issue-id="issueId" :run="run" @answered="load" />
+          <OwnerInput v-if="run.ownerInput && !run.ownerInput.answer" :project="project" :issue-id="issueId" :run="run" data-alert-action="owner-input" :class="{ 'alert-focus': alertTarget?.target === 'owner-input' && alertTarget.state === 'waiting' }" @answered="load" />
 
           <p v-if="explanation.next || explanation.kept" class="status__next">
             {{ [explanation.kept, explanation.next].filter(Boolean).join(' ') }}
@@ -1780,4 +1816,5 @@ watch(() => route.query.run, (runId) => {
 /* Up to three long dispositions beside Cancel: on a phone they wrap rather than run off the card. */
 .integrity__actions { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .integrity__paths { max-height: 240px; overflow: auto; font-size: 0.75rem; padding: 8px; background: rgb(var(--v-theme-surface-variant)); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.alert-focus { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 4px; border-radius: 6px; }
 </style>

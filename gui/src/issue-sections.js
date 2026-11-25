@@ -29,6 +29,21 @@ export function writeHidden (ids, storage) {
   try { store(storage).setItem(HIDDEN, JSON.stringify(SECTION_IDS.filter((id) => ids.includes(id)))) } catch { /* per-browser convenience only */ }
 }
 
+/*
+ * What the page shows: the saved choice (`hidden`) with the sections an alert link opened for this visit
+ * (`revealed`, docs/operator-alerts.md) shown on top. A reveal is never part of the saved choice: only a toggle
+ * changes `hidden`, and `save` says when it must be written.
+ */
+export const sectionShown = ({ hidden, revealed }, id) => !hidden.includes(id) || revealed.includes(id)
+
+export function toggleSectionState ({ hidden, revealed }, id) {
+  // Shown only for this visit: hiding it again ends the reveal; the saved choice already hides it.
+  if (hidden.includes(id) && revealed.includes(id)) return { hidden, revealed: revealed.filter((x) => x !== id), save: false }
+  return { hidden: hidden.includes(id) ? hidden.filter((x) => x !== id) : [...hidden, id], revealed, save: true }
+}
+
+export const revealSectionState = ({ hidden, revealed }, ids) => ({ hidden, revealed: [...new Set([...revealed, ...ids.filter((id) => hidden.includes(id))])] })
+
 /** true (opened), false (closed) or null: no choice made, so the page decides. */
 export function readFolder (storage) {
   try {

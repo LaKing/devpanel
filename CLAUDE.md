@@ -63,6 +63,8 @@ npm run --silent retire-refs [-- --project <id>] [--apply]   # per repository, t
                              # retire and why the rest stay, as JSON; read-only without --apply (no lock, nothing written);
                              # --apply retires them in one transaction per repository under its delivery lock; exit 1 on any
                              # enumeration error or Git warning (tools/retire-refs.mjs; execution-contract.md "Retiring refs/devpanel/*")
+npm run --silent attention-times [-- --from <utc> --to <utc> --project <id>]   # time to response of waits on a person, before/after
+                             # operator alerts and by alerted, as JSON; read-only (tools/attention-times.mjs, docs/operator-alerts.md)
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
 npm run --silent runs -- --project <id> [--from <utc>] [--to <utc>]   # one JSON line per run of the project whose startedAt is in the UTC window
@@ -551,6 +553,18 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   the authoritative `remaining` budget block. Detail is on demand via `get_step` and `get_file`. A run change reaches
   it as `runDelta` (status, phase, checks verdict, blocked reason, what it acts on), `get_run` only for detail; a live
   run's progress wakes nobody and rides with the next wake (`holdProgress`).
+- `notifications/` — operator alerts (docs/operator-alerts.md): `notifier.mjs` reads `attention.mjs attentionItems` (the
+  inbox's own classification, supervisor questions through a getter) on a server-owned timer started after the top-level
+  supervisor, keys each waiting event (pause id, owner input, recovery occurrence = `recovery.continuesFrom ?? detectedAt`
+  or the journal finding's `detectedAt`, supervisor question id), alerts once per key (`state.json` `seen`, baseline before
+  `installedAt`), groups arrivals, and sends one Web Push (`webpush.mjs`: RFC 8291 + VAPID on node:crypto, TTL 1 h, no
+  redirects, host allow-list) per opted-in device; at least once (a send cut by a restart is resent), finished attempts
+  logged once per `{deliveryId, n}` and repaired at start; an opt-out marks devices revoked before anything else and
+  replies with accepted sends (until response + 1 h) and uncertain ones (no time; older than 2 h counted). `waits.mjs`
+  reads time to response from run records (`run.recoveries[]`, decision steps, `ownerInput`), `attention-times` prints it.
+  Run summaries read only `journal-recovery.json` and `legacy-journal-disposition.json` (never `events.jsonl`) and both
+  caches sign them; the finding is published with `writeExclusive` (link, never replace); recovery entry and exit go
+  through `run-control.mjs enterRecovery`/`leaveRecovery`.
 - `ready-queue.mjs` — what the supervisor could start next, read by the engine and sent in the prompt as `readyQueue`
   when it says something new: the declared campaign's issues (no campaign: the whole panel) in dependency order, each
   with `blockedBy[].until {event, at}`; an observation, `start_run` still decides. When an issue that waited could start

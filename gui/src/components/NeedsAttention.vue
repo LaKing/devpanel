@@ -5,6 +5,7 @@ import { api } from '@/api'
 import { socket } from '@/socket'
 import { formatDuration } from '@/format'
 import SupervisorQuestion from './SupervisorQuestion.vue'
+import AlertSettings from './AlertSettings.vue'
 
 /*
  * Runs that only a person can move on, newest run of each open issue.
@@ -86,6 +87,7 @@ defineExpose({ load })
 
 <template>
   <div class="attention">
+    <AlertSettings />
     <v-alert v-if="error" type="error" variant="tonal" density="compact" class="attention__notice">{{ error }}</v-alert>
     <div v-if="loading && !items.length" class="attention__muted">Looking…</div>
     <p v-else-if="!items.length" class="attention__muted">Nothing is waiting on a person.</p>

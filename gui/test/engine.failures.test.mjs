@@ -1,3 +1,4 @@
+import { runWaits } from '../server/notifications/waits.mjs'
 import os from 'node:os'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -264,24 +265,56 @@ export default async (t) => {
 
     // A writer left edits too: the source quarantine and its disposition.
     {
-      const { engine, calls, state, onDisk } = await make({ partial: true })
+      const { f, engine, calls, state, onDisk } = await make({ partial: true })
       let run = await onDisk()
       t.eq('the source quarantine ends it', `${run.status}:${run.integrity?.status}`, 'blocked:quarantined')
       t.eq('the pointer survives the quarantine', [run.configUnresolved?.length, run.recovery?.configUnresolved], [1, true])
+      // One recovery from the quarantine to the successful recovery (docs/operator-alerts.md): one occurrence,
+      // one alert, one waiting interval, and the wall clock excused for it exactly once.
+      const T0 = run.recovery.detectedAt
+      const suspendedBefore = run.controlSuspendedMs ?? 0
+      const writes = []
+      f.clock.advance(60_000)
+      const T1 = f.clock.iso()
+      // Time passes while the integrity checkpoint is written: resolveIntegrity names integrityDir() a second time
+      // for that write, after record.at was taken and before the clock is read again.
+      const integrityDir = engine.integrityDir.bind(engine)
+      let dirCalls = 0
+      engine.integrityDir = () => { if (++dirCalls === 2) f.clock.advance(5_000); return integrityDir() }
+      const T1d = new Date(Date.parse(T1) + 5_000).toISOString()
+      const persist = engine.persist.bind(engine)
+      engine.persist = async (event) => { writes.push(structuredClone(engine.run.recovery)); return persist(event) }
       await engine.resolveIntegrity({ disposition: 'accept-partial', expectedStateHash: engine.run.integrity.latest.stateHash, reason: 'inspected', actor: 'operator' })
+      engine.persist = persist
+      engine.integrityDir = integrityDir
       run = await onDisk()
       t.eq('the disposition clears the pending invocation, never the pointer', [Object.values(run.participants).some((p) => p.pendingInvocation), run.configUnresolved?.length], [false, 1])
       t.ok('and leaves the run on the public recovery path', ownerLossRecoverable(run), JSON.stringify({ status: run.status, recovery: run.recovery }))
       t.eq('the supervisor offers recover', supportedActions(run), ['recover', 'abandon'])
+      const record = run.integrity.dispositions.at(-1)
+      t.eq('the disposition keeps its own time', record.at, T1)
+      t.eq('its credit ends where the integrity write ended', record.suspendedMs, Date.parse(T1d) - Date.parse(T0))
+      t.eq('the continuing recovery starts at that same instant', run.recovery.detectedAt, T1d)
+      t.eq('and keeps the quarantine as its identity', run.recovery.continuesFrom, T0)
+      t.ok('no write ever held a cleared recovery while a pointer was open', writes.every((r) => r?.required === true), JSON.stringify(writes))
+      t.eq('no recovery interval is closed yet', (run.recoveries ?? []).length, 0)
 
+      f.clock.advance(30_000)
       const second = await engine.recoverOwnerLoss()
       run = await onDisk()
       t.eq('a second sync failure through recover: replayed, still recoverable', [second.resumed, calls.recover, ownerLossRecoverable(run), run.configUnresolved?.length], [false, 1, true, 1])
+      t.eq('the failed retry keeps both the identity and the clock start', [run.recovery.continuesFrom, run.recovery.detectedAt], [T0, T1d])
 
+      f.clock.advance(40_000)
+      const T3 = f.clock.iso()
       state.acknowledge = true
       const third = await engine.recoverOwnerLoss()
       run = await onDisk()
       t.ok('acknowledged: the pointer is gone and the run resumes as the disposition allowed', third.resumed && !run.configUnresolved?.length, third.reason)
+      t.eq('the excused time is the whole recovery, counted once', (run.controlSuspendedMs ?? 0) - suspendedBefore, Date.parse(T3) - Date.parse(T0))
+      t.eq('one recovery interval, from the quarantine to the recovery', (run.recoveries ?? []).map((r) => `${r.occurrence}>${r.resolvedAt}`), [`${T0}>${T3}`])
+      const rows = runWaits(run, { project: 'devpanel-project', issueId: 'i' }).filter((r) => r.kind === 'recovery')
+      t.eq('time to response: one row, entered at the quarantine, handled at the recovery', rows.map((r) => `${r.enteredAt}>${r.handledAt}`), [`${T0}>${T3}`])
       await releaseWorkspace(engine)
     }
 

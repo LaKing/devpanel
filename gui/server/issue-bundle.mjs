@@ -8,6 +8,7 @@ import { writeJson } from './runtime/persistence.mjs'
 import { renderResult } from './run-result-step.mjs'
 import { worktreeGitArgs, engineGitEnv } from './runtime/engine-git.mjs'
 import { withLock } from './runtime/lock.mjs'
+import { readJournalFinding } from './runtime/store.mjs'
 
 /*
  * An archived issue, packed.
@@ -106,6 +107,11 @@ async function runRecords (dir) {
       const hash = snapshot?.configHash ?? snapshot?.snapshotOf ?? null
       if (hash) record.playbook = { ...record.playbook, configHash: hash }
     }
+    // The journal finding and its retirement live beside run.json, not in it: kept on the packed record so time to
+    // response (notifications/waits.mjs) still reads when a journal recovery began and was retired or handled.
+    // Always present (null when there is nothing to keep): a record without the key was packed before it existed,
+    // and its journal is read from the bundle itself (packedJournals).
+    record.journalTiming = journalWorthKeeping(await readJournalFinding(dir, entry.name).catch(() => null))
     const outputs = {}
     for (const f of await fs.readdir(path.join(runsDir, entry.name, 'outputs')).catch(() => [])) {
       const o = await readJson(path.join(runsDir, entry.name, 'outputs', f)).catch(() => null)
@@ -337,6 +343,46 @@ export async function packedSummaries (issuesDir, project) {
     if (s?.issue) out.push(s)
   }
   return out
+}
+
+const journalWorthKeeping = (journal) => (journal && (journal.finding || journal.retired || journal.recoveryRequired) ? journal : null)
+const packedJournalCache = new Map()
+
+/**
+ * The journal findings and retirements of runs packed before runRecords kept `journalTiming`, read from the
+ * sidecars inside the bundle (journal-recovery.json, legacy-journal-disposition.json) by the same reader an unpacked
+ * issue uses. Only those two files per run are extracted, into a temporary directory; cached per bundle file.
+ */
+export async function packedJournals (issuesDir, project, id, runIds) {
+  const { bundle } = bundleFiles(issuesDir, project, id)
+  const stat = await fs.stat(bundle).catch(() => null)
+  if (!stat || !runIds.length) return new Map()
+  const cacheKey = `${bundle}\0${runIds.join(',')}`
+  const cached = packedJournalCache.get(cacheKey)
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.journals
+  const work = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-packed-journal-'))
+  const journals = new Map()
+  try {
+    // Issue and run ids are plain names, so a listing names them as packIssue wrote them.
+    const listed = (await run('tar', ['-tzf', bundle], BIG)).stdout.split('\n')
+    const names = new Set(listed)
+    const present = []
+    for (const runId of runIds) {
+      const prefix = `${id}/runs/${runId}/`
+      // A retirement is checked against the hashes of its run's whole evidence (legacy-journal.mjs), which a
+      // retired pre-execution run keeps small by definition: that run directory is extracted whole.
+      // Named once, as its directory: tar extracts what is under it (a member named again would be "not found").
+      if (names.has(`${prefix}legacy-journal-disposition.json`)) present.push(names.has(prefix) ? prefix : `${prefix}legacy-journal-disposition.json`)
+      else if (names.has(`${prefix}journal-recovery.json`)) present.push(`${prefix}journal-recovery.json`)
+    }
+    if (present.length) await run('tar', ['-C', work, '-xzf', bundle, ...present], BIG)
+    for (const runId of runIds) {
+      const journal = journalWorthKeeping(await readJournalFinding(path.join(work, id), runId).catch(() => null))
+      if (journal) journals.set(runId, journal)
+    }
+  } finally { await fs.rm(work, { recursive: true, force: true }) }
+  packedJournalCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, journals })
+  return journals
 }
 
 /** The run records of a packed issue, for history statistics. */

@@ -30,6 +30,10 @@ export default async function (t) {
     t.eq('API preserves readable history', detail.events, before.events)
     t.eq('API exposes journal recovery finding', detail.journal.recoveryRequired, true)
     t.eq('API exposes overall recovery requirement', detail.recovery.required, true)
+    // One occurrence for the loaded engine, the detail and an alert link (docs/operator-alerts.md): the persisted finding's time, not the engine's clock.
+    const finding = JSON.parse(await fs.readFile(path.join(f.issuePath, 'runs', engine.runId, 'journal-recovery.json'), 'utf8'))
+    t.eq('the loaded engine dates the recovery by the persisted finding', engine.run.recovery.detectedAt, finding.detectedAt)
+    t.eq('and the detail names the same occurrence', detail.recovery.detectedAt, finding.detectedAt)
     t.eq('missing history cannot certify a resolved result', runResult({ ...engine.run, status: 'completed', outcome: 'resolved' }, {}).result, null)
     await simulateProcessDeath(f.issuePath)
     const resumed = await resumeRun({ ...options, runId: engine.runId })

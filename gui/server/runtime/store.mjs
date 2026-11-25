@@ -1,5 +1,5 @@
 import { legacyJournalDisposition } from './legacy-journal.mjs'
-import { writeJson, appendDurable } from './persistence.mjs'
+import { writeJson, writeJsonExclusive, appendDurable } from './persistence.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -151,13 +151,52 @@ export async function initRun (issuePath, { runId, issue, resolved, clock = syst
   return run
 }
 
+/** A pause's id: its own, or for one recorded before pauses had ids, the same derived one every reader uses. */
+export const pauseIdOf = (runId, pause) => pause?.id ?? (pause ? 'legacy-' + crypto.createHash('sha256').update(JSON.stringify([runId, pause])).digest('hex') : null)
+
 export async function readRun (issuePath, runId) {
   const run = await readJson(path.join(runDir(issuePath, runId), 'run.json'))
-  if (run.pause && !run.pause.id) run.pause.id = 'legacy-' + crypto.createHash('sha256').update(JSON.stringify([runId, run.pause])).digest('hex')
+  if (run.pause && !run.pause.id) run.pause.id = pauseIdOf(runId, run.pause)
   const { events, ...journal } = await inspectRunJournal(issuePath, runId)
+  return journalOverlay(run, journal)
+}
+
+/**
+ * What a journal reading adds to a run record, the same for the run detail (readRun, which inspects and may
+ * publish a finding) and the list summary (readJournalFinding, which only reads): a damaged journal is a
+ * recovery, dated by the run's own recovery or else by the finding's first detection, so both readings name
+ * the same occurrence (notifications link to it).
+ */
+export function journalOverlay (run, journal) {
   run.journal = journal
-  if (journal.recoveryRequired && !run.abandonment) run.recovery = { ...run.recovery, required: true, reason: journal.message }
+  if (journal.recoveryRequired && !run.abandonment) {
+    run.recovery = { ...run.recovery, required: true, reason: journal.message,
+      detectedAt: (run.recovery?.required ? run.recovery?.detectedAt : null) ?? journal.finding?.detectedAt ?? null }
+  }
   return run
+}
+
+/**
+ * The journal as a list reading sees it: the persisted finding and the legacy retirement only. Never parses
+ * events.jsonl and never writes, so a list read racing an engine append can neither take a half-written tail
+ * for damage nor publish a finding (only the engine, requireCompleteEvents callers and readRun publish one).
+ */
+export async function readJournalFinding (issuePath, runId) {
+  try {
+    const disposition = await legacyJournalDisposition(issuePath, runId)
+    if (disposition) {
+      // The finding it retired stays beside it: when the recovery began, for time to response.
+      const finding = await readJson(path.join(runDir(issuePath, runId), 'journal-recovery.json')).catch(() => null)
+      return { complete: false, recoveryRequired: false, retired: true, disposition, finding, message: 'Legacy pre-execution failure retired with preserved evidence.' }
+    }
+  } catch (error) { return { complete: false, recoveryRequired: true, message: error.message, finding: null } }
+  let finding
+  try { finding = await readJson(path.join(runDir(issuePath, runId), 'journal-recovery.json')) } catch (error) {
+    if (error.code === 'ENOENT') return { recoveryRequired: false }
+    return { complete: false, recoveryRequired: true, finding: null, message: `Event journal recovery record is unreadable: ${error.code ?? error.message}. Execution requires recovery.` }
+  }
+  if (!finding || typeof finding.message !== 'string' || finding.recoveryRequired !== true) return { complete: false, recoveryRequired: true, finding: null, message: 'Event journal recovery record is unreadable. Execution requires recovery.' }
+  return { complete: false, recoveryRequired: true, finding, message: finding.message + ' A durable recovery finding remains even if journal bytes are subsequently repaired.' }
 }
 export const readSnapshot = (issuePath, runId) => readJson(path.join(runDir(issuePath, runId), 'resolved-playbook.json'))
 
@@ -469,8 +508,13 @@ async function judgeJournal (issuePath, runId, journal) {
     // This runs on every read of a run. A reader can hold the path of an issue being packed or
     // deleted: its journal is missing because the run is gone, and creating the directories here
     // would bring back a folder without its archive marker, which then reads as an open issue.
-    try { await writeJson(file, finding, { parents: false }) } catch (error) {
-      return { ...journal, recoveryPersistenceError: error.code ?? error.message,
+    // Published exclusively: two first readers at once must agree on one detectedAt (the occurrence
+    // a notification links to), so the one that loses adopts the finding already there.
+    try { await writeJsonExclusive(file, finding, { parents: false }) } catch (error) {
+      let adopted = null
+      if (error.code === 'EEXIST') adopted = await readJson(file).catch(() => null)
+      if (adopted?.recoveryRequired === true && typeof adopted.message === 'string') finding = adopted
+      else return { ...journal, recoveryPersistenceError: error.code ?? error.message,
         message: journal.message + ` Recovery finding could not be persisted: ${error.code ?? error.message}.` }
     }
   }
