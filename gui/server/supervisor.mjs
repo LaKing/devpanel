@@ -1593,7 +1593,7 @@ export function createSupervisor ({
    * modules its end gave back are owed, never a refusal: the return is already on
    * the record, and the engine takes them before any turn, waiting for a holder.
    */
-  async function finalize ({ project, issueId, runId, reconcile = false, actor = 'operator' }) {
+  async function finalize ({ project, issueId, runId, reconcile = false, actor = 'operator', budgets = {} }) {
     const action = reconcile ? 'reconcile-delivery' : 'finalize'
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
@@ -1629,6 +1629,9 @@ export function createSupervisor ({
       })
       armAutoReconcile(engine, project)
       if (!supportedActions(engine.run).includes(action)) throw err(409, reconcile ? `This run cannot be reconciled: ${reconcileUnavailable(engine.run) ?? 'it is not waiting at delivery'}.` : 'This run is not waiting at delivery; there is nothing to finalize.')
+      // The budget is checked like every continuation's, before the workspace is touched:
+      // refused here, the run stays blocked where it was (a refusal inside would fail it).
+      if (!reconcile) engine.finalizeLimits({ budgets })
       // The policy is the project's as configured now, like a check refresh's target; it is recorded on the attempt.
       const policy = reconcile ? await reconcilePolicyOf(project) : null
       if (engine.run.workspace?.state === 'retained') {
@@ -1656,7 +1659,7 @@ export function createSupervisor ({
       let returned = false
       let delivering
       try {
-        delivering = reconcile ? engine.reconcileDelivery({ policy, actor }) : engine.finalize({ mayReturnDelivery: true })
+        delivering = reconcile ? engine.reconcileDelivery({ policy, actor }) : engine.finalize({ mayReturnDelivery: true, budgets })
         emit?.({ type: reconcile ? 'run-reconciling' : 'run-finalizing', project, issueId, runId })
         const done = await delivering
         if (!reconcile) returned = done === 'returned'

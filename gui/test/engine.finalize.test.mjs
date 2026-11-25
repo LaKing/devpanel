@@ -75,6 +75,21 @@ export default async function (t) {
     t.ok('finalizing a completed run is refused', /not waiting at delivery/.test((await rejected(() => resumed.finalize()))?.message ?? ''))
     t.eq('the record persisted', (await readRun(f.issuePath, engine.runId)).status, 'completed')
 
+    t.section('2b. finalize checks the step budget as a continuation does, before it changes anything')
+    f = await engineFixture()
+    engine = await start(f, unverifiableDelivery())
+    await engine.drive()
+    {
+      const count = engine.run.steps.filter((s) => s.role !== 'operator').length
+      engine.run.budgets.limits.maxSteps = count
+      const before = JSON.stringify([engine.run.status, engine.run.blockedReason, engine.run.finalizations ?? null, engine.run.budgets.limits])
+      const spent = await rejected(() => engine.finalize())
+      t.eq('a spent step budget refuses with the existing error', [spent?.status, spent?.message], [422, 'Increase the exhausted budget before resuming. Recorded usage is preserved.'])
+      const lowered = await rejected(() => engine.finalize({ budgets: { maxSteps: count - 1 } }))
+      t.eq('a lower limit is refused', [lowered?.status, lowered?.message], [400, 'Resume budgets must be positive integer limits and cannot reduce existing allowances.'])
+      t.eq('nothing on the run changed', JSON.stringify([engine.run.status, engine.run.blockedReason, engine.run.finalizations ?? null, engine.run.budgets.limits]), before)
+    }
+
     t.section('3. a candidate that moved after approval is still refused: finalize is not a bypass')
     f = await engineFixture()
     engine = await start(f, unverifiableDelivery())

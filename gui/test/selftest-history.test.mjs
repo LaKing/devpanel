@@ -7,7 +7,7 @@ import { Worker } from 'node:worker_threads'
 import { promisify } from 'node:util'
 
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
-import { startRun, releaseWorkspace, releaseOwnership, worktreeDiffDelivery } from '../server/runtime/launch.mjs'
+import { startRun, resumeRun, releaseWorkspace, releaseOwnership, worktreeDiffDelivery } from '../server/runtime/launch.mjs'
 import { plan } from '../server/runtime/engine.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
@@ -613,6 +613,24 @@ export default async function (t) {
     t.ok('the explanation names it', explainRun(engine.run).detail.includes('core/merge-only'), explainRun(engine.run).detail)
     t.ok('replay asks for nothing again', replayTurn(engine).kind !== 'turn', replayTurn(engine).kind)
     await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+  }
+
+  t.section('a reconcile interrupted after its approvals were carried: replay through finish reaches closure with them')
+  {
+    const { f, engine, prompts } = await reconcileRun()
+    // The process stops after the accepted reconcile is persisted, before its closure.
+    engine.evaluateClosure = async () => { throw Object.assign(new Error('simulated process death'), { simulatedCrash: true }) }
+    const died = await engine.reconcileDelivery({ policy: {} }).then(() => null, (error) => error)
+    t.ok('the reconcile was accepted and its approval carried before the stop', died?.simulatedCrash && engine.run.reconciliations.at(-1).state === 'accepted' && engine.run.approvals.some((a) => a.reconciledFrom) && engine.run.steps.some((s) => s.reconcileNotice), died?.message)
+    const turns = prompts.length
+    await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    const replayed = await resumeRun({ issuePath: f.issuePath, runId: engine.runId, harnesses: f.harnesses, stepStore: f.stepStore, clock: f.clock, configRoot: f.configRoot, deliveryProvider: worktreeDiffDelivery, workspaceProvider: f.workspaceProvider, projectPath: f.projectPath })
+    t.ok('the reconcile notice counts as no review against the carried approval', replayed.effectiveApprovals().some((a) => a.reconciledFrom && a.revision === replayed.run.revisions.at(-1).fingerprint))
+    await replayed.drive()
+    t.eq('closure finds the same-revision approval', replayed.run.closure?.conditions?.sameRevisionApproval, true, JSON.stringify(replayed.run.closure?.conditions))
+    t.eq('and delivers', `${replayed.run.status} ${replayed.run.outcome}`, 'completed resolved', replayed.run.blockedReason)
+    t.eq('with no new turn', prompts.length, turns)
+    await releaseOwnership(replayed, { reason: 'test' }).catch(() => {})
   }
 
   t.section('auditor-1-005: a reconcile drive that ignored nothing adds no turn')

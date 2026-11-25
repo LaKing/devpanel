@@ -885,7 +885,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/retry-input', route(asyn
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/finalize', route(async (req, res) => {
   const { project, id, runId } = req.params
-  const result = await supervisor.finalize({ project, issueId: id, runId })
+  const result = await supervisor.finalize({ project, issueId: id, runId, budgets: req.body?.budgets ?? {} })
   io.emit('issues:changed', { reason: 'run-finalized', project, id })
   res.json(result)
 }))

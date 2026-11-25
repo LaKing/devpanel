@@ -54,7 +54,7 @@ async function scenario ({ author = null, beforeDelivery = null, policy = {}, pl
     }
     if (stepId.startsWith('audit-')) return fence({ verdict: 'approved', artifactRevision: revision(prompt), findings: [], priorFindings: [] })
     if (stepId === 'confirm') {
-      await beforeDelivery?.(++confirms, f)
+      await beforeDelivery?.(++confirms, f, engine)
       return fence({ revision: revision(prompt), satisfied: true, criteria: [{ id: 'AC1', met: true, evidence: 'audit and diff' }] })
     }
     return base(turn)
@@ -169,6 +169,20 @@ export default async function (t) {
       const heads = [(await exec('git', ['--git-dir', run.workspace.gitDir, 'rev-parse', 'HEAD'])).stdout.trim(), worker ? (await fs.readFile(path.join(worker, 'HEAD'), 'utf8')).trim() : entry.sourceBase]
       t.eq(`the worktree's HEAD names the moved base (engine directory${worker ? ' and the seat\'s' : ''})`, heads, [entry.sourceBase, entry.sourceBase])
       t.eq('metrics count the return', runMetrics(run).deliveryReturns, 1)
+      await done(engine)
+    }
+
+    t.section('1b. the conflict met with the budget spent at the confirmation: blocked at delivery, not returned, no step past it')
+    {
+      let limit = null
+      const agents = (run) => run.steps.filter((s) => s.role !== 'operator').length
+      // The confirmation is the last allowed step.
+      const { engine } = await scenario({ author: resolve(), beforeDelivery: async (n, f, e) => { if (n === 1) { limit = agents(e.run) + 1; e.run.budgets.limits.maxSteps = limit } } })
+      const run = engine.run
+      t.eq('blocked at delivery for the conflict, not budget-exhausted', [run.status, run.blockedReason], ['blocked', 'source-delivery-blocked'])
+      t.ok('the delivery record and its conflict are kept', Boolean(run.delivery) && Boolean(run.delivery.application ?? run.delivery.error), JSON.stringify(run.delivery))
+      t.ok('the closure says why nothing went back to the author', /budget is spent/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
+      t.eq('no return step, and no step past the budget', [run.steps.some((s) => s.decision?.key === 'implement-review:return'), agents(run)], [false, limit])
       await done(engine)
     }
 

@@ -6,8 +6,40 @@ import { supportedActions, workspaceDisposition } from '../server/supervisor.mjs
 import { engineFixture, scriptFor, blocking, pausingStrategy } from './fakes/fixture.mjs'
 
 const launch = (f, extra = {}) => startRun({ playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id }, issuePath: f.issuePath, projectPath: f.projectPath, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider, configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery, ...extra })
-const reload = (f, runId) => resumeRun({ issuePath: f.issuePath, runId, projectPath: f.projectPath, harnesses: f.harnesses, stepStore: f.stepStore, configRoot: f.configRoot, clock: f.clock, deliveryProvider: f.delivery })
+const reload = (f, runId, extra = {}) => resumeRun({ issuePath: f.issuePath, runId, projectPath: f.projectPath, harnesses: f.harnesses, stepStore: f.stepStore, configRoot: f.configRoot, clock: f.clock, deliveryProvider: f.delivery, ...extra })
 async function refuses (fn) { try { await fn(); return null } catch (error) { return error } }
+
+// A plan-and-implement run whose implementation loop has one round, rejected: it ends rounds-exhausted.
+async function exhaustedRun ({ launchSteps = null } = {}) {
+  const f = await engineFixture({ playbook: 'plan-and-implement', script: scriptFor({ implReviews: [[blocking('needs-fix')], []] }) })
+  const file = path.join(f.configRoot, 'playbooks', 'plan-and-implement.yaml')
+  await fs.writeFile(file, (await fs.readFile(file, 'utf8')).replace('budgets:\n', 'overrides:\n  implement-review.maxRounds: 1\nbudgets:\n'))
+  const engine = await launch(f)
+  if (launchSteps) engine.run.budgets.limits.maxSteps = launchSteps
+  await engine.drive()
+  return { f, engine }
+}
+const agentCount = (run) => run.steps.filter((s) => s.role !== 'operator').length
+const confirmed = (e) => e.outputs[e.run.steps.at(-1)?.number]?.contract === 'closureConfirmation'
+const confirmStep = (e) => e.run.steps.filter((s) => e.outputs[s.number]?.contract === 'closureConfirmation').at(-1)
+// What lost the granted round in the reported run is not known: the cap drops back once the confirmation is on the record.
+const dropCap = (e) => { e.snapshot.phases.find((p) => p.id === 'implement-review').loop.maxRounds = 1 }
+const events = async (f, runId) => (await inspectRunJournal(f.issuePath, runId)).events.map((e) => e.type)
+
+// A run older code left blocked rounds-exhausted after its granted round was approved and confirmed:
+// stopped right after the confirmation, recorded as that block, with no approval on the record.
+async function legacyRun ({ overrides = true } = {}) {
+  const { f, engine } = await exhaustedRun()
+  await engine.resumeExecution()
+  await releaseOwnership(engine)
+  const resumed = await reload(f, engine.runId, { hooks: { afterPersistBeforeAdvance: async (e) => { if (confirmed(e)) e.cancel('requested') } } })
+  await resumed.drive()
+  Object.assign(resumed.run, { status: 'blocked', blockedReason: 'rounds-exhausted', outcome: 'unresolved', approvals: [], closure: null })
+  if (!overrides) delete resumed.run.controlOverrides.rounds
+  await resumed.persist({ type: 'finished', reason: 'rounds-exhausted', outcome: 'unresolved' })
+  await releaseOwnership(resumed)
+  return { f, runId: engine.runId, legacy: await reload(f, engine.runId) }
+}
 
 export default async t => {
   t.section('pause completes the current turn, then resumes from persisted state')
@@ -240,5 +272,133 @@ export default async t => {
       t.ok('exhausted with no completed round says so', spent?.code === 'WALL_CLOCK_EXHAUSTED' && /no mean round time/.test(spent.message), spent?.message)
       await releaseOwnership(engine)
     }
+  }
+
+  // The step counts of the reproduction, for the budget fixtures below.
+  let M = null
+  let N = null
+  t.section('AC3: maxRounds 1, changes-needed, exhausted, resume, the granted round approved and confirmed: delivered')
+  {
+    const { f, engine } = await exhaustedRun()
+    t.eq('round 1 ends the loop', `${engine.run.status} ${engine.run.blockedReason}`, 'blocked rounds-exhausted')
+    M = agentCount(engine.run)
+    await engine.resumeExecution()
+    await releaseOwnership(engine)
+    const resumed = await reload(f, engine.runId)
+    await resumed.drive()
+    const latest = resumed.run.revisions.at(-1).fingerprint
+    t.ok('the granted round approved the latest revision', resumed.run.approvals.some((a) => a.role === 'auditor-1' && a.revision === latest), JSON.stringify(resumed.run.approvals))
+    t.eq('the confirmation is satisfied for it', [confirmStep(resumed) && resumed.outputs[confirmStep(resumed).number].output.satisfied, resumed.outputs[confirmStep(resumed).number].output.revision], [true, latest])
+    t.eq('delivered', `${resumed.run.status} ${resumed.run.outcome} ${resumed.run.blockedReason}`, 'completed resolved null')
+    t.ok('the delivery is on the record', Boolean(resumed.run.delivery) && f.delivery.calls.length === 1)
+    N = agentCount(resumed.run)
+    await releaseOwnership(resumed)
+  }
+
+  t.section('AC1: a loop that reads exhausted after its granted round was approved and confirmed goes on to delivery')
+  {
+    const { f, engine } = await exhaustedRun()
+    await engine.resumeExecution()
+    await releaseOwnership(engine)
+    const resumed = await reload(f, engine.runId, { hooks: { afterPersistBeforeAdvance: async (e) => { if (confirmed(e)) dropCap(e) } } })
+    await resumed.drive()
+    t.eq('delivered, not rounds-exhausted', `${resumed.run.status} ${resumed.run.outcome} ${resumed.run.blockedReason}`, 'completed resolved null')
+    t.ok('the conversion is on the record', (await events(f, engine.runId)).includes('confirmed-after-exhaustion'))
+    await releaseOwnership(resumed)
+  }
+
+  t.section('AC1 at the step budget: a confirmation that is the last allowed step still delivers')
+  {
+    const { f, engine } = await exhaustedRun({ launchSteps: M + 1 })
+    t.eq('the first stop is the rounds, not the budget', engine.run.blockedReason, 'rounds-exhausted')
+    await engine.resumeExecution({ budgets: { maxSteps: N } })
+    await releaseOwnership(engine)
+    const resumed = await reload(f, engine.runId)
+    await resumed.drive()
+    t.eq('delivered, not budget-exhausted', `${resumed.run.status} ${resumed.run.outcome} ${resumed.run.blockedReason}`, 'completed resolved null')
+    t.eq('no step past the budget', agentCount(resumed.run), N)
+    await releaseOwnership(resumed)
+  }
+
+  t.section('a Stop while closure with the budget spent records its holds: cancelled, nothing delivered')
+  {
+    const { f, engine } = await exhaustedRun({ launchSteps: M + 1 })
+    await engine.resumeExecution({ budgets: { maxSteps: N } })
+    await releaseOwnership(engine)
+    let armed = false
+    const resumed = await reload(f, engine.runId, { hooks: { afterPersistBeforeAdvance: async (e) => { if (confirmed(e)) armed = true } } })
+    const record = resumed.recordOwnerHolds.bind(resumed)
+    // Armed only once the confirmation is recorded, so it fires at the budget-boundary closure.
+    resumed.recordOwnerHolds = async () => { await record(); if (armed) { resumed.run.status = 'stopping'; resumed.cancel('requested') } }
+    const run = await resumed.drive()
+    t.eq('cancelled, with no closure and no delivery', [run.status, run.closure ?? null, f.delivery.calls.length], ['cancelled', null, 0])
+    await releaseOwnership(resumed)
+  }
+
+  t.section('a contradictory confirmation is not taken for one: the loop stays exhausted and resume grants a round')
+  {
+    const { f, engine } = await exhaustedRun()
+    await engine.resumeExecution()
+    await releaseOwnership(engine)
+    const resumed = await reload(f, engine.runId, { hooks: { afterPersistBeforeAdvance: async (e) => {
+      if (!confirmed(e)) return
+      e.outputs[e.run.steps.at(-1).number].output.criteria[0].unmet = 'missing-work'
+      dropCap(e)
+    } } })
+    await resumed.drive()
+    t.eq('blocked rounds-exhausted, nothing delivered', [resumed.run.status, resumed.run.blockedReason, resumed.confirmedLatest()], ['blocked', 'rounds-exhausted', false])
+    const entry = await resumed.resumeExecution()
+    t.eq('resume grants the loop a round', [entry.enteredClosure ?? false, entry.overrides.rounds['implement-review']], [false, 3])
+    await releaseOwnership(resumed)
+  }
+
+  for (const overrides of [true, false]) {
+    t.section(`AC2: a run older code left rounds-exhausted after an approved, confirmed round resumes into delivery (${overrides ? 'with' : 'without'} its granted round)`)
+    const { f, runId, legacy } = await legacyRun({ overrides })
+    t.ok('its last turn is outside the loop, and no approval is on the record', !legacy.snapshot.phases.find((p) => p.id === legacy.run.phase?.id)?.loop && legacy.run.approvals.length === 0, JSON.stringify(legacy.run.phase))
+    const entry = await legacy.resumeExecution()
+    t.eq('resume is accepted and grants no round', [entry.enteredClosure, entry.overrides.rounds?.['implement-review'] ?? null], [true, overrides ? 2 : null])
+    await legacy.drive()
+    t.eq('delivered', `${legacy.run.status} ${legacy.run.outcome} ${legacy.run.blockedReason}`, 'completed resolved null')
+    t.ok('the approval the engine accepted counts again', legacy.run.approvals.some((a) => a.role === 'auditor-1' && a.revision === legacy.run.revisions.at(-1).fingerprint))
+    void f; void runId
+    await releaseOwnership(legacy)
+  }
+
+  t.section('a persisted approval nothing derives (carried to a merged candidate) stands until a reset or an accepted later review of its seat')
+  {
+    const { legacy } = await legacyRun()
+    const e = legacy
+    const current = e.run.revisions.at(-1).fingerprint
+    const review = e.run.steps.filter((s) => s.role === 'auditor-1' && e.outputs[s.number]?.contract === 'reviewResult').at(-1)
+    // As a reconcile leaves it: a merged revision, the approval carried to it on its original step.
+    e.run.revisions.push({ ...e.run.revisions.at(-1), fingerprint: 'sha256:merged', reconciledFrom: current })
+    e.run.approvals = [{ role: 'auditor-1', revision: 'sha256:merged', step: review.number, reconciledFrom: current }]
+    const roles = () => e.effectiveApprovals().map((a) => `${a.role}@${a.revision}`)
+    t.eq('it stands', roles(), ['auditor-1@sha256:merged'])
+    const later = { number: '990', role: 'auditor-1', phase: review.phase, stepId: review.stepId, round: review.round, recheckDrive: 'checks/990', reconcileNotice: 1 }
+    e.run.steps.push(later)
+    e.outputs['990'] = structuredClone(e.outputs[review.number])
+    t.eq('a reconcile notice of that seat replaces nothing', roles(), ['auditor-1@sha256:merged'])
+    delete later.reconcileNotice
+    t.eq('an accepted re-review of the same round (recheckDrive) replaces it', roles(), [])
+    e.run.steps.pop()
+    delete e.outputs['990']
+    t.eq('without it, it stands again', roles(), ['auditor-1@sha256:merged'])
+    e.run.windowResetAfter = review.number
+    t.eq('an evidence-window reset past its step drops it', roles(), [])
+    await releaseOwnership(legacy)
+  }
+
+  t.section('AC2: only approvals the engine accepted are recovered, and a superseded confirmation grants a round')
+  {
+    const { legacy } = await legacyRun()
+    const current = legacy.run.revisions.at(-1).fingerprint
+    legacy.run.approvals = [{ role: 'auditor-2', revision: current, step: confirmStep(legacy).number }, { role: 'auditor-3', revision: 'stale', step: confirmStep(legacy).number }]
+    t.eq('the accepted review comes back; neither persisted entry stands', legacy.effectiveApprovals().map((a) => a.role), ['auditor-1'])
+    legacy.run.supersededSteps = [...(legacy.run.supersededSteps ?? []), confirmStep(legacy).number]
+    const entry = await legacy.resumeExecution()
+    t.eq('with the confirmation superseded, the loop gets one more round (no 409)', [entry.enteredClosure ?? false, entry.overrides.rounds['implement-review']], [false, 3])
+    await releaseOwnership(legacy)
   }
 }

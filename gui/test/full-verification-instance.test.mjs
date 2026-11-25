@@ -255,7 +255,7 @@ export default async function (t) {
       // Blocked at delivery with its worktree kept: what Finalize is offered for.
       const blocked = { status: 'blocked', blockedReason: 'delivery-unverifiable', outcome: 'unresolved', participants: {}, workspace: { path: path.join(dir, 'worktree'), state: 'active' } }
       let supervisor = null
-      const resumeEngine = async ({ runId, issuePath }) => ({ runId, issuePath, run: structuredClone(blocked), runLock: { release: async () => {} },
+      const resumeEngine = async ({ runId, issuePath }) => ({ runId, issuePath, run: structuredClone(blocked), runLock: { release: async () => {} }, finalizeLimits: () => ({}),
         // The run of section 7 sees a freeze begin while it delivers.
         finalize: async () => { delivered.push(runId); if (runId === 'auto-run') await supervisor.freeze('2026-11-14.2'); return 'delivered' },
         reconcileDelivery: async () => { delivered.push(runId) } })
@@ -315,7 +315,7 @@ export default async function (t) {
       const delivered = []
       await fs.mkdir(path.join(dir, 'app-project'), { recursive: true })
       const blocked = { status: 'blocked', blockedReason: 'delivery-unverifiable', outcome: 'unresolved', participants: {}, workspace: { path: path.join(dir, 'worktree'), state: 'active' } }
-      const resumeEngine = async ({ runId, issuePath }) => ({ runId, issuePath, run: structuredClone(blocked), runLock: { release: async () => {} },
+      const resumeEngine = async ({ runId, issuePath }) => ({ runId, issuePath, run: structuredClone(blocked), runLock: { release: async () => {} }, finalizeLimits: () => ({}),
         finalize: async () => { delivered.push(runId); return 'delivered' },
         reconcileDelivery: async () => { delivered.push(`reconcile:${runId}`) } })
       const supervisor = createSupervisor({ issues, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir, resumeEngine })

@@ -3758,7 +3758,8 @@ export class Engine {
    * when a limit is still exhausted after the raise, or when the wall clock left
    * is below the run's mean round, unless that was explicitly accepted.
    */
-  async continuationLimits ({ budgets = {}, stoppedAt = null, acceptShortWallClock = false, guardShortWallClock = true } = {}) {
+  /** The run's limits with an operator's raise applied: positive integers, never lower than they were. */
+  raisedLimits (budgets = {}) {
     const limits = { ...this.run.budgets.limits }
     if (!budgets || typeof budgets !== 'object' || Array.isArray(budgets)) throw Object.assign(new Error('budgets must be an object'), { status: 400 })
     for (const [key, value] of Object.entries(budgets)) {
@@ -3767,6 +3768,29 @@ export class Engine {
       }
       limits[key] = value
     }
+    return limits
+  }
+
+  /** Whether the step or token allowance is spent under these limits. */
+  stepsOrTokensSpent (limits) {
+    return Boolean((limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
+        (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens))
+  }
+
+  /**
+   * The limits a Finalize gets: it checks the step and token budget like every other
+   * continuation (an automatic reconcile it arms may spend an audit turn), and refuses with
+   * the same error while one is spent; the operator raises it here. The wall clock is not
+   * checked: the time the run stood blocked is excused, and Finalize starts no turn.
+   */
+  finalizeLimits ({ budgets = {} } = {}) {
+    const limits = this.raisedLimits(budgets)
+    if (this.stepsOrTokensSpent(limits)) throw Object.assign(new Error('Increase the exhausted budget before resuming. Recorded usage is preserved.'), { status: 422 })
+    return limits
+  }
+
+  async continuationLimits ({ budgets = {}, stoppedAt = null, acceptShortWallClock = false, guardShortWallClock = true } = {}) {
+    const limits = this.raisedLimits(budgets)
     const events = (await store.readEvents(this.issuePath, this.runId)).events
     // A recovery of a lost owner that these limits refused left the run `owner-lost` with no pause or end:
     // it stopped when its owner was last seen, and a Resume raising the limit must be able to say so.
@@ -3783,8 +3807,7 @@ export class Engine {
     // let through this way; a short clock still needs the operator's consent.
     const consultOnly = Boolean(openPlanReviewHold(this.snapshot, this.run.steps, this.outputs))
     const exhaustedClock = refusal?.code === 'WALL_CLOCK_EXHAUSTED'
-    const exhaustedBudget = Boolean((limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
-        (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens))
+    const exhaustedBudget = this.stepsOrTokensSpent(limits)
     if (exhaustedClock && !consultOnly) refuse()
     if (exhaustedBudget && !consultOnly) {
       // Short of wall clock as well: said here, and the override does not get past this.
@@ -3824,8 +3847,15 @@ export class Engine {
     const previousStatus = this.run.status
     const previousReason = this.run.blockedReason
     const overrides = structuredClone(this.run.controlOverrides ?? {})
-    if (previousReason === 'rounds-exhausted') {
-      const phase = this.snapshot.phases.find(p => p.id === this.run.phase?.id && p.loop)
+    // Older code could block an approved revision the coordinator then confirmed as
+    // rounds-exhausted: no round is owed, replay goes on to closure.
+    const enteredClosure = previousReason === 'rounds-exhausted' && this.confirmedLatest()
+    if (previousReason === 'rounds-exhausted' && !enteredClosure) {
+      // The loop the run stopped in; a run whose last turn was outside it (the confirmation)
+      // names it through the step that recorded its candidate, else its last loop turn.
+      const loopOf = (id) => this.snapshot.phases.find(p => p.loop && p.id === id)
+      const byStep = this.run.steps.find((s) => s.number === this.run.revisions?.at(-1)?.byStep)
+      const phase = loopOf(this.run.phase?.id) ?? loopOf(byStep?.phase) ?? loopOf(this.activeSteps().filter((s) => loopOf(s.phase)).at(-1)?.phase)
       if (!phase) throw Object.assign(new Error('Cannot identify the exhausted review phase.'), { status: 409 })
       overrides.rounds ??= {}
       // One more than the rounds that actually ran: an extend-if-converging
@@ -3836,7 +3866,7 @@ export class Engine {
     if (previousReason === 'protocol-repair-exhausted') overrides.repairAttempts = this.snapshot.reviewPolicy.protocolRepair.maxAttempts + 1
     this.run.controlOverrides = overrides
     this.applyControlOverrides()
-    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides, ...(wallClock ? { wallClock } : {}), ...(consultOnly ? { consultOnly } : {}) }
+    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides, ...(wallClock ? { wallClock } : {}), ...(consultOnly ? { consultOnly } : {}), ...(enteredClosure ? { enteredClosure } : {}) }
     this.run.resumeHistory ??= []
     this.run.resumeHistory.push(entry)
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
@@ -4654,11 +4684,18 @@ export class Engine {
     })
   }
 
+  /** The reviews the engine ACCEPTED, with the plan findings they answer and the policy they were read under. */
+  acceptedReviews () {
+    // Only reviews the engine ACCEPTED count (the module's acceptedReviews, which leaves out reconcile notices).
+    const { prior, reviews } = acceptedReviews({ snapshot: this.snapshot, run: this.run, outputs: this.outputs })
+    return { policy: this.snapshot.reviewPolicy, prior, reviews }
+  }
+
   /** Apply the consequences of a completed review to run state. */
   applyReviewOutcomes () {
-    const policy = this.snapshot.reviewPolicy
-    // Only reviews the engine ACCEPTED count (acceptedReviews).
-    const { prior, reviews, latest } = acceptedReviews({ snapshot: this.snapshot, run: this.run, outputs: this.outputs })
+    const accepted = this.acceptedReviews()
+    const { policy, prior, reviews } = accepted
+    const latest = reviews.at(-1)
     if (!latest) return
 
     let review = summariseReview(latest.out.output, policy, priorBefore(prior, latest.step.number))
@@ -4673,7 +4710,11 @@ export class Engine {
     // disappears and an addressed plan or closure finding stops being owed.
     const unexamined = prior.filter((f) => f.source === 'closure-confirmation' && Number(f.raisedInStep) > Number(latest.step.number))
     this.run.outstandingFindings = [...review.findings.filter((f) => isSubstantial([f], policy)), ...unexamined]
+    this.run.approvals = this.derivedApprovals(accepted)
+  }
 
+  /** The approvals the accepted reviews give the current candidate. */
+  derivedApprovals ({ policy, prior, reviews } = this.acceptedReviews()) {
     // Derived, never accumulated: an approval exists only while the revision it
     // names is still the candidate. Accumulating let an invalidated approval be
     // re-added by a later pass.
@@ -4682,7 +4723,7 @@ export class Engine {
     // it (plan()): the earlier approval must not stand beside a later verdict.
     const replaced = ({ step }) => reviews.some(({ step: later }) => later.recheckDrive && Number(later.number) > Number(step.number) &&
       later.role === step.role && later.phase === step.phase && later.stepId === step.stepId && later.round === step.round)
-    this.run.approvals = reviews
+    return reviews
       .filter((x) => !replaced(x))
       .map(({ step, out }) => ({ step, review: summariseReview(out.output, policy, priorBefore(prior, step.number)) }))
       // `current` may be null before anything is fingerprinted; a null-to-null
@@ -4690,6 +4731,55 @@ export class Engine {
       .filter(({ step }) => !this.snapshot.tactic || Number(step.number) > Number(this.run.steps.filter(s => s.revision).at(-1)?.number ?? -1))
       .filter(({ review: r }) => r.verdict === 'approved' && !r.substantial && r.revision != null && r.revision === current)
       .map(({ step, review: r }) => ({ role: step.role, revision: r.revision, step: step.number, at: this.clock.iso() }))
+  }
+
+  /**
+   * The approvals closure may read: the derived ones, plus a persisted approval that
+   * still stands (same candidate, its step in the window, recorded after the candidate,
+   * no later accepted review of that seat). A record older code left without an approval
+   * the engine accepted gets it back; nothing the engine did not accept is added. An
+   * approval a reconcile carried to the merged candidate stands: the reconcile's own
+   * notice is not an accepted review (acceptedReviews), so it replaces nothing.
+   */
+  effectiveApprovals () {
+    const accepted = this.acceptedReviews()
+    const derived = this.derivedApprovals(accepted)
+    const current = this.run.revisions.at(-1)?.fingerprint ?? null
+    const steps = this.snapshot.tactic ? this.activeSteps() : this.run.steps
+    const inWindow = new Set(steps.map((s) => s.number))
+    const candidateStep = Number(this.run.steps.filter((s) => s.revision).at(-1)?.number ?? -1)
+    const reviewedLater = (a) => accepted.reviews.some(({ step }) => step.role === a.role && Number(step.number) > Number(a.step))
+    const acceptedStep = (a) => accepted.reviews.some(({ step }) => step.number === a.step && step.role === a.role)
+    const standing = (this.run.approvals ?? []).filter((a) => current != null && a.revision === current && inWindow.has(a.step) && acceptedStep(a) &&
+      (!this.snapshot.tactic || Number(a.step) > candidateStep) && !derived.some((d) => d.role === a.role) && !reviewedLater(a))
+    return [...derived, ...standing]
+  }
+
+  recoverApprovals () { this.run.approvals = this.effectiveApprovals() }
+
+  /**
+   * Whether the coordinator's confirmation in force is one replay accepts, confirms the
+   * latest candidate, and was recorded after the step that recorded it.
+   */
+  confirmedLatest () {
+    if (!this.snapshot.tactic) return false
+    const latest = this.run.revisions?.at(-1)
+    if (!latest?.fingerprint) return false
+    const [number, out] = this.activeConfirmation()
+    if (!out) return false
+    if (classifiesUnmet(this.snapshot) && confirmationProblem(out.output) !== null) return false
+    if (!this.coordinatorConfirmed(out.output, { identities: new Set([latest.fingerprint]), hasCandidate: true })) return false
+    return Number(number) > Number(latest.byStep)
+  }
+
+  /**
+   * A loop that reads as exhausted after its latest candidate was approved and confirmed
+   * goes to closure, which judges every condition again; recorded each time.
+   */
+  async confirmedEnding (ending) {
+    if (ending.reason !== 'rounds-exhausted' || !this.confirmedLatest()) return ending
+    await this.persist({ type: 'confirmed-after-exhaustion', revision: this.run.revisions.at(-1).fingerprint })
+    return terminal('complete', 'pending-closure')
   }
 
   /** Drive turns until a terminal state, cancellation, or the budget runs out. */
@@ -4779,6 +4869,22 @@ export class Engine {
         }
       }
       const exceeded = this.budgetExceeded()
+      // The budget ran out with the latest candidate approved and confirmed: closure needs
+      // no turn, so it runs, with no author round after it (no return, no automatic reconcile).
+      if (exceeded && this.snapshot.tactic && !this.checksInFlight && this.confirmedLatest()) {
+        if (!await this.applyOperatorRequests()) break
+        if (!await this.applyCoordinatorEffects()) break
+        await this.recordOwnerHolds()
+        // Stop wins, as in the budget block below after the same write.
+        if (this.controller.signal.aborted) { await this.settleAbort(); break }
+        const ending = plan(this.snapshot, this.activeSteps(), this.outputs, this.planEvidence())
+        if (ending.kind === 'terminal' && ['complete', 'rounds-exhausted'].includes(ending.reason)) {
+          if (this.run.keptInstance) await this.discardKeptInstance('no-full-drive-follows')
+          this.closingWithoutTurns = true
+          try { await this.finish(await this.confirmedEnding(ending)) } finally { this.closingWithoutTurns = false }
+          break
+        }
+      }
       if (exceeded) {
         // The hold record as it stands now: a hold answered just before (top of the loop, or the owner) reads answered.
         await this.recordOwnerHolds()
@@ -4821,7 +4927,7 @@ export class Engine {
       // but that drive or another review of the round means nothing will continue it.
       if (this.run.keptInstance && !this.checksInFlight && next.kind !== 'checks' && !concurrentReview(next)) await this.discardKeptInstance('no-full-drive-follows')
       if (next.kind === 'terminal') {
-        if (await this.finish(next) === 'returned') continue
+        if (await this.finish(await this.confirmedEnding(next)) === 'returned') continue
         break
       }
       if (next.kind === 'pause') {
@@ -5254,8 +5360,12 @@ export class Engine {
     // The loop or the confirmation ended some other way: no valid confirmation, no acceptance.
     if (result.reason !== 'complete' && this.run.checkAcceptanceRequest) this.refuseAcceptanceRequest(`the run ended (${result.reason}) with no valid confirmation of this revision`)
     if (result.reason === 'complete') {
-      // An automatic return reopened the review loop: the run goes on.
-      if (await this.evaluateClosure({ mayReturn: true }) === 'returned') return 'returned'
+      // Approvals the engine accepted and older code left off the record count again.
+      this.recoverApprovals()
+      // An automatic return reopened the review loop: the run goes on. With the budget
+      // spent no author round can follow, so nothing returns.
+      const options = this.closingWithoutTurns ? { mayReturn: false, mayReturnDelivery: false } : { mayReturn: true }
+      if (await this.evaluateClosure(options) === 'returned') return 'returned'
     } else if (result.reason === 'abort') {
       // A designed early exit — triage judged the playbook a poor fit.
       this.run.status = 'completed'
@@ -5320,7 +5430,7 @@ export class Engine {
    * live again, on the current source, and nothing is finished here. Only that
    * return is opened; an unmet confirmation still blocks, as a finalize always did.
    */
-  async finalize ({ mayReturnDelivery = false } = {}) {
+  async finalize ({ mayReturnDelivery = false, budgets = {} } = {}) {
     if (this.run.status !== 'blocked' || !FINALIZABLE_BLOCKS.includes(this.run.blockedReason)) {
       throw Object.assign(new Error(`this run is not waiting at delivery (status ${this.run.status}, ${this.run.blockedReason ?? 'no block'})`), { status: 409 })
     }
@@ -5328,6 +5438,9 @@ export class Engine {
       throw Object.assign(new Error('the worktree is gone; nothing is left to deliver'), { status: 409 })
     }
     await fs.access(this.run.workspace.path).catch(() => { throw Object.assign(new Error(`the worktree ${this.run.workspace.path} no longer exists`), { status: 409 }) })
+    const limits = this.finalizeLimits({ budgets })
+    const previousLimits = this.run.budgets.limits
+    this.run.budgets.limits = limits
     const previous = this.run.blockedReason
     // The time the run stood blocked is a stop, not its wall clock (as a Resume or Continue counts it), whether
     // this finalize completes it, leaves it blocked or returns it to its author: a later continuation of the run
@@ -5335,7 +5448,8 @@ export class Engine {
     const stoppedAt = Date.parse(this.run.endedAt ?? '')
     const suspendedMs = Number.isFinite(stoppedAt) ? Math.max(0, this.clock.now() - stoppedAt) : 0
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
-    this.run.finalizations = [...(this.run.finalizations ?? []), { at: this.clock.iso(), previousBlock: previous, previousDelivery: this.run.delivery ?? null, suspendedMs }]
+    this.run.finalizations = [...(this.run.finalizations ?? []), { at: this.clock.iso(), previousBlock: previous, previousDelivery: this.run.delivery ?? null, suspendedMs,
+      ...(Object.keys(budgets).length ? { previousLimits, limits } : {}) }]
     this.run.status = 'running'
     this.run.blockedReason = null
     this.run.endedAt = null
@@ -6120,7 +6234,7 @@ export class Engine {
         if (back.returned) return 'returned'
         if (back.interrupted) return
         deliveryNotReturned = back.refusal
-      } else deliveryNotReturned = 'this closure ran outside the drive loop (a finalize nothing drives on), which gives no author round'
+      } else deliveryNotReturned = this.closingWithoutTurns ? 'the budget is spent, so no author round can follow' : 'this closure ran outside the drive loop (a finalize nothing drives on), which gives no author round'
     }
 
     if (conditions.deliveryCompleted) {
@@ -6137,7 +6251,8 @@ export class Engine {
 
     // An automatic reconcile comes next: on the record in the same write as the
     // block (every caller's `finished` persist), so no reader sees the block without it.
-    if (reconcilePolicy && !autoReconcileRefusal(this.run, reconcilePolicy)) this.run.autoReconcile = { state: 'pending', at: this.clock.iso(), owner: this.reconcileOwner ?? null }
+    // Not with the budget spent: a reconcile may spend an audit turn.
+    if (reconcilePolicy && !this.closingWithoutTurns && !autoReconcileRefusal(this.run, reconcilePolicy)) this.run.autoReconcile = { state: 'pending', at: this.clock.iso(), owner: this.reconcileOwner ?? null }
     else if (this.run.autoReconcile?.state === 'pending') delete this.run.autoReconcile
   }
 }

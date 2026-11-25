@@ -41,7 +41,8 @@ const lines = (n, edit = {}) => Array.from({ length: n }, (_, i) => edit[i + 1] 
  */
 const COMPATIBLE = '      - id: compatible\n        run: "! (grep -q fixed server.mjs && grep -q INCOMPATIBLE server.mjs)"\n'
 // `tracked` adds files to the source before the run; a `source` entry of null deletes that file there during the run.
-async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '', tracked = {} }) {
+// `before(engine)` runs before the drive; `onConfirm(engine)` in the confirmation turn.
+async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '', tracked = {}, before = null, onConfirm = null }) {
   let engine
   const script = scriptFor()
   const f = await engineFixture({ playbook: 'implementation', delivery: 'apply-to-source', script: async (turn) => {
@@ -49,6 +50,7 @@ async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '
       for (const [file, text] of Object.entries(worktree)) await fs.writeFile(path.join(engine.run.workspace.path, file), text)
       for (const [file, text] of Object.entries(source)) await (text === null ? fs.rm(path.join(f.projectPath, file)) : fs.writeFile(path.join(f.projectPath, file), text))
     }
+    if (turn.stepId === 'confirm') await onConfirm?.(engine)
     return script(turn.stepId.startsWith('audit-implement-') ? { ...turn, stepId: 'audit-implementation' } : turn)
   } })
   await fs.writeFile(path.join(f.projectPath, 'server.mjs'), lines(10))
@@ -62,6 +64,7 @@ async function blockedRun ({ worktree, source, commands = COMPATIBLE, target = '
   const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
   if (!resolved.ok) throw new Error(resolved.errors.map((e) => e.message).join('; '))
   engine = await startRun({ ...f, issue: { ...f.issue, project: 'devpanel-project' }, deliveryProvider: worktreeDiffDelivery, expectConfigHash: resolved.resolved.configHash, runOptions: options })
+  await before?.(engine)
   await engine.drive()
   return { f, engine }
 }
@@ -230,6 +233,47 @@ export default async function (t) {
       t.eq('it is delivered without anyone pressing Reconcile', `${run.status} ${run.outcome}`, 'completed resolved', JSON.stringify(run.reconciliations?.at(-1) ?? run.blockedReason))
       t.eq('the attempt is the engine\'s', run.reconciliations?.[0]?.by, 'engine')
       t.eq("the candidate's entry is above the source's", await read(f, 'changelog.txt'), 'candidate: fixed line 9\nother: landed first\nv1 released\n')
+      await supervisor.shutdown?.()
+    }
+
+    t.section('budget a. closure reached with the step budget spent marks no automatic reconcile')
+    {
+      const policy = { '**/changelog.txt': 'prepend' }
+      const scenario = { worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'candidate: fixed line 9\nv1 released\n' }, source: { 'changelog.txt': 'other: landed first\nv1 released\n' } }
+      const agents = (run) => run.steps.filter((s) => s.role !== 'operator').length
+      const { engine } = await blockedRun({ ...scenario, before: (e) => { e.reconcilePolicy = () => policy }, onConfirm: (e) => { e.run.budgets.limits.maxSteps = agents(e.run) + 1 } })
+      t.eq('blocked at delivery, not budget-exhausted', [engine.run.status, engine.run.blockedReason], ['blocked', 'source-delivery-blocked'])
+      t.eq('the drift is one an automatic reconcile would take', autoReconcileRefusal(engine.run, policy), null)
+      t.eq('but none is marked pending with no step left', engine.run.autoReconcile, undefined)
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+    }
+
+    t.section('budget b. Finalize checks the step budget: refused while it is spent, the run left blocked; raised, it goes on')
+    {
+      const scenario = { worktree: { 'server.mjs': lines(10, { 9: 'line 9 fixed' }), 'changelog.txt': 'candidate: fixed line 9\nv1 released\n' }, source: { 'changelog.txt': 'other: landed first\nv1 released\n' } }
+      const { f, engine } = await blockedRun(scenario)
+      const count = engine.run.steps.filter((s) => s.role !== 'operator').length
+      engine.run.budgets.limits.maxSteps = count
+      await engine.persist()
+      await fs.mkdir(path.join(f.configRoot, 'projects'), { recursive: true })
+      await fs.writeFile(path.join(f.configRoot, 'projects', 'devpanel-project.yaml'), "id: devpanel-project\nworkspace:\n  reconcile:\n    '**/changelog.txt': prepend\n")
+      await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
+      const projectsDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reconcile-projects-'))
+      temps.push(projectsDir)
+      await fs.symlink(f.projectPath, path.join(projectsDir, 'devpanel-project'))
+      const supervisor = createSupervisor({ issues: f.issues, harnessDir: path.join(f.configRoot, 'harness'), projectsDir, configRoot: f.configRoot })
+      const runFile = path.join(f.issue.path, 'runs', engine.runId, 'run.json')
+      const refused = await supervisor.finalize({ project: 'devpanel-project', issueId: f.issue.id, runId: engine.runId }).then(() => null, (e) => e)
+      t.eq('refused with the existing budget error', [refused?.status, refused?.message], [422, 'Increase the exhausted budget before resuming. Recorded usage is preserved.'])
+      let run = JSON.parse(await fs.readFile(runFile, 'utf8'))
+      t.eq('the run stands blocked where it was, nothing reconciled or marked', [run.status, run.blockedReason, run.autoReconcile ?? null, run.reconciliations ?? null, run.finalizations ?? null], ['blocked', 'source-delivery-blocked', null, null, null])
+      const lowered = await supervisor.finalize({ project: 'devpanel-project', issueId: f.issue.id, runId: engine.runId, budgets: { maxSteps: count - 1 } }).then(() => null, (e) => e)
+      t.eq('a lower limit is refused as Resume refuses it', lowered?.status, 400)
+      await supervisor.finalize({ project: 'devpanel-project', issueId: f.issue.id, runId: engine.runId, budgets: { maxSteps: count + 1 } })
+      const end = Date.now() + 60000
+      do { await new Promise((r) => setTimeout(r, 100)); run = JSON.parse(await fs.readFile(runFile, 'utf8')) } while ((!run.reconciliations?.some((r) => r.endedAt) || run.status === 'running') && Date.now() < end)
+      t.eq('raised, it is delivered through the automatic reconcile', `${run.status} ${run.outcome}`, 'completed resolved', JSON.stringify(run.reconciliations?.at(-1) ?? run.blockedReason))
+      t.eq('the raise is on the finalization', [run.finalizations?.[0]?.previousLimits?.maxSteps, run.finalizations?.[0]?.limits?.maxSteps], [count, count + 1])
       await supervisor.shutdown?.()
     }
 
