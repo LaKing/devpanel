@@ -1042,6 +1042,14 @@ or a live run that could not be compared. Every path is compared; only the file
 lists shown stop at 30 (`more`). `unknown` is not an all-clear, and `possible` names the live runs whose files the candidate's
 links can reach.
 
+A preview naming an issue, and a reading that names an issue and a playbook (under
+`configuration.prerequisites`), carry a `refused-seat` information prerequisite when the
+issue's latest run recorded a provider refusal (`failure.class: refusal`; status failed,
+blocked, or cancelled by abandoning either) and this start would put the same model on that
+run's refused seat (`runtime/refused-seat.mjs`). It names the run, the seat and the model,
+refuses nothing and never makes a configuration unready; `runOptions.participants` can seat
+another model.
+
 On a project with a modules tier, a preview, and a reading that names a playbook (under
 `configuration`), also carry `modulesCoverage` (`runtime/modules-coverage.mjs`): what that
 tier would test, through the drive's own filter mapping (`driveFilters`). The evidence is

@@ -1,6 +1,7 @@
 import { inspectSourceRepository } from './runtime/source-repository.mjs'
 import { locksModules } from './runtime/module-locks.mjs'
 import { modulesTiming } from './runtime/modules-tier.mjs'
+import { refusedSeatPrerequisite } from './runtime/refused-seat.mjs'
 
 /*
  * Could a run start here, and if not, what exactly is in the way?
@@ -51,10 +52,11 @@ function ownershipOf (fault) {
  * @param moduleLocks  () => supervisor.moduleLockReading: the project's module pool and its locks
  * @param modulesCoverage  (target) => supervisor.modulesCoverage: what the named playbook's modules tier would test
  * @param stagingSyncs  () => sync-records.mjs standingSyncs: dependency syncs standing on staging hosts
+ * @param refusedSeat  () => refused-seat.mjs latestRefusal: the issue's latest recorded provider refusal
  */
 export async function launchReadiness ({
   project, issueId = null, projectPath, budget = null, perIssueLeft = null,
-  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null, modulesCoverage = null, stagingSyncs = null,
+  playbook = null, runOptions = {}, resolve = null, inspectLaunch = null, pathOverlap = null, moduleLocks = null, modulesCoverage = null, stagingSyncs = null, refusedSeat = null,
   now = Date.now(), inspect = inspectSourceRepository
 }) {
   const fault = await inspect({ projectPath })
@@ -88,7 +90,7 @@ export async function launchReadiness ({
   // is not a question with an answer.
   let configuration = null
   if (playbook) {
-    configuration = await inspectConfiguration({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage, now })
+    configuration = await inspectConfiguration({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage, refusedSeat, now })
   }
 
   // Not a prerequisite: nothing here refuses a start, so baselineReady does not hear of it.
@@ -124,13 +126,13 @@ export async function launchReadiness ({
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
     ...(Array.isArray(syncs) ? (syncs.length ? { stagingSyncs: syncs } : {}) : syncs ? { stagingSyncs: syncs } : {}),
-    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. stagingSyncs, when present, is information too: dependency syncs standing on a staging host now, each naming the run that installed them, the manifests the stage deviates by, its state and whether a live process answers for it (held: its drive reverts it as it ends). configuration.modulesTiming, when present, says when the playbook\'s modules tier drives: every-revision (each revision, beside its reviews) or approved (only a revision its round approved, or whose every substantial finding awaits the check). configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
+    means: 'Each condition is current and independent: a repository fault does not imply a budget fault, and neither is evidence about the other. Anything not listed in prerequisites was checked and found in order. baselineReady covers only what holds for every configuration — it is not launchability, and a playbook whose base policy has not been evaluated may still be refused. pathOverlap, when present, is apart from all of this: files of this candidate another project\'s live run is touching, which refuses nothing. stagingSyncs, when present, is information too: dependency syncs standing on a staging host now, each naming the run that installed them, the manifests the stage deviates by, its state and whether a live process answers for it (held: its drive reverts it as it ends). configuration.modulesTiming, when present, says when the playbook\'s modules tier drives: every-revision (each revision, beside its reviews) or approved (only a revision its round approved, or whose every substantial finding awaits the check). A configuration prerequisite with category information (refused-seat: the issue\'s latest run recorded a provider refusal on a seat this start fills with the same model) is reported and never makes the configuration unready. configuration.modulesCoverage, likewise information: what the playbook\'s modules tier would test for the issue\'s newest recorded change set or expected paths (nothing: the gate will be inconclusive; unknown: no evidence, never a claim of nothing).',
     detail: 'This reserves nothing and spends no allowance, and it is an observation, not a guarantee: the checkout can change a moment later, so start_run re-checks every condition for itself. It is also not a preview — a preview binds a configuration, and one taken before these conditions changed is not evidence that a run is launchable now.'
   }
 }
 
 /** The selected configuration's own source policy, under the hash it belongs to. */
-async function inspectConfiguration ({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage = null, now }) {
+async function inspectConfiguration ({ playbook, runOptions, project, projectPath, fault, resolve, inspectLaunch, modulesCoverage = null, refusedSeat = null, now }) {
   const observedAt = new Date(now).toISOString()
   if (!resolve || !inspectLaunch) return { playbook, ready: false, prerequisites: [{ condition: 'configuration', state: 'this service cannot resolve a configuration', needs: 'ask for the baseline reading only' }], observedAt }
 
@@ -153,17 +155,23 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
   // When its modules tier drives: every-revision (beside the reviews) or approved (after the round approves).
   const timing = modulesTiming(resolved.checks?.target)
   if (timing) identity.modulesTiming = timing
+  // The issue's latest run recorded a provider refusal on a seat this configuration fills with the
+  // same model (refused-seat.mjs): an information prerequisite, never a reason to be unready.
+  const refusal = refusedSeat ? await Promise.resolve().then(refusedSeat).catch(() => null) : null
+  const refused = refusedSeatPrerequisite(refusal, resolved.participants)
+  const information = refused ? [{ ...refused, condition: 'refused-seat', state: refused.detail, needs: 'nothing; information only' }] : []
 
   // A base policy over a checkout git cannot read is not a question with an
   // answer; saying "unevaluated" is honest, inventing a verdict is not.
   if (fault) {
-    return { ...identity, ready: false, observedAt, prerequisites: [{ condition: 'base policy', state: 'not evaluated: the repository fault above must be cleared first', needs: 'clear the repository fault, then read again' }] }
+    return { ...identity, ready: false, observedAt, prerequisites: [{ condition: 'base policy', state: 'not evaluated: the repository fault above must be cleared first', needs: 'clear the repository fault, then read again' }, ...information] }
   }
 
   const condition = await inspectLaunch({ projectPath, workspace: resolved.workspace, configHash: resolved.configHash })
   const prerequisites = condition?.blockedReason
     ? [{ condition: 'base policy', state: condition.blockedReason, needs: condition.code === 'DIRTY_BASE' ? 'clean the checkout, commit it, or select another base policy for the run' : 'clear the condition named above', code: condition.code ?? null, resolvableBy: condition.resolvableBy ?? null }]
     : []
+  prerequisites.push(...information)
   return {
     ...identity,
     observed: {
@@ -174,7 +182,8 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
       at: observedAt
     },
     observedAt,
-    ready: prerequisites.length === 0,
+    // An information prerequisite (refused-seat) is reported, never a reason to be unready.
+    ready: prerequisites.every((p) => p.category === 'information'),
     prerequisites
   }
 }

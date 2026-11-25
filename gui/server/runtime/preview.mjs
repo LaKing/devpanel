@@ -3,6 +3,7 @@ import { sizingSummary } from './triage-sizing.mjs'
 import { evaluate } from './engine.mjs'
 import { locksModules } from './module-locks.mjs'
 import { modulesTiming } from './modules-tier.mjs'
+import { latestRefusal, refusedSeatPrerequisite } from './refused-seat.mjs'
 
 /*
  * Dry-run preview.
@@ -84,8 +85,9 @@ function indexSteps (phases) {
  * @param project  optional { id, path }
  * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
  * @param modulesCoverage  optional (target) => the reading of runtime/modules-coverage.mjs: what the modules tier would test
+ * @param refusedSeat  optional () => the issue's latest recorded refusal (runtime/refused-seat.mjs); read from issue.path by default
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null, refusedSeat = issue?.path ? () => latestRefusal(issue.path) : null } = {}) {
   // A production release with no named releaseId is filled from the issues
   // (release-selection.mjs selectStagedRelease), the same way the start fills it.
   const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
@@ -234,6 +236,11 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     // Information, like path-overlap: occupancy is not a configuration fault, and the start's own refusal is retryable.
     prerequisites.push({ kind: 'module-lock', category: 'information', status: 'occupied', detail: `${locks.conflicts.map((c) => `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; ')}: the start waits until that run ends (retryable; the supervisor's ready queue shows blockedBy module-lock)`, holders: locks.conflicts })
   }
+  // The issue's latest run recorded a provider refusal on a seat this start fills with the same
+  // model (refused-seat.mjs): information only, it never makes the configuration unready.
+  const refusal = refusedSeat ? await Promise.resolve().then(refusedSeat).catch(() => null) : null
+  const refused = refusedSeatPrerequisite(refusal, r.participants)
+  if (refused) prerequisites.push(refused)
   prerequisites.push({
     kind: 'not-probed',
     category: 'information',
