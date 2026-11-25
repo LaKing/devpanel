@@ -2021,6 +2021,19 @@ isolated; the default is to block rather than let an author loose on a live tree
 
 Locks carry owner identity — pid, boot id, process start time, host.
 
+Pack, restore and delete of an issue hold its locks for the whole operation, in one
+order nobody inverts: the project's admission lock, the id's bundle lock
+(`<id>.tar.gz.lock`), then for a folder its run lock (a dead owner taken over, an
+unknown one never), its step lock and the moves lock (`server/issue-locks.mjs`). A packed
+restore has no folder yet: it takes the run and step locks inside the extracted tree, publishes
+it by one rename onto a path that does not exist, and holds the moves lock only for that rename
+and the bundle files' removal; its locks then follow the folder until the marker is off and the
+kept notes are steps. Step,
+note, file and issue.json writes take the step lock; no lock inside an issue folder is
+taken with mkdir, so a folder packed, restored away or deleted is never brought back.
+A refusal on either side is 409 `ISSUE_BUSY` (retryable) and changes nothing; a writer
+whose folder went is 409 `ISSUE_MOVED`.
+
 - **Run lock** — one live run per issue. Several issues of one project may run at
   once. Their candidates may conflict at delivery, which is handled there
   (drift beside the patch is `composed`, on its own paths `source-drift`), and runs

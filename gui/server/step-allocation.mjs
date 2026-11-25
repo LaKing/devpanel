@@ -1,13 +1,18 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { withLock } from './runtime/lock.mjs'
+import { withIssueLock } from './issue-locks.mjs'
 import { writeJson } from './runtime/persistence.mjs'
 import { requireUnarchived } from './issue-archive.mjs'
 
-export async function withStepReservation (dir, {slug, invocationId = null, onReserve = null, origin = null}, write) {
+// The issue's step lock is the issue-level lock pack, restore and delete hold for their
+// whole operation (issue-locks.mjs). Never created: a folder that went refuses (ISSUE_MOVED),
+// a lifecycle operation holding it refuses (ISSUE_BUSY), both retryable. `held` is only for
+// a caller that already holds it (restore turning kept notes into steps).
+export async function withStepReservation (dir, {slug, invocationId = null, onReserve = null, origin = null, waitMs = 10000, held = false}, write) {
   if (origin !== null && !['agent-turn','external-report','human-input'].includes(origin)) throw new Error('Invalid step origin')
   if (!/^[a-z0-9-]+$/.test(slug)) throw new Error('Invalid step slug')
-  return withLock(path.join(dir,'.step-alloc.lock'),{purpose:'step-allocation',waitMs:10000},async()=>{
+  const locked = held ? (fn) => fn() : (fn) => withIssueLock(path.join(dir,'.step-alloc.lock'),{purpose:'step-allocation',waitMs},fn)
+  return locked(async()=>{
     await requireUnarchived(dir)
     const file=path.join(dir,'.step-reservations.json')
     let reservations

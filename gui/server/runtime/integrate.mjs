@@ -9,6 +9,7 @@ import { projectConfig } from '../config/load.mjs'
 import * as store from './store.mjs'
 import { fetchFromStore, isStoreOf } from './git-store.mjs'
 import { acquire, LockHeld } from './lock.mjs'
+import { issueMoved } from '../issue-locks.mjs'
 import { hostPlatform } from './platform.mjs'
 
 /*
@@ -98,6 +99,8 @@ async function underRunLock (issuePath, runId, purpose, platform, fn) {
   try {
     lock = await acquire(path.join(issuePath, '.run.lock'), { purpose, runId, mkdir: false, platform })
   } catch (error) {
+    // The folder went (packed or deleted) since the caller read it.
+    if (error.code === 'ENOENT') throw issueMoved(path.join(issuePath, '.run.lock'))
     if (!(error instanceof LockHeld)) throw error
     const holder = { pid: error.owner?.pid ?? null, runId: error.owner?.runId ?? null }
     throw runLocked(`the issue's run lock is held (${error.liveness}, pid ${holder.pid ?? 'unknown'}${holder.runId ? `, run ${holder.runId}` : ''}); nothing was read or written, try again when it is free`, { liveness: error.liveness, holder })

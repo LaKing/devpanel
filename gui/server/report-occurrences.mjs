@@ -2,9 +2,9 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import { ARCHIVE_FILE, issueStatus } from './issue-archive.mjs'
-import { withMoves } from './issue-bundle.mjs'
+import { withIssueLock } from './issue-locks.mjs'
 import { reportFingerprint } from './report-identity.mjs'
-import { LockHeld, withLock } from './runtime/lock.mjs'
+import { LockHeld } from './runtime/lock.mjs'
 import { writeAtomic, writeJson } from './runtime/persistence.mjs'
 
 /*
@@ -14,7 +14,7 @@ import { writeAtomic, writeJson } from './runtime/persistence.mjs'
  * decided issue is news, and opens a new issue with `repeats` as before (report-identity.mjs).
  *
  * Closure is concluded only from positive evidence: the archive marker is there, the record parses and holds a
- * disposition or a closed status, or the folder is gone while the moves lock is held (packed or deleted). A record
+ * disposition or a closed status, or the folder is gone (packed or deleted) when its step lock is sought. A record
  * that cannot be read, a folder without its record, or a lock that stays held is `unknown`: answered 503 with
  * Retry-After, nothing opened, because a second open issue for one fault is what this exists to prevent. Whether the
  * framework's reporter sends a record again after a 503 is NOT confirmed (its code is not part of this tree); if it
@@ -29,9 +29,9 @@ import { writeAtomic, writeJson } from './runtime/persistence.mjs'
  * pass; a text is at most MAX_TEXT_BYTES (256 KiB, the route's body limit, so a reported text is never cut). At most
  * 64 KiB + 10 x 256 KiB = 2.5625 MiB per issue, however long the fault recurs. Lists read only the JSON.
  *
- * Both locks are taken in this order: the project's moves lock (so the folder cannot be packed away under us, and
- * lock.mjs's mkdir cannot bring a packed folder back), then the issue's .step-alloc.lock, under which archiving
- * writes its marker. Packing never takes the step lock, so the order cannot deadlock.
+ * Only the issue's .step-alloc.lock is taken, never with mkdir (issue-locks.mjs): pack, restore and delete hold it
+ * for their whole operation (taking the moves lock after it), so the folder cannot be packed or deleted under us,
+ * and a folder already gone is not brought back.
  */
 
 export const MAX_RECENT = 10
@@ -148,18 +148,16 @@ export async function recordOccurrence ({ issuesDir, project, id, entry, text, s
   const dir = path.join(issuesDir, project, id)
   const waitMs = seams.occurrenceWaitMs ?? 5000
   await seams.beforeOccurrence?.(id)
-  const attempt = () => withMoves(issuesDir, project, async () => {
-    const before = await classify(dir, { underMoves: true })
-    if (before !== 'open') return { state: before }
-    return withLock(path.join(dir, '.step-alloc.lock'), { purpose: 'report-occurrence', waitMs }, async () => {
-      await seams.insideOccurrence?.(id)
-      const now = await classify(dir, { underMoves: true })
-      if (now !== 'open') return { state: now }
-      return { state: 'recorded', count: await append(dir, entry, text) }
-    })
-  }, { waitMs })
+  const attempt = () => withIssueLock(path.join(dir, '.step-alloc.lock'), { purpose: 'report-occurrence', waitMs }, async () => {
+    await seams.insideOccurrence?.(id)
+    const now = await classify(dir, { underMoves: true })
+    if (now !== 'open') return { state: now }
+    return { state: 'recorded', count: await append(dir, entry, text) }
+  })
   for (let tries = 0; tries < 2; tries++) {
     try { return await attempt() } catch (error) {
+      // No folder to lock: packed or deleted, either way closed.
+      if (error.code === 'ISSUE_MOVED') return { state: 'closed' }
       if (!(error instanceof LockHeld)) throw error
       if (await classify(dir) === 'closed') return { state: 'closed' }
       if (tries === 0) await new Promise((resolve) => setTimeout(resolve, seams.occurrenceRetryMs ?? 1000))

@@ -548,7 +548,17 @@ function group (entries) {
  * packed inside it. What that copy said is kept beside it too, so a later start
  * does not unpack the bundle again.
  */
-function receiptHome ({ project, issue, issues, rel, ref }) {
+function receiptHome ({ project, issue, issues, rel, ref, source }) {
+  // The store places a receipt where its run or operation is recorded, under that place's lock,
+  // and fills the packed cache only while the bundle is there (issues.js writeCoverageReceipt).
+  if (issues.writeCoverageReceipt) {
+    const write = (receipt) => issues.writeCoverageReceipt(project, issue.id, { source, rel, ref, receipt })
+    if (!issue.packed) return { write, read: () => fs.readFile(path.join(issue.path, rel), 'utf8').then(JSON.parse).catch(() => null) }
+    return {
+      write,
+      read: () => issues.fillPackedReceipt(project, issue.id, { rel, ref, read: () => execTar(['-xzOf', issue.location, `${issue.id}/${rel}`]).then(JSON.parse).catch(() => null) })
+    }
+  }
   if (!issue.packed) {
     const file = path.join(issue.path, rel)
     return { read: () => fs.readFile(file, 'utf8').then(JSON.parse).catch(() => null), write: (receipt) => writeJson(file, receipt) }
@@ -568,8 +578,8 @@ function receiptHome ({ project, issue, issues, rel, ref }) {
   }
 }
 
-const runReceipt = (args, runId) => receiptHome({ ...args, rel: `runs/${runId}/staging-coverage-notes.json`, ref: runId })
-const operationReceipt = (args, id) => receiptHome({ ...args, rel: `operations/staging-coverage-notes-${id}.json`, ref: id })
+const runReceipt = (args, runId) => receiptHome({ ...args, rel: `runs/${runId}/staging-coverage-notes.json`, ref: runId, source: { kind: 'run', runId } })
+const operationReceipt = (args, id) => receiptHome({ ...args, rel: `operations/staging-coverage-notes-${id}.json`, ref: id, source: { kind: 'operation', operationId: id } })
 
 /**
  * One note per issue, under a key, so a replay or a later end rewrites it; the

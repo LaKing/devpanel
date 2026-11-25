@@ -3,7 +3,8 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import { archiveRoot, bundleFiles, withMoves } from './issue-bundle.mjs'
+import { archiveRoot, bundleFiles, packedSummary, withMoves } from './issue-bundle.mjs'
+import { withIssueLock } from './issue-locks.mjs'
 import { writeJson } from './runtime/persistence.mjs'
 
 /*
@@ -305,7 +306,17 @@ export function completePendingLookup ({ issuesDir, project, id, record }) {
   lastTried.set(key, lookupRetry.now())
   const running = (async () => {
     const out = await findRepeat({ issuesDir, project, fingerprint: record.report.fingerprint, excludeId: id, before: record.openedAt, seams: lookupRetry.seams, movesWaitMs: 0 })
-    await writeJson(bundleFiles(issuesDir, project, id).repeatLookup, { openedAt: record.openedAt, repeats: out.repeats, repeatLookup: out.repeatLookup, at: new Date().toISOString() })
+    await lookupRetry.seams.beforeOutcomeWrite?.(id)
+    // Under the id's bundle lock (pack, restore and delete hold it for their whole operation), and only while the
+    // issue it was asked for still holds the id: never recreated after a delete, never over a newer issue's outcome.
+    // Busy: not written now; the next read reruns it.
+    const files = bundleFiles(issuesDir, project, id)
+    await withIssueLock(files.lock, { purpose: 'repeat-lookup', waitMs: 0, mkdir: true }, async () => {
+      const current = await readText(path.join(issuesDir, project, id, 'issue.json')).then(JSON.parse, () => null) ??
+        (await packedSummary(issuesDir, project, id))?.issue ?? null
+      if (!record.openedAt || current?.openedAt !== record.openedAt) return
+      await writeJson(files.repeatLookup, { openedAt: record.openedAt, repeats: out.repeats, repeatLookup: out.repeatLookup, at: new Date().toISOString() })
+    }).catch((error) => { if (error.code !== 'ISSUE_BUSY') throw error })
   })().catch((error) => { console.warn(`repeat lookup of ${project}/${id} could not be completed: ${error.message}`) })
     .finally(() => inFlight.delete(key))
   inFlight.set(key, running)

@@ -7,7 +7,8 @@ import { promisify } from 'node:util'
 import { writeJson } from './runtime/persistence.mjs'
 import { renderResult } from './run-result-step.mjs'
 import { worktreeGitArgs, engineGitEnv } from './runtime/engine-git.mjs'
-import { withLock } from './runtime/lock.mjs'
+import { relocate, withLock } from './runtime/lock.mjs'
+import { acquireIssueLock, removeAllSettled, withIssueLock } from './issue-locks.mjs'
 import { readJournalFinding } from './runtime/store.mjs'
 
 /*
@@ -39,9 +40,17 @@ import { readJournalFinding } from './runtime/store.mjs'
  * An id names one issue. The bundle, its summary and its run records hold their id
  * (archivedIdHolders): packing refuses to replace them and restore refuses to replace
  * a folder, each naming both, and a bundle is published with link(), which cannot
- * replace one. `<bundle>.lock` keeps one pack or restore per id. `.moves.lock` is held
- * only for the moment an issue moves between folder and bundle, and by a listing that
- * must see each issue exactly once (report-identity.mjs).
+ * replace one. `<bundle>.lock` keeps one pack, restore or delete per id, and a new
+ * issue takes it for the id it is about to create (issues.js openIssueFolder).
+ * `.moves.lock` is held while an issue moves between folder and bundle, and by a
+ * listing that must see each issue exactly once (report-identity.mjs).
+ *
+ * Through issues.js, pack, restore and delete run under the issue's lifecycle locks
+ * (issue-locks.mjs): admission, this bundle lock and, for a folder, its `.run.lock`,
+ * `.step-alloc.lock` and the moves lock, for the whole operation. A packed restore takes
+ * the run and step locks inside the extracted tree, so the folder appears at its path
+ * already locked; no empty reservation is made. It holds the moves lock only for the
+ * publishing rename and the removal of the bundle files.
  */
 
 const run = promisify(execFile)
@@ -76,8 +85,9 @@ export async function refuseArchiveOverBundle (issuesDir, project, id) {
 }
 
 /** Held only while an issue moves between folder and bundle, or while a listing must see each issue once. */
+// Held past the wait it is ISSUE_BUSY (409, retryable), a LockHeld still (issue-locks.mjs).
 export function withMoves (issuesDir, project, fn, { waitMs = 10000 } = {}) {
-  return withLock(path.join(archiveRoot(issuesDir), project, '.moves.lock'), { purpose: 'issue-moves', waitMs }, fn)
+  return withIssueLock(path.join(archiveRoot(issuesDir), project, '.moves.lock'), { purpose: 'issue-moves', waitMs, mkdir: true }, fn)
 }
 
 /** Locks mean nothing once packed, nor do their takeover gates and publication temp files; worktrees are left out only once their changes are saved. */
@@ -193,11 +203,14 @@ async function saveWorktreeChanges (dir, runs) {
  * `issue` is the issue as the lists describe it (issues.js readIssue), kept
  * as the summary. `releaseWorktrees(dir)` hands run worktrees back to git.
  */
-export async function packIssue ({ issuesDir, project, id, issue, releaseWorktrees }) {
+export async function packIssue ({ issuesDir, project, id, issue, releaseWorktrees, held = false }) {
   const dir = path.join(issuesDir, project, id)
   const files = bundleFiles(issuesDir, project, id)
   await fs.mkdir(files.dir, { recursive: true })
-  return withLock(files.lock, { purpose: 'issue-pack' }, async () => {
+  // `held`: the caller holds this id's bundle lock and the moves lock for the whole pack (issues.js).
+  const locked = held ? (fn) => fn() : (fn) => withLock(files.lock, { purpose: 'issue-pack' }, fn)
+  const moving = held ? (fn) => fn() : (fn) => withMoves(issuesDir, project, fn)
+  return locked(async () => {
     // Before a worktree is touched: a refused issue stays exactly as it was.
     if (!await exists(dir)) throw Object.assign(new Error(`${id} has no folder to pack; it was packed already.`), { status: 409 })
     await refuseArchiveOverBundle(issuesDir, project, id)
@@ -249,7 +262,7 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
         throw Object.assign(new Error(`The archive bundle is missing ${missing.length} file(s) (${missing.slice(0, 3).join(', ')}); the issue was left unpacked.`), { status: 500 })
       }
       const unpackedBytes = (await Promise.all(packed.map((f) => fs.lstat(path.join(dir, f)).then((s) => s.size, () => 0)))).reduce((a, b) => a + b, 0)
-      await withMoves(issuesDir, project, async () => {
+      await moving(async () => {
         // link(), not rename(): it cannot replace a bundle another writer put there.
         try { await fs.link(tmp, files.bundle) } catch (error) {
           if (error.code === 'EEXIST') throw collision(issuesDir, project, id, `Archiving ${id}`)
@@ -274,15 +287,24 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
 
 /**
  * Unpack a bundle back into the project folder; the bundle files go once it is there.
- * Extracted privately and published whole. mkdir reserves the destination, so anything
- * already there, empty or not, refuses the restore, and rename replaces only that
- * reservation. `beforePublish` and `afterClaim` exist only so a test can land between the steps.
+ * Extracted privately and published whole by one rename onto a path that does not exist:
+ * anything already there, empty or not, refuses the restore. No reservation is made, so
+ * no empty folder can take a writer before the content arrives; new issues and other
+ * lifecycle operations of this id are kept out by the bundle lock (held throughout).
+ *
+ * `issueLocks` ({purpose}): take `.run.lock` and `.step-alloc.lock` inside the extracted
+ * tree before it is published, so the folder appears at its path already locked; the
+ * handles follow it (lock.mjs relocate) and are released only after every bundle file
+ * removal has settled and `whilePublished(target)` has run. `bundleHeld`: the caller
+ * holds this id's bundle lock. `beforePublish`, `removeFile` and `releaseLock` exist only so a
+ * test can land between the steps.
  */
-export async function unpackIssue ({ issuesDir, project, id, beforePublish = null, afterClaim = null }) {
+export async function unpackIssue ({ issuesDir, project, id, beforePublish = null, bundleHeld = false, issueLocks = null, whilePublished = null, removeFile = null, releaseLock = null, movesWaitMs = 10000 }) {
   const files = bundleFiles(issuesDir, project, id)
   const target = path.join(issuesDir, project, id)
   await fs.mkdir(files.dir, { recursive: true })
-  return withLock(files.lock, { purpose: 'issue-restore' }, async () => {
+  const locked = bundleHeld ? (fn) => fn() : (fn) => withLock(files.lock, { purpose: 'issue-restore' }, fn)
+  return locked(async () => {
     const held = await archivedIdHolders(issuesDir, project, id)
     if (await exists(target)) {
       // The other restore got here first: nothing is extracted over what has happened since.
@@ -290,6 +312,8 @@ export async function unpackIssue ({ issuesDir, project, id, beforePublish = nul
       throw collision(issuesDir, project, id, `Restoring ${id}`)
     }
     const work = await fs.mkdtemp(path.join(issuesDir, project, '.restoring-'))
+    let locks = []
+    let failure = null
     try {
       await run('tar', ['-C', work, '-xzf', files.bundle], BIG)
       const extracted = path.join(work, id)
@@ -306,23 +330,33 @@ export async function unpackIssue ({ issuesDir, project, id, beforePublish = nul
           await writeJson(file, record)
         }
       }
+      if (issueLocks) {
+        for (const name of ['.run.lock', '.step-alloc.lock']) {
+          locks.push(await acquireIssueLock(path.join(extracted, name), { purpose: issueLocks.purpose ?? 'issue-restore' }))
+        }
+      }
       await beforePublish?.()
       await withMoves(issuesDir, project, async () => {
-        try { await fs.mkdir(target) } catch (error) {
-          if (error.code === 'EEXIST') throw collision(issuesDir, project, id, `Restoring ${id}`)
-          throw error
-        }
-        await afterClaim?.()
-        try { await fs.rename(extracted, target) } catch (error) {
-          if (error.code !== 'ENOTEMPTY' && error.code !== 'EEXIST') throw error
-          // Someone wrote into the reservation: what they wrote stays, and so does the bundle.
-          await fs.rmdir(target).catch(() => {})
-          throw collision(issuesDir, project, id, `Restoring ${id}`)
-        }
-        await Promise.all([files.bundle, files.summary, files.runs, files.receipts].map((f) => fs.rm(f, { force: true })))
-      })
+        if (await fs.lstat(target).then(() => true, () => false)) throw collision(issuesDir, project, id, `Restoring ${id}`)
+        await fs.rename(extracted, target)
+        // Synchronously, with nothing awaited between: the handles name the published files.
+        locks = locks.map((lock) => relocate(lock, path.join(target, path.basename(lock.file))))
+        // Inside moves, as before: a listing never sees the folder and its bundle at once.
+        await removeAllSettled([files.bundle, files.summary, files.runs, files.receipts], removeFile)
+      }, { waitMs: movesWaitMs })
+      await whilePublished?.(target)
+    } catch (error) {
+      failure = error
+      throw error
     } finally {
-      await fs.rm(work, { recursive: true, force: true })
+      // Every lock is released and the work removed, whichever of them fails; a failure here is reported
+      // only when nothing failed before it.
+      const cleanup = []
+      for (const lock of locks.reverse()) {
+        try { await (releaseLock ? releaseLock(lock) : lock.release()) } catch (error) { cleanup.push(error) }
+      }
+      await fs.rm(work, { recursive: true, force: true }).catch((error) => cleanup.push(error))
+      if (!failure && cleanup.length) throw cleanup[0]
     }
     return target
   })
@@ -390,8 +424,11 @@ export async function packedRuns (issuesDir, project, id) {
   return readJson(bundleFiles(issuesDir, project, id).runs).catch(() => [])
 }
 
-/** Remove a packed issue for good. */
-export async function deletePacked (issuesDir, project, id) {
+/**
+ * Remove a packed issue for good. The caller holds the admission and bundle locks
+ * (issues.js deleteIssue); every removal settles before this answers.
+ */
+export async function deletePacked (issuesDir, project, id, { removeFile = null } = {}) {
   const files = bundleFiles(issuesDir, project, id)
-  await Promise.all([files.bundle, files.summary, files.runs, files.notes, files.receipts, files.repeatLookup].map((f) => fs.rm(f, { force: true })))
+  await removeAllSettled([files.bundle, files.summary, files.runs, files.notes, files.receipts, files.repeatLookup], removeFile)
 }

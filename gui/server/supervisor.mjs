@@ -30,7 +30,8 @@ import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from '.
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
 import { planDeletedRun, retireRefs } from './runtime/ref-retention.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
-import { LockHeld, acquire, ownerLiveness, withLock } from './runtime/lock.mjs'
+import { LockHeld, acquire, ownerLiveness } from './runtime/lock.mjs'
+import { admissionLockFile, withIssueLock } from './issue-locks.mjs'
 import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, writesCheckout } from './run-exclusivity.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
 import { terminatePids } from './runtime/process.mjs'
@@ -127,7 +128,12 @@ export function createSupervisor ({
   platform = hostPlatform(),
   // How finalize and reconcile load the run they deliver (launch.mjs resumeRun); a test hands in its own
   // to hold one between admission and delivery while a full verification freeze begins.
-  resumeEngine = resumeRun
+  resumeEngine = resumeRun,
+  // How long a start, resume, recovery or inquiry action waits behind the project's admission lock
+  // (another start, or an issue being archived, restored or deleted) before it is refused, retryably.
+  admissionWaitMs = 60000,
+  // Seams for tests only (deleteRun's wait behind the issue's step lock).
+  seams = {}
 } = {}) {
   const availability = createAvailabilityStore(availabilityFile)
   const pathOverlap = createPathOverlap({ listProjects: () => issues.listProjects(), listIssues: (project) => issues.listIssues(project) })
@@ -261,13 +267,15 @@ export function createSupervisor ({
    * recovery, finalize, inquiry close/acknowledge/reopen and inquiry packing
    * all take it, so their checks and the state they change cannot interleave —
    * across processes too (pid, boot id and start time, dead-owner proof).
+   * Pack, restore and delete of an issue take it too (issues.js); a caller that
+   * already holds it passes `admissionHeld`. Held past the wait: ISSUE_BUSY (409, retryable).
    */
   // The project is validated BEFORE the lock path is built from it: the lock
   // creates its directory, and a name such as `..` would put it outside issues/.
   const admission = async (project, fn) => {
     if (!issues.ISSUES_DIR) return fn()
     await issues.requireProject(project)
-    return withLock(path.join(issues.ISSUES_DIR, project, '.admission.lock'), { purpose: 'admission', waitMs: 60000 }, fn)
+    return withIssueLock(admissionLockFile(issues.ISSUES_DIR, project), { purpose: 'admission', waitMs: admissionWaitMs, mkdir: true }, fn)
   }
 
   /** A closed inquiry is terminal until reopened; an inquiry runs only as one. */
@@ -1048,7 +1056,7 @@ export function createSupervisor ({
       try {
         const issue = await issues.getIssue(project, issueId)
         if (!issue.packed) {
-          released = await withLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-reconcile-release', runId }, async () => {
+          released = await withIssueLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-reconcile-release', runId }, async () => {
             const run = await store.readRun(issue.path, runId)
             if (!reconcilePending(run) || run.autoReconcile.at !== at) return false
             run.autoReconcile = { state: 'not-run', reason, at: new Date().toISOString() }
@@ -1221,7 +1229,8 @@ export function createSupervisor ({
     if (!verdict.packable) return { packed: false, reason: verdict.reason, state: f.state }
     // Archiving writes the answer, the closure record and the run's result
     // text into the bundle before the folder goes (issue-bundle.mjs).
-    await issues.setIssueArchived(project, issueId, true, { overrideReason: `inquiry ${f.state.state}${f.issue.inquiry?.closure ? ` (${f.issue.inquiry.closure.action})` : ''}` })
+    // Inside the caller's admission lock (packInquiry, closeInquiry, the end of an inquiry's run): handed over, never taken again.
+    await issues.setIssueArchived(project, issueId, true, { overrideReason: `inquiry ${f.state.state}${f.issue.inquiry?.closure ? ` (${f.issue.inquiry.closure.action})` : ''}`, admissionHeld: true })
     return { packed: true, state: f.state }
   }
 
@@ -1265,9 +1274,9 @@ export function createSupervisor ({
       // ordinary archived issue is never unpacked by this action (audit I9).
       if (issue.kind !== 'inquiry') throw err(409, `${inquiryId} is not an inquiry`)
       if (issue.packed) {
-        await issues.setIssueArchived(project, inquiryId, false)
+        await issues.setIssueArchived(project, inquiryId, false, { admissionHeld: true })
         issue = await issues.getIssue(project, inquiryId)
-      } else if (issue.archived) await issues.setIssueArchived(project, inquiryId, false)
+      } else if (issue.archived) await issues.setIssueArchived(project, inquiryId, false, { admissionHeld: true })
       if (issue.kind !== 'inquiry') throw err(409, `${inquiryId} is not an inquiry`)
       if (!inquiryClosed(issue)) return { inquiryId, reopened: false, detail: 'it was not closed' }
       await issues.setInquiryClosure(project, inquiryId, null, { reopenedBy: by, reason: reason.trim() })
@@ -1316,7 +1325,7 @@ export function createSupervisor ({
       const at = new Date().toISOString()
       const acknowledgement = { by: actor, at, reason: text }
       let current = null
-      const tags = !run ? [] : await withLock(path.join(issuePath, '.run.lock'), { purpose: 'cleanup-acknowledgement', takeOverDead: false }, async () => {
+      const tags = !run ? [] : await withIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'cleanup-acknowledgement', takeOverDead: false }, async () => {
         current = await store.readRun(issuePath, runId)
         const open = openCleanup(current)
         for (const entry of open) Object.assign(entry, { acknowledgedAt: at, acknowledgement })
@@ -1364,7 +1373,7 @@ export function createSupervisor ({
         if (still.length) throw cleanupRefusal(still)
         return { runId, proved: true, tags: proved.map((e) => e.tag) }
       }
-      return withLock(path.join(issuePath, '.run.lock'), { purpose: 'cleanup-proof', takeOverDead: false }, async () => {
+      return withIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'cleanup-proof', takeOverDead: false }, async () => {
         const current = await store.readRun(issuePath, runId)
         const open = openCleanup(current)
         let outcome
@@ -1697,7 +1706,7 @@ export function createSupervisor ({
     const issue = await holderOf(project, issueId)
     if (active.has(key(project, issueId))) throw err(409, 'Stop the active run and wait for it to finish before abandoning.')
     try {
-      return await withLock(path.join(issue.path, '.run.lock'), { purpose: 'run-abandon', takeOverDead: false }, async () => {
+      return await withIssueLock(path.join(issue.path, '.run.lock'), { purpose: 'run-abandon', takeOverDead: false }, async () => {
         const run = await store.readRun(issue.path, runId)
         if (run.abandonment) return run
         if (LIVE_STATUSES.includes(run.status)) throw err(409, 'The run still claims to be active. Stop it before abandoning.')
@@ -1727,7 +1736,7 @@ export function createSupervisor ({
       })
     } catch (error) {
       if (error.code === 'ENOENT') throw err(404, 'No such run')
-      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Abandonment refused.')
+      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Abandonment refused.', { code: 'ISSUE_BUSY', retryable: true })
       throw error
     }
   }
@@ -1752,7 +1761,10 @@ export function createSupervisor ({
     if (issue.packed || issue.archived) throw err(409, 'This issue is archived. Restore it before deleting a run.')
     if (active.has(key(project, issueId)) || starting.has(key(project, issueId))) throw err(409, 'A run is active on this issue; wait for it to settle.')
     try {
-      return await withLock(path.join(issue.path, '.run.lock'), { purpose: 'run-delete', takeOverDead: false }, async () => {
+      // The issue's step lock straight after the run lock, before anything changes: coverage receipts check and
+      // write under it (issues.js writeCoverageReceipt), and a busy one refuses (ISSUE_BUSY) with nothing touched.
+      return await withIssueLock(path.join(issue.path, '.run.lock'), { purpose: 'run-delete', takeOverDead: false }, () =>
+        withIssueLock(path.join(issue.path, '.step-alloc.lock'), { purpose: 'run-delete', waitMs: seams.stepLockWaitMs ?? 10000, doing: 'Deleting the run' }, async () => {
         const run = await store.readRun(issue.path, runId)
         if (LIVE_STATUSES.includes(run.status) || run.status === 'paused') throw err(409, `The run is ${run.status}. Stop or abandon it before deleting.`)
         if (reconcilePending(run)) throw err(409, 'An automatic reconcile of this run is undecided; wait for it before deleting.')
@@ -1782,10 +1794,10 @@ export function createSupervisor ({
         }
         if (refs.error) console.warn(`deleteRun ${project}/${issueId}/${runId}: its refs/devpanel/* were kept: ${refs.error}`)
         return { runId, deleted: true, steps: [...folders].sort(), refs }
-      })
+      }))
     } catch (error) {
       if (error.code === 'ENOENT') throw err(404, 'No such run')
-      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Run not deleted.')
+      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Run not deleted.', { code: 'ISSUE_BUSY', retryable: true })
       throw error
     }
   }
@@ -1825,7 +1837,7 @@ export function createSupervisor ({
     } catch (error) {
       await engine?.runLock?.release().catch(() => {})
       if (error.code === 'ENOENT') throw err(404, 'No such run')
-      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Landing not recorded.')
+      if (error instanceof LockHeld) throw err(409, 'Execution still owns this issue, or ownership cannot be verified. Landing not recorded.', { code: 'ISSUE_BUSY', retryable: true })
       throw error
     }
   }
@@ -2095,7 +2107,7 @@ export function createSupervisor ({
         const reason = error.message
         refused.push({ ...named, reason })
         console.warn(`[devpanel] ${project}/${issue.id} run ${runId} was not resumed after the shutdown: ${reason}`)
-        await withLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-resume-refused', takeOverDead: false }, async () => {
+        await withIssueLock(path.join(issue.path, '.run.lock'), { purpose: 'auto-resume-refused', takeOverDead: false }, async () => {
           const current = await store.readRun(issue.path, runId)
           current.autoResumeRefused = { at: new Date().toISOString(), reason }
           await store.writeRun(issue.path, runId, current)
@@ -2375,7 +2387,8 @@ function refusalOf (result) {
 
 /** Map internal failures onto answers a caller can act on. */
 function translate (error) {
-  if (error instanceof LockHeld) return occupied(path.basename(error.file) === '.admission.lock' ? 'other starts on this project are still being admitted; try again shortly' : 'another run already holds this issue')
+  // The admission lock is also held by an issue being archived, restored or deleted (issues.js); either way retryable.
+  if (error instanceof LockHeld) return occupied(path.basename(error.file) === '.admission.lock' ? 'other starts on this project are still being admitted; try again shortly' : 'another run already holds this issue', { code: 'ISSUE_BUSY' })
   // The refusal names what was unproven. A generic message would leave the
   // operator with a button that fails for no stated reason.
   if (error.message?.startsWith('refusing to launch')) return err(422, error.message)

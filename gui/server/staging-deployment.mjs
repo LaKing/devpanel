@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { acquire } from './runtime/lock.mjs'
+import { acquireIssueLock } from './issue-locks.mjs'
 import { runProcess } from './runtime/process.mjs'
 import { projectInfrastructure } from './infrastructure.mjs'
 import { DEPLOYMENT_UNPROVEN } from './staging-coverage.mjs'
@@ -14,9 +15,14 @@ export async function deployStaging ({ project, issuePath, root, signal, retryFa
   const infrastructure = await projectInfrastructure(project, { root })
   const config = infrastructure?.stagingDeployment
   if (!config?.enabled) throw new Error('Shared staging deployment is not enabled for this project')
+  // The issue's run lock first, held to the end: pack and delete of the issue wait for the deployment
+  // (ISSUE_BUSY), and a folder packed or deleted meanwhile is not brought back (ISSUE_MOVED).
+  const issueLock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'staging-deployment', doing: 'The staging deployment' })
+  let lock = null
+  try {
   const dir = path.join(issuePath, 'operations')
   await fs.mkdir(dir, { recursive: true })
-  const lock = await acquire(path.join(path.dirname(issuePath), '.staging-deployment.lock'), { purpose: 'shared-staging-deployment' })
+  lock = await acquire(path.join(path.dirname(issuePath), '.staging-deployment.lock'), { purpose: 'shared-staging-deployment' })
   const file = path.join(dir, 'staging-deployment.json')
   try {
     let previous
@@ -74,6 +80,7 @@ export async function deployStaging ({ project, issuePath, root, signal, retryFa
     await save()
     return state
   } finally { await lock.release() }
+  } finally { await issueLock.release() }
 }
 
 export function deploymentReport (result) {

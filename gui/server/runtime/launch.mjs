@@ -21,7 +21,7 @@ import { ensureGitStore, gitStoreDir } from './git-store.mjs'
 import { hostSettings } from '../config/host-settings.mjs'
 import { Engine } from './engine.mjs'
 import { requireUnarchived } from '../issue-archive.mjs'
-import { acquire } from './lock.mjs'
+import { acquireIssueLock } from '../issue-locks.mjs'
 import { hostPlatform } from './platform.mjs'
 import { fencePolicy, unfencedRecord } from './confinement-policy.mjs'
 import { readBarrier, barrierRefusal } from './cleanup-barrier.mjs'
@@ -730,8 +730,10 @@ export async function reserveRun ({
   const runId = presetRunId ?? store.newRunId(clock)
 
   // One active run per issue. Taken before any durable state exists, so a refused
-  // acquisition cannot leave a stray run directory behind.
-  const runLock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock })
+  // acquisition cannot leave a stray run directory behind. Never with mkdir: a folder packed or
+  // deleted meanwhile is ISSUE_MOVED, one a lifecycle operation holds ISSUE_BUSY (issue-locks.mjs).
+  const runLock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock, doing: 'Starting a run' })
+    .catch((error) => { throw Object.assign(error, { started: false }) })
 
   try {
     await requireUnarchived(issuePath)
@@ -1064,7 +1066,7 @@ export async function resumeRun ({ issuePath, runId, harnesses, stepStore, clock
   // The lock first: run.json and the baseline are read under it, so a writer
   // that held the lock until just now is never read stale and then overwritten.
   // A folder that has gone is not brought back (mkdir: false).
-  const runLock = takeLock ? await acquire(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock, mkdir: false }) : null
+  const runLock = takeLock ? await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'run', runId, clock, doing: 'Resuming the run' }) : null
   try {
     const engine = new Engine({ issuePath, runId, harnesses, steps: stepStore, clock, hooks, emit, deliveryProvider, configRoot, availability })
     engine.runLock = runLock

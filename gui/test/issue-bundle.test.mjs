@@ -256,36 +256,47 @@ export default async function (t) {
       t.eq('the bundle is as it was', await sha(b.files.bundle), beforeB)
       await fs.rm(b.dir, { recursive: true })
 
-      const w = await packedIssue('Written into the reservation')
-      const written = await refusalOf(unpackIssue({ issuesDir, project, id: w.id, afterClaim: () => fs.writeFile(path.join(w.dir, 'theirs'), 'kept') }))
-      t.ok('content written into the reservation refuses it, naming both', named(written, w), written?.message)
-      t.eq('that content stays', await fs.readFile(path.join(w.dir, 'theirs'), 'utf8'), 'kept')
-      await fs.rm(w.dir, { recursive: true })
-
-      // createIssue made its folder just as this id came to a bundle, and a restore arrives before it looks again.
-      let restoreError = null
-      let older = null
-      const created = await issues.createIssue(project, { name: 'Interleaved' }, { afterMkdir: async (id) => {
-        if (older) return
-        // Packed from a folder that stands aside: the id is free again only for the moment it takes to hold it.
-        const aside = `${folderOf(id)}.aside`
-        await fs.rename(folderOf(id), aside)
-        const made = await issues.createIssue(project, { name: 'Interleaved' }, { afterMkdir: async () => {} })
-        await issues.setIssueArchived(project, made.id, true, { overrideReason: 'test fixture' })
-        older = { id: made.id, dir: folderOf(made.id), files: bundleFiles(issuesDir, project, made.id) }
-        await fs.rename(aside, folderOf(id))
-        restoreError = await refusalOf(unpackIssue({ issuesDir, project, id }))
+      // No reservation is made: until the content arrives there is nothing at the target a writer could find.
+      const w = await packedIssue('Nothing before publish')
+      let seen = null
+      await unpackIssue({ issuesDir, project, id: w.id, beforePublish: async () => {
+        seen = [await exists(w.dir), await issues.createStep(project, w.id, { name: 'early', text: 'x', lockWaitMs: 0 }).then(() => 'written', (e) => e.status)]
       } })
-      t.ok('a restore arriving after createIssue\'s mkdir is refused, naming both', named(restoreError, older), restoreError?.message)
-      t.eq('createIssue takes the empty folder back and moves on', [created.id, created.sameTitleAs?.id], [`${older.id}-2`, older.id])
-      t.eq('the older one is still whole in its bundle, and restores now', await unpackIssue({ issuesDir, project, id: older.id }), older.dir)
+      t.eq('before publish the target does not exist and a step write is refused', seen, [false, 409])
+      t.eq('and the restore publishes the issue whole, with no early step', [(await fs.readdir(w.dir)).includes('issue.json'), (await fs.readdir(w.dir)).some((n) => n.endsWith('-early'))], [true, false])
+
+      // createIssue chose this id before it came to a bundle, and resumes while a restore of it holds the id's bundle lock:
+      // it never makes the folder, takes the next suffix, and each keeps its own record.
+      let older = null
+      let resumeCreator
+      const chosen = new Promise((resolve) => { resumeCreator = resolve })
+      let creatorAt = null
+      const creatorPaused = new Promise((resolve) => { creatorAt = resolve })
+      const creating = issues.createIssue(project, { name: 'Interleaved' }, { createLockWaitMs: 0, afterIdChosen: async (id) => { if (!older) { creatorAt(id); await chosen } } })
+      const firstChoice = await creatorPaused
+      const made = await issues.createIssue(project, { name: 'Interleaved' })
+      t.eq('the other issue takes the id the paused one chose', made.id, firstChoice)
+      await issues.setIssueArchived(project, made.id, true, { overrideReason: 'test fixture' })
+      older = { id: made.id, dir: folderOf(made.id), files: bundleFiles(issuesDir, project, made.id) }
+      let releaseRestore
+      const restoreHeld = new Promise((resolve) => { releaseRestore = resolve })
+      let restoreAt
+      const restorePaused = new Promise((resolve) => { restoreAt = resolve })
+      const restoring = unpackIssue({ issuesDir, project, id: older.id, beforePublish: async () => { restoreAt(); await restoreHeld } })
+      await restorePaused
+      resumeCreator()
+      const created = await creating
+      t.eq('createIssue never takes the restoring id: it moves on', [created.id, created.sameTitleAs?.id], [`${older.id}-2`, older.id])
+      t.eq('and nothing stands at the restoring id meanwhile', await exists(older.dir), false)
+      releaseRestore()
+      t.eq('the restore completes', await restoring, older.dir)
       t.eq('each has its own record', [(await issues.getIssue(project, older.id)).name, (await issues.getIssue(project, created.id)).id], ['Interleaved', created.id])
       await issues.setIssueArchived(project, older.id, true, { overrideReason: 'test fixture' }).catch(() => {})
 
-      const r = await packedIssue('Reservation held')
+      const r = await packedIssue('Restore held')
       let during = null
-      await unpackIssue({ issuesDir, project, id: r.id, afterClaim: async () => { during = await issues.createIssue(project, { name: 'Reservation held' }) } })
-      t.eq('a new issue during a held reservation takes another id', during.id, `${r.id}-2`)
+      await unpackIssue({ issuesDir, project, id: r.id, beforePublish: async () => { during = await issues.createIssue(project, { name: 'Restore held' }, { createLockWaitMs: 0 }) } })
+      t.eq('a new issue during a restore takes another id', during.id, `${r.id}-2`)
       t.ok('and the restore completes, with its content', (await fs.readdir(r.dir)).includes('issue.json'))
 
       const twice = await packedIssue('Restored twice')

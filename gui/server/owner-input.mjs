@@ -1,7 +1,7 @@
 import path from 'node:path'
 
 import * as store from './runtime/store.mjs'
-import { acquire } from './runtime/lock.mjs'
+import { acquireIssueLock } from './issue-locks.mjs'
 import { resolvePlaybook } from './config/load.mjs'
 import { setIssueDependencies } from './issue-dependencies.mjs'
 
@@ -39,7 +39,8 @@ export function createOwnerInput ({ issues, supervisor, configRoot }) {
     if (issue.packed) throw fail(409, 'the issue is archived; restore it first')
     const issuePath = issue.path
 
-    const lock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'owner-input', runId }).catch((error) => { throw Object.assign(error, { status: 409 }) })
+    // ISSUE_BUSY or ISSUE_MOVED (409, retryable): never brings back a folder packed or deleted meanwhile.
+    const lock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'owner-input', runId, doing: 'Answering the owner questions' })
     let run, record
     try {
       run = await store.readRun(issuePath, runId)
@@ -111,7 +112,7 @@ export function createOwnerInput ({ issues, supervisor, configRoot }) {
     // so it is reported rather than thrown after the work was done.
     let recordError = null
     try {
-      const again = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'owner-input', runId })
+      const again = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'owner-input', runId })
       try {
         const fresh = await store.readRun(issuePath, runId)
         fresh.ownerInput = { ...fresh.ownerInput, answer: record }

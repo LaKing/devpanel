@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 import * as store from '../runtime/store.mjs'
-import { acquire } from '../runtime/lock.mjs'
+import { acquireIssueLock } from '../issue-locks.mjs'
 
 /*
  * Triage questions go to the consult panel before the owner (docs/consult.md,
@@ -35,8 +35,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 async function update (issuePath, runId, change) {
   let lock = null
   for (let attempt = 0; !lock; attempt++) {
-    try { lock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'owner-input-consult', runId }) } catch (error) {
-      if (attempt >= 20) throw error
+    try { lock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'owner-input-consult', runId }) } catch (error) {
+      // A folder packed or deleted meanwhile does not come back by waiting.
+      if (error.code !== 'ISSUE_BUSY' || attempt >= 20) throw error
       await sleep(500)
     }
   }

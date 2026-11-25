@@ -20,17 +20,25 @@ function patch (name, hook) {
   return () => { fs[name] = real }
 }
 
-/** Resolves when a link to `lockFile` is refused because someone holds it. */
+/**
+ * Resolves when a waiter meets `lockFile` held: a link to it refused because someone holds it, or
+ * (lock.mjs examines a lock plainly there without publishing anything beside it) the lock found present.
+ */
 function blockedAt (lockFile) {
   let resolve
   const seen = new Promise((r) => { resolve = r })
-  const restore = patch('link', async (args, real) => {
+  const restoreLink = patch('link', async (args, real) => {
     try { return await real(...args) } catch (error) {
       if (error.code === 'EEXIST' && args[1] === lockFile) resolve()
       throw error
     }
   })
-  return { seen, restore }
+  const restoreLstat = patch('lstat', async (args, real) => {
+    const stat = await real(...args)
+    if (args[0] === lockFile) resolve()
+    return stat
+  })
+  return { seen, restore: () => { restoreLstat(); restoreLink() } }
 }
 
 /** Run `contender` the first time `target` is renamed into place, before that rename lands. */

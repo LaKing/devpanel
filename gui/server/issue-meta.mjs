@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { LockHeld, withLock } from './runtime/lock.mjs'
+import { withIssueLock } from './issue-locks.mjs'
 import { writeJson } from './runtime/persistence.mjs'
 
 /**
@@ -10,22 +10,19 @@ import { writeJson } from './runtime/persistence.mjs'
  * read the old record and have the later rename drop the other's change.
  *
  * `mutate(meta)` changes the record in place; when it throws, nothing is
- * written. A holder that keeps the lock past the wait is answered 409.
+ * written. A holder that keeps the lock past the wait (another writer, or pack,
+ * restore or delete) is answered 409 ISSUE_BUSY, retryable; a folder gone meanwhile
+ * 409 ISSUE_MOVED (issue-locks.mjs).
  * Never call this while holding the issue's .step-alloc.lock (it is not reentrant).
  */
 export async function updateIssueMeta (dir, mutate, { purpose = 'issue-meta', waitMs = 10000 } = {}) {
-  try {
-    return await withLock(path.join(dir, '.step-alloc.lock'), { purpose, waitMs, mkdir: false }, async () => {
-      const file = path.join(dir, 'issue.json')
-      let meta = {}
-      try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
-      const result = await mutate(meta)
-      if (result === false) return false
-      await writeJson(file, meta)
-      return true
-    })
-  } catch (error) {
-    if (error instanceof LockHeld) throw Object.assign(new Error('the issue is being changed by another request; try again'), { status: 409 })
-    throw error
-  }
+  return withIssueLock(path.join(dir, '.step-alloc.lock'), { purpose, waitMs, doing: 'changing the issue' }, async () => {
+    const file = path.join(dir, 'issue.json')
+    let meta = {}
+    try { meta = JSON.parse(await fs.readFile(file, 'utf8')) } catch { meta = {} }
+    const result = await mutate(meta)
+    if (result === false) return false
+    await writeJson(file, meta)
+    return true
+  })
 }

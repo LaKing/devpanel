@@ -13,11 +13,11 @@ import { explainRun, limitRaises } from './runtime/run-explanation.mjs'
 import { journalOverlay, pauseIdOf, readJournalFinding, readOutputs } from './runtime/store.mjs'
 import { reconcilePending, recoveryOccurrence } from './runtime/run-control.mjs'
 import { acceptRisksError, readAcceptedRisks, riskId, unacceptedRisks } from './runtime/residual-risks.mjs'
-import { LockHeld, withLock } from './runtime/lock.mjs'
 import { updateIssueMeta } from './issue-meta.mjs'
+import { acquireIssueLock, admissionLockFile, removeAllSettled, withIssueLock } from './issue-locks.mjs'
 import { unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { ARCHIVE_FILE, archiveState, issueStatus, requireUnarchived } from './issue-archive.mjs'
-import { archivedIdHolders, bundleFiles, deletePacked, packIssue, packedJournals, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
+import { archiveRoot, archivedIdHolders, bundleFiles, deletePacked, packIssue, packedJournals, packedRuns, packedSummaries, packedSummary, refuseArchiveOverBundle, unpackIssue } from './issue-bundle.mjs'
 import { completePendingLookup, findRepeat, folderFingerprint, repeatOutcome, reportFingerprint } from './report-identity.mjs'
 import { findOpenMatch, occurrenceSummary, occurrenceTexts, readOccurrences, recordOccurrence } from './report-occurrences.mjs'
 import { openedBy as openedByRecord, derivedOpenedBy } from './opened-by.mjs'
@@ -599,6 +599,100 @@ export const packedOperations = async (project, id) => (await packedSummary(ISSU
 
 export const packedReceiptsFile = (project, id) => bundleFiles(ISSUES_DIR, project, id).receipts
 
+/*
+ * A staging coverage receipt (staging-coverage.mjs), written where the run or operation it
+ * describes (`source`: {kind: 'run', runId} | {kind: 'operation', operationId}) is recorded:
+ * in the folder, checked and written under its step lock (which deleteRun, pack and delete
+ * hold while they remove it) and never creating a directory; else beside a bundle whose
+ * summary lists it, under the id's bundle lock; else nowhere ('gone'). Never re-resolved by
+ * id alone, so a live folder of the same id never receives a packed issue's receipt.
+ */
+export async function writeCoverageReceipt (project, id, { source, rel, ref, receipt }, seams = {}) {
+  requireOwnId(project, id)
+  const folder = receiptFolder(project, id)
+  const files = bundleFiles(ISSUES_DIR, project, id)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const inFolder = await folderExists(folder)
+    await seams.afterFolderRead?.(inFolder)
+    if (inFolder) {
+      let written
+      try {
+        written = await withIssueLock(path.join(folder, '.step-alloc.lock'), { purpose: 'coverage-receipt', waitMs: 10000 }, async () => {
+          if (!await recordedInFolder(folder, source)) return false
+          await writeJson(path.join(folder, rel), receipt, { parents: false })
+          return true
+        })
+      } catch (error) {
+        if (error.code === 'ISSUE_MOVED') continue
+        if (error.code === 'ENOENT') return 'gone'
+        throw error
+      }
+      if (written) return 'folder'
+    }
+    if (!(await archivedIdHolders(ISSUES_DIR, project, id)).length) {
+      // A restore between the two readings published the folder and then removed the bundle: written there next.
+      if (await folderExists(folder)) continue
+      return 'gone'
+    }
+    const written = await withIssueLock(files.lock, { purpose: 'coverage-receipt', waitMs: 10000, mkdir: true }, async () => {
+      const summary = await packedSummary(ISSUES_DIR, project, id)
+      // Restored while this waited for the bundle lock: the record is back in the folder, written there next.
+      if (!summary) return await folderExists(folder) ? 'restored' : false
+      if (!await recordedInPacked(project, id, summary, source)) return false
+      const kept = await fs.readFile(files.receipts, 'utf8').then(JSON.parse, () => ({}))
+      await writeJson(files.receipts, { ...kept, [ref]: receipt })
+      return true
+    })
+    if (written === 'restored') continue
+    return written ? 'packed' : 'gone'
+  }
+  return 'gone'
+}
+
+/**
+ * A packed receipt read from inside the bundle and kept beside it, only while the bundle is
+ * still there (under its lock): a restore or delete since then gets nothing written, and the
+ * receipt is read from the restored folder instead (null when there is none).
+ */
+export async function fillPackedReceipt (project, id, { rel, ref, read }) {
+  requireOwnId(project, id)
+  const files = bundleFiles(ISSUES_DIR, project, id)
+  return withIssueLock(files.lock, { purpose: 'coverage-receipt', waitMs: 10000, mkdir: true }, async () => {
+    if (!await fs.stat(files.bundle).then(() => true, () => false)) {
+      return fs.readFile(path.join(receiptFolder(project, id), rel), 'utf8').then(JSON.parse, () => null)
+    }
+    const kept = await fs.readFile(files.receipts, 'utf8').then(JSON.parse, () => ({}))
+    if (ref in kept) return kept[ref]
+    const value = await read()
+    await writeJson(files.receipts, { ...kept, [ref]: value })
+    return value
+  })
+}
+
+// Where a receipt's run or operation is recorded: a full verification's run home lives in its dot-prefixed
+// directory (as issueDir resolves it), an issue under its id.
+const receiptFolder = (project, id) => HOME_PATTERN.test(id) ? homePath(project, id) : path.join(ISSUES_DIR, project, id)
+
+async function recordedInFolder (folder, source) {
+  if (source?.kind === 'run') return fs.stat(path.join(folder, 'runs', source.runId, 'run.json')).then(() => true, () => false)
+  if (source?.kind === 'operation') {
+    const dir = path.join(folder, 'operations')
+    for (const name of (await fs.readdir(dir).catch(() => [])).filter((n) => /^staging-deployment(-.+)?\.json$/.test(n))) {
+      if ((await fs.readFile(path.join(dir, name), 'utf8').then(JSON.parse, () => null))?.id === source.operationId) return true
+    }
+  }
+  return false
+}
+
+async function recordedInPacked (project, id, summary, source) {
+  if (source?.kind === 'run') {
+    if ((summary.results ?? []).some((r) => r.runId === source.runId)) return true
+    return (await packedRuns(ISSUES_DIR, project, id)).some((r) => r?.runId === source.runId)
+  }
+  if (source?.kind === 'operation') return (summary.operations ?? []).some((o) => o.id === source.operationId)
+  return false
+}
+
 const MAX_ID_SUFFIX = 100
 
 /*
@@ -606,10 +700,15 @@ const MAX_ID_SUFFIX = 100
  * live one answers as it always has (409 naming it), unless both are reports whose fingerprints differ: that is
  * another fault under one title, and a 409 would make its reporter stop and lose it.
  */
-async function freeIssueId (project, base, slug, fingerprint, lookupSeams) {
+async function freeIssueId (project, base, slug, fingerprint, lookupSeams, busy = null) {
   let sameTitleAs = null
   for (let n = 1; n <= MAX_ID_SUFFIX; n++) {
     const id = n === 1 ? base : `${base}-${n}`
+    // An id another operation holds the bundle lock of (pack, restore, a delete still cleaning up): taken as used.
+    if (busy?.has(id)) {
+      sameTitleAs ??= { project, id }
+      continue
+    }
     const dir = path.join(ISSUES_DIR, project, id)
     const folder = await fs.stat(dir).then(() => true, () => false)
     const held = (await archivedIdHolders(ISSUES_DIR, project, id)).length > 0
@@ -634,8 +733,13 @@ async function freeIssueId (project, base, slug, fingerprint, lookupSeams) {
       throw Object.assign(new IssueError(`"${slug}" was already opened against this project today`, 409), { existingId: id })
     }
   }
+  // Some of those ids were only busy (another operation's bundle lock): retryable, nothing was opened.
+  if (busy?.size) throw idsBusy(slug)
   throw new IssueError(`"${slug}" has taken every id up to ${base}-${MAX_ID_SUFFIX} today; this one was not opened`, 409)
 }
+
+// Not an IssueError, so the API answers with the code and the retryable flag (index.js).
+const idsBusy = slug => Object.assign(new Error(`"${slug}" could not be given a free id while another operation holds the remaining ones; this one was not opened, try again`), { status: 409, code: 'ISSUE_BUSY', retryable: true })
 
 // Reports with a fingerprint take turns per project, so each sees every report finished before it.
 const reportTurns = new Map()
@@ -760,35 +864,50 @@ export async function createIssue (project, { name, input, fromInquiry = null, o
 }
 
 /*
- * The folder of a new issue. mkdir fails on anything there, which is how uniqueness among folders is enforced;
- * packing publishes a bundle before its folder goes, so a folder made as one went is seen beside its bundle,
- * and only the empty folder just made is taken back.
+ * The folder of a new issue. mkdir fails on anything there, which is how uniqueness among folders is enforced.
+ * The chosen id's bundle lock is held from the archive check to the record: pack, restore and delete of an
+ * id hold it for their whole operation, so no bundle appears or goes meanwhile, and an id a bundle holds is
+ * never made a folder at all (no empty directory a writer could find). Busy means another operation is at
+ * work on that id: the next suffix is taken, as for a folder already there.
  */
 async function openIssueFolder ({ project, base, slug, fingerprint, seams, describe, report }) {
+  // Ids whose bundle lock was busy: never chosen again by this creation, so it moves on to a free suffix.
+  const busy = new Set()
   for (let attempt = 0; attempt < MAX_ID_SUFFIX; attempt++) {
-    const { id, sameTitleAs } = await freeIssueId(project, base, slug, fingerprint, seams.lookup)
-    const dir = path.join(ISSUES_DIR, project, id)
-    try { await fs.mkdir(dir) } catch (error) {
-      if (error.code === 'EEXIST') continue
+    const { id, sameTitleAs } = await freeIssueId(project, base, slug, fingerprint, seams.lookup, busy)
+    await seams.afterIdChosen?.(id)
+    let lock
+    try {
+      lock = await acquireIssueLock(bundleFiles(ISSUES_DIR, project, id).lock, { purpose: 'issue-create', waitMs: seams.createLockWaitMs ?? 10000, mkdir: true })
+    } catch (error) {
+      if (error.code === 'ISSUE_BUSY') { busy.add(id); continue }
       throw error
-    }
-    await seams.afterMkdir?.(id)
-    if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) {
-      await fs.rmdir(dir).catch(() => {})
-      continue
     }
     try {
-      if (report !== null) {
-        await fs.mkdir(path.join(dir, '000-report'))
-        await fs.writeFile(path.join(dir, '000-report', 'response.md'), report, 'utf8')
+      await seams.afterCreateLock?.(id)
+      if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) continue
+      const dir = path.join(ISSUES_DIR, project, id)
+      try { await fs.mkdir(dir) } catch (error) {
+        if (error.code === 'EEXIST') continue
+        throw error
       }
-      await fs.writeFile(path.join(dir, META_FILE), JSON.stringify(describe(sameTitleAs), null, 2) + '\n', 'utf8')
-    } catch (error) {
-      await fs.rm(dir, { recursive: true, force: true })
-      throw error
+      await seams.afterMkdir?.(id)
+      try {
+        if (report !== null) {
+          await fs.mkdir(path.join(dir, '000-report'))
+          await fs.writeFile(path.join(dir, '000-report', 'response.md'), report, 'utf8')
+        }
+        await fs.writeFile(path.join(dir, META_FILE), JSON.stringify(describe(sameTitleAs), null, 2) + '\n', 'utf8')
+      } catch (error) {
+        await fs.rm(dir, { recursive: true, force: true })
+        throw error
+      }
+    } finally {
+      await lock.release()
     }
     return readIssue(project, id)
   }
+  if (busy.size) throw idsBusy(slug)
   throw new IssueError(`"${slug}" could not be given a free id; this one was not opened`, 409)
 }
 
@@ -1104,7 +1223,7 @@ export const DEFAULT_PRIORITY = 'normal'
  * issue.json, which holds both the acceptances and the disposition, so a refused
  * call leaves neither.
  */
-export async function setIssueDisposition (project, id, { value, evidence, runId = null, by = 'operator', override = null, related = null, acceptRisks = null } = {}) {
+export async function setIssueDisposition (project, id, { value, evidence, runId = null, by = 'operator', override = null, related = null, acceptRisks = null, lockWaitMs = 10000 } = {}) {
   if ((await readIssue(project, id).catch(() => null))?.kind === 'inquiry') throw new IssueError('an inquiry has no disposition; close or acknowledge it', 409)
   if (!DISPOSITIONS.includes(value)) throw new IssueError(`disposition must be one of ${DISPOSITIONS.join(', ')}`)
   if (typeof evidence !== 'string' || !evidence.trim()) throw new IssueError('a disposition needs evidence: say what was checked')
@@ -1144,7 +1263,7 @@ export async function setIssueDisposition (project, id, { value, evidence, runId
     }
     if (newlyAccepted.length) meta.acceptedRisks = [...accepted, ...newlyAccepted]
     meta.disposition = { value, evidence: evidence.trim(), runId: runId ?? null, by, at, openRisks, override: overrideRecord, related: links }
-  })
+  }, { waitMs: lockWaitMs })
   return getIssue(project, id)
 }
 
@@ -1191,7 +1310,7 @@ async function relatedIssues (project, id, value, related) {
  * one in its result and never write one, because the order of the company's work
  * is not a thing a run gets to change from inside itself.
  */
-export async function setIssuePriority (project, id, { value, reason, by = 'operator' } = {}) {
+export async function setIssuePriority (project, id, { value, reason, by = 'operator', lockWaitMs = 10000 } = {}) {
   if ((await readIssue(project, id).catch(() => null))?.kind === 'inquiry') throw new IssueError('an inquiry has no priority', 409)
   if (!PRIORITIES.includes(value)) throw new IssueError(`priority must be one of ${PRIORITIES.join(', ')}`)
   if (typeof reason !== 'string' || !reason.trim()) throw new IssueError('a priority needs a reason: say why this order')
@@ -1208,7 +1327,7 @@ export async function setIssuePriority (project, id, { value, reason, by = 'oper
     history.push({ value, reason: reason.trim(), by, at: new Date().toISOString() })
     meta.priorityHistory = history
     meta.priority = currentPriority(history)
-  })
+  }, { waitMs: lockWaitMs })
   return getIssue(project, id)
 }
 
@@ -1235,14 +1354,10 @@ export async function createFollowUps (project, id, runId, { by = null } = {}) {
   // run.json is read and written back under the issue's run lock (no run or
   // other writer of it in between), and the accepted risks under the issue's
   // step lock (no disposition in between): run, then step, as archiving takes them.
-  try {
-    return await withLock(path.join(dir, '.run.lock'), { purpose: 'follow-ups', takeOverDead: false, mkdir: false }, () =>
-      withLock(path.join(dir, '.step-alloc.lock'), { purpose: 'follow-ups', waitMs: 10000, mkdir: false }, () =>
-        followUpsHeld(project, id, runId, dir, by)))
-  } catch (error) {
-    if (error instanceof LockHeld) throw new IssueError('a run of this issue is live or its state is being changed; try again when it ends', 409)
-    throw error
-  }
+  // Refused as ISSUE_BUSY (409, retryable) while a run or a lifecycle operation holds either lock.
+  return withIssueLock(path.join(dir, '.run.lock'), { purpose: 'follow-ups', takeOverDead: false, doing: 'creating follow-ups' }, () =>
+    withIssueLock(path.join(dir, '.step-alloc.lock'), { purpose: 'follow-ups', waitMs: 10000, doing: 'creating follow-ups' }, () =>
+      followUpsHeld(project, id, runId, dir, by)))
 }
 
 async function followUpsHeld (project, id, runId, dir, by) {
@@ -1290,46 +1405,152 @@ async function followUpsHeld (project, id, runId, dir, by) {
  * on the archive record, with the reason when one was given. The supervisor's
  * own rule (a disposition first) lives in the supervisor, not here.
  */
-export async function setIssueArchived (project, id, archived, { overrideReason = null } = {}) {
+export async function setIssueArchived (project, id, archived, { overrideReason = null, admissionHeld = false, seams = {} } = {}) {
   await requireProject(project)
-  if (!archived && ISSUE_PATTERN.test(String(id)) && await packedSummary(ISSUES_DIR, project, id)) {
-    // Restore a packed issue: unpack it, then it is an ordinary archived
-    // folder, and the marker comes off as for any restore.
-    await unpackIssue({ issuesDir: ISSUES_DIR, project, id })
-  }
-  // Archiving what is already packed is a repeat, and harmless.
-  if (archived && ISSUE_PATTERN.test(String(id)) && !await fs.stat(path.join(ISSUES_DIR, project, id)).then(() => true, () => false) &&
-      await packedSummary(ISSUES_DIR, project, id)) return getIssue(project, id)
-  // Refused before the marker: the folder stays as it was, and the bundle of its id with it.
-  if (archived && ISSUE_PATTERN.test(String(id))) await refuseArchiveOverBundle(ISSUES_DIR, project, id)
-  const result = await markArchived(project, id, archived, { overrideReason })
-  if (!archived) {
-    await drainArchivedNotes(project, id)
-    return getIssue(project, id)
-  }
-  await packArchived(project, id)
+  requireOwnId(project, id)
+  if (!ISSUE_PATTERN.test(String(id))) await issueDir(project, id)
+  if (archived) await archiveIssue(project, id, { overrideReason, admissionHeld, seams })
+  else await restoreIssue(project, id, { admissionHeld, seams })
   return getIssue(project, id)
 }
 
-/**
- * Pack an archived issue out of the project folder (issue-bundle.mjs). Done
- * after the archive marker is written and the issue's locks are released: the
- * marker already refuses new runs and steps, and the locks live in the folder
- * that is about to go.
+/*
+ * Pack, restore and delete hold the issue's lifecycle locks for the whole operation
+ * (issue-locks.mjs), in two phases: the project's admission lock (unless the caller
+ * already holds it: an inquiry's pack and reopen run inside the supervisor's admission)
+ * and the id's bundle lock; then, with those held, they decide what is there (a folder,
+ * a bundle, neither) and only for a folder take its run lock (a dead owner taken over, an
+ * unknown one never), its step lock and the moves lock. Every refusal comes before the
+ * first change and is ISSUE_BUSY (409, retryable). `seams` exist only for tests.
  */
-export async function packArchived (project, id) {
-  const dir = await issueDir(project, id)
-  if (!await archiveState(dir)) throw new IssueError('Only an archived issue is packed.', 409)
+const LIFECYCLE_WAIT_MS = 10000
+const folderExists = (dir) => fs.stat(dir).then((s) => s.isDirectory(), () => false)
+
+/*
+ * An id a lifecycle operation, an archived note or a receipt acts on names a direct child of the project
+ * folder: ISSUE_PATTERN alone admits separators and dot segments in the slug, which would reach outside it.
+ */
+function requireOwnId (project, id) {
+  const value = typeof id === 'string' ? id : ''
+  const projectDir = path.resolve(ISSUES_DIR, project)
+  if (!value || /[/\\\0]/.test(value) || value === '.' || value === '..' || path.dirname(path.resolve(projectDir, value)) !== projectDir) {
+    throw new IssueError('no such issue', 404)
+  }
+}
+
+async function withOuterLocks (project, id, { purpose, doing, admissionHeld = false, seams = {} }, fn) {
+  const waitMs = seams.lockWaitMs ?? LIFECYCLE_WAIT_MS
+  const admission = admissionHeld ? null : await acquireIssueLock(admissionLockFile(ISSUES_DIR, project), { purpose, doing, waitMs: seams.admissionWaitMs ?? waitMs, mkdir: true })
+  try {
+    return await withIssueLock(bundleFiles(ISSUES_DIR, project, id).lock, { purpose, doing, waitMs, mkdir: true }, fn)
+  } finally {
+    await admission?.release()
+  }
+}
+
+async function withFolderLocks (project, dir, { purpose, doing, seams = {} }, fn) {
+  const waitMs = seams.lockWaitMs ?? LIFECYCLE_WAIT_MS
+  return withIssueLock(path.join(dir, '.run.lock'), { purpose, doing, waitMs: 0 }, () =>
+    withIssueLock(path.join(dir, '.step-alloc.lock'), { purpose, doing, waitMs }, () =>
+      withIssueLock(path.join(archiveRoot(ISSUES_DIR), project, '.moves.lock'), { purpose, doing, waitMs, mkdir: true }, fn)))
+}
+
+async function archiveIssue (project, id, { overrideReason, admissionHeld, seams }) {
+  const doing = `Archiving ${id}`
+  await withOuterLocks(project, id, { purpose: 'issue-archive', doing, admissionHeld, seams }, async () => {
+    const dir = path.join(ISSUES_DIR, project, id)
+    if (!await folderExists(dir)) {
+      // Archiving what is already packed is a repeat, and harmless.
+      if (await packedSummary(ISSUES_DIR, project, id)) return
+      await issueDir(project, id)
+    }
+    await withFolderLocks(project, dir, { purpose: 'issue-archive', doing, seams }, async () => {
+      // Refused before the marker: the folder stays as it was, and the bundle of its id with it.
+      await refuseArchiveOverBundle(ISSUES_DIR, project, id)
+      const marked = Boolean(await archiveState(dir))
+      if (!marked) {
+        await refuseActiveRuns(dir, 'archiving')
+        await requireCleanupRecorded(dir, 'archiving this issue')
+      }
+      await seams.whileLocked?.(dir)
+      if (!marked) await writeArchiveMarker(dir, overrideReason)
+      await packHeld(project, id, dir)
+    })
+  })
+}
+
+/** Pack an archived issue out of the project folder (issue-bundle.mjs). Only the archive endpoint treats a packed issue as a repeat. */
+export async function packArchived (project, id, { admissionHeld = false, seams = {} } = {}) {
+  await requireProject(project)
+  requireOwnId(project, id)
+  const doing = `Packing ${id}`
+  return withOuterLocks(project, id, { purpose: 'issue-pack', doing, admissionHeld, seams }, async () => {
+    const dir = path.join(ISSUES_DIR, project, id)
+    if (!await folderExists(dir)) {
+      if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) throw Object.assign(new Error(`${id} has no folder to pack; it was packed already.`), { status: 409 })
+      await issueDir(project, id)
+    }
+    return withFolderLocks(project, dir, { purpose: 'issue-pack', doing, seams }, async () => {
+      if (!await archiveState(dir)) throw new IssueError('Only an archived issue is packed.', 409)
+      await seams.whileLocked?.(dir)
+      return packHeld(project, id, dir)
+    })
+  })
+}
+
+/** The pack itself; the caller holds every lifecycle lock of the issue. */
+async function packHeld (project, id, dir) {
   await requireCleanupRecorded(dir, 'packing this issue')
+  await refuseActiveRuns(dir, 'packing')
   const issue = await readIssue(project, id)
   let released = null
   const summary = await packIssue({
-    issuesDir: ISSUES_DIR, project, id,
+    issuesDir: ISSUES_DIR, project, id, held: true,
     issue: { ...issue, runs: await runSummaries(dir) },
     releaseWorktrees: async (paths) => { released = await releaseWorktrees(dir, project, { only: paths }) }
   })
   if (released?.pruned) await git('git', ['-C', released.projectPath, 'worktree', 'prune']).catch(() => {})
   return summary
+}
+
+/*
+ * Restore: a packed issue is unpacked with its run and step locks already taken in the
+ * extracted tree (issue-bundle.mjs unpackIssue); an archived folder takes them in place.
+ * Either way the marker comes off and the kept notes become steps under those locks.
+ */
+async function restoreIssue (project, id, { admissionHeld, seams }) {
+  const doing = `Restoring ${id}`
+  await withOuterLocks(project, id, { purpose: 'issue-restore', doing, admissionHeld, seams }, async () => {
+    const dir = path.join(ISSUES_DIR, project, id)
+    if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) {
+      // A folder beside its bundle is refused there, as a collision naming both.
+      await unpackIssue({
+        issuesDir: ISSUES_DIR, project, id, bundleHeld: true, issueLocks: { purpose: 'issue-restore' },
+        beforePublish: seams.beforePublish, removeFile: seams.removeFile, releaseLock: seams.releaseLock, movesWaitMs: seams.lockWaitMs ?? LIFECYCLE_WAIT_MS,
+        whilePublished: (target) => unarchiveHeld(project, id, target, seams)
+      })
+      return
+    }
+    if (!await folderExists(dir)) await issueDir(project, id)
+    await withFolderLocks(project, dir, { purpose: 'issue-restore', doing, seams }, () => unarchiveHeld(project, id, dir, seams))
+  })
+}
+
+async function unarchiveHeld (project, id, dir, seams) {
+  await seams.whileLocked?.(dir)
+  await fs.rm(path.join(dir, ARCHIVE_FILE), { force: true })
+  await drainHeld(project, id)
+}
+
+/*
+ * Kept notes of a restored issue become its steps, with the step lock the restore holds; the
+ * notes file goes only after every note is written (each keyed by invocationId, so a retried
+ * restore repeats nothing). Still held by a bundle: the notes are that issue's.
+ */
+async function drainHeld (project, id) {
+  if ((await archivedIdHolders(ISSUES_DIR, project, id)).length) return
+  for (const { name, text, invocationId } of await readArchivedNotes(project, id)) await createStep(project, id, { name, text, invocationId, stepLockHeld: true })
+  await fs.rm(bundleFiles(ISSUES_DIR, project, id).notes, { force: true })
 }
 
 /*
@@ -1346,49 +1567,41 @@ async function requireCleanupRecorded (dir, verb) {
   }
 }
 
-async function markArchived (project, id, archived, { overrideReason = null } = {}) {
-  const dir = await issueDir(project, id)
-  return withLock(path.join(dir, '.run.lock'), { purpose: 'issue-archive', takeOverDead: false }, async () => {
-    return withLock(path.join(dir, '.step-alloc.lock'), { purpose: 'issue-archive', waitMs: 10000 }, async () => {
-      if (archived) {
-        if (await archiveState(dir)) return getIssue(project, id)   // already archived: repeat is harmless
-        let meta = {}
-        try { meta = JSON.parse(await fs.readFile(path.join(dir, META_FILE), 'utf8')) } catch { meta = {} }
-        // Archive preserves every existing file in place; the override lives in
-        // the archive record itself, the one file archiving creates.
-        let archiveOverride = null
-        if (!meta.disposition) {
-          const reason = typeof overrideReason === 'string' && overrideReason.trim() ? overrideReason.trim() : null
-          archiveOverride = { reason }
-        }
-        let runs = []
-        try { runs = await fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }) } catch (error) {
-          if (error.code !== 'ENOENT') throw error
-        }
-        for (const entry of runs.filter((e) => e.isDirectory())) {
-          let run
-          try { run = JSON.parse(await fs.readFile(path.join(dir, 'runs', entry.name, 'run.json'), 'utf8')) } catch (error) {
-            if (error.code === 'ENOENT') continue
-            throw new IssueError('Run state could not be checked. Resolve it before archiving.', 409)
-          }
-          if (['pending', 'preflighting', 'running', 'stopping', 'paused'].includes(run.status) ||
-              reconcilePending(run) ||
-              run.recovery?.required || run.blockedReason === 'recovery-required' ||
-              Object.values(run.participants ?? {}).some((p) => p.pendingInvocation || p.state === 'recovery-required')) {
-            throw new IssueError('Stop the active run and resolve any pending recovery before archiving this issue.', 409)
-          }
-        }
-        await requireCleanupRecorded(dir, 'archiving this issue')
-        {
-          const file = path.join(dir, ARCHIVE_FILE)
-          await writeJson(file, { archivedAt: new Date().toISOString(), ...(archiveOverride ? { override: archiveOverride } : {}) })
-        }
-      } else {
-        await fs.rm(path.join(dir, ARCHIVE_FILE), { force: true })
-      }
-      return getIssue(project, id)
-    })
-  })
+/*
+ * A run that is live, paused, awaiting reconcile or recovery refuses archiving, packing
+ * and deleting. Read under the run lock, so a dead owner's lock taken over still finds
+ * its run's record saying so.
+ */
+async function refuseActiveRuns (dir, verb) {
+  let runs = []
+  try { runs = await fs.readdir(path.join(dir, 'runs'), { withFileTypes: true }) } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  for (const entry of runs.filter((e) => e.isDirectory())) {
+    let run
+    try { run = JSON.parse(await fs.readFile(path.join(dir, 'runs', entry.name, 'run.json'), 'utf8')) } catch (error) {
+      if (error.code === 'ENOENT') continue
+      throw new IssueError(`Run state could not be checked. Resolve it before ${verb}.`, 409)
+    }
+    if (['pending', 'preflighting', 'running', 'stopping', 'paused'].includes(run.status) ||
+        reconcilePending(run) ||
+        run.recovery?.required || run.blockedReason === 'recovery-required' ||
+        Object.values(run.participants ?? {}).some((p) => p.pendingInvocation || p.state === 'recovery-required')) {
+      throw new IssueError(`Stop the active run and resolve any pending recovery before ${verb} this issue.`, 409)
+    }
+  }
+}
+
+// Archive preserves every existing file in place; the override lives in the archive record itself, the one file archiving creates.
+async function writeArchiveMarker (dir, overrideReason) {
+  let meta = {}
+  try { meta = JSON.parse(await fs.readFile(path.join(dir, META_FILE), 'utf8')) } catch { meta = {} }
+  let archiveOverride = null
+  if (!meta.disposition) {
+    const reason = typeof overrideReason === 'string' && overrideReason.trim() ? overrideReason.trim() : null
+    archiveOverride = { reason }
+  }
+  await writeJson(path.join(dir, ARCHIVE_FILE), { archivedAt: new Date().toISOString(), ...(archiveOverride ? { override: archiveOverride } : {}) })
 }
 
 const git = promisify(execFile)
@@ -1435,39 +1648,71 @@ async function releaseWorktrees (dir, project, { only = null } = {}) {
  * refuses an issue with a live or recovery-required run, so delete never has to
  * reason about one — and nothing can be destroyed that was not first taken out
  * of the active lists deliberately.
+ *
+ * Under the lifecycle locks (setIssueArchived above), decided only once they are held.
+ * A folder leaves its public path in one rename before anything is removed, so its
+ * locks and marker stand until it is unreachable. A failure after that rename leaves
+ * the moved-aside folder where it is and names it (`strandedPath`); nothing recovers it.
  */
-export async function deleteIssue (project, id) {
+export async function deleteIssue (project, id, { seams = {} } = {}) {
   await requireProject(project)
-  if (ISSUE_PATTERN.test(String(id)) && await packedSummary(ISSUES_DIR, project, id) &&
-      !await fs.stat(path.join(ISSUES_DIR, project, id)).then(() => true, () => false)) {
-    const summary = await packedSummary(ISSUES_DIR, project, id)
-    await deletePacked(ISSUES_DIR, project, id)
-    await writeJson(path.join(ISSUES_DIR, project, '.deleted-issues', id + '.json'), { project, id, runIds: (summary.results ?? []).map((r) => r.runId), deletedAt: new Date().toISOString(), packed: true })
-    return { project, id, deleted: true }
-  }
-  const dir = await issueDir(project, id)
-
-  if (!await archiveState(dir)) {
-    throw new IssueError('Archive this issue before deleting it. Archiving is reversible; deleting is not.', 409)
-  }
-
-  return withLock(path.join(dir, '.run.lock'), { purpose: 'issue-delete', takeOverDead: false }, async () => {
-    await requireCleanupRecorded(dir, 'deleting this issue')
-    const runIds = (await fs.readdir(path.join(dir,'runs')).catch(error=>{if(error.code==='ENOENT')return [];throw error})).filter(id=>!id.startsWith('worktree-')&&!id.startsWith('workspace-'))
-    const released = await releaseWorktrees(dir, project)
-    await fs.rm(dir, { recursive: true, force: true })
-    // What is kept beside a bundle of this id is that issue's, not this folder's.
-    if (!(await archivedIdHolders(ISSUES_DIR, project, id)).length) {
-      await Promise.all([bundleFiles(ISSUES_DIR, project, id).notes, bundleFiles(ISSUES_DIR, project, id).repeatLookup].map((f) => fs.rm(f, { force: true })))
+  requireOwnId(project, id)
+  if (!ISSUE_PATTERN.test(String(id))) await issueDir(project, id)
+  const doing = `Deleting ${id}`
+  return withOuterLocks(project, id, { purpose: 'issue-delete', doing, seams }, async () => {
+    const dir = path.join(ISSUES_DIR, project, id)
+    const files = bundleFiles(ISSUES_DIR, project, id)
+    const holders = await archivedIdHolders(ISSUES_DIR, project, id)
+    if (!await folderExists(dir)) {
+      if (!holders.length) throw new IssueError('no such issue', 404)
+      const summary = await packedSummary(ISSUES_DIR, project, id)
+      await seams.whileLocked?.(null)
+      await deletePacked(ISSUES_DIR, project, id, { removeFile: seams.removeFile })
+      await writeJson(path.join(ISSUES_DIR, project, '.deleted-issues', id + '.json'), { project, id, runIds: (summary?.results ?? []).map((r) => r.runId), deletedAt: new Date().toISOString(), packed: true })
+      return { project, id, deleted: true }
     }
-    await writeJson(path.join(path.dirname(dir),'.deleted-issues',id+'.json'), {project,id,runIds,deletedAt:new Date().toISOString()})
-    // After the directory is gone, so every registration that pointed into it
-    // is now prunable.
-    if (released.pruned) {
-      await git('git', ['-C', released.projectPath, 'worktree', 'prune']).catch(() => {})
-    }
-    return { project, id, deleted: true }
+    return withFolderLocks(project, dir, { purpose: 'issue-delete', doing, seams }, async () => {
+      if (!await archiveState(dir)) {
+        throw new IssueError('Archive this issue before deleting it. Archiving is reversible; deleting is not.', 409)
+      }
+      await refuseActiveRuns(dir, 'deleting')
+      await requireCleanupRecorded(dir, 'deleting this issue')
+      await seams.whileLocked?.(dir)
+      const runIds = (await fs.readdir(path.join(dir,'runs')).catch(error=>{if(error.code==='ENOENT')return [];throw error})).filter(id=>!id.startsWith('worktree-')&&!id.startsWith('workspace-'))
+      const released = await releaseWorktrees(dir, project)
+      const removing = await fs.mkdtemp(path.join(path.dirname(dir), '.removing-'))
+      const moved = path.join(removing, id)
+      try { await fs.rename(dir, moved) } catch (error) {
+        await fs.rmdir(removing).catch(() => {})
+        throw error
+      }
+      try {
+        await seams.afterUnpublish?.(moved)
+        // What is kept beside a bundle of this id is that issue's, not this folder's.
+        if (!holders.length) await removeAllSettled([files.notes, files.repeatLookup], seams.removeFile)
+        await fs.rm(removing, { recursive: true, force: true })
+        await writeJson(path.join(path.dirname(dir),'.deleted-issues',id+'.json'), {project,id,runIds,deletedAt:new Date().toISOString()})
+      } catch (error) {
+        if (await folderExists(moved)) throw strandedError(error, moved)
+        throw error
+      }
+      // After the directory is gone, so every registration that pointed into it
+      // is now prunable.
+      if (released.pruned) {
+        await git('git', ['-C', released.projectPath, 'worktree', 'prune']).catch(() => {})
+      }
+      return { project, id, deleted: true }
+    })
   })
+}
+
+/** A delete that failed after moving the folder aside: the folder stays there, and the error says where (index.js sends it on). */
+function strandedError (error, moved) {
+  const e = error instanceof Error ? error : new Error(String(error))
+  e.strandedPath = moved
+  e.message = `${e.message}; the issue's folder was left at ${moved}; remove it by hand or retry the delete`
+  if (typeof e.status !== 'number') e.status = 500
+  return e
 }
 
 const endWithNewline = (text) => (text.endsWith('\n') ? text : text + '\n')
@@ -1553,40 +1798,62 @@ async function isArchived (project, id) {
  * refuses new steps and the bundle stays as it was verified. Keyed by
  * invocationId in both places, so writing it again rewrites it. A restore turns
  * the kept ones into steps; `archivedNotes` shows them until then.
+ *
+ * The kept file is written under the id's bundle lock, which pack, restore and delete
+ * hold for their whole operation, and decided again under it: an issue deleted
+ * meanwhile (no folder, no bundle) gets nothing written and answers 404.
  */
 export async function createEngineNote (project, id, { name, text, invocationId }) {
   await requireProject(project)
   if (typeof id !== 'string' || !ISSUE_PATTERN.test(id)) throw new IssueError('no such issue', 404)
-  if (!await isArchived(project, id)) {
-    try {
-      return { where: 'step', step: (await createStep(project, id, { name, text, invocationId })).number }
-    } catch (error) {
-      if (error.status !== 409 || !await isArchived(project, id)) throw error
+  requireOwnId(project, id)
+  let lastError = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (!await isArchived(project, id)) {
+      try {
+        return { where: 'step', step: (await createStep(project, id, { name, text, invocationId })).number }
+      } catch (error) {
+        // Busy, moved or archived meanwhile: decided below, under the bundle lock.
+        if (error.status !== 409 && error.status !== 404) throw error
+        lastError = error
+      }
     }
+    const { dir, lock, notes } = bundleFiles(ISSUES_DIR, project, id)
+    await fs.mkdir(dir, { recursive: true })
+    const where = await withIssueLock(lock, { purpose: 'archived-notes', waitMs: 10000, mkdir: true }, async () => {
+      const folder = path.join(ISSUES_DIR, project, id)
+      // A folder answers for itself, whatever a bundle of its id holds.
+      if (await folderExists(folder)) { if (!await archiveState(folder)) return 'step' } else if (!(await archivedIdHolders(ISSUES_DIR, project, id)).length) {
+        throw new IssueError('no such issue', 404)
+      }
+      const kept = await readArchivedNotes(project, id)
+      const note = { name, text, invocationId, at: new Date().toISOString() }
+      await writeJson(notes, [...kept.filter((n) => n.invocationId !== invocationId), note])
+      return 'archive'
+    })
+    if (where === 'step') continue
+    // A restore may have finished between the two: nothing would come for this one.
+    if (!await isArchived(project, id)) await drainArchivedNotes(project, id)
+    return { where: 'archive' }
   }
-  const { dir, notes } = bundleFiles(ISSUES_DIR, project, id)
-  await fs.mkdir(dir, { recursive: true })
-  await withLock(`${notes}.lock`, { purpose: 'archived-notes', waitMs: 10000 }, async () => {
-    const kept = await readArchivedNotes(project, id)
-    const note = { name, text, invocationId, at: new Date().toISOString() }
-    await writeJson(notes, [...kept.filter((n) => n.invocationId !== invocationId), note])
-  })
-  // A restore may have finished between the two: nothing would come for this one.
-  if (!await isArchived(project, id)) await drainArchivedNotes(project, id)
-  return { where: 'archive' }
+  throw lastError ?? new IssueError('the issue kept changing while a note was written; try again', 409)
 }
 
-/** Kept notes of a restored issue become its steps. Without an id, of every restored issue of the project (a restore that died midway). */
+/**
+ * Kept notes of a restored issue become its steps. Without an id, of every restored issue of the project (a restore that died midway).
+ * Under the id's bundle lock (then the folder's step lock, through createStep), decided again there.
+ */
 export async function drainArchivedNotes (project, id = null) {
   const { dir } = bundleFiles(ISSUES_DIR, project, id ?? 'x')
   const ids = id ? [id] : (await fs.readdir(dir).catch(() => [])).filter((n) => n.endsWith('.notes.json')).map((n) => n.slice(0, -'.notes.json'.length))
   for (const issueId of ids) {
-    if (await isArchived(project, issueId)) continue
-    // Still held by a bundle: the notes are that issue's, not a folder's that shares its id.
-    if ((await archivedIdHolders(ISSUES_DIR, project, issueId)).length) continue
     const file = bundleFiles(ISSUES_DIR, project, issueId).notes
     if (!await fs.stat(file).then(() => true, () => false)) continue
-    await withLock(`${file}.lock`, { purpose: 'archived-notes', waitMs: 10000 }, async () => {
+    await withIssueLock(bundleFiles(ISSUES_DIR, project, issueId).lock, { purpose: 'archived-notes', waitMs: 10000, mkdir: true }, async () => {
+      if (await isArchived(project, issueId)) return
+      // Still held by a bundle: the notes are that issue's, not a folder's that shares its id.
+      if ((await archivedIdHolders(ISSUES_DIR, project, issueId)).length) return
+      if (!await folderExists(path.join(ISSUES_DIR, project, issueId))) return
       for (const { name, text, invocationId } of await readArchivedNotes(project, issueId)) await createStep(project, issueId, { name, text, invocationId })
       await fs.rm(file, { force: true })
     })
@@ -1648,7 +1915,6 @@ async function stepFolder (project, id, number) {
 export async function addStepFile (project, id, number, filename, bytes) {
   const safe = safeFilename(filename)
   const { dir, folder } = await stepFolder(project, id, number)
-  await requireUnarchived(dir)
 
   if (!Buffer.isBuffer(bytes)) throw new IssueError('no file content was sent', 400)
   if (bytes.length === 0) throw new IssueError('that file is empty', 400)
@@ -1663,7 +1929,11 @@ export async function addStepFile (project, id, number, filename, bytes) {
     throw new IssueError('invalid filename', 400)
   }
 
-  await fs.writeFile(target, bytes)
+  // Under the issue's step lock, as every step write: pack, restore and delete hold it throughout.
+  await withIssueLock(path.join(dir, '.step-alloc.lock'), { purpose: 'step-file', waitMs: 10000, doing: 'attaching a file' }, async () => {
+    await requireUnarchived(dir)
+    await fs.writeFile(target, bytes)
+  })
   return readStep(dir, path.basename(folder))
 }
 
@@ -1700,7 +1970,9 @@ export async function readStepFile (project, id, number, filename) {
  * under the shared allocation lock, including the resume.
  */
 export async function createStep (project, id, {
-  name, response = null, text = null, format = 'md', links = null, invocationId = null, onReserve = null
+  name, response = null, text = null, format = 'md', links = null, invocationId = null, onReserve = null,
+  // How long to wait behind the step lock, and whether the caller holds it already (a restore's drain).
+  lockWaitMs = 10000, stepLockHeld = false
 } = {}) {
   const dir = await issueDir(project, id)
   // Naming a note is work the author should not have to do to write one down.
@@ -1708,7 +1980,7 @@ export async function createStep (project, id, {
   const { slug } = requireName(name?.trim() ? name : 'note', 'a step')
   const noteFile = text ? noteFilename(format) : null
 
-  return withStepReservation(dir, {slug, invocationId, onReserve}, async entry => {
+  return withStepReservation(dir, {slug, invocationId, onReserve, waitMs: lockWaitMs, held: stepLockHeld}, async entry => {
     const folder = path.join(dir, entry.folder)
     await fs.mkdir(folder, { recursive: true })
 

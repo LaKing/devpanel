@@ -96,6 +96,7 @@ export async function acquire (file, {
     file,
     owner,
     token,
+    platform,
     /**
      * Release only what we still hold. Unlinking blindly would delete a lock a
      * different owner acquired after ours was taken over — so the token is
@@ -109,7 +110,9 @@ export async function acquire (file, {
   const contendedUntil = Date.now() + Math.max(waitMs, TAKEOVER_CONTENTION_MS)
   for (;;) {
     if (signal?.aborted) throw abortedWait(file)
-    if (await createWith(file, record)) return handle
+    // A lock plainly there is examined without publishing a temp file beside it: a writer queued
+    // behind a pack must not change the directory tar is reading (it would fail the pack).
+    if (!await present(file) && await createWith(file, record)) return handle
 
     const examined = await examine(file, platform)
     const { held } = examined
@@ -128,6 +131,11 @@ export async function acquire (file, {
 }
 
 const TAKEOVER_CONTENTION_MS = 1000
+// A missing folder reads as absent too: createWith then fails ENOENT, as before, and creates nothing.
+const present = (file) => fs.lstat(file).then(() => true, (error) => {
+  if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return false
+  throw error
+})
 const abortedWait = (file) => Object.assign(new Error(`cancelled while waiting for ${path.basename(file)}`), { name: 'AbortError' })
 /*
  * A lock file that does not parse. Locks are now published complete (link of a
@@ -267,6 +275,17 @@ async function removeUnderGate (file, token, owner, platform, { pollMs = 10 } = 
   } finally {
     await fs.rm(gate, { force: true })
   }
+}
+
+/**
+ * The same held lock after its file was moved with the directory it lives in
+ * (a restore publishes an extracted tree with its locks already taken): the
+ * record names no path, so only the handle has to learn where it is now.
+ * Synchronous, so nothing can run between a rename and the handle's update.
+ */
+export function relocate (handle, file) {
+  const platform = handle.platform ?? hostPlatform()
+  return { ...handle, file, release () { return removeUnderGate(file, handle.token, handle.owner, platform) } }
 }
 
 /** Run `fn` while holding the lock, releasing it however `fn` ends. */

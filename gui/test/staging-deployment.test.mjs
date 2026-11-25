@@ -18,7 +18,11 @@ export default async function (t) {
   ] }
   await fs.mkdir(path.join(root, 'projects'), { recursive: true })
   const save = () => fs.writeFile(path.join(root, 'projects/fixture.yaml'), YAML.stringify(cfg))
-  const call = (issue, extra = {}) => deployStaging({ project: 'fixture', issuePath: path.join(dir, issue), root, ...extra })
+  // An issue's folder exists before anything deploys for it: the deployment takes its run lock and never creates it.
+  const call = async (issue, extra = {}) => {
+    await fs.mkdir(path.join(dir, issue), { recursive: true })
+    return deployStaging({ project: 'fixture', issuePath: path.join(dir, issue), root, ...extra })
+  }
   try {
     await save()
     const originalOpen = fs.open

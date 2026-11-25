@@ -569,7 +569,12 @@ export default async function (t) {
         await fs.writeFile(path.join(root, 'projects/fixture.yaml'), YAML.stringify(cfg))
       }
       w.issue('i1'); w.issue('i2'); w.issue('rel')
-      const deploy = (issue, extra = {}) => deployStaging({ project: 'fixture', issuePath: w.issues.find((i) => i.id === issue).path, root, coverage: deploymentCoverage(w.ctx), ...extra })
+      // An issue's folder exists before anything deploys for it: the deployment takes its run lock and never creates it.
+      const deploy = async (issue, extra = {}) => {
+        const issuePath = w.issues.find((i) => i.id === issue).path
+        await fs.mkdir(issuePath, { recursive: true })
+        return deployStaging({ project: 'fixture', issuePath, root, coverage: deploymentCoverage(w.ctx), ...extra })
+      }
       for (const id of ['dep-a', 'dep-b', 'dep-red', 'dep-stale']) w.issue(id)
       await w.write('f', 'new\n')
       await w.deliver('i1', 'r1', T(1), [['f', 'old\n', 'new\n']])

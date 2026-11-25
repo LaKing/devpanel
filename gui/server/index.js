@@ -269,7 +269,8 @@ for (const action of ['archive', 'restore']) {
     const { project, id } = req.params
     let issue
     try { issue = await issues.setIssueArchived(project, id, action === 'archive', { overrideReason: req.body?.overrideReason ?? null }) } catch (error) {
-      if (error instanceof LockHeld) {
+      // ISSUE_BUSY (issue-locks.mjs) goes out as it is, with its code and retryable flag.
+      if (error instanceof LockHeld && !error.code) {
         throw new IssueError('This issue is busy. Stop its run and resolve any pending recovery before archiving or restoring.', 409)
       }
       throw error
@@ -1059,7 +1060,8 @@ if (hasBuild) {
 // Express 5 identifies an error handler by its four parameters.
 app.use((err, _req, res, _next) => {
   console.warn(`${_req.method} ${_req.path}: ${err.message}`)
-  if (err instanceof IssueError) return res.status(err.status).json({ error: err.message })
+  // A delete that failed after moving the folder aside names where it was left (issues.js deleteIssue).
+  if (err instanceof IssueError) return res.status(err.status).json({ error: err.message, ...(err.strandedPath ? { strandedPath: err.strandedPath } : {}) })
   // A start refused before a run was reserved carries its classification on the
   // error itself, because there is no run record to read it from.
   if (typeof err.status === 'number') {
@@ -1072,7 +1074,8 @@ app.use((err, _req, res, _next) => {
       ...(err.remedy ? { remedy: err.remedy } : {}),
       ...(err.resolvableBy ? { resolvableBy: err.resolvableBy } : {}),
       ...(err.detail ? { detail: err.detail } : {}),
-      ...(err.pregate ? { pregate: err.pregate } : {})
+      ...(err.pregate ? { pregate: err.pregate } : {}),
+      ...(err.strandedPath ? { strandedPath: err.strandedPath } : {})
     })
   }
   console.error('request failed:', err.stack ?? err.message)

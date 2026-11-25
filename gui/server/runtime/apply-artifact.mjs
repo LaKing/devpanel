@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import * as store from './store.mjs'
-import { acquire } from './lock.mjs'
+import { acquireIssueLock } from '../issue-locks.mjs'
 import { fingerprint, LEGACY_FINGERPRINT_RULE } from './fingerprint.mjs'
 import { reconstructInto, discardReconstruction, verifyReconstruction } from './launch.mjs'
 import { applyToSource, sourceTarget } from './source-delivery.mjs'
@@ -241,7 +241,8 @@ export async function approvedCheckPatch ({ issuePath, runId, projectPath = null
 /** Explicit operator action for completed patch-only runs, including removed worktrees. */
 export async function applyRunArtifact ({ issuePath, runId, projectPath, expectedRevision }) {
   if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw refuse('Invalid run id')
-  const lock = await acquire(path.join(issuePath, '.run.lock'), { purpose: 'apply-artifact', runId }).catch(error => { throw Object.assign(error, { status: 409 }) })
+  // ISSUE_BUSY or ISSUE_MOVED (409, retryable): never brings back a folder packed or deleted meanwhile.
+  const lock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'apply-artifact', runId, doing: 'Applying the patch' })
   let temporary
   try {
     await store.requireCompleteEvents(issuePath, runId)

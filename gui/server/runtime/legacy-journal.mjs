@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { withLock } from './lock.mjs'
+import { withIssueLock } from '../issue-locks.mjs'
 import { writeJson, readRegularFile } from './persistence.mjs'
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const dispositionName = 'legacy-journal-disposition.json'
@@ -43,7 +43,7 @@ export async function legacyJournalDisposition (issuePath, runId) {
 
 export async function retireLegacyJournal (issuePath, runId, reason) {
   if (!/^[a-zA-Z0-9-]+$/.test(runId) || !reason?.trim()) throw new Error('Run ID and forensic reason are required')
-  return withLock(path.join(issuePath,'.run.lock'), {purpose:'legacy-journal-retirement',waitMs:0}, async()=>{
+  return withIssueLock(path.join(issuePath,'.run.lock'), {purpose:'legacy-journal-retirement',waitMs:0}, async()=>{
     const existing=await legacyJournalDisposition(issuePath,runId)
     if(existing)return existing
     const record={kind:'retired-pre-execution-failure',at:new Date().toISOString(),reason,hashes:await evidence(path.join(issuePath,'runs',runId))}
