@@ -186,8 +186,16 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   ambiguous, and classifies every rejection (`no-structured-output`, `contract-violation`, `ambiguous-output`).
   Validation is compiled from the snapshot's `contracts` (keyed by hash), never from the live schema files.
 - Live output: adapters forward every raw stdout/stderr chunk via `observe.onOutput`; the engine appends them to
-  `runs/<run-id>/live/<invocationId>.jsonl` and emits `run:event {type:'live'}` only after the write. Served by
-  `GET …/runs/:runId/live/:invocationId?after=<seq>`; rendered by `src/components/LiveOutput.vue`.
+  `runs/<run-id>/live/<invocationId>.jsonl` and emits `run:event {type:'live'}` only after the write. A chunk carries `prev`
+  (the seq of the entry before it in the file). It goes only to the sockets in that invocation's room (`live:subscribe` /
+  `live:unsubscribe`, acked; at most 64 per socket; `server/live-rooms.mjs`); the supervisor's `supervisor:live` is sent the
+  same way, and every other event stays broadcast. Served by `GET …/runs/:runId/live/:invocationId?after=<seq>`, the
+  full rest as before. Viewers ask for bounded pages: `limit`/`tail`/`before`, at most 1000 entries and 512 KiB;
+  an oversized entry is `sliced` and read in parts with `entry`+`offset` (`store.readLiveView`). Rendered by
+  `src/components/LiveOutput.vue` and `RunTerminal.vue`.
+  Through `src/live-stream.js` they subscribe only while shown and in flight.
+  `src/live-follow.js` keeps one cursor shared by socket chunks and HTTP pages. A join generation means a rejoin
+  always reads again. The window is bounded, with *Load earlier* to read older output.
 - Revisions: the engine records `step.revision` after a `recordsRevision` turn; the author only echoes
   `basedOnRevision` (the revision it was told, or null). A wrong echo is a protocol failure. Per-turn `usage` is
   on the step with provider categories; `tokens` is the provider total, cache included for Anthropic.
@@ -388,8 +396,10 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   `decision:<id>` in the same store: hold/clear/test there, a rejected key or rate limit holds it. See `docs/decisions.md`.
 - `runtime/coordinator-chat.mjs` — the operator's chat with a run's coordinator (`CoordinatorChat.vue`, `GET/POST
   …/runs/:runId/chat`). A question is answered in a tool-free FORK of the coordinator's native session (adapters'
-  `fork: true`) and changes nothing. An instruction is delivered verbatim in the next coordinator turn and recorded on
-  that step (`step.instructions`); a fresh session gets all of them. Both are in `runs/<id>/chat.jsonl` (not run state).
+  `fork: true`) and changes nothing. An instruction is delivered verbatim in the next turn of every seat (coordinator,
+  author, each auditor), attached at the launch under the chat lock, and recorded on each step that carried it
+  (`step.instructions` with the step's `role`); a fresh session gets all of them, a re-invoked turn replays its own
+  snapshot (`p.turnInstructions`, `selectInstructions`). Both are in `runs/<id>/chat.jsonl` (not run state).
   Adapters request thinking or reasoning summaries so the panel can show a turn's reasoning. See execution-contract.md
   "The operator can ask the coordinator, and instruct it".
   The top-level supervisor has the same split (docs/top-level-supervisor.md "Instruct, ask, and its questions to the

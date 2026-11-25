@@ -2812,20 +2812,54 @@ The issue page offers a chat with a run's coordinator seat
   up to its last completed turn, and the prompt states where the run stands now.
   The cost is reported on the answer. It is operator spend, not counted against
   the run's budgets. A run without a coordinator session yet refuses with 409.
-- **Instruction.** It is delivered by the engine, verbatim, at the end of the next
-  coordinator-only turn's prompt (`operator-instructions`), and that step records
-  the ids it carried (`step.instructions`, `step.instructionScope`). Delivery
-  follows session scope. A turn on an existing session is given only what no
-  earlier step of the same scope carried. A fresh session (none yet, or one the
-  engine reset) is given every instruction so far, with the earlier ones marked,
-  because it never saw them. An instruction influences how the coordinator writes
-  its briefs; it is not an approval, does not waive a closure condition, and does
-  not pause or wake the run. A completed or abandoned run refuses one.
+- **Instruction.** It reaches every seat: the coordinator, the author and each
+  auditor (any role with turns) get it, verbatim and marked as the operator's
+  (`operator-instructions`), in their next turn: its text follows a header line
+  (time and author) exactly as recorded. The step of each turn that
+  carried it records the ids (`step.instructions`, `step.instructionScope`,
+  beside the step's `role`), and what a seat has carried is read from those
+  steps alone. Delivery is per seat and follows session scope. A turn on an
+  existing session is given only what no earlier step of the same role and
+  scope carried, whether or not another seat carried it first; a resumed session
+  never gets one twice and marks nothing as earlier. A fresh session (none yet,
+  or one the engine reset) is given every instruction so far, with those this
+  seat already had marked as given earlier, because it never saw them. The
+  reviewers of one consensus round each carry it; neither delivery depends on
+  the other. A completed or abandoned run refuses one.
+
+  The cut-off is the launch: the engine reads the chat, attaches the instructions
+  and starts the runtime with the run's chat appends held (`underChatLock`), so
+  one recorded before the call is in that prompt and one recorded after it waits
+  for the seat's next turn. The ids are on `pendingInvocation` before the call,
+  and an id counts as carried only once its step is recorded. A turn that never
+  reached the runtime (withheld by a freeze, proved not started, refused before
+  the call) selects again at its first real launch. A re-invocation of the same
+  scheduled turn (step, round, attempt, re-review revision and drive) after an
+  attempt that may have reached its session carries that turn's original
+  snapshot, whatever was recorded since and however often it is retried: later
+  instructions go to the seat's next turn. When the snapshot carried
+  instructions, or the re-invocation must run in another session scope (the
+  fence unavailable after a restart), the session that may hold the earlier
+  prompt is not resumed: the re-invocation runs on a fresh session and carries
+  the instructions of its original launch, all marked earlier. A same-scope
+  retry whose snapshot carried none is not reset on that account: it resumes
+  the session it still has (an in-process retry), and where recovery already
+  cleared it (the retry of a turn left uncertain by a restart) it runs fresh
+  with the instructions of its original launch, marked earlier. A turn in flight from
+  before per-seat delivery replays the ids on its `pendingInvocation`, plus,
+  on a fresh session, those its seat's own steps carried.
+
+  An instruction is information for the turn, for every seat. The coordinator
+  follows it in how it writes its briefs; a worker or auditor takes it into
+  account in its own work. It is not an approval, does not waive a criterion, a
+  check or a closure condition, and does not pause or wake the run. A seat
+  cannot restart, reset or end the run on its account: only the coordinator's
+  effects can restart or reset anything.
 
 Both kinds are appended to `runs/<id>/chat.jsonl` before the
 `run:event {type:'chat'}` announces them. The file is not run state. The engine
-reads it only while building a coordinator prompt, so replaying recorded steps
-is unaffected. A question with no recorded answer after a restart reads as
+reads it only while building a seat's prompt, so replaying recorded steps is
+unaffected. A question with no recorded answer after a restart reads as
 interrupted and is never re-asked.
 
 Reasoning is shown, not inferred. Claude seats pass `showThinkingSummaries`

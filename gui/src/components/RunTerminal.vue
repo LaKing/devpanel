@@ -1,22 +1,21 @@
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
-import { api } from '@/api'
 import { formatStep } from '@/format'
-import { socket } from '@/socket'
-import { contiguous, mergeEntries } from '@/live-log'
-import { createRenderer } from '@/terminal-format'
+import { useLiveStream } from '@/live-stream'
+import { createRenderer, keepTail } from '@/terminal-format'
+import LiveChunkPager from './LiveChunkPager.vue'
 
 /*
  * One invocation, as a terminal. Read-only: the runtime runs headless and is
  * never typed into; this redraws its event stream as the CLI would have shown
  * it (terminal-format.js), opening with the exact command line.
  *
- * The bytes come the same way as everywhere else: the persisted backlog from
- * the API, then socket chunks that the server emits only after persisting
- * them. A gap is caught up from the server; an entry that lands before what is
- * already drawn redraws the terminal from the start, so the screen is always
- * a function of the stored log.
+ * The bytes come the same way as everywhere else (live-stream.js): bounded
+ * pages of the persisted log, then socket chunks while this viewer is shown and
+ * subscribed. Entries are committed in file order; when the window changes at
+ * its start (earlier output loaded, or a jump back to the latest) the terminal
+ * is drawn again from the window, so the screen is always a function of it.
  */
 
 const props = defineProps({
@@ -31,23 +30,31 @@ const props = defineProps({
 })
 
 const host = ref(null)
+const root = ref(null)
 // xterm draws with a canvas. The jsdom browser the test suite renders pages in
 // has none (asking for one logs an error), so there the same formatted text is
 // shown as plain text instead.
 const canDraw = typeof navigator === 'undefined' || !/jsdom/i.test(navigator.userAgent)
 const plainText = ref('')
+const PLAIN_MAX = 2 * 1024 * 1024
 const stripAnsi = (text) => text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r\n/g, '\n')
 const raw = ref(false)
-const error = ref('')
-const loading = ref(true)
 let term = null
 let fit = null
 let observer = null
 let entries = []
-let next = 0
 let drawnSeq = 0
+let drawnFirst = null
 let renderer = createRenderer()
-let inflight = null
+
+const { view, loadEarlier, jumpToLatest, fetchSlice } = useLiveStream({
+  target: () => ({ supervisor: false, project: props.project, issueId: props.issueId, runId: props.runId, invocationId: props.invocationId }),
+  live: () => props.live,
+  root,
+  onUpdate: (state) => absorb(state.entries)
+})
+const error = computed(() => view.value.error)
+const sliced = computed(() => view.value.entries.filter((e) => e.sliced))
 
 function redraw () {
   if (!canDraw) { renderer = createRenderer({ raw: raw.value }); drawnSeq = 0; plainText.value = ''; draw(); return }
@@ -70,52 +77,22 @@ function draw () {
   }
   if (!out) return
   if (canDraw) term.write(out)
-  else plainText.value += stripAnsi(out)
+  else plainText.value = keepTail(plainText.value + stripAnsi(out), PLAIN_MAX)
 }
 
-function absorb (incoming) {
-  const before = entries.at(-1)?.seq ?? 0
-  const merged = mergeEntries(entries, incoming)
-  entries = merged.entries
-  next = merged.next
-  // Something landed behind what is already on screen: draw it all again.
-  if (incoming.some((e) => e.seq <= drawnSeq && e.seq <= before)) redraw()
-  else draw()
+/*
+ * The window only grows at its end while following. When its start moved back
+ * (earlier output) or the window was replaced (jump to latest), draw it again;
+ * a start that moved forward (old entries trimmed) leaves the screen as it is.
+ */
+function absorb (window) {
+  const first = window[0]?.seq ?? null
+  const replaced = drawnFirst !== null && (first === null || first < drawnFirst || (window.at(-1)?.seq ?? 0) < drawnSeq)
+  entries = window
+  if (replaced) { drawnFirst = first; redraw(); return }
+  if (drawnFirst === null) drawnFirst = first
+  draw()
 }
-
-let inflightTarget = null
-let loadSeq = 0
-function load ({ reset = false } = {}) {
-  const target = props.invocationId
-  if (reset) { entries = []; next = 0; redraw() }
-  if (inflight && inflightTarget === target) return inflight
-  const seq = ++loadSeq
-  inflightTarget = target
-  const promise = (async () => {
-    try {
-      const page = await api.liveOutput(props.project, props.issueId, props.runId, target, next)
-      if (seq !== loadSeq || target !== props.invocationId) return
-      absorb(page.entries)
-      error.value = ''
-    } catch (e) {
-      if (seq === loadSeq && target === props.invocationId) error.value = e.message
-    } finally {
-      if (inflight === promise) { inflight = null; inflightTarget = null }
-      if (seq === loadSeq && target === props.invocationId) loading.value = false
-    }
-  })()
-  inflight = promise
-  return promise
-}
-
-function onRunEvent (event) {
-  if (event?.type !== 'live' || event.invocationId !== props.invocationId || event.runId !== props.runId) return
-  const entry = event.entry
-  if (!entry || entry.seq <= next) return
-  absorb([entry])
-  if (!contiguous(entries)) load()
-}
-const onReconnect = () => load()
 
 /* xterm is loaded when a terminal is first drawn: it is large, and it touches a
    canvas the moment its module loads. */
@@ -125,12 +102,7 @@ const loadXterm = () => Promise.all([
 
 let disposed = false
 onMounted(async () => {
-  if (!canDraw) {
-    load({ reset: true })
-    socket.on('run:event', onRunEvent)
-    socket.on('connect', onReconnect)
-    return
-  }
+  if (!canDraw) return
   const [{ Terminal }, { FitAddon }, { Unicode11Addon }] = await loadXterm()
   if (disposed) return
   term = new Terminal({
@@ -181,26 +153,24 @@ onMounted(async () => {
   })
   document.fonts?.ready.then(remeasure).catch(() => {})
   observer.observe(host.value)
-  load({ reset: true })
-  socket.on('run:event', onRunEvent)
-  socket.on('connect', onReconnect)
+  // Whatever arrived while xterm was loading.
+  redraw()
 })
 
 onUnmounted(() => {
   disposed = true
-  socket.off('run:event', onRunEvent)
-  socket.off('connect', onReconnect)
   observer?.disconnect()
   term?.dispose()
   term = null
 })
 
-watch(() => props.invocationId, () => { loading.value = true; load({ reset: true }) })
+// Another invocation: the stream reopens (live-stream.js); start from a clear screen.
+watch(() => props.invocationId, () => { entries = []; drawnFirst = null; redraw() })
 watch(raw, redraw)
 </script>
 
 <template>
-  <div class="term">
+  <div ref="root" class="term">
     <header class="term__bar">
       <span class="term__dots" aria-hidden="true"><i /><i /><i /></span>
       <span class="term__title">
@@ -210,11 +180,14 @@ watch(raw, redraw)
       </span>
       <span v-if="live" class="term__live"><i />live</span>
       <span v-else class="term__dim">finished</span>
+      <button v-if="view.earlier" type="button" class="term__toggle" @click="loadEarlier">Load earlier</button>
+      <button v-if="view.detached" type="button" class="term__toggle" @click="jumpToLatest">Jump to latest</button>
       <button type="button" class="term__toggle" :aria-pressed="raw" @click="raw = !raw">{{ raw ? 'Formatted' : 'Raw' }}</button>
     </header>
     <div v-if="error" class="term__error">{{ error }}</div>
     <div v-if="canDraw" ref="host" class="term__screen" />
     <pre v-else class="term__screen term__plain">{{ plainText }}</pre>
+    <LiveChunkPager class="term__pager" :entries="sliced" :fetch-slice="fetchSlice" :invocation-id="invocationId" />
   </div>
 </template>
 

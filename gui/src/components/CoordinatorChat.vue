@@ -17,8 +17,9 @@ import MarkdownText from './MarkdownText.vue'
  * instructions with whether a turn has carried them yet.
  *
  * A question is answered by a COPY of the coordinator's session; it changes
- * nothing about the run. An instruction is given to the coordinator in its next
- * turn and that turn records it. The two buttons say which is which, because
+ * nothing about the run. An instruction is given to every seat (coordinator,
+ * author, each auditor) in its next turn, and each turn that carries it records
+ * it. The two buttons say which is which, because
  * the difference is authority, not wording.
  */
 
@@ -40,18 +41,19 @@ const openReasoning = ref(new Set())
 async function load () {
   try {
     chat.value = await api.coordinatorChat(props.project, props.issueId, props.run.runId)
+    // A question still being answered names its fork's invocation (after a reload too).
+    const asking = chat.value?.entries?.find((e) => e.kind === 'question' && e.state === 'asking' && e.invocationId)
+    if (asking && !askInvocation.value) askInvocation.value = asking.invocationId
     error.value = ''
   } catch (e) { error.value = e.message }
 }
 
+/* Output chunks reach only subscribed viewers, so the fork's invocation comes with the question itself. */
 function onRunEvent (event) {
-  if (event?.runId !== props.run.runId) return
-  if (event.type === 'chat') {
-    if (event.entry?.kind === 'answer') askInvocation.value = null
-    load()
-  } else if (event.type === 'live' && event.stepId === 'ask' && askInvocation.value !== event.invocationId) {
-    askInvocation.value = event.invocationId
-  }
+  if (event?.runId !== props.run.runId || event.type !== 'chat') return
+  if (event.entry?.kind === 'answer') askInvocation.value = null
+  else if (event.entry?.kind === 'question' && event.entry.state === 'asking' && event.entry.invocationId) askInvocation.value = event.entry.invocationId
+  load()
 }
 
 onMounted(() => { load(); socket.on('run:event', onRunEvent) })
@@ -174,14 +176,14 @@ const cost = (usd) => (typeof usd === 'number' ? ` · $${usd.toFixed(usd < 0.01 
           <div v-else class="cchat__bubble cchat__bubble--error"><div class="cchat__meta">No answer was recorded (interrupted).</div></div>
         </template>
 
-        <!-- An instruction: steers the run at the coordinator's next turn. -->
+        <!-- An instruction: steers the run at each seat's next turn. -->
         <div v-else-if="item.kind === 'instruction'" class="cchat__bubble cchat__bubble--mine cchat__bubble--instruction">
           <div class="cchat__meta">
             {{ time(item.at) }} · {{ item.entry.actor }} instructed ·
             <template v-if="item.entry.delivery === 'delivered'">
-              delivered in step <a v-for="(c, i) in item.entry.carriedBy" :key="c.step" href="#" @click.prevent="emit('open-turn', c.step)">{{ i ? ', ' : '' }}{{ c.step }}</a>
+              delivered in step <a v-for="(c, i) in item.entry.carriedBy" :key="c.step" href="#" @click.prevent="emit('open-turn', c.step)">{{ i ? ', ' : '' }}{{ c.step }}{{ c.role ? ` · ${c.role}` : '' }}</a>
             </template>
-            <template v-else>waiting for the coordinator's next turn</template>
+            <template v-else>waiting for each seat's next turn</template>
           </div>
           <p class="cchat__text">{{ item.entry.text }}</p>
         </div>
@@ -197,12 +199,12 @@ const cost = (usd) => (typeof usd === 'number' ? ` · $${usd.toFixed(usd < 0.01 
                :title="chat?.canAsk ? 'Answered by a copy of the coordinator\'s session; the run is not affected' : 'The coordinator has no session yet'"
                @click="send('question')">Ask</v-btn>
         <v-btn size="small" variant="flat" color="primary" :loading="sending" :disabled="Boolean(chat?.instructionRefusal)"
-               :title="chat?.instructionRefusal ?? 'Given to the coordinator in its next turn; it steers the run'"
+               :title="chat?.instructionRefusal ?? 'Given to every seat in its next turn; it steers the run'"
                @click="send('instruction')">Instruct</v-btn>
       </div>
       <p class="cchat__hint muted">
         <strong>Ask</strong> is answered by a copy of the coordinator's session and changes nothing.
-        <strong>Instruct</strong> is delivered in the coordinator's next turn and is recorded on that step.
+        <strong>Instruct</strong> is delivered in every seat's next turn and is recorded on each step that carried it.
       </p>
       <p v-if="chat?.instructionRefusal" class="cchat__hint muted">{{ chat.instructionRefusal }}</p>
       <p v-if="error" class="cchat__error" role="alert">{{ error }}</p>

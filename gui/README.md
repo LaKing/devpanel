@@ -401,7 +401,7 @@ them, so deleting `001` by hand does not make the next step collide with `002`.
 | `GET /api/projects/:project/issues/:id/family` | `{parent, children, dependsOn, dependsOnReason, blocks}`, each member `{project, id, name, disposition, archived, packed, settled, run}` (packed issues included; an unreadable one `missing: true`). Provenance and order stay separate: a parent is not a prerequisite |
 | `POST /api/projects/:project/issues/:id/steps` | add the next step — `{ name }` |
 | `GET /api/projects/:project/issues/:id/runs/:runId` | one run in full; `actions` lists what the run's state admits now, from the functions that admit them (`supportedActions` is the same list under its older name; a listed action can still be refused for what only the call shows: the workspace changed, a budget, a busy project); `metrics` (`runtime/run-metrics.mjs`) holds `time` (`agentMs`, `operatorWaitMs`, `suspendedMs`, `checksMs` = the union of every recorded check run's own interval with overlap counted once, `waitingForChecksMs` = check time while no seat turn ran, a turn still in flight included, `otherMs` without it), `rounds` (`byPhase[phase].roundExecutions` = rounds per loop), `findings` (`blockingByRound` = one row per review with its `phase`, `cycle`, `round`, `blocking` and `blockingSlugs`), `closureReturns` and `regressionsAfterApproval` (checks that failed, inherited failures included, or whose baseline comparison named new failures, on a revision already approved when they began; `regressionsBasis` says whether an older record made it partly inferred); `landed` is the manual landing record, or null |
-| `GET /api/projects/:project/issues/:id/runs/:runId/live/:invocationId` | the runtime's raw output for one turn, `?after=<seq>` to continue |
+| `GET /api/projects/:project/issues/:id/runs/:runId/live/:invocationId` | the runtime's raw output for one turn. `?after=<seq>` continues and returns the whole rest, `{invocationId, entries, next, live}`, as before. Bounded reads, used by viewers, are opt-in: `limit` (at most 1000) with `after`, `tail=<n>`, or `before=<seq>`. Each returns one page of at most 1000 entries and 512 KiB serialized, plus `first`, `last`, `more` and `earlier`. An entry that cannot fit a page alone comes clipped (`sliced`), and `entry=<seq>&offset=<n>` reads its text in bounded slices. `GET /api/supervisor/live/:invocationId` takes the same parameters |
 | `GET /api/projects/:project/checkout-overlap` | the project page's notice: the checkout's uncommitted paths that a live run is also touching, as a `path-overlap.mjs` reading (`state`, `basis: path-overlap`, `overlaps` naming each run and its files); a path under a link is not counted (a checkout that commits its links dereferenced lists every linked file as deleted; the owning project's page shows those); reads, blocks nothing |
 | `GET /api/projects/:project/staging-pending` | delivered runs no successful staging release (a Deployment run in the staging environment) has covered: `{configured, pending, indeterminate, liveRuns, releases, batch}` (`server/staging-coverage.mjs`, docs/staging-deployment.md "What a release covers"); reads, starts nothing |
 | `GET /api/projects/:project/actions` | the project's operator actions (`checkpoint` when `checkpoint.sh` exists, plus `projects/<id>.yaml` `actions`), each with its declared `effect` (only `commit-checkout`, or null) and last operation |
@@ -472,8 +472,22 @@ it in that object, and read it from a component.
 
 Events: `hello` (host facts + first sample, on connect), `metrics` (each tick),
 `ping:check` (round-trip latency probe), `issues:changed` (an issue was opened),
-`run:event` (run transitions; `type: 'live'` carries one persisted chunk of a
-runtime's output, `type: 'activity'` a liveness tick).
+`run:event` (run transitions to every client; `type: 'live'` carries one persisted chunk of a
+runtime's output, `type: 'activity'` a liveness tick), `supervisor:changed`, `supervisor:live`.
+
+Output is sent only to the sockets watching that invocation (`server/live-rooms.mjs`). A viewer
+sends `live:subscribe` with `{ scope: 'run', project, issueId, runId, invocationId }` or
+`{ scope: 'supervisor', invocationId }` and an ack (`{ ok }`). It joins that invocation's room and
+receives its `run:event {type:'live'}` or `supervisor:live` chunks. `live:unsubscribe` leaves the room,
+and a disconnect leaves every room. A socket holds at most 64 live rooms. Every other event is still
+broadcast. Each chunk carries `prev`, the seq of the entry before it in the file. Seqs can skip, because
+a capped log keeps its exit marker. An entry too large for one page arrives clipped (`sliced`).
+`LiveOutput.vue` and `RunTerminal.vue` follow an invocation through `src/live-stream.js` and the
+Vue-free core `src/live-follow.js`:
+- They subscribe only while shown (v-show included) and only for a turn in flight.
+- They read a bounded tail, then commit socket chunks when `prev` is their cursor, and otherwise
+  catch up with `after=<cursor>&limit=` pages.
+- The window holds at most 5000 entries / 4 MiB, and *Load earlier* reads `before=`.
 
 ## Testing
 
@@ -760,8 +774,11 @@ At any point the operator can talk to a run's coordinator (the issue page's
 adds to it. `kind: 'question'` (202) is answered in a fork of the coordinator's native
 session: one tool-free turn on a copy, with live output under `live/ask-<uuid>.jsonl`, and
 the run itself is untouched. `kind: 'instruction'` (201) is delivered verbatim in the
-coordinator's next turn. That step records it (`step.instructions`), and a completed
-run refuses one with 409. Both arrive as `run:event {type:'chat'}`. The chat shows the
+next turn of every seat (coordinator, author, each auditor), each seat getting what it
+has not carried yet. Each step that carried it records it (`step.instructions`, with the
+step's `role`), and the chat's `carriedBy` names each step and role; a completed
+run refuses one with 409. For a worker an instruction is information for its turn; only
+the coordinator's effects can restart or reset anything. Both arrive as `run:event {type:'chat'}`. The chat shows the
 coordinator's turns with their streamed reasoning: Claude seats request thinking
 summaries and Codex seats request reasoning summaries.
 

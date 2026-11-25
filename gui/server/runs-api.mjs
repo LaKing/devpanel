@@ -322,13 +322,19 @@ export function protocolDiagnostics (run, outputs) {
     }))
 }
 
-/** The runtime's output for one invocation, after a sequence number. */
-export async function readLiveOutput (issuePath, runId, invocationId, { after = 0 } = {}) {
+/**
+ * The runtime's output for one invocation. A plain `after` read is the full
+ * suffix, as it always was; `limit`, `tail`, `before` or `entry` ask for a
+ * bounded page or slice (store.readLiveView).
+ */
+export async function readLiveOutput (issuePath, runId, invocationId, query = {}) {
   const run = await store.readRun(issuePath, runId).catch(() => null)
   if (!run) throw err(404, 'no such run')
-  const entries = await store.readLive(issuePath, runId, invocationId, { after })
   const pending = Object.values(run.participants).some((p) => p.pendingInvocation?.invocationId === invocationId)
-  return { invocationId, entries, next: entries.at(-1)?.seq ?? after, live: pending }
+  const view = await store.readLiveView(store.liveFile(issuePath, runId, invocationId), query)
+  if (!view) throw err(404, 'no such entry')
+  if (view.legacy) return { invocationId, entries: view.entries, next: view.next, live: pending }
+  return { invocationId, ...view, live: pending }
 }
 
 /** A step's response, as text. Kept separate: it can be large. */

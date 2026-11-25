@@ -13,7 +13,7 @@ import { admits, describeRefusal, loadPolicy } from './runtime/spending-policy.m
 import { alwaysWakes, createWakeFilter, DEFAULT_MAX_DEFER_MS, holdOutside, holdProgress, normaliseCampaign, splitByCampaign, summariseEvent } from './decisions/wake-filter.mjs'
 import { createStartGate, migrateStartLimits, accumulateHistory, emptyHistory } from './supervisor-starts.mjs'
 import { runlessFence } from '../../harness/fence.mjs'
-import { appendLiveFile, readLiveFile } from './runtime/store.mjs'
+import { appendLiveFile, readLiveView } from './runtime/store.mjs'
 import { CONTEXT_BLOCKS, RESEND_AFTER_CHARS, composeContext, countAttempt, recordSent } from './supervisor-context.mjs'
 import { chatFileName, createChat } from './supervisor-chat.mjs'
 
@@ -296,7 +296,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     const onOutput = (stream, chunk) => {
       const entry = { seq: ++seq, at: new Date().toISOString(), kind: stream, text: String(chunk) }
       pending = pending.then(() => appendLiveFile(liveFile(invocationId), entry, sizes))
-        .then((written) => { if (written.entry) emit({ type: 'live', invocationId, entry: written.entry }) })
+        .then((written) => { if (written.entry) emit({ type: 'live', invocationId, entry: written.entry, prev: written.prev }) })
         .catch(() => {})
     }
     return { observe: { onOutput }, flush: () => pending }
@@ -1485,11 +1485,14 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       if (typeof invocationId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(invocationId)) throw fail('Invalid invocation id')
       return { invocationId, prompt: await fs.readFile(promptFile(invocationId), 'utf8').catch(() => null) }
     },
-    live: async (invocationId, { after = 0 } = {}) => {
+    live: async (invocationId, query = {}) => {
       if (typeof invocationId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(invocationId)) throw fail('Invalid invocation id')
-      const entries = await readLiveFile(liveFile(invocationId), { after })
       const live = state.pending?.invocationId === invocationId || asking?.invocationId === invocationId
-      return { invocationId, entries, next: entries.at(-1)?.seq ?? after, live }
+      // A plain `after` read is the full suffix; `limit`/`tail`/`before`/`entry` are bounded (store.readLiveView).
+      const view = await readLiveView(liveFile(invocationId), query)
+      if (!view) throw fail('No such entry', 404)
+      if (view.legacy) return { invocationId, entries: view.entries, next: view.next, live }
+      return { invocationId, ...view, live }
     },
     chat: (text) => serial(async () => {
       if (!['active','working'].includes(state.status)) throw fail('Start the supervisor before sending a message',409)

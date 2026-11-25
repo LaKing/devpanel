@@ -31,7 +31,17 @@ import { scriptFor } from './fixture.mjs'
  *   auth            authentication status a probe reports (default 'ok')
  *   modelAccess     model-access status a probe reports (default 'ok')
  *   script          options forwarded to scriptFor()
+ *   noise           per-step noisy output while the turn is in flight, e.g.
+ *                   { implement: { chunks: 400, bytes: 1024, intervalMs: 10 } };
+ *                   chunk i of step s is `DPNOISE:<s>:<i> ` padded to `bytes`
+ *                   and newline-terminated, so a test can find each one
  */
+
+/** Chunk `i` of a step's noise: deterministic and greppable. */
+export const noiseChunk = (stepId, i, bytes = 1024) => {
+  const head = `DPNOISE:${stepId}:${i} `
+  return head + '.'.repeat(Math.max(0, bytes - head.length - 1)) + String.fromCharCode(10)
+}
 
 // Read per call, not at import: the module is cached across test suites, and a
 // path captured once would point every later suite at the first suite's file.
@@ -118,8 +128,19 @@ export async function invoke (args) {
   // Pacing happens here rather than inside the script so that cancellation is
   // observed while the turn is genuinely in flight.
   const delay = (stepId && cfg.delayFor?.[stepId] != null) ? cfg.delayFor[stepId] : (cfg.delayMs ?? 0)
+  const noise = stepId ? cfg.noise?.[stepId] : null
   try {
-    await sleep(delay, args.signal)
+    if (noise) {
+      // The noise is the turn's work: it runs to the end, then any remaining delay.
+      const started = Date.now()
+      for (let i = 0; i < (noise.chunks ?? 0); i++) {
+        args.observe?.onOutput?.('stdout', noiseChunk(stepId, i, noise.bytes ?? 1024))
+        await sleep(noise.intervalMs ?? 10, args.signal)
+      }
+      await sleep(delay - (Date.now() - started), args.signal)
+    } else {
+      await sleep(delay, args.signal)
+    }
   } catch (error) {
     // A runtime does not vanish the instant it is asked to. Confirming
     // termination is what makes "stopping" a state rather than an instant.

@@ -2210,7 +2210,7 @@ export function createSupervisor ({
    * session, and an instruction is appended to the run's chat file for the
    * engine to deliver at the coordinator's next turn.
    */
-  const asking = new Map() // `${project}/${issueId}/${runId}` -> Set of question ids in flight
+  const asking = new Map() // `${project}/${issueId}/${runId}` -> Map of question id -> fork invocation id, in flight
 
   /** The live engine when the run is driven here, else a lock-free read of it. */
   async function chatEngine (project, issueId, runId) {
@@ -2232,8 +2232,8 @@ export function createSupervisor ({
       model: role ? engine.participantSpec(role).model?.id ?? null : null,
       canAsk: Boolean(p?.session?.id || p?.readSession?.id),
       instructionRefusal: instructionRefusal(engine.run),
-      asking: [...(asking.get(`${project}/${issueId}/${runId}`) ?? [])],
-      entries: chatView(entries, engine.run.steps ?? [], { asking: asking.get(`${project}/${issueId}/${runId}`) ?? new Set() })
+      asking: [...(asking.get(`${project}/${issueId}/${runId}`)?.keys() ?? [])],
+      entries: chatView(entries, engine.run.steps ?? [], { asking: asking.get(`${project}/${issueId}/${runId}`) ?? new Map() })
     }
   }
 
@@ -2253,14 +2253,14 @@ export function createSupervisor ({
     if (asking.get(k)?.size) throw err(409, 'the coordinator is still answering the previous question')
     const engine = await chatEngine(project, issueId, runId)
     const harnesses = await loadHarnesses()
-    const inFlight = asking.get(k) ?? new Set()
+    const inFlight = asking.get(k) ?? new Map()
     asking.set(k, inFlight)
     let recorded
     const ready = new Promise((resolve) => { recorded = resolve })
     const done = askCoordinator(engine, {
       text, actor, harnesses,
       emit: (event) => emit?.({ ...event, project, issueId, runId }),
-      onAsking: (id) => { inFlight.add(id); recorded(id) }
+      onAsking: (id, invocationId) => { inFlight.set(id, invocationId ?? null); recorded(id) }
     }).finally(() => { inFlight.clear(); asking.delete(k) })
     // Validation and "no session yet" fail before anything is recorded.
     const first = await Promise.race([ready, done.then(() => null)])

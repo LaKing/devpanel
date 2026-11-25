@@ -11,7 +11,15 @@ import { buildApp } from './build.mjs'
  * what a person would see. Only the window itself is synthetic.
  */
 
-export async function openBrowser (origin, { token = null, storage = null } = {}) {
+/*
+ * `local`: localStorage entries set before the page's script runs (a view that
+ * restores a preference at mount, such as hidden issue-page sections).
+ *
+ * `traffic` on the returned browser counts what the page received and sent:
+ * WebSocket frames (texts kept), fetch and XHR response bodies (texts kept with
+ * their URL), as UTF-8 bytes. Headers are not counted.
+ */
+export async function openBrowser (origin, { token = null, storage = null, local = null } = {}) {
   const { file } = await buildApp()
   const bundle = await fs.readFile(file, 'utf8')
 
@@ -57,6 +65,8 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
    */
   let offline = false
   const sockets = new Set()
+  const traffic = { socketIn: 0, socketOut: 0, httpIn: 0, frames: [], sent: [], httpBodies: [] }
+  const textOf = (data) => (typeof data === 'string' ? data : data?.byteLength != null ? Buffer.from(data).toString('utf8') : String(data ?? ''))
 
   const RealWebSocket = window.WebSocket
   function TrackedWebSocket (...args) {
@@ -64,6 +74,18 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
     const socket = new RealWebSocket(...args)
     sockets.add(socket)
     socket.addEventListener('close', () => sockets.delete(socket))
+    socket.addEventListener('message', (event) => {
+      const text = textOf(event.data)
+      traffic.socketIn += Buffer.byteLength(text)
+      traffic.frames.push(text)
+    })
+    const send = socket.send.bind(socket)
+    socket.send = (data) => {
+      const text = textOf(data)
+      traffic.socketOut += Buffer.byteLength(text)
+      traffic.sent.push(text)
+      return send(data)
+    }
     return socket
   }
   TrackedWebSocket.prototype = RealWebSocket.prototype
@@ -72,7 +94,19 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
 
   const RealXhr = window.XMLHttpRequest
   class OfflineAwareXhr extends RealXhr {
+    open (...args) {
+      this._url = String(args[1] ?? '')
+      return super.open(...args)
+    }
+
     send (...args) {
+      // socket.io's polling transport sends its frames as request bodies.
+      if (typeof args[0] === 'string') { traffic.socketOut += Buffer.byteLength(args[0]); traffic.sent.push(args[0]) }
+      this.addEventListener('loadend', () => {
+        const text = typeof this.responseText === 'string' ? this.responseText : ''
+        traffic.httpIn += Buffer.byteLength(text)
+        traffic.httpBodies.push({ url: this._url, text, at: Date.now() })
+      })
       if (!offline) return super.send(...args)
       setTimeout(() => {
         this.dispatchEvent(new window.ProgressEvent('error'))
@@ -97,7 +131,12 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
     const held = stallFor(args[0])
     if (held) await new Promise((resolve) => setTimeout(resolve, held.ms))
     if (offline) throw new TypeError('Failed to fetch')
-    return realFetch(...args)
+    const response = await realFetch(...args)
+    response.clone().text().then((text) => {
+      traffic.httpIn += Buffer.byteLength(text)
+      traffic.httpBodies.push({ url: String(args[0]?.url ?? args[0]), text, at: Date.now() })
+    }).catch(() => {})
+    return response
   }
 
   const setOffline = (value) => {
@@ -109,6 +148,7 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
 
   // A signed-in browser, without typing the token in every scenario.
   if (token) window.sessionStorage.setItem(storage ?? 'devpanel.token', token)
+  for (const [key, value] of Object.entries(local ?? {})) window.localStorage.setItem(key, value)
 
   const script = window.document.createElement('script')
   script.textContent = bundle
@@ -162,6 +202,7 @@ export async function openBrowser (origin, { token = null, storage = null } = {}
   return {
     window,
     problems,
+    traffic,
     text,
     has: (needle) => text().includes(needle),
     until,

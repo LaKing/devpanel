@@ -336,14 +336,29 @@ const TERMINAL_KINDS = new Set(['spawn', 'exit', 'truncated'])
 export const appendLive = (issuePath, runId, invocationId, entry, sizes = new Map(), options = {}) =>
   appendLiveFile(liveFile(issuePath, runId, invocationId), entry, sizes, options)
 
+/*
+ * The seq of the last entry written to each file, per recorder (keyed by its
+ * `sizes` map). Sequence numbers are allocated before the append and output
+ * past the cap is dropped, so the persisted seqs can skip (1, 2, 3, 5): a
+ * viewer cannot tell a missed socket event from such a hole by arithmetic.
+ * Each persisted entry is therefore forwarded with `prev`, the seq of the
+ * entry before it in the file.
+ */
+const lastSeqs = new WeakMap()
+
 /** The same, to any live file (the top-level supervisor keeps its own). */
 export async function appendLiveFile (file, entry, sizes = new Map(), { maxBytes = LIVE_MAX_BYTES } = {}) {
   const size = sizes.get(file) ?? 0
   const capped = size >= maxBytes
 
-  if (capped && !TERMINAL_KINDS.has(entry.kind)) return { kept: false, entry: null }
+  if (capped && !TERMINAL_KINDS.has(entry.kind)) return { kept: false, entry: null, prev: null }
 
   await fs.mkdir(path.dirname(file), { recursive: true })
+  let seqs = lastSeqs.get(sizes)
+  if (!seqs) { seqs = new Map(); lastSeqs.set(sizes, seqs) }
+  // A recorder that has not written this file yet: whatever is already there
+  // (a writer resumed on an existing file) comes first.
+  if (!seqs.has(file)) seqs.set(file, (await readLiveFile(file)).at(-1)?.seq ?? 0)
   let record = entry
   const line = JSON.stringify(entry) + NL
   if (!capped && size + Buffer.byteLength(line) > maxBytes && !TERMINAL_KINDS.has(entry.kind)) {
@@ -353,7 +368,9 @@ export async function appendLiveFile (file, entry, sizes = new Map(), { maxBytes
   const bytes = Buffer.byteLength(payload)
   await fs.appendFile(file, payload, { mode: 0o600 })
   sizes.set(file, record.kind === 'truncated' ? Math.max(size + bytes, maxBytes) : size + bytes)
-  return { kept: record === entry, entry: record }
+  const prev = seqs.get(file)
+  seqs.set(file, record.seq)
+  return { kept: record === entry, entry: record, prev }
 }
 
 /** Entries after sequence number `after` (exclusive), so a client can catch up incrementally. */
@@ -372,6 +389,145 @@ export async function readLiveFile (file, { after = 0 } = {}) {
     } catch { /* a torn last line is still being written */ }
   }
   return out
+}
+
+/*
+ * Bounded reads of a live log, for viewers (opt-in: a plain `after` read stays
+ * the full suffix). A page holds at most LIVE_PAGE_ENTRIES entries and
+ * LIVE_PAGE_BYTES of serialized entries, so escaping and metadata count. An
+ * entry that cannot fit a page alone is returned clipped (`sliced`), and its
+ * text is read in bounded slices with `entry` + `offset`.
+ */
+export const LIVE_PAGE_BYTES = 512 * 1024
+export const LIVE_PAGE_ENTRIES = 1000
+const ENVELOPE_BYTES = 1024
+const FIELD_KEEP_BYTES = 16 * 1024
+const entryBytes = (entry) => Buffer.byteLength(JSON.stringify(entry)) + 1
+
+/** Never split a surrogate pair. */
+function cutAt (text, end) {
+  if (end > 0 && end < text.length) {
+    const code = text.charCodeAt(end - 1)
+    if (code >= 0xd800 && code <= 0xdbff) return end - 1
+  }
+  return end
+}
+
+/** The longest prefix of `text` from `offset` whose JSON string form fits `budget` bytes. */
+function fitText (text, offset, budget) {
+  let lo = offset
+  let hi = text.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (Buffer.byteLength(JSON.stringify(text.slice(offset, mid))) <= budget) lo = mid
+    else hi = mid - 1
+  }
+  return cutAt(text, lo)
+}
+
+/** An entry as it may be delivered: itself when it fits `maxBytes`, else its text clipped and marked. */
+export function clipForDelivery (entry, maxBytes = LIVE_PAGE_BYTES - ENVELOPE_BYTES) {
+  if (!entry || entryBytes(entry) <= maxBytes) return entry
+  const text = typeof entry.text === 'string' ? entry.text : ''
+  const out = { seq: entry.seq, at: entry.at, kind: entry.kind }
+  const omitted = []
+  for (const [key, value] of Object.entries(entry)) {
+    if (key in out || key === 'text') continue
+    if (Buffer.byteLength(JSON.stringify(value) ?? '') <= FIELD_KEEP_BYTES) out[key] = value
+    else omitted.push(key)
+  }
+  if (omitted.length) out.omitted = omitted
+  const shell = { ...out, text: '', sliced: { total: text.length, offset: 0, length: 0 } }
+  const end = fitText(text, 0, Math.max(0, maxBytes - entryBytes(shell) - 32))
+  return { ...out, text: text.slice(0, end), sliced: { total: text.length, offset: 0, length: end } }
+}
+
+const intOr = (value, fallback) => (Number.isInteger(value) && value >= 0 ? value : fallback)
+
+/**
+ * One bounded page. `after` (forward from a seq, exclusive), `tail` (the last N)
+ * or `before` (backward from a seq, exclusive); `limit` caps the entries.
+ */
+export function pageLive (all, { after = 0, before = null, tail = null, limit = LIVE_PAGE_ENTRIES } = {}) {
+  const max = Math.min(Math.max(1, intOr(limit, LIVE_PAGE_ENTRIES)), LIVE_PAGE_ENTRIES)
+  const budget = LIVE_PAGE_BYTES - ENVELOPE_BYTES
+  const last = all.at(-1)?.seq ?? 0
+  let entries = []
+  let used = 0
+  const take = (entry, front) => {
+    const delivered = entries.length ? entry : clipForDelivery(entry, budget)
+    const bytes = entryBytes(delivered)
+    if (entries.length && (entries.length >= max || used + bytes > budget)) return false
+    if (front) entries.unshift(delivered); else entries.push(delivered)
+    used += bytes
+    return delivered === entry
+  }
+  if (tail != null || before != null) {
+    const n = tail != null ? Math.min(Math.max(1, intOr(tail, max)), max) : max
+    const end = before != null ? all.findIndex((e) => e.seq >= before) : -1
+    const upto = end < 0 ? all.length : end
+    for (let i = upto - 1; i >= 0 && entries.length < n; i--) {
+      // Backward, a clipped entry ends the page: it is the oldest one held.
+      if (!take(all[i], true) || entries[0].sliced) break
+    }
+    const first = entries[0]?.seq ?? null
+    const firstIndex = first == null ? upto : all.findIndex((e) => e.seq === first)
+    const lastHeld = entries.at(-1)?.seq ?? null
+    const lastIndex = lastHeld == null ? upto - 1 : all.findIndex((e) => e.seq === lastHeld)
+    return { entries, next: lastHeld ?? (firstIndex > 0 ? all[firstIndex - 1].seq : 0), first, last, more: lastIndex < all.length - 1, earlier: firstIndex > 0 }
+  }
+  const start = all.findIndex((e) => e.seq > after)
+  if (start >= 0) {
+    for (let i = start; i < all.length; i++) {
+      if (!take(all[i], false) || entries.at(-1).sliced) break
+    }
+  }
+  const held = entries.length
+  const lastHeld = entries.at(-1)?.seq ?? after
+  return {
+    entries,
+    next: lastHeld,
+    first: entries[0]?.seq ?? null,
+    last,
+    more: start >= 0 && start + held < all.length,
+    earlier: start > 0 || (start < 0 && all.length > 0)
+  }
+}
+
+/** A bounded slice of one entry's text, from `offset` (UTF-16 code units). */
+export function sliceLiveEntry (all, seq, offset = 0) {
+  const entry = all.find((e) => e.seq === seq)
+  if (!entry) return null
+  const text = typeof entry.text === 'string' ? entry.text : ''
+  const from = Math.min(intOr(offset, 0), text.length)
+  const end = fitText(text, from, LIVE_PAGE_BYTES - ENVELOPE_BYTES)
+  return { seq, offset: from, text: text.slice(from, end), total: text.length, done: end >= text.length }
+}
+
+/*
+ * A live-output route's query. A plain `after` is the full suffix, as it always was;
+ * `limit`, `tail`, `before` or `entry` (+ `offset`) ask for one bounded page or slice.
+ * `after` is parsed exactly as the routes always did (any finite number, else 0);
+ * for the new parameters anything but a whole number is absent.
+ */
+export function parseLiveQuery (q = {}) {
+  const n = (v) => { if (v === undefined) return null; const x = Number(v); return Number.isInteger(x) && x >= 0 ? x : null }
+  const after = Number(q.after ?? 0)
+  return { after: Number.isFinite(after) ? after : 0, limit: n(q.limit), tail: n(q.tail), before: n(q.before), entry: n(q.entry), offset: n(q.offset) ?? 0 }
+}
+
+
+/**
+ * A live read for a viewer: bounded when asked (`limit`, `tail`, `before`,
+ * `entry`), else exactly the old full suffix after `after`.
+ */
+export async function readLiveView (file, { after = 0, limit = null, tail = null, before = null, entry = null, offset = 0 } = {}) {
+  if (entry != null) return sliceLiveEntry(await readLiveFile(file), entry, offset)
+  if (limit == null && tail == null && before == null) {
+    const entries = await readLiveFile(file, { after })
+    return { entries, next: entries.at(-1)?.seq ?? after, legacy: true }
+  }
+  return pageLive(await readLiveFile(file), { after, before, tail, limit: limit ?? LIVE_PAGE_ENTRIES })
 }
 
 /**

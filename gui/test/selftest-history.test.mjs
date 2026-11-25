@@ -16,6 +16,7 @@ import { baselineOf, fingerprint, treeIdentity } from '../server/runtime/fingerp
 import { compareSelftestReports, gatingResult, gateReason, identifyCheckFailures, inconclusiveBase } from '../server/runtime/baseline-failures.mjs'
 import { classifyAll, classifyTest, EXPIRY_PASSES, forgetRunDrives, historyDir, moduleBoundary, openStability, readDrives, recordDrive, scanDeclarations, touchVerdict } from '../server/runtime/selftest-history.mjs'
 import { checkSummary } from '../server/runtime/check-summary.mjs'
+import { recordInstruction } from '../server/runtime/coordinator-chat.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { renderResult } from '../server/run-result-step.mjs'
 import { runMetrics } from '../server/runtime/run-metrics.mjs'
@@ -666,6 +667,27 @@ export default async function (t) {
     t.eq('a cleanup hold refuses it', held.engine.run.reconciliations.at(-1).state, 'notice-unfinished')
     standsAsBefore(t, held.engine, held.before, 'a cleanup hold')
     await releaseOwnership(held.engine, { reason: 'test' }).catch(() => {})
+  }
+
+  t.section('operator instructions: a new drive\'s notice after a failed one is a new turn, carrying what is owed (coordinator-chat.mjs turnIdentity)')
+  {
+    let notices = 0
+    const run = await reconcileRun({ onNotice: ({ approved }) => { if (notices++ === 0) throw new Error('the runtime fell over'); return approved } })
+    const { f, engine, prompts } = run
+    const say = (text) => recordInstruction({ issuePath: f.issuePath, runId: engine.runId, run: engine.run, text, actor: 'Alice' })
+    const a = await say('Alpha: keep the merge minimal.')
+    await engine.reconcileDelivery({ policy: {} })
+    t.eq('the first notice failed without a step', [engine.run.reconciliations.at(-1).state, engine.run.steps.some((s) => s.reconcileNotice)], ['notice-failed', false])
+    t.ok('it carried A', rereviewed(prompts).at(-1)?.prompt.includes('Alpha: keep the merge minimal.'))
+    const b = await say('Bravo: say which paths merged.')
+    await engine.reconcileDelivery({ policy: {} })
+    const second = rereviewed(prompts).at(-1)
+    t.eq('a second notice ran, for a new drive', [rereviewed(prompts).length, engine.run.reconciliations.at(-1).checks?.dir !== engine.run.reconciliations.at(-2).checks?.dir], [2, true])
+    t.ok('it carries A and B: no replay of the failed notice\'s snapshot', second.prompt.includes('Alpha: keep the merge minimal.') && second.prompt.includes('Bravo: say which paths merged.'))
+    t.ok('A, which the failed notice may have delivered, is marked earlier on its fresh session', /\(given earlier\) [^\n]* — Alice:\nAlpha/.test(second.prompt), second.prompt.slice(second.prompt.indexOf('## Operator instructions'), second.prompt.indexOf('## Operator instructions') + 800))
+    const step = engine.run.steps.find((s) => s.reconcileNotice)
+    t.eq('its step lists both, keyed by the new drive', [step?.instructions, step?.recheckDrive], [[a.id, b.id], engine.run.reconciliations.at(-1).checks?.dir])
+    await releaseOwnership(engine, { reason: 'test' }).catch(() => {})
   }
 
   t.section('auditor-1-007 (AC1): an unfinished base replaced by its redrive stays on the record')

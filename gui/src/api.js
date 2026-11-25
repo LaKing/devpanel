@@ -28,6 +28,16 @@ async function request (path, options = {}) {
 
 const enc = encodeURIComponent
 
+/**
+ * A live-output read's query string. A number is the old `after` (the full
+ * suffix); an object may add `limit`, `tail`, `before`, `entry` and `offset`
+ * for one bounded page or slice.
+ */
+const liveQuery = (query) => {
+  const q = typeof query === 'object' && query ? query : { after: query ?? 0 }
+  return '?' + Object.entries(q).filter(([, v]) => v != null).map(([k, v]) => `${enc(k)}=${enc(v)}`).join('&')
+}
+
 export const api = {
   infrastructure: project => request(`/api/projects/${encodeURIComponent(project)}/infrastructure`),
   checkoutOverlap: project => request(`/api/projects/${encodeURIComponent(project)}/checkout-overlap`),
@@ -46,7 +56,7 @@ export const api = {
   supervisorModels: () => request('/api/supervisor/models'),
   startSupervisor: (options) => request('/api/supervisor/start', { method: 'POST', body: JSON.stringify(options) }),
   askSupervisor: (text) => request('/api/supervisor/ask', { method: 'POST', body: JSON.stringify({ text }) }),
-  supervisorLive: (invocationId, after = 0) => request(`/api/supervisor/live/${enc(invocationId)}?after=${after}`),
+  supervisorLive: (invocationId, query = 0) => request(`/api/supervisor/live/${enc(invocationId)}${liveQuery(query)}`),
   supervisorQuestions: () => request('/api/supervisor/questions'),
   answerSupervisorQuestion: (id, answer, actor) => request(`/api/supervisor/questions/${enc(id)}/answer`, { method: 'POST', body: JSON.stringify({ answer, actor }) }),
   setSupervisorCampaign: (campaign, actor) => request('/api/supervisor/campaign', { method: 'POST', body: JSON.stringify({ campaign, actor }) }),
@@ -141,8 +151,8 @@ export const api = {
   },
   listRuns: (project, id) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs`),
   getRun: (project, id, runId) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}`),
-  liveOutput: (project, id, runId, invocationId, after = 0) =>
-    request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/live/${enc(invocationId)}?after=${after}`),
+  liveOutput: (project, id, runId, invocationId, query = 0) =>
+    request(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/live/${enc(invocationId)}${liveQuery(query)}`),
 
   /** `configHash` binds the start to the preview the operator actually read. */
   /** `pregate` is `{ override: true, reason }` only when an operator starts Triage past a pre-gate hold. */

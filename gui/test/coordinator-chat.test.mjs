@@ -20,20 +20,27 @@ export default async (t) => {
       { id: 'q1', kind: 'question', at: '2026-10-03T10:01:00Z', actor: 'op', text: 'why?' },
       { id: 'i2', kind: 'instruction', at: '2026-10-03T10:02:00Z', actor: 'op', text: 'two' }
     ]
-    const steps = [{ number: 3, stepId: 'brief', instructions: ['i1'] }, { number: 4, stepId: 'triage', instructions: ['i2'], instructionScope: 'read' }]
+    // A record from before per-seat delivery: coordinator steps only, the main one without a scope.
+    const steps = [{ number: 3, stepId: 'brief', role: 'coordinator', instructions: ['i1'] }, { number: 4, stepId: 'triage', role: 'coordinator', instructions: ['i2'], instructionScope: 'read' }]
     t.eq('the main session is owed what no main-scope step carried', instructionsFor(entries, steps).map((e) => e.id), ['i2'])
     t.eq('the read session keeps its own account', instructionsFor(entries, steps, { scope: 'read' }).map((e) => e.id), ['i1'])
     t.eq('a fresh session is given every instruction', instructionsFor(entries, steps, { freshSession: true }).map((e) => e.id), ['i1', 'i2'])
     t.eq('questions are never delivered', instructionsFor(entries, []).map((e) => e.id), ['i1', 'i2'])
-    const view = chatView(entries, steps, { asking: new Set(['q1']) })
+    t.eq('per seat: the coordinator reads the older record exactly as before', instructionsFor(entries, steps, { role: 'coordinator' }).map((e) => e.id), ['i2'])
+    t.eq('per seat: an auditor is not credited with the coordinator\'s carry', instructionsFor(entries, steps, { role: 'auditor-1' }).map((e) => e.id), ['i1', 'i2'])
+    const seatSteps = [...steps, { number: 5, stepId: 'audit-implement-1', role: 'auditor-1', instructions: ['i1', 'i2'] }]
+    t.eq('…and the coordinator is not credited with the auditor\'s', instructionsFor(entries, seatSteps, { role: 'coordinator' }).map((e) => e.id), ['i2'])
+    t.eq('a seat owes nothing it carried itself', instructionsFor(entries, seatSteps, { role: 'auditor-1' }).map((e) => e.id), [])
+    const view = chatView(entries, seatSteps, { asking: new Set(['q1']) })
     t.eq('a carried instruction reads as delivered, naming its step', [view[0].delivery, view[0].carriedBy[0]?.step], ['delivered', 3])
+    t.eq('…and every seat that carried it, with its role', view[0].carriedBy.map((c) => [c.step, c.role]), [[3, 'coordinator'], [5, 'auditor-1']])
     t.eq('a question in flight reads as asking', view[1].state, 'asking')
     t.eq('the same question after a restart reads as interrupted', chatView(entries, steps)[1].state, 'interrupted')
     t.eq('a completed run takes no instructions', typeof instructionRefusal({ status: 'completed' }), 'string')
     t.eq('a paused or failed one does', [instructionRefusal({ status: 'paused' }), instructionRefusal({ status: 'failed' })], [null, null])
   }
 
-  t.section('2. an instruction given while the run waits is delivered in the next coordinator turn, once')
+  t.section('2. an instruction given while the run waits is delivered in the next turn of every seat, once')
   {
     const f = await engineFixture({ script: scriptFor({ needsInput: 'Which branch?' }) })
     await pausingStrategy(f.configRoot, { rounds: false })
@@ -58,13 +65,19 @@ export default async (t) => {
     const coordinatorTurns = seen.filter((a) => a.meta.role === 'coordinator')
     const first = coordinatorTurns[0]
     t.ok('the next coordinator turn carries it verbatim, last', first?.prompt.includes('## Operator instructions') && first.prompt.includes('Keep the public API unchanged.'), first?.prompt.slice(-800))
-    t.ok('worker turns do not', seen.filter((a) => a.meta.role !== 'coordinator').every((a) => !a.prompt.includes('Keep the public API unchanged.')))
-    t.ok('later coordinator turns on the same session do not repeat it', coordinatorTurns.slice(1).every((a) => !a.prompt.includes('Keep the public API unchanged.')), coordinatorTurns.length)
-    const carrier = done.steps.find((s) => s.instructions?.includes(instruction.id))
-    t.ok('the step that carried it records so', Boolean(carrier) && carrier.role === 'coordinator', JSON.stringify(done.steps.map((s) => [s.stepId, s.instructions])))
-    t.eq('…in the main session scope', carrier?.instructionScope, 'main')
+    const byRole = {}
+    for (const a of seen) (byRole[a.meta.role] ??= []).push(a)
+    t.eq('every seat took a turn after it', Object.keys(byRole).sort(), ['auditor-1', 'coordinator', 'implementer'])
+    for (const [role, turns] of Object.entries(byRole)) {
+      t.ok(`${role}: its next turn carries it verbatim`, turns[0].prompt.includes('## Operator instructions') && turns[0].prompt.includes('Keep the public API unchanged.'))
+      t.ok(`${role}: its later turns on the same session do not repeat it`, turns.slice(1).every((a) => !a.prompt.includes('Keep the public API unchanged.')), turns.length)
+    }
+    t.ok('a worker is told what an instruction is not', byRole.implementer[0].prompt.includes('Only the coordinator\'s decisions do that.') && !coordinatorTurns[0].prompt.includes('Only the coordinator\'s decisions do that.'))
+    const carriers = done.steps.filter((s) => s.instructions?.includes(instruction.id))
+    t.eq('each seat\'s step that carried it records so, with its role', carriers.map((s) => s.role).sort(), ['auditor-1', 'coordinator', 'implementer'], JSON.stringify(done.steps.map((s) => [s.stepId, s.role, s.instructions])))
+    t.ok('…in the main session scope', carriers.every((s) => s.instructionScope === 'main'))
     const view = chatView(await readChat(f.issuePath, engine.runId), done.steps)
-    t.eq('the chat shows it delivered in that step', view[0].carriedBy.map((c) => c.step), [carrier?.number])
+    t.eq('the chat shows it delivered in those steps', view[0].carriedBy.map((c) => c.step), carriers.map((s) => s.number))
     let late = null
     try { await recordInstruction({ issuePath: f.issuePath, runId: engine.runId, run: done, text: 'too late', actor: 'op' }) } catch (error) { late = error }
     t.eq('the completed run refuses another', late?.status, 409)

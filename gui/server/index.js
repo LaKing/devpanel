@@ -58,6 +58,8 @@ import { checkPatch } from './runtime/patch-check.mjs'
 import { availabilityReport } from './availability-api.mjs'
 import { createModelPerformanceService } from './model-performance.mjs'
 import { devOrigins } from './dev-origins.mjs'
+import { attachLiveRooms, deliverRunLive, deliverSupervisorLive } from './live-rooms.mjs'
+import { parseLiveQuery as liveQuery } from './runtime/store.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -451,7 +453,9 @@ const emitRunEvent = (event) => {
   const { type, project, issueId, runId, role, stepId } = event
   // Output chunks and activity ticks are high-volume and already on disk.
   if (type !== 'live' && type !== 'activity') console.info('Issue run event:', { type, project, issueId, runId, role, stepId })
-  io?.emit('run:event', event)
+  // Output goes only to the sockets watching that invocation (live-rooms.mjs); everything else to all.
+  if (type === 'live') deliverRunLive(io, event)
+  else io?.emit('run:event', event)
 }
 
 // Every agent currently invoked, anywhere. Behind the same token as the rest:
@@ -469,8 +473,7 @@ app.post('/api/supervisor/ask', route(async (req, res) => res.status(202).json(a
 // What one of the supervisor's calls was sent: kept beside its state, not in it (top-supervisor.mjs keepPrompt).
 app.get('/api/supervisor/prompts/:invocationId', route(async (req, res) => res.json(await topSupervisor.prompt(req.params.invocationId))))
 app.get('/api/supervisor/live/:invocationId', route(async (req, res) => {
-  const after = Number(req.query.after ?? 0)
-  res.json(await topSupervisor.live(req.params.invocationId, { after: Number.isFinite(after) ? after : 0 }))
+  res.json(await topSupervisor.live(req.params.invocationId, liveQuery(req.query)))
 }))
 app.get('/api/supervisor/questions', route(async (_req, res) => res.json(topSupervisor.questions())))
 app.post('/api/supervisor/questions/:id/answer', route(async (req, res) => res.json(await topSupervisor.answerQuestion(req.params.id, req.body ?? {}))))
@@ -694,11 +697,10 @@ app.get('/api/projects/:project/issues/:id/runs/:runId', route(async (req, res) 
 
 // The runtime's own output for one turn, as recorded. `after` continues from a
 // sequence number, so a client that missed socket events catches up without
-// re-reading everything.
+// re-reading everything; viewers ask for bounded pages (liveQuery).
 app.get('/api/projects/:project/issues/:id/runs/:runId/live/:invocationId', route(async (req, res) => {
   const issue = await unpackedIssue(req.params.project, req.params.id)
-  const after = Number(req.query.after ?? 0)
-  res.json(await readLiveOutput(issue.path, req.params.runId, req.params.invocationId, { after: Number.isFinite(after) ? after : 0 }))
+  res.json(await readLiveOutput(issue.path, req.params.runId, req.params.invocationId, liveQuery(req.query)))
 }))
 
 // ---- run control ---------------------------------------------------------
@@ -1104,7 +1106,7 @@ topSupervisor = await topSupervisorService({ issues, supervisor, modelPerformanc
   emit: (event) => {
     // A working call's streamed output: its own channel, so it does not make
     // every open supervisor page re-read the whole state per chunk.
-    if (event?.type === 'live') { io?.emit('supervisor:live', event); return }
+    if (event?.type === 'live') { deliverSupervisorLive(io, event); return }
     if (event?.type === 'question') { io?.emit('supervisor:changed'); io?.emit('issues:changed', { reason: 'supervisor-question' }); return }
     const key = JSON.stringify(event)
     if (key !== previousSupervisorState) { console.info('Supervisor state:', event); previousSupervisorState = key }
@@ -1168,6 +1170,8 @@ io.on('connection', (socket) => {
   })).catch((error) => console.warn(`[devpanel] socket hello failed: ${error?.message ?? error}`))
 
   // Round-trip latency probe: the client sends a timestamp, we hand it straight back.
+  attachLiveRooms(socket)
+
   socket.on('ping:check', (sentAt, ack) => {
     if (typeof ack === 'function') ack(sentAt)
   })

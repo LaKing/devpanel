@@ -190,7 +190,18 @@ export function formatEvent (event, { cols = 0 } = {}) {
 /**
  * An incremental renderer. `write(entry)` returns what to append to the
  * terminal for that entry; stdout lines are only formatted once complete.
+ * A line that never ends is held only up to MAX_PARTIAL: past it, what is held
+ * is written unformatted and dropped, so a newline-free stream cannot grow it.
  */
+export const MAX_PARTIAL = 64 * 1024
+
+/** The last `max` characters of `text`, cut at a line start when one is near (the plain-text terminal's bound). */
+export function keepTail (text, max) {
+  if (text.length <= max) return text
+  const cut = text.length - max
+  const nl = text.indexOf('\n', cut)
+  return text.slice(nl >= 0 && nl - cut < 4096 ? nl + 1 : cut)
+}
 export function createRenderer ({ raw = false, cols = 0 } = {}) {
   let partial = ''
   const line = (text) => {
@@ -220,7 +231,13 @@ export function createRenderer ({ raw = false, cols = 0 } = {}) {
         out += line(partial.slice(0, nl))
         partial = partial.slice(nl + 1)
       }
+      if (partial.length > MAX_PARTIAL) {
+        out += partial + NL + style.grey('(line continues)') + NL
+        partial = ''
+      }
       return out
-    }
+    },
+    /** How much of an unfinished line is held. */
+    pendingBytes: () => partial.length
   }
 }

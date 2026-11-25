@@ -226,6 +226,38 @@ export default async function (t) {
     } finally { if (savedSsh === undefined) delete process.env.DEVPANEL_SSH_BIN; else process.env.DEVPANEL_SSH_BIN = savedSsh }
   }
 
+  t.section('4b. a turn whose operator instructions cannot be attached closes its broker, as the call would')
+  {
+    const seen = []
+    const f = await engineFixture({ script: scriptFor() })
+    const original = f.harnesses.fake.invoke
+    f.harnesses.fake.invoke = async (options) => { seen.push(options.meta?.role); return original(options) }
+    const infraFile = path.join(f.configRoot, 'projects', 'devpanel-project.yaml')
+    await fs.mkdir(path.dirname(infraFile), { recursive: true })
+    await fs.writeFile(infraFile, YAML.stringify({ id: 'devpanel-project', infrastructure: {
+      kind: 'boilerplate', orientation: 'Orientation.',
+      staging: { id: 'stage', ssh: { hostRef: 'ssh-config:stage.invalid', workdir: '/srv' }, projectRoot: '/opt/stage', files: {}, database: { uriRef: 'env:DEVPANEL_TEST_NO_URI', databases: [{ name: 'app' }] } },
+      deployments: [{ id: 'production', ssh: { hostRef: 'ssh-config:production.invalid', workdir: '/srv' }, projectRoot: '/opt/production', files: {} }],
+      testDrive: { commands: [{ id: 'candidate', run: 'true' }] } } }))
+    const savedSsh = process.env.DEVPANEL_SSH_BIN
+    const noSsh = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'broker-ssh-')), 'ssh')
+    await fs.writeFile(noSsh, '#!/bin/sh\nif [ "$1" = -G ]; then echo "hostname stage.invalid"; exit 0; fi\nexit 1\n', { mode: 0o755 })
+    process.env.DEVPANEL_SSH_BIN = noSsh
+    const brokerDirs = async () => (await fs.readdir(os.tmpdir())).filter((n) => n.startsWith('dpb-'))
+    try {
+      const engine = await startRun({ playbookId: f.playbookId, issue: { project: 'devpanel-project', id: f.issue.id }, issuePath: f.issuePath, projectPath: f.projectPath,
+        configRoot: f.configRoot, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery })
+      const before = new Set(await brokerDirs())
+      // The chat file becomes a directory before the author's launch: its read under the chat lock fails.
+      engine.hooks.beforeInvoke = async (e) => { if (e.run.participants.implementer?.pendingInvocation) await fs.mkdir(path.join(f.issuePath, 'runs', e.runId, 'chat.jsonl'), { recursive: true }) }
+      await engine.drive().catch(() => {})
+      t.ok('the author\'s runtime was never called', !seen.includes('implementer'), seen.join())
+      t.eq('the run failed for its environment, before the runtime started', [engine.run.failure?.class, /operator instructions could not be attached/.test(engine.run.failure?.message ?? '')], ['environment', true], engine.run.failure?.message)
+      t.eq('no broker directory (token, socket) was left behind', (await brokerDirs()).filter((n) => !before.has(n)), [])
+      await releaseWorkspace(engine)
+    } finally { if (savedSsh === undefined) delete process.env.DEVPANEL_SSH_BIN; else process.env.DEVPANEL_SSH_BIN = savedSsh }
+  }
+
   t.section('5. a database that listens on a socket only: an SSH socket forward per query, after the grant')
   {
     t.eq('the URI keeps credentials, database and options; only the host becomes the socket',

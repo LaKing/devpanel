@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
-import { readLive } from '../server/runtime/store.mjs'
+import { appendLive, clipForDelivery, liveFile, LIVE_PAGE_BYTES, parseLiveQuery, readLive, readLiveView } from '../server/runtime/store.mjs'
 import { engineFixture, cleanupFixtures } from './fakes/fixture.mjs'
 import { startStage } from './browser/stage.mjs'
 
@@ -97,6 +97,89 @@ export default async function (t) {
     t.ok('the retained buffer is capped', r.stdout.length <= 4096, `${r.stdout.length}`)
     t.ok('and holds the END of the stream', r.stdout.trimEnd().endsWith('"result":"final"}'))
     t.ok('the observer saw everything', seen.join('').includes('line 0 ') && seen.join('').includes('line 1999 '))
+  }
+
+  t.section('1d. each forwarded entry names the one before it in the file, holes included')
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'live-prev-'))
+    const sizes = new Map()
+    const prevs = []
+    const put = async (entry) => { const w = await appendLive(dir, 'r', 'inv', entry, sizes, { maxBytes: 300 }); if (w.entry) prevs.push(`${w.entry.seq}<${w.prev}`) }
+    await put({ seq: 1, at: 't', kind: 'spawn', text: 'process 1 started' })
+    await put({ seq: 2, at: 't', kind: 'stdout', text: 'x'.repeat(60) })
+    await put({ seq: 3, at: 't', kind: 'stdout', text: 'y'.repeat(200) })
+    await put({ seq: 4, at: 't', kind: 'stdout', text: 'z' })
+    await put({ seq: 5, at: 't', kind: 'exit', text: 'invocation completed' })
+    t.eq('the capped log 1,2,3,5 forwards prev 0,1,2,3', prevs.join(' '), '1<0 2<1 3<2 5<3')
+    const resumed = await appendLive(dir, 'r', 'inv', { seq: 6, at: 't', kind: 'exit', text: 'again' }, new Map(), { maxBytes: 300 })
+    t.eq('a writer resumed on an existing file reads its last seq first', resumed.prev, 5)
+    await fs.rm(dir, { recursive: true, force: true })
+  }
+
+  t.section('1e. bounded reads: the plain read unchanged, pages and slices within their bound')
+  {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'live-page-'))
+    const file = liveFile(dir, 'r', 'inv')
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    const lines = []
+    for (let i = 1; i <= 1001; i++) lines.push(JSON.stringify({ seq: i, at: 't', kind: 'stdout', text: `"q${'\u0001'.repeat(i % 7)}${i}"` }))
+    const big = 'é'.repeat(800 * 1024) + '"' + 'w'.repeat(700 * 1024)
+    lines.push(JSON.stringify({ seq: 1002, at: 't', kind: 'stdout', text: big, extra: 'k'.repeat(20 * 1024) }))
+    lines.push(JSON.stringify({ seq: 1003, at: 't', kind: 'exit', text: 'done' }))
+    await fs.writeFile(file, lines.join(NL) + NL)
+
+    const legacy = await readLiveView(file, { after: 0 })
+    t.eq('a plain after read is the full suffix, as before', [legacy.entries.length, legacy.next, legacy.legacy], [1003, 1003, true])
+    const legacyTail = await readLiveView(file, { after: 1000 })
+    t.eq('and from a cursor, everything after it', legacyTail.entries.map((e) => e.seq).join(','), '1001,1002,1003')
+
+    // The routes' old cursor parsing, verbatim: Number(after ?? 0), any finite value, else 0.
+    const base = (raw) => { const a = Number(raw ?? 0); return Number.isFinite(a) ? a : 0 }
+    for (const raw of [undefined, '1000.5', '-3', 'abc', '', '1e3', 'Infinity', '7.25']) {
+      t.eq(`after=${raw} is parsed as the routes always did`, parseLiveQuery(raw === undefined ? {} : { after: raw }).after, base(raw))
+    }
+    const fractional = await readLiveView(file, parseLiveQuery({ after: '1001.5' }))
+    t.eq('a fractional cursor returns what follows it, as before', fractional.entries.map((e) => e.seq).join(','), '1002,1003')
+    const beyond = await readLiveView(file, parseLiveQuery({ after: '5000.5' }))
+    t.eq('an empty suffix keeps the given cursor as next', [beyond.entries.length, beyond.next], [0, 5000.5])
+    const negative = await readLiveView(file, parseLiveQuery({ after: '-3' }))
+    t.eq('a negative cursor reads everything, next its last', [negative.entries.length, negative.next], [1003, 1003])
+    t.eq('a plain read never carries the bounded fields', Object.keys(parseLiveQuery({ after: '2' })).filter((k) => parseLiveQuery({ after: '2' })[k] != null && k !== 'after' && k !== 'offset'), [])
+
+    const bound = (page) => Buffer.byteLength(JSON.stringify(page)) <= LIVE_PAGE_BYTES
+    const pages = []
+    let after = 0
+    for (let n = 0; n < 50; n++) {
+      const page = await readLiveView(file, { after, limit: 1000 })
+      pages.push(page)
+      after = page.next
+      if (!page.more) break
+    }
+    t.ok('every page body fits the byte bound, escaping included', pages.every(bound), pages.map((p) => Buffer.byteLength(JSON.stringify(p))).join(','))
+    t.ok('and holds at most 1000 entries', pages.every((p) => p.entries.length <= 1000))
+    t.eq('paging forward reproduces every seq once, in order', pages.flatMap((p) => p.entries.map((e) => e.seq)).join(','), Array.from({ length: 1003 }, (_, i) => i + 1).join(','))
+    const clipped = pages.flatMap((p) => p.entries).find((e) => e.seq === 1002)
+    t.eq('the oversized entry comes clipped, its large field named', [clipped.sliced.total, clipped.omitted], [big.length, ['extra']])
+    let rebuilt = ''
+    let offset = 0
+    const sliceSizes = []
+    for (let n = 0; n < 50; n++) {
+      const slice = await readLiveView(file, { entry: 1002, offset })
+      sliceSizes.push(Buffer.byteLength(JSON.stringify(slice)))
+      rebuilt += slice.text
+      offset = slice.offset + slice.text.length
+      if (slice.done) break
+    }
+    t.eq('its slices joined are the original text', rebuilt === big, true)
+    t.ok('and each slice fits the bound', sliceSizes.every((n) => n <= LIVE_PAGE_BYTES), sliceSizes.join(','))
+
+    const tail = await readLiveView(file, { tail: 5 })
+    t.eq('tail: the newest entries that fit (the oversized one is left to an earlier read)', [tail.entries.map((e) => e.seq).join(','), tail.earlier, tail.more, tail.last], ['1003', true, false, 1003])
+    const before = await readLiveView(file, { before: 100, limit: 10 })
+    t.eq('before: the entries just before a seq', [before.entries.map((e) => e.seq).join(','), before.earlier, before.first], ['90,91,92,93,94,95,96,97,98,99', true, 90])
+    t.eq('clipForDelivery leaves a small entry as it is', clipForDelivery({ seq: 1, kind: 'stdout', text: 'x' }).sliced, undefined)
+    t.ok('and bounds a large one', Buffer.byteLength(JSON.stringify(clipForDelivery({ seq: 1, kind: 'stdout', text: big }))) <= LIVE_PAGE_BYTES)
+    await fs.rm(dir, { recursive: true, force: true })
   }
 
   // ------------------------------------------------------------ real adapters

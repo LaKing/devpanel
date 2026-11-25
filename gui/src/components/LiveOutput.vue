@@ -1,23 +1,20 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 
-import { api } from '@/api'
 import { formatStep } from '@/format'
-import { socket } from '@/socket'
-import { contiguous, mergeEntries, parseRows } from '@/live-log'
+import { parseRows } from '@/live-log'
+import { useLiveStream } from '@/live-stream'
+import LiveChunkPager from './LiveChunkPager.vue'
 
 /*
  * The runtime's own output for one invocation, as it is written.
  *
- * The backlog comes from the API — it is what the server persisted — and new
- * chunks arrive over the socket only after the server has persisted them, so a
+ * The backlog comes from the API in bounded pages — it is what the server
+ * persisted — and new chunks arrive over the socket only while this viewer is
+ * shown and subscribed to the invocation (live-stream.js, live-follow.js). A
  * browser that opens mid-turn and one that watched from the start see the same
- * bytes. Reconnecting re-reads from the last sequence number rather than
- * trusting a buffer.
- *
- * Every entry carries a sequence number, and the list is keyed by it: a chunk
- * that arrives both as a socket event and inside a backlog page lands once, and
- * a gap is filled by one catch-up request at a time.
+ * bytes; a reconnect catches up from the last committed sequence number.
+ * The window is bounded; earlier output is loaded on demand.
  *
  * Two views of the same bytes: the parsed view turns the runtime's JSON event
  * lines into readable rows (assistant text, tool calls, results); raw shows the
@@ -38,62 +35,27 @@ const props = defineProps({
   stepId: { type: String, default: null }
 })
 
-const entries = ref([])
-const loading = ref(true)
-const error = ref('')
 const raw = ref(false)
 const follow = ref(true)
 const box = ref(null)
-let next = 0
-let loadedFor = null
-let inflight = null
-let inflightTarget = null
-let loadSeq = 0
+const root = ref(null)
 
-function absorb (incoming) {
-  const merged = mergeEntries(entries.value, incoming)
-  entries.value = merged.entries
-  next = merged.next
+const { view, loadEarlier, jumpToLatest, fetchSlice } = useLiveStream({
+  target: () => ({ supervisor: props.supervisor, project: props.project, issueId: props.issueId, runId: props.runId, invocationId: props.invocationId }),
+  live: () => props.live,
+  root,
+  onUpdate: () => scrollToEnd()
+})
+const entries = computed(() => view.value.entries)
+const loading = computed(() => view.value.loading)
+const error = computed(() => view.value.error)
+const sliced = computed(() => entries.value.filter((e) => e.sliced))
+const PARTIAL_SHOWN = 64 * 1024
+
+async function earlier () {
+  follow.value = false
+  await loadEarlier()
 }
-
-/** One catch-up at a time per invocation: a target switch starts a fresh request. */
-function load ({ reset = false } = {}) {
-  const target = props.invocationId
-  if (reset) { entries.value = []; next = 0 }
-  if (inflight && inflightTarget === target) return inflight
-  const seq = ++loadSeq
-  inflightTarget = target
-  const promise = (async () => {
-    try {
-      const page = props.supervisor ? await api.supervisorLive(target, next) : await api.liveOutput(props.project, props.issueId, props.runId, target, next)
-      if (seq !== loadSeq || target !== props.invocationId) return
-      absorb(page.entries)
-      error.value = ''
-    } catch (e) {
-      if (seq === loadSeq && target === props.invocationId) error.value = e.message
-    } finally {
-      if (inflight === promise) { inflight = null; inflightTarget = null }
-      if (seq === loadSeq && target === props.invocationId) {
-        loading.value = false
-        scrollToEnd()
-      }
-    }
-  })()
-  inflight = promise
-  return promise
-}
-
-function onRunEvent (event) {
-  if (event?.type !== 'live' || event.invocationId !== props.invocationId || (!props.supervisor && event.runId !== props.runId)) return
-  const entry = event.entry
-  if (!entry || entry.seq <= next) return
-  absorb([entry])
-  // A gap means a missed event: catch up from the server rather than guessing.
-  if (!contiguous(entries.value)) load()
-  scrollToEnd()
-}
-
-const onReconnect = () => load()
 
 function scrollToEnd () {
   if (!follow.value) return
@@ -107,25 +69,16 @@ function onScroll () {
   follow.value = el.scrollHeight - el.scrollTop - el.clientHeight < 24
 }
 
-onMounted(() => {
-  loadedFor = props.invocationId
-  load({ reset: true })
-  socket.on(props.supervisor ? 'supervisor:live' : 'run:event', onRunEvent)
-  socket.on('connect', onReconnect)
-})
-onUnmounted(() => {
-  socket.off(props.supervisor ? 'supervisor:live' : 'run:event', onRunEvent)
-  socket.off('connect', onReconnect)
-})
-watch(() => props.invocationId, (id) => { if (id !== loadedFor) { loadedFor = id; loading.value = true; load({ reset: true }) } })
+watch(() => props.invocationId, () => { follow.value = true })
 
-const rows = computed(() => parseRows(entries.value))
+// The trailing unfinished line is shown clipped: a stream with no newline cannot grow a row without bound.
+const rows = computed(() => parseRows(entries.value).map((r) => (r.partial && r.text.length > PARTIAL_SHOWN ? { ...r, text: r.text.slice(-PARTIAL_SHOWN) } : r)))
 const clockTime = (iso) => (iso ? iso.slice(11, 19) : '')
 const LABEL = { text: 'says', tool: 'tool', result: 'result', error: 'error', thinking: 'thinks', system: 'sys', done: 'done', stdout: 'out', stderr: 'err', spawn: 'spawn', exit: 'exit', truncated: 'cap' }
 </script>
 
 <template>
-  <div class="live">
+  <div ref="root" class="live">
     <header class="live__head">
       <span class="live__title">
         <v-progress-circular v-if="live" indeterminate size="12" width="2" class="mr-2" />
@@ -134,7 +87,9 @@ const LABEL = { text: 'says', tool: 'tool', result: 'result', error: 'error', th
         <span v-if="stepId" class="live__dim">Step: {{ formatStep(stepId, role) }}</span>
       </span>
       <span class="live__controls">
-        <span class="live__dim">{{ entries.length }} chunks<template v-if="!follow && live"> · paused (scroll to bottom to follow)</template></span>
+        <span class="live__dim">{{ entries.length }} chunks<template v-if="!follow && live"> · paused (scroll to bottom to follow)</template><template v-if="view.polling"> · polling</template></span>
+        <v-btn v-if="view.earlier" size="x-small" variant="text" @click="earlier">Load earlier</v-btn>
+        <v-btn v-if="view.detached" size="x-small" variant="text" @click="jumpToLatest">Jump to latest</v-btn>
         <v-btn-toggle v-model="raw" density="compact" variant="outlined" divided mandatory class="live__toggle">
           <v-btn :value="false" size="x-small">parsed</v-btn>
           <v-btn :value="true" size="x-small">raw</v-btn>
@@ -167,6 +122,7 @@ const LABEL = { text: 'says', tool: 'tool', result: 'result', error: 'error', th
         </div>
       </template>
     </div>
+    <LiveChunkPager :entries="sliced" :fetch-slice="fetchSlice" :invocation-id="invocationId" />
   </div>
 </template>
 
