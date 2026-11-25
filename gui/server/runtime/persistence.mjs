@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
 
 // Atomic visibility and acknowledged durability are separate guarantees.
 // Callers that update shared state must also lock the whole read/modify/write.
@@ -65,5 +66,19 @@ export function persistence (io = fs) {
   return { writeAtomic, writeExclusive, appendDurable, syncDir }
 }
 export const { writeAtomic, writeExclusive, appendDurable, syncDir } = persistence()
+/**
+ * A file's contents through one handle opened O_NONBLOCK and checked to be a regular file before
+ * anything is read: a FIFO or a device in a record's place never blocks the reader, it fails with
+ * code ENOTREG. ENOENT, EACCES and the rest are thrown as fs throws them.
+ */
+export async function readRegularFile (file, encoding = null) {
+  const handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)
+  try {
+    if (!(await handle.stat()).isFile()) throw Object.assign(new Error(`${file} is not a regular file`), { code: 'ENOTREG' })
+    return await handle.readFile(encoding ? { encoding } : undefined)
+  } finally {
+    await handle.close().catch(() => {})
+  }
+}
 export const writeJson = (file, value, options) => writeAtomic(file, JSON.stringify(value, null, 2) + '\n', options)
 export const writeJsonExclusive = (file, value, options) => writeExclusive(file, JSON.stringify(value, null, 2) + '\n', options)

@@ -96,6 +96,17 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
     return res.blob()
   },
+  // The start preview's link (server/runtime/retained-work.mjs): a blob, so the token stays in the header.
+  // A 409 carries `code` (stale, unprovable, changed, …): the message names it.
+  async downloadRetainedPatch (project, id, runId, { artifact, revision }) {
+    const res = await fetch(`/api/projects/${enc(project)}/issues/${enc(id)}/runs/${enc(runId)}/retained-patch?artifact=${enc(artifact)}&revision=${enc(revision)}`, { headers: authHeaders() })
+    if (res.status === 401) { markRejected(); throw new Error('unauthorised') }
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error ? `${body.code ? `${body.code}: ` : ''}${body.error}` : `${res.status} ${res.statusText}`)
+    }
+    return res.blob()
+  },
   restoreIssue: (project, id) => request(`/api/projects/${enc(project)}/issues/${enc(id)}/restore`, { method: 'POST' }),
 
   createIssue: (project, payload) => request(`/api/projects/${enc(project)}/issues`, {

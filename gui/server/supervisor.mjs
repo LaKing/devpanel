@@ -602,7 +602,7 @@ export function createSupervisor ({
     if (!read) return null
     const { pool } = read
     const held = (await readPoolLocks(pool.id, { platform })).map((l) => ({ ...l, owner: pool.modules.get(l.module)?.owner ?? null }))
-    const issue = issueId ? await issues.getIssue(project, issueId).catch(() => null) : null
+    const issue = issueId ? await issues.getIssue(project, issueId, { settle: false }).catch(() => null) : null
     const expected = issue?.sizing?.affectedModules ?? []
     return {
       pool: pool.id,
@@ -624,7 +624,7 @@ export function createSupervisor ({
   async function modulesCoverage ({ project, projectPath = null, issueId = null, issuePath = null, target }) {
     if (!isModulesTarget(target) || !target?.modules) return null
     try {
-      const issue = issueId ? await issues.getIssue(project, issueId).catch(() => null) : null
+      const issue = issueId ? await issues.getIssue(project, issueId, { settle: false }).catch(() => null) : null
       const input = await coverageInput({ issuePath: issuePath ?? issue?.path ?? null, target, projectPath })
       return coverageReading({ target, triage: issue?.sizing?.affectedModules ?? [], input })
     } catch (error) {

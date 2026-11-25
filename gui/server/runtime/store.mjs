@@ -1,5 +1,6 @@
 import { legacyJournalDisposition } from './legacy-journal.mjs'
-import { writeJson, writeJsonExclusive, appendDurable } from './persistence.mjs'
+import { writeJson, writeJsonExclusive, appendDurable, readRegularFile } from './persistence.mjs'
+import { constants as fsConstants } from 'node:fs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -34,7 +35,8 @@ export const runDir = (issuePath, runId) => {
   return path.join(runsDir(issuePath), runId)
 }
 
-const readJson = async (file) => JSON.parse(await fs.readFile(file, 'utf8'))
+// Every record the store reads (run.json, the snapshot, outputs, baselines) through a non-blocking regular-file read.
+const readJson = async (file) => JSON.parse(await readRegularFile(file, 'utf8'))
 
 /**
  * Freeze the configuration a run executes, embedding the actual prompt bytes.
@@ -173,6 +175,19 @@ export function journalOverlay (run, journal) {
     run.recovery = { ...run.recovery, required: true, reason: journal.message,
       detectedAt: (run.recovery?.required ? run.recovery?.detectedAt : null) ?? journal.finding?.detectedAt ?? null }
   }
+  return run
+}
+/**
+ * readRun for a reader that must write nothing (the start preview, its patch download): the
+ * journal is judged by inspectJournalReadOnly, so damage is reported, never persisted as a
+ * recovery finding. A journal that is not clean reads as recovery required, as readRun reads damage.
+ */
+export async function readRunReadOnly (issuePath, runId) {
+  const run = await readJson(path.join(runDir(issuePath, runId), 'run.json'))
+  if (run.pause && !run.pause.id) run.pause.id = 'legacy-' + crypto.createHash('sha256').update(JSON.stringify([runId, run.pause])).digest('hex')
+  const verdict = await inspectJournalReadOnly(issuePath, runId)
+  run.journal = { complete: verdict.clean, readOnly: true, reason: verdict.reason }
+  if (!verdict.clean && verdict.reason !== 'legacy journal retired' && !run.abandonment) run.recovery = { ...run.recovery, required: true, reason: verdict.reason }
   return run
 }
 
@@ -425,9 +440,11 @@ export async function appendEvent (issuePath, runId, event, { clock = systemCloc
 /** The whole journal through one handle, with the identity it had while read (null if it moved). */
 async function readJournal (file) {
   let handle
-  try { handle = await fs.open(file, 'r') } catch (error) { return { error } }
+  try { handle = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK) } catch (error) { return { error } }
   try {
     const s0 = await handle.stat({ bigint: true })
+    // A FIFO or device in the journal's place is unreadable, never waited on.
+    if (!s0.isFile()) return { error: Object.assign(new Error('the event journal is not a regular file'), { code: 'ENOTREG' }) }
     const bytes = await handle.readFile()
     const s1 = await handle.stat({ bigint: true })
     return { bytes, stat: sameIdentity(s0, s1) && s1.size === BigInt(bytes.length) ? s1 : null }

@@ -30,7 +30,7 @@ import { GIT_OUTPUT_LIMIT, classifyUntracked, describeBlocking, gitRead, include
 import { runProcess } from './process.mjs'
 import { applyToSource, sourceTarget, bindSourceOwners } from './source-delivery.mjs'
 import { holdSnapshotLocks } from './source-lock.mjs'
-import { carryForward } from './carry-forward.mjs'
+import { carryForward, seedApplies } from './carry-forward.mjs'
 import { publishCandidate } from './publication.mjs'
 
 const run = gitRead
@@ -940,8 +940,8 @@ export async function provisionRun (reservation, {
     const baseline = await baselineOf(workspace.path, { projection: workspaceProjection(workspace) })
     await store.writeBaseline(issuePath, runId, baseline)
     // After the baseline, so a carried-forward patch is part of this candidate.
-    const writes = Object.values(reservation.resolution.resolved.participants ?? {}).some((p) => p.writesCode)
-    if (writes && !staged && workspace.isolation !== 'in-place') {
+    // The same decision the start preview states (carry-forward.mjs seedApplies).
+    if (seedApplies({ participants: reservation.resolution.resolved.participants, isolation: workspace.isolation, stagedRelease: Boolean(staged) }).applies) {
       // The earlier run's base snapshot is in the run's source repository: the
       // panel's Git store when the host keeps one, else the project's.
       const sourceRepository = workspace.repository?.source ?? workspace.source?.repository ?? await promisify(execFile)('git', ['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir']).then((r) => r.stdout.trim(), () => null)

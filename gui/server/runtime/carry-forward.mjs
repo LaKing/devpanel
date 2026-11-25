@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
+import { constants } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { readRun, runsDir, runDir } from './store.mjs'
@@ -33,11 +34,12 @@ const run = (args, { cwd, env = {}, input = null, limit = OUTPUT_LIMIT } = {}) =
 })
 
 /** The latest earlier run of this issue that was approved and never delivered, with its patch. */
-export async function undeliveredApproval (issuePath, runId) {
+/** `readRun`: the start preview passes store.readRunReadOnly, so reading a damaged journal writes nothing. */
+export async function undeliveredApproval (issuePath, runId, { readRun: read = readRun } = {}) {
   const ids = (await fs.readdir(runsDir(issuePath)).catch(() => [])).filter((id) => id !== runId && !id.startsWith('worktree-'))
   const runs = []
   for (const id of ids) {
-    const prior = await readRun(issuePath, id).catch(() => null)
+    const prior = await read(issuePath, id).catch(() => null)
     if (!eligibleSeed(prior)) continue
     const written = (await fs.stat(path.join(runDir(issuePath, id), 'run.json')).catch(() => null))?.mtimeMs ?? 0
     runs.push({ id, prior, written })
@@ -50,6 +52,42 @@ export async function undeliveredApproval (issuePath, runId) {
 const eligibleSeed = (prior) => Boolean(prior) && !['running', 'pending', 'paused'].includes(prior.status) && Boolean(prior.revisions?.length)
 
 /**
+ * Whether a start carries an earlier approved patch forward at all: provisioning
+ * (launch.mjs) and the start preview (retained-work.mjs) both ask this, with the
+ * launch's own inputs, so the preview never states a seed the launch would skip.
+ */
+export function seedApplies ({ participants, isolation, stagedRelease }) {
+  if (!Object.values(participants ?? {}).some((p) => p.writesCode)) return { applies: false, reason: 'writes-no-code' }
+  if (stagedRelease) return { applies: false, reason: 'production-release' }
+  if (isolation === 'in-place') return { applies: false, reason: 'in-place' }
+  return { applies: true, reason: null }
+}
+
+/**
+ * The selected seed patch, read the way provisioning reads it but without ever
+ * blocking: opened O_NONBLOCK (a FIFO with no writer answers at once instead of
+ * hanging the start), checked to be a regular file on the open handle, then read
+ * from that same handle. Links are followed, as readFile did. `probe` stops after
+ * the check (the preview). { state: available|missing|unreadable|empty, code?, size, bytes? }
+ */
+export async function readSeedPatch (file, { probe = false } = {}) {
+  let handle
+  try {
+    handle = await fs.open(file, constants.O_RDONLY | constants.O_NONBLOCK)
+    const st = await handle.stat()
+    if (!st.isFile()) return { state: 'unreadable', code: 'not-regular', size: null }
+    if (st.size === 0) return { state: 'empty', size: 0 }
+    if (probe) return { state: 'available', size: st.size }
+    const bytes = await handle.readFile()
+    return bytes.length ? { state: 'available', size: bytes.length, bytes } : { state: 'empty', size: 0 }
+  } catch (error) {
+    return { state: error.code === 'ENOENT' ? 'missing' : 'unreadable', code: error.code ?? 'error', size: null }
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
+/**
  * Of an issue's runs ({ id, prior: run record, written: run.json mtime }), the one
  * the next run would be seeded from, as undeliveredApproval says. Pure: the
  * retirement of refs (ref-retention.mjs) feeds it its own strict inventory.
@@ -60,6 +98,10 @@ export function selectUndeliveredApproval (issuePath, runs) {
     .sort((a, b) => a.order[0].localeCompare(b.order[0]) || a.order[1] - b.order[1]).at(-1)
   if (!latest) return null
   const { id, prior } = latest
+  // Its patch a person landed (run.landed) or applied afterwards (a verified
+  // artifactApplication): delivered, as run-result.mjs reads it. It still is the
+  // latest work, so nothing older is seeded in its place, and nothing is applied twice.
+  if (prior.landed || prior.artifactApplication?.verified === true) return null
   const c = prior.closure?.conditions
   const approved = c?.sameRevisionApproval && c.checksSatisfied && c.noOutstandingBlockingFindings && c.deliveryCompleted === false
   // A delivery return took the approved revision back to the author and the run
@@ -83,7 +125,7 @@ const conflictedPaths = (stderr) => [...stderr.matchAll(/Applied patch to '([^']
 export async function carryForward ({ issuePath, runId, workspace, sourceRepository, outputLimit: limit = OUTPUT_LIMIT }) {
   const source = await undeliveredApproval(issuePath, runId)
   if (!source) return null
-  const patch = await fs.readFile(source.patch).catch(() => null)
+  const patch = (await readSeedPatch(source.patch)).bytes ?? null
   const copy = path.join(workspace.scratchPath ?? runDir(issuePath, runId), 'carried-forward.patch')
   const seed = { fromRun: source.runId, revision: source.revision, reason: source.reason, patch: copy, state: 'context-only', conflicts: [], error: null }
   if (!patch?.length) return { ...seed, error: 'the approved patch could not be read' }

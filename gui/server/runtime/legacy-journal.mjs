@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { withLock } from './lock.mjs'
-import { writeJson } from './persistence.mjs'
+import { writeJson, readRegularFile } from './persistence.mjs'
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex')
 const dispositionName = 'legacy-journal-disposition.json'
 
@@ -36,7 +36,7 @@ async function evidence (dir) {
 export async function legacyJournalDisposition (issuePath, runId) {
   const dir=path.join(issuePath,'runs',runId)
   let record
-  try { record=JSON.parse(await fs.readFile(path.join(dir,dispositionName),'utf8')) } catch(e) { if(e.code==='ENOENT')return null; throw e }
+  try { record=JSON.parse(await readRegularFile(path.join(dir,dispositionName),'utf8')) } catch(e) { if(e.code==='ENOENT')return null; throw e }
   if (record.kind !== 'retired-pre-execution-failure' || !record.reason || JSON.stringify(await evidence(dir)) !== JSON.stringify(record.hashes)) throw new Error('Legacy retirement evidence changed; recovery required')
   return record
 }

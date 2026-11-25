@@ -1,6 +1,6 @@
 import { issuesRoot, listProjectDirs, projectLabel, projectPath as projectSourceDir, projectsRoot, resolveProjectPath } from './project-path.mjs'
 import { withStepReservation } from './step-allocation.mjs'
-import { writeAtomic, writeJson } from './runtime/persistence.mjs'
+import { writeAtomic, writeJson, readRegularFile } from './runtime/persistence.mjs'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
@@ -153,7 +153,7 @@ async function readIssue (project, dirName) {
 
   let meta = {}
   try {
-    meta = JSON.parse(await fs.readFile(path.join(dir, META_FILE), 'utf8'))
+    meta = JSON.parse(await readRegularFile(path.join(dir, META_FILE), 'utf8'))
   } catch {
     meta = {}
   }
@@ -282,7 +282,8 @@ async function runSummaries (dir, unreadable = []) {
     const cached = summaryCache.get(file)
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.accepted === accepted && journalSig && cached.journalSig === journalSig) { out.push(cached.summary); continue }
     let run
-    try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch (error) {
+    // Non-blocking, regular files only (the start preview reads the issue through here): a FIFO is unreadable.
+    try { run = JSON.parse(await readRegularFile(file, 'utf8')) } catch (error) {
       if (error.code !== 'ENOENT') unreadable.push(runId)
       continue
     }
@@ -295,7 +296,7 @@ async function runSummaries (dir, unreadable = []) {
       const last = run.steps?.at?.(-1)
       const outputs = {}
       if (last) {
-        try { outputs[last.number] = JSON.parse(await fs.readFile(path.join(dir, 'runs', runId, 'outputs', `${last.number}.json`), 'utf8')) } catch { /* no output */ }
+        try { outputs[last.number] = JSON.parse(await readRegularFile(path.join(dir, 'runs', runId, 'outputs', `${last.number}.json`), 'utf8')) } catch { /* no output */ }
       }
       const disposition = runResult(run, outputs)
       const summary = {
@@ -941,7 +942,8 @@ async function stepOwners (dir) {
     let cached = ownerCache.get(file)
     if (!cached || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) {
       let run
-      try { run = JSON.parse(await fs.readFile(file, 'utf8')) } catch { continue }
+      // Non-blocking, regular files only: the start preview reads the issue through here, and a FIFO is skipped.
+      try { run = JSON.parse(await readRegularFile(file, 'utf8')) } catch { continue }
       const playbook = run.playbook?.title ?? run.playbook?.id ?? null
       cached = { mtimeMs: stat.mtimeMs, size: stat.size, runId, playbook, startedAt: run.startedAt ?? null,
         steps: (run.steps ?? []).map((st) => [String(st.number).padStart(3, '0'), st.role ?? null]) }
@@ -951,7 +953,7 @@ async function stepOwners (dir) {
     for (const [number, role] of cached.steps) owners.set(number, { runId, playbook: cached.playbook, startedAt: cached.startedAt, role, kind: role === 'operator' ? 'answer' : 'turn' })
   }
   let reservations = []
-  try { reservations = JSON.parse(await fs.readFile(path.join(dir, '.step-reservations.json'), 'utf8')) } catch { /* none */ }
+  try { reservations = JSON.parse(await readRegularFile(path.join(dir, '.step-reservations.json'), 'utf8')) } catch { /* none */ }
   for (const r of Array.isArray(reservations) ? reservations : []) {
     const m = /^run-result:(.+)$/.exec(r?.invocationId ?? '')
     if (!m) continue
@@ -1022,8 +1024,12 @@ export async function ensureRunHome (project, date, report) {
   return getRunHome(project, id)
 }
 
-/** One issue with its steps, or a 404. */
-export async function getIssue (project, id) {
+/**
+ * One issue with its steps, or a 404. `settle: false` reads without rerunning a pending repeat lookup, so the
+ * call writes nothing: the start preview and its readings use it; the issue page keeps settling on read.
+ */
+export async function getIssue (project, id, { settle = true } = {}) {
+  const settleRepeatLookup = settle ? settleRepeatLookupOf : (_project, issue) => issue
   try { await issueDir(project, id) } catch (error) {
     // Archived issues are packed out of the project folder; they are read from
     // their summary (issue-bundle.mjs) until restored.
@@ -1037,7 +1043,7 @@ export async function getIssue (project, id) {
 }
 
 /** A pending repeat lookup is rerun on read, in whatever state the issue is; its outcome is read back. */
-async function settleRepeatLookup (project, issue) {
+async function settleRepeatLookupOf (project, issue) {
   if (!issue.repeatLookup) return issue
   await completePendingLookup({ issuesDir: ISSUES_DIR, project, id: issue.id, record: issue })
   return { ...issue, ...await repeatOutcome(ISSUES_DIR, project, issue.id, issue) }

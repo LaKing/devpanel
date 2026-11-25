@@ -3,7 +3,8 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { startRun, worktreeDiffDelivery, releaseOwnership } from '../server/runtime/launch.mjs'
-import { carryForward, carryForwardBrief } from '../server/runtime/carry-forward.mjs'
+import { carryForward, carryForwardBrief, seedApplies, undeliveredApproval } from '../server/runtime/carry-forward.mjs'
+import crypto from 'node:crypto'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { engineFixture, scriptFor } from './fakes/fixture.mjs'
 
@@ -97,5 +98,33 @@ export default async function (t) {
     const unlimited = await carry({})
     t.eq('under the stated limit the same tree merges as before', [unlimited?.state, unlimited?.error], ['conflicts', null])
     await releaseOwnership(two, { reason: 'test' }).catch(() => {})
+  }
+
+  t.section('a FIFO in place of the approved patch: launch answers context-only at once instead of hanging (AC8)')
+  {
+    const { f, one, start } = await setup()
+    const artifact = path.join(f.issuePath, 'runs', one.runId, one.run.delivery.artifactRef)
+    t.eq('the delivery records the digest of the bytes it verified', one.run.delivery.patchHash, 'sha256:' + crypto.createHash('sha256').update(await fs.readFile(artifact)).digest('hex'))
+    const selected = await undeliveredApproval(f.issuePath, null)
+    t.eq('the selector names run 1', selected?.runId, one.runId)
+    await fs.rm(artifact)
+    if (!await exec('mkfifo', [artifact]).then(() => true, () => false)) t.skip('FIFO seed', 'mkfifo could not run here')
+    else {
+      const two = await Promise.race([start(), new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000))])
+      t.ok('provisioning finished', two !== 'timeout')
+      t.eq('the seed is context-only, with the existing wording', [two.run?.workspace.seed?.state, two.run?.workspace.seed?.error], ['context-only', 'the approved patch could not be read'])
+      t.eq('the worktree holds the source, not the patch', await fs.readFile(path.join(two.run.workspace.path, 'server.mjs'), 'utf8'), 'console.log("Hello Other world")')
+      await releaseOwnership(two, { reason: 'test' }).catch(() => {})
+    }
+  }
+
+  t.section('seedApplies: the one decision provisioning and the start preview share (AC5)')
+  {
+    const writer = { implementer: { writesCode: true } }
+    const reader = { analyst: { writesCode: false } }
+    t.eq('a writing playbook in an isolated worktree seeds', seedApplies({ participants: writer, isolation: 'worktree', stagedRelease: false }), { applies: true, reason: null })
+    t.eq('no seat writes code', seedApplies({ participants: reader, isolation: 'worktree', stagedRelease: false }), { applies: false, reason: 'writes-no-code' })
+    t.eq('a production release from a staged archive', seedApplies({ participants: writer, isolation: 'worktree', stagedRelease: true }), { applies: false, reason: 'production-release' })
+    t.eq('in place', seedApplies({ participants: writer, isolation: 'in-place', stagedRelease: false }), { applies: false, reason: 'in-place' })
   }
 }

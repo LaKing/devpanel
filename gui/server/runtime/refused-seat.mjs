@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { readRegularFile } from './persistence.mjs'
 
 /*
  * Did the issue's latest run record a provider refusal, and would this start put
@@ -29,7 +30,8 @@ export async function latestRefusal (issuePath) {
   names.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
   for (const name of names) {
     let text
-    try { text = await fs.readFile(path.join(runsDir, name, 'run.json'), 'utf8') } catch (error) {
+    // Non-blocking and regular files only: a FIFO in run.json's place is unreadable (ENOTREG), never waited on.
+    try { text = await readRegularFile(path.join(runsDir, name, 'run.json'), 'utf8') } catch (error) {
       if (error.code === 'ENOENT') continue   // a half-written directory is not a run
       return null                             // the newest run cannot be read: say nothing
     }

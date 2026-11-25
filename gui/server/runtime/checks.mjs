@@ -121,7 +121,13 @@ export async function runChecks ({
     if (prepared) await fs.cp(prepared.tree, rebuilt, { recursive: true, verbatimSymlinks: true })
     else {
       if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
-      else patch = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
+      else {
+        const built = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
+        patch = built.file
+        // The digest deliver() took of the bytes it wrote and verified, kept with the record so a later
+        // reader can prove the retained artifact is those bytes (retained-work.mjs).
+        result.artifact = { ref: path.relative(runDir, built.file), patchHash: built.patchHash ?? null }
+      }
       await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
     }
     let check = await fingerprint(rebuilt, prepared ? { clock } : { baseCommit, baseline, clock })
@@ -355,7 +361,7 @@ async function buildPatch ({ workspacePath, baseCommit, baseline, fingerprint: f
   if (receipt.reconstruction && receipt.reconstruction.verified !== true) {
     throw new Error(`the candidate's patch does not reconstruct: ${receipt.reconstruction.detail ?? 'unverified'}`)
   }
-  return path.join(dir, receipt.artifactRef)
+  return { file: path.join(dir, receipt.artifactRef), patchHash: receipt.patchHash ?? null }
 }
 
 async function nextIndex (checksDir) {

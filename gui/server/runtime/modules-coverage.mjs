@@ -3,6 +3,7 @@ import path from 'node:path'
 import { affectedModules, driveFilters, isModulesTarget } from './modules-tier.mjs'
 import { planPaths, revisionPaths } from './path-overlap.mjs'
 import { priorRuns } from './prior-runs.mjs'
+import { readRunReadOnly } from './store.mjs'
 
 /*
  * What the modules tier would test, read before a start (preview and readiness).
@@ -49,11 +50,13 @@ export async function coverageInput ({ issuePath, target, projectPath = null }) 
   const incomplete = []
   if (!issuePath) return { known: false, incomplete }
   const collections = target?.modules?.collections
-  for (const run of (await priorRuns(issuePath, null)).reverse()) {
+  // Read-only (readRunReadOnly): the start preview reads earlier runs through here and writes nothing.
+  for (const run of (await priorRuns(issuePath, null, { readRun: readRunReadOnly })).reverse()) {
+   try {
     // An earlier drive of this run that tested nothing: a note beside the reading, never its proof.
-    const empty = (run.checkHistory ?? []).findLast((h) => h.tier === 'modules' && h.modules?.tests === 0)
+    const empty = (Array.isArray(run.checkHistory) ? run.checkHistory : []).findLast((h) => h?.tier === 'modules' && h.modules?.tests === 0)
     const earlierDrive = empty ? { earlierDrive: { run: run.runId, revision: empty.revision ?? null, at: empty.at ?? null } } : {}
-    const latest = run.revisions?.at(-1)
+    const latest = Array.isArray(run.revisions) ? run.revisions.at(-1) : null
     if (latest?.affectedModules && sameCollections(latest.modules?.collections, collections)) {
       return { known: true, source: 'recorded-revision', fromRun: run.runId, revision: latest.fingerprint ?? null, affected: latest.affectedModules, incomplete, ...earlierDrive }
     }
@@ -61,6 +64,10 @@ export async function coverageInput ({ issuePath, target, projectPath = null }) 
     if (revision.length) return { known: true, source: 'previous-revision', fromRun: run.runId, revision: latest?.fingerprint ?? null, paths: revision, incomplete, ...earlierDrive }
     const plan = (await planPaths(issuePath, run, incomplete)).map((p) => relative(projectPath, p)).filter(Boolean)
     if (plan.length) return { known: true, source: 'plan', fromRun: run.runId, paths: plan, incomplete, ...earlierDrive }
+   } catch (error) {
+    // One run's malformed record is a gap in the reading, not the end of it.
+    incomplete.push(`run ${run.runId} could not be read: ${error.message}`)
+   }
   }
   return { known: false, incomplete }
 }

@@ -236,6 +236,8 @@ export const isModulesTarget = (target) => target?.tier === 'modules' || Boolean
  * a revision every occupied reviewer approved or whose every substantial finding
  * awaits the check. Null for any other target. What the engine and every report read.
  */
+/** Why a Boilerplate project's per-revision modules check cannot run: it declares no testDrive.modules (engine recordUndeclaredModules, the start preview). */
+export const undeclaredModulesReason = (project) => `${project ?? 'this project'} declares no testDrive.modules: the modules tier, the per-revision check of coding playbooks on a Boilerplate project, has nothing to run (docs/project-infrastructure.md "The modules tier"). The smoke and full tiers are not run per revision by coding playbooks.`
 export const modulesTiming = (target) => isModulesTarget(target) ? (target.modules?.timing ?? target.timing ?? 'every-revision') : null
 
 /**

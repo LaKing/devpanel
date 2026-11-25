@@ -4,6 +4,7 @@ import { evaluate } from './engine.mjs'
 import { locksModules } from './module-locks.mjs'
 import { modulesTiming } from './modules-tier.mjs'
 import { latestRefusal, refusedSeatPrerequisite } from './refused-seat.mjs'
+import { retainedWork as readRetainedWork, checksOutlook } from './retained-work.mjs'
 
 /*
  * Dry-run preview.
@@ -86,8 +87,9 @@ function indexSteps (phases) {
  * @param pathOverlap  optional ({ deliveryAction }) => the reading of runtime/path-overlap.mjs; read-only, and without it a preview reads configuration alone
  * @param modulesCoverage  optional (target) => the reading of runtime/modules-coverage.mjs: what the modules tier would test
  * @param refusedSeat  optional () => the issue's latest recorded refusal (runtime/refused-seat.mjs); read from issue.path by default
+ * @param retainedWork optional ({ resolved, coverage }) => what a follow-up start would build on (runtime/retained-work.mjs); read from issue.path by default
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null, refusedSeat = issue?.path ? () => latestRefusal(issue.path) : null } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null, refusedSeat = issue?.path ? () => latestRefusal(issue.path) : null, retainedWork = issue?.path ? (args) => readRetainedWork({ issuePath: issue.path, ...args }) : null } = {}) {
   // A production release with no named releaseId is filled from the issues
   // (release-selection.mjs selectStagedRelease), the same way the start fills it.
   const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
@@ -241,6 +243,9 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   const refusal = refusedSeat ? await Promise.resolve().then(refusedSeat).catch(() => null) : null
   const refused = refusedSeatPrerequisite(refusal, r.participants)
   if (refused) prerequisites.push(refused)
+  // What a follow-up start would build on (retained-work.mjs): information only, it never makes the
+  // configuration unready, and it reads, never writes. A failure to read it is said, not hidden.
+  const retained = retainedWork ? await Promise.resolve().then(() => retainedWork({ resolved: r, coverage, projectId: project?.id ?? issue?.project ?? null })).catch((error) => ({ state: 'unavailable', detail: error.message })) : null
   prerequisites.push({
     kind: 'not-probed',
     category: 'information',
@@ -264,6 +269,8 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     checks: r.checks,
     // When the modules tier drives (every-revision beside the reviews, or approved), null for any other target.
     modulesTiming: modulesTiming(r.checks.target),
+    // Whether checks run for this start, and their timing only when they do (retained-work.mjs checksOutlook).
+    checksOutlook: checksOutlook(r, coverage, project?.id ?? issue?.project ?? null),
     infrastructure: r.infrastructure,
     autoClose: r.autoClose,
     delivery: { ...r.completion.delivery, destination: r.completion.delivery.action === 'apply-to-source' ? project?.path ?? null : null },
@@ -276,6 +283,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     ...(overlap ? { pathOverlap: overlap } : {}),
     ...(locks ? { moduleLocks: locks } : {}),
     ...(coverage ? { modulesCoverage: coverage } : {}),
+    ...(retained ? { retainedWork: retained } : {}),
     configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
     liveEligible: r.liveExecution.eligible
   }

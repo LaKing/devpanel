@@ -56,8 +56,10 @@ import { triageAgreement } from './decisions/triage-shadow.mjs'
 import { installLogging } from './logging.mjs'
 import { LockHeld } from './runtime/lock.mjs'
 import { integrateRun, integrationTarget, reconcileIntegration, runLocked } from './runtime/integrate.mjs'
-import { applyRunArtifact, approvedCheckPatch, retainedPatch } from './runtime/apply-artifact.mjs'
+import { applyRunArtifact, approvedCheckPatch, retainedPatch, retainedPatchDownload } from './runtime/apply-artifact.mjs'
 import { checkPatch } from './runtime/patch-check.mjs'
+import { undeliveredApproval } from './runtime/carry-forward.mjs'
+import { readRunReadOnly } from './runtime/store.mjs'
 import { availabilityReport } from './availability-api.mjs'
 import { createModelPerformanceService } from './model-performance.mjs'
 import { devOrigins } from './dev-origins.mjs'
@@ -406,6 +408,20 @@ app.get('/api/projects/:project/issues/:id/runs/:runId/patch', route(async (req,
   res.download(file)
 }))
 
+// The start preview's patch link (runtime/retained-work.mjs): an earlier run's original patch for one
+// revision, served only when the bytes read once hash to the digest the runtime recorded for them,
+// and those same bytes are sent. 409 with `code` (stale, unprovable, changed, missing, unreadable,
+// tooLarge) otherwise; /patch above is unchanged.
+app.get('/api/projects/:project/issues/:id/runs/:runId/retained-patch', route(async (req, res) => {
+  const { project, id, runId } = req.params
+  const issue = await unpackedIssue(project, id)
+  const found = await retainedPatchDownload({ issuePath: issue.path, runId, artifact: String(req.query.artifact ?? ''), revision: String(req.query.revision ?? ''),
+    cap: MAX_FILE_BYTES, selectSeed: () => undeliveredApproval(issue.path, null, { readRun: readRunReadOnly }) })
+  res.attachment(found.filename)
+  res.set({ 'Content-Type': 'application/octet-stream', 'X-Devpanel-Patch-Revision': found.revision, 'X-Devpanel-Patch-Sha256': found.sha256 })
+  res.send(found.bytes)
+}))
+
 // Read-only, asked each time the issue page shows the run: would the patch apply to the checkout now?
 app.get('/api/projects/:project/issues/:id/runs/:runId/patch-check', route(async (req, res) => {
   const { project, id, runId } = req.params
@@ -706,7 +722,8 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
   let issue = null
   let projectRef = null
   if (project && issueId) {
-    const found = await getIssue(project, issueId)
+    // Read without settling a pending repeat lookup: the preview writes nothing.
+    const found = await getIssue(project, issueId, { settle: false })
     issue = { name: found.name, openedOn: found.openedOn, path: found.path, project: found.project }
     projectRef = { id: project, path: projectPath(project) }
   }

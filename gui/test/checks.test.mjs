@@ -54,6 +54,8 @@ export default async function (t) {
     t.eq('materialisation verified against the revision', result.materialization.verified, true)
     t.eq('both commands recorded', result.commands.length, 2)
     t.ok('with exit codes', result.commands.every((x) => x.exitCode === 0))
+    const artifactBytes = await fs.readFile(path.join(c.runDir, result.artifact?.ref ?? 'missing'))
+    t.eq('the check artifact\'s digest is on the record, of the bytes it wrote', result.artifact?.patchHash, 'sha256:' + (await import('node:crypto')).createHash('sha256').update(artifactBytes).digest('hex'))
     const digest = await runChecks({
       target: { kind: 'local', commands: [{ id: 'digest', run: 'echo "PASS calculation-view 2"; head -c 5000 /dev/zero | tr "\\0" x' }] },
       revision: c.fp.fingerprint, fingerprint: c.fp, baseCommit: c.ws.baseCommit, baseline: c.baseline, workspacePath: c.ws.path, runDir: c.runDir
@@ -65,8 +67,10 @@ export default async function (t) {
     })
     const liveFile = path.join(c.runDir, 'checks', 'live-copy', 'slow.live')
     let during = ''
-    for (let tries = 0; tries < 100 && !during.includes('first-line'); tries++) { during = await fs.readFile(liveFile, 'utf8').catch(() => ''); if (!during.includes('first-line')) await new Promise((resolve) => setTimeout(resolve, 20)) }
-    const printed = during.slice(during.indexOf('\n\n') + 2)
+    // Wait for the output body, not the command header (which also names first-line).
+    const body = (text) => text.includes('\n\n') ? text.slice(text.indexOf('\n\n') + 2) : ''
+    for (let tries = 0; tries < 100 && !body(during).includes('first-line'); tries++) { during = await fs.readFile(liveFile, 'utf8').catch(() => ''); if (!body(during).includes('first-line')) await new Promise((resolve) => setTimeout(resolve, 20)) }
+    const printed = body(during)
     t.ok('while a command runs, what it printed so far is in its live copy, after its command line', during.startsWith('$ echo first-line') && printed.includes('first-line') && !printed.includes('last-line'), during)
     const slowResult = await slow
     t.eq('the command ends as any other', [slowResult.result, slowResult.commands[0].stdout.trim().split('\n').at(-1)], ['passed', 'last-line'])

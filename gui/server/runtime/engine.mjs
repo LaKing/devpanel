@@ -32,7 +32,7 @@ import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
-import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, modulesTiming, revisionFiles } from './modules-tier.mjs'
+import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, modulesTiming, revisionFiles, undeclaredModulesReason } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, testedNothing, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
 import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
@@ -414,6 +414,82 @@ const isFull = countsForClosure
 // whose reviewer seats are all empty, is checked at once, or nobody would.
 const deferredIn = (snapshot, phase) => checksAfterApproval(snapshot) &&
   Boolean(phase?.loop?.steps?.some((s) => s.output === 'reviewResult' && snapshot.participants?.[s.role]))
+
+/** The steps replay reads: after the latest window reset, superseded ones dropped (Engine#activeSteps). */
+export const activeStepsOf = (run) => {
+  const after = run.windowResetAfter ?? -1
+  return (run.steps ?? []).filter(s => Number(s.number) > Number(after) && !(run.supersededSteps ?? []).includes(s.number))
+}
+
+/**
+ * The reviews the engine ACCEPTED, oldest first, with the prior findings that bound them and the
+ * latest one's round (`group`, one per seat under a tactic). One that is being repaired — a
+ * contradiction, a missing or duplicated disposition — is not evidence of anything yet, however
+ * well-formed its JSON was. Pure: applyReviewOutcomes derives outstanding findings and approvals
+ * from it, and the start preview (retained-work.mjs) reads which review each finding came from.
+ */
+export function acceptedReviews ({ snapshot, run, outputs }) {
+  const policy = snapshot.reviewPolicy
+  const steps = snapshot.tactic ? activeStepsOf(run) : (run.steps ?? [])
+  const prior = priorFindings(steps, outputs, policy)
+  const criteria = criterionIds(steps, outputs)
+  const expectsPrior = (stepId) => (stepSpec(snapshot, stepId)?.context ?? []).includes('findings.plan')
+  const reviews = steps
+    .map((s) => ({ step: s, out: outputs[s.number] }))
+    .filter((x) => x.out?.contract === 'reviewResult' && x.out.valid && !x.step.reconcileNotice)
+    .filter((x) => reviewProblem(x.out.output, policy, priorBefore(prior, x.step.number), expectsPrior(x.step.stepId), criteria) === null)
+  const latest = reviews.at(-1) ?? null
+  const group = latest && snapshot.tactic ? reviews.filter(x => x.step.phase === latest.step.phase && x.step.round === latest.step.round) : latest ? [latest] : []
+  return { prior, reviews, latest, group }
+}
+
+/*
+ * When a resolved playbook checks each recorded revision, phase by phase, as the engine's own
+ * predicates decide it (checksAfterApproval, deferredIn, tiered, modulesApproved): a default and the
+ * exceptions the engine applies to it, each a fixed sentence. A description, never a promise of a
+ * time; whether checks run at all (in place, no target, an undeclared modules tier) is the caller's
+ * to say first (retained-work.mjs checksOutlook).
+ */
+const SCHEDULE_EXCEPTIONS = {
+  // Engine plan: only while no check of the reviewed revision has failed (verdictOfChecks !== 'failed'), outside the last round.
+  'awaits-check-early': ({ tieredTarget }) => `A revision is also checked before approval when every substantial finding of its round awaits the check, unless a check of that revision already failed${tieredTarget ? ' (a failed smoke gets no full drive here; only the last allowed round drives it)' : ''}.`,
+  'last-round-drive': () => 'In the last allowed round, a revision is also checked when any finding awaits the check. When every substantial finding of that round awaits it and the drive does not fail, the seats that raised them review again in the same round; with other blocking findings beside them there is no re-review, and the next round\'s brief carries the result.',
+  'targeted-on-repair': () => 'A repair revision whose failing tests the previous drive or an open finding names runs the targeted tier instead of the smoke; it never counts for closure.',
+  // The modules branch (checkCandidate) passes no earlier revisions, so only its own two skips apply there.
+  'retry-failed': ({ retries, modules }) => modules
+    // failedInTests and syncFailedForGood are read on the first drive only; retryFailedCheck's loop does not read them again.
+    ? `A failed modules drive is retried up to ${retries} time${retries === 1 ? '' : 's'} on the same revision (a later pass is recorded as flaky). Only the first drive can skip the retries: when its tests ran and failed, or the stage reported its dependency install failed, nothing is retried; once a retry has started, a failing retry is retried again within the limit, whatever failed.`
+    : `A failed check is retried up to ${retries} time${retries === 1 ? '' : 's'} on the same revision (a later pass is recorded as flaky), unless an earlier revision of the run already failed the same way.`,
+  'no-retry': () => 'A failed check is not retried (retryFailed: 0).',
+  'environmental-retry': () => 'A drive another run\'s stage change stopped (environmental) runs once more, whatever the retry setting says.'
+}
+/** Checks beside reviews unless the strategy keeps them first (Engine#concurrentChecks, `checks.concurrent: false`). */
+const checksConcurrent = (snapshot) => snapshot.checks?.concurrent !== false && snapshot.reviewPolicy?.concurrentReviews !== false
+export function checkSchedule (snapshot) {
+  const target = snapshot.checks?.target
+  if (!target) return []
+  const modules = isModulesTarget(target)
+  const retries = Number.isInteger(target.retryFailed) ? target.retryFailed : 1
+  const concurrent = checksConcurrent(snapshot)
+  return (snapshot.phases ?? []).filter((phase) => (phase.loop ? phase.loop.steps : [phase.step]).some((s) => s?.recordsRevision)).map((phase) => {
+    const deferred = deferredIn(snapshot, phase)
+    const tieredTarget = tiered(snapshot)
+    const reviewed = (phase.loop?.steps ?? []).some((s) => s.output === 'reviewResult' && snapshot.participants?.[s.role])
+    const ids = []
+    let fallback
+    if (!deferred) fallback = !reviewed ? 'when-recorded' : concurrent ? 'beside-reviews' : 'before-reviews'
+    else if (tieredTarget) fallback = concurrent ? 'smoke-beside-reviews-full-after-approval' : 'smoke-before-reviews-full-after-approval'
+    else fallback = 'after-approval'
+    if (deferred) {
+      ids.push('awaits-check-early')
+      if (!modules) ids.push('last-round-drive')
+      if (tieredTarget && target.tiers?.targeted) ids.push('targeted-on-repair')
+    }
+    ids.push(retries >= 1 ? 'retry-failed' : 'no-retry')
+    if (modules) ids.push('environmental-retry')
+    return { phase: phase.id, default: fallback, concurrent, retries, exceptions: ids.map((id) => ({ id, sentence: SCHEDULE_EXCEPTIONS[id]({ retries, modules, tieredTarget }) })) }
+  })
+}
 
 const terminal = (reason, outcome = 'unresolved', extra = {}) => ({ kind: 'terminal', reason, outcome, ...extra })
 
@@ -2294,6 +2370,8 @@ export class Engine {
     // what replay needs to know that an earlier round's revision failed.
     this.run.checkHistory ??= []
     this.run.checkHistory.push({ revision: current, ...tierOf, result: result.result, gating: gatingResult(result, this.run), ...(inconclusiveBase(result, this.run) ? { inconclusive: true } : {}), at: this.clock.iso(), step: step?.number ?? null, afterApproval, dir: result.dir,
+      // The check artifact's digest survives a delivery return, which clears checkResults (retained-work.mjs).
+      ...(result.artifact ? { artifact: result.artifact } : {}),
       // Each check run's own interval (the retried attempts too), so check time
       // stays measurable after a later revision drops this from checkResults.
       runs: [...(result.attempts ?? []), result].map((c) => ({ at: c.at, durationMs: c.durationMs })), retryEvidence,
@@ -2387,7 +2465,7 @@ export class Engine {
    */
   async recordUndeclaredModules ({ configured, current, step }) {
     const at = this.clock.iso()
-    const error = `${this.run.issue?.project ?? 'this project'} declares no testDrive.modules: the modules tier, the per-revision check of coding playbooks on a Boilerplate project, has nothing to run (docs/project-infrastructure.md "The modules tier"). The smoke and full tiers are not run per revision by coding playbooks.`
+    const error = undeclaredModulesReason(this.run.issue?.project)
     const result = { revision: current, result: 'unavailable', target: configured.kind ?? null, tier: 'modules', at, durationMs: 0, materialization: null, commands: [], error, dir: null, undeclared: true }
     this.run.checkResults.push({ ...result, step: step?.number ?? null })
     ;(this.run.checkHistory ??= []).push({ revision: current, tier: 'modules', result: 'unavailable', gating: 'unavailable', at, step: step?.number ?? null, afterApproval: this.run.approvals.some((a) => a.revision === current), dir: null, runs: [] })
@@ -4460,7 +4538,7 @@ export class Engine {
 
   /** Checks beside reviews unless the strategy keeps them first (`checks.concurrent: false`). */
   concurrentChecks () {
-    return this.snapshot.checks?.concurrent !== false && this.snapshot.reviewPolicy?.concurrentReviews !== false
+    return checksConcurrent(this.snapshot)
   }
 
   /**
@@ -4579,17 +4657,8 @@ export class Engine {
   /** Apply the consequences of a completed review to run state. */
   applyReviewOutcomes () {
     const policy = this.snapshot.reviewPolicy
-    const prior = priorFindings(this.snapshot.tactic ? this.activeSteps() : this.run.steps, this.outputs, policy)
-    const criteria = criterionIds(this.snapshot.tactic ? this.activeSteps() : this.run.steps, this.outputs)
-    const expectsPrior = (stepId) => (stepSpec(this.snapshot, stepId)?.context ?? []).includes('findings.plan')
-    // Only reviews the engine ACCEPTED count. One that is being repaired — a
-    // contradiction, a missing or duplicated disposition — is not evidence of
-    // anything yet, however well-formed its JSON was.
-    const reviews = (this.snapshot.tactic ? this.activeSteps() : this.run.steps)
-      .map((s) => ({ step: s, out: this.outputs[s.number] }))
-      .filter((x) => x.out?.contract === 'reviewResult' && x.out.valid && !x.step.reconcileNotice)
-      .filter((x) => reviewProblem(x.out.output, policy, priorBefore(prior, x.step.number), expectsPrior(x.step.stepId), criteria) === null)
-    const latest = reviews.at(-1)
+    // Only reviews the engine ACCEPTED count (acceptedReviews).
+    const { prior, reviews, latest } = acceptedReviews({ snapshot: this.snapshot, run: this.run, outputs: this.outputs })
     if (!latest) return
 
     let review = summariseReview(latest.out.output, policy, priorBefore(prior, latest.step.number))
@@ -4936,8 +5005,7 @@ export class Engine {
   }
 
   activeSteps () {
-    const after = this.run.windowResetAfter ?? -1
-    return this.run.steps.filter(s => Number(s.number) > Number(after) && !(this.run.supersededSteps ?? []).includes(s.number))
+    return activeStepsOf(this.run)
   }
 
   async applyCoordinatorEffects () {
@@ -5604,7 +5672,7 @@ export class Engine {
     const runDir = store.runDir(this.issuePath, this.runId)
     const ws = this.run.workspace
     const n = (this.run.deliveryReturns?.length ?? 0) + 1
-    const from = resume?.from ?? { revision: approved.revision, artifactRef: approved.artifactRef, baseCommit: ws.baseCommit, ...(ws.repository ? { sourceBase: ws.sourceBase ?? ws.baseCommit } : {}) }
+    const from = resume?.from ?? { revision: approved.revision, artifactRef: approved.artifactRef, patchHash: approved.patchHash ?? null, baseCommit: ws.baseCommit, ...(ws.repository ? { sourceBase: ws.sourceBase ?? ws.baseCommit } : {}) }
     const kept = path.join(runDir, 'delivery-return', String(n))
     const keptMap = async (name) => new Map(Object.entries(JSON.parse(await fs.readFile(path.join(kept, name), 'utf8'))))
     let baseline = this.baseline ?? new Map()
@@ -5994,6 +6062,9 @@ export class Engine {
         completedAt: null,
         artifactRef: receipt?.artifactRef ?? null,
         bytes: receipt?.bytes ?? null,
+        // The digest of the bytes the receipt wrote and verified (launch.mjs), from the same buffer:
+        // what the start preview's patch link proves a retained artifact against (retained-work.mjs).
+        patchHash: receipt?.patchHash ?? null,
         reconstruction,
         ...(action === 'apply-to-source' ? { application: receipt?.application ?? null } : {}),
         // A three-way merge with edits in the source (source-merge.mjs): what merged, what conflicted, the merged tree.
@@ -6045,7 +6116,7 @@ export class Engine {
       if (refusal) deliveryNotReturned = refusal === LEFT_TO_RECONCILE ? null : refusal
       else if (!target) deliveryNotReturned = 'no author step of this run produced the candidate'
       else if (mayReturnDelivery) {
-        const back = await this.returnFromDelivery({ ...target, policy: reconcilePolicy, approved: { revision: current, artifactRef: this.run.delivery.artifactRef } })
+        const back = await this.returnFromDelivery({ ...target, policy: reconcilePolicy, approved: { revision: current, artifactRef: this.run.delivery.artifactRef, patchHash: this.run.delivery.patchHash ?? this.run.delivery.application?.patchHash ?? null } })
         if (back.returned) return 'returned'
         if (back.interrupted) return
         deliveryNotReturned = back.refusal

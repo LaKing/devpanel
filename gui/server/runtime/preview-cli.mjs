@@ -98,21 +98,36 @@ console.log(`  ${c.dim}workspace${c.off} ${p.workspace.isolation}${p.workspace.o
 
 head('Verification and closure')
 console.log(`  ${c.dim}checks${c.off}     requirement=${p.checks.requirement}  target=${p.checks.target?.kind ?? `${c.yellow}none${c.off}`}`)
-if (p.checks.target?.tiers) {
-  const ids = [...(p.checks.target.commands ?? []), ...(p.checks.target.finallyCommands ?? [])].map((x) => x.id)
-  console.log(`  ${c.dim}smoke${c.off}      every revision, beside the reviews: ${p.checks.target.tiers.smoke.join(', ')}`)
-  const targeted = p.checks.target.tiers.targeted
-  if (targeted) console.log(`  ${c.dim}targeted${c.off}   instead of the smoke, on a repair revision whose failing tests are named: ${targeted.run} (for ${targeted.command}), with ${targeted.always.join(', ') || 'nothing else'}; closure never counts it`)
-  console.log(`  ${c.dim}full${c.off}       once, on the approved revision; closure counts only this: ${ids.join(', ')}`)
-  const continuing = continuationPlan(p.checks.target)
-  if (continuing.refusal) console.log(`  ${c.dim}continue${c.off}   no: the full drive runs from scratch (${continuing.refusal})`)
-  else {
-    console.log(`  ${c.dim}continue${c.off}   the full drive continues the smoke's running instance, kept ${continuing.keepSeconds}s: skips ${continuing.smokeRun.join(', ')}; runs ${continuing.run.join(', ') || 'no command'}, then every finalizer`)
-    if (continuing.outOfPosition.length) console.log(`  ${c.dim}order${c.off}      out of declared position: ${continuing.outOfPosition.map((o) => `${o.id} (declared before ${o.declaredBefore.join(', ')})`).join('; ')}`)
-    if (continuing.declaredBeforeServices.length) console.log(`  ${c.yellow}warning${c.off}    ${continuing.declaredBeforeServices.join(', ')} will run after the service started: if the service depends on it at boot, or it needs the service down, set tiers.continueSmoke: false or declare it later`)
-  }
-} else if (p.modulesTiming) console.log(`  ${c.dim}modules${c.off}    ${p.modulesTiming === 'approved' ? 'only on an approved revision (or one whose every substantial finding awaits its result), timing: approved' : 'every revision, beside the reviews, timing: every-revision'}`)
-else if (p.checks.target) console.log(`  ${c.dim}timing${c.off}     ${p.checks.target.timing ?? 'every-revision'}`)
+// Whether checks run for this start, and when, as the engine decides it (retained-work.mjs checksOutlook):
+// no tier, timing or continuation line is printed for checks that will not run.
+const checksRun = !p.checksOutlook || p.checksOutlook.state === 'configured'
+if (p.checksOutlook) console.log(`  ${c.dim}outlook${c.off}    ${p.checksOutlook.state}: ${p.checksOutlook.detail}`)
+if (checksRun) {
+  if (p.checks.target?.tiers) {
+    // Which tiers run, and when, is each phase's schedule below: a phase with no occupied reviewer
+    // (Prompt) drives the full tier when the revision is recorded, with no smoke first.
+    const schedule = p.checksOutlook?.schedule ?? []
+    const smokeRuns = schedule.some((ph) => String(ph.default).startsWith('smoke-'))
+    const ids = [...(p.checks.target.commands ?? []), ...(p.checks.target.finallyCommands ?? [])].map((x) => x.id)
+    if (smokeRuns) console.log(`  ${c.dim}smoke${c.off}      commands: ${p.checks.target.tiers.smoke.join(', ')}`)
+    const targeted = p.checks.target.tiers.targeted
+    if (targeted && schedule.some((ph) => ph.exceptions.some((e) => e.id === 'targeted-on-repair'))) console.log(`  ${c.dim}targeted${c.off}   commands: ${targeted.run} (for ${targeted.command}), with ${targeted.always.join(', ') || 'nothing else'}; closure never counts it`)
+    console.log(`  ${c.dim}full${c.off}       commands: ${ids.join(', ')}; closure counts only this tier`)
+    const continuing = smokeRuns ? continuationPlan(p.checks.target) : { refusal: 'no phase runs the smoke tier first' }
+    if (continuing.refusal) console.log(`  ${c.dim}continue${c.off}   no: the full drive runs from scratch (${continuing.refusal})`)
+    else {
+      // Engine checkCandidate: refused at drive time for a refresh, another revision, a smoke that was retried or
+      // not kept, a revision that ran the targeted tier, or a changed target; a continued drive that fails is
+      // retried from scratch. Conditional, then: the CLI reads configuration only.
+      console.log(`  ${c.dim}continue${c.off}   the full drive may continue the smoke's running instance (kept ${continuing.keepSeconds}s), skipping ${continuing.smokeRun.join(', ')} and running ${continuing.run.join(', ') || 'no command'}, then every finalizer — only when that smoke passed on its first drive and was kept for the same revision and target; otherwise, and on a refresh or a retry after a failed continued drive, it runs from scratch with every command in declared order`)
+      // Both hold only for a drive that does continue; a drive from scratch keeps the declared order.
+      if (continuing.outOfPosition.length) console.log(`  ${c.dim}order${c.off}      if the drive continues the smoke, out of declared position: ${continuing.outOfPosition.map((o) => `${o.id} (declared before ${o.declaredBefore.join(', ')})`).join('; ')}`)
+      if (continuing.declaredBeforeServices.length) console.log(`  ${c.yellow}warning${c.off}    if the drive continues the smoke, ${continuing.declaredBeforeServices.join(', ')} would run after the service started: if the service depends on it at boot, or it needs the service down, set tiers.continueSmoke: false or declare it later`)
+    }
+  } else if (p.modulesTiming) console.log(`  ${c.dim}modules${c.off}    timing: ${p.modulesTiming} (configured)`)
+  else if (p.checks.target) console.log(`  ${c.dim}timing${c.off}     ${p.checks.target.timing ?? 'every-revision'} (configured)`)
+  for (const ph of p.checksOutlook?.schedule ?? []) console.log(`  ${c.dim}${ph.phase}${c.off}  by default ${ph.default}${ph.exceptions.map((e) => `; ${e.sentence}`).join('')}`)
+}
 if (p.checks.target?.baselineCache) {
   const b = p.checks.target.baselineCache
   console.log(`  ${c.dim}baseline${c.off}   cached across runs (issues/<project>/.baselines), exact key: base commit, target hash, ${b.files?.length ? `files ${b.files.join(' ')}, ` : ''}environment command; keeps ${b.maxEntries ?? 12} entries, ${b.maxAgeDays ?? 14} days`)

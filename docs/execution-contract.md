@@ -2481,6 +2481,110 @@ the prompts the coordinator authors during the run, and every future agent outpu
 node server/runtime/preview-cli.mjs <playbook> [--issue <project>/<id>] [--prompts]
 ```
 
+### Retained work in the start preview
+
+With an issue, the preview also says what a follow-up start would build on
+(`retainedWork`, `runtime/retained-work.mjs`). Every file it reads (run records, journals
+and their legacy disposition, outputs, snapshots, the reservation list, step responses and
+the retained files) is opened `O_NONBLOCK` and checked to be a regular file on the handle
+before anything is read (`persistence.mjs readRegularFile`, the store's own reads, and the
+dry walk's), so a FIFO or device in a record's place is unreadable, never waited on. The same holds for
+the other readings the start preview awaits: the refusal lookup (`refused-seat.mjs`), the path overlap
+and modules coverage (earlier runs through `store.readRunReadOnly`, one malformed run a gap, patches read
+non-blocking), the module-lock records, the issue's own `issue.json`, run records, last outputs and step
+owners (`issues.js`, read with `getIssue(…, { settle: false })`, which leaves a pending repeat lookup for the
+issue page to settle), so the preview writes nothing and waits on no special file in those readings. A
+residual risk remains: a production preview's release selection (`release-selection.mjs`, unchanged) still
+hashes and extracts a staged archive by its path, so a FIFO or device in `release.tar`'s place can stall that
+preview. Retained work itself runs no git (the existing overlap reading may list a retained worktree's changed
+paths with git, read-only), invokes nothing and writes
+nothing — run records are read with `store.readRunReadOnly`, so a damaged journal is
+reported, never persisted as a recovery finding — and it decides nothing: provisioning asks the selector again at launch, and
+Accumulate captures its window then, so a change in between is followed by the launch.
+
+- **The seed** is the carry-forward selector's own choice (`undeliveredApproval`), and
+  whether this start would apply it is the launch's own decision (`seedApplies`: a
+  writing seat, no staged production release, not in place). A run whose patch was
+  landed by hand (`run.landed`) or applied afterwards (a verified `artifactApplication`)
+  is delivered: it seeds nothing, and nothing older is seeded in its place. Its file is
+  read as provisioning reads it, opened `O_NONBLOCK` and checked to be a regular file on
+  the handle before anything is read (`readSeedPatch`), so a FIFO in its place gives the
+  existing context-only outcome at once, at launch and in the preview.
+- **Candidates** are each earlier run's patch Accumulate would carry (`changes.patch`, or
+  `candidate.patch`). Whether this launch would include one is the capture's own walk
+  (`current-window.mjs walkWindowInputs`) run without reading or writing: the same order,
+  the human input first, the generated `steps.md` charged its rendered bytes, and one
+  resolved budget whose per-file limit is `inputFileLimit(windowLimits)`. An input error
+  that would stop capture (an unreadable input, a run record that does not parse) means the
+  capture returns no window at all, so no candidate, before or after it, is offered through
+  Accumulate (`capture-fails`), and the preview says capture would fail; readable findings
+  stay shown. Any error in that prediction (a reservation file that does not parse) stops
+  only the prediction. Originals are discovered per run, each on its own and whatever the
+  walk listed: the delivered patch, the patch a delivery returned, and the check original of
+  the last revision with the resolver's own rules (`retainedArtifactCandidates`: results and
+  history, the revision and its `migratedFrom`), a reachable copy of another revision
+  hiding none of them, and the seed hiding only its own source (a check original of the
+  seed's revision beside a missing delivery seed is linked). A patch a delivery returned is
+  offered only as the seed, the download route's own rule (`returnedServable`); otherwise it
+  is a diagnostic. Malformed return pointers and reconciliation entries cost only themselves; each access path is judged by its own bytes (an empty copy does
+  not hide a non-empty original); outputs are read one file at a time; a run that exists
+  but cannot be read (EACCES on its directory, a record that does not parse) is listed as
+  unreadable with its code and makes the findings state unknown. Each run is read apart: a
+  malformed field (an object where a list belongs) costs that run's part only, never the
+  preview. A candidate counts only with a way to reach it: included by this start's Accumulate, included if
+  Accumulate were turned on, or a verified download. One with none is a diagnostic, and so
+  is a candidate a check of the run's last revision recorded whose original is gone, is not
+  a regular file or cannot be read (Accumulate would not list it at all; a reserved result
+  folder without `changes.patch` does not hide it). Such an original that a recorded digest
+  does prove (a migrated revision, whose file keeps its old fingerprint) is linked. A
+  zero-byte patch never counts as reusable.
+- **The label** is `seed`, `retained-candidate`, both, or `none`; a seed that cannot be
+  read is shown beside any candidate, never instead of it.
+- **Links** go to `GET …/runs/:runId/retained-patch?artifact=delivery|returned|check&revision=R`,
+  which reads the original once, checks it is a regular file within the upload cap,
+  and sends those bytes only when they hash to a digest the runtime recorded from the
+  bytes it wrote and verified: `delivery.patchHash`, else an engine apply-to-source
+  delivery's `delivery.application.patchHash`; a delivery return's `from.patchHash`;
+  a check artifact's `artifact.patchHash`, kept on both `checkResults` and `checkHistory`
+  (a delivery return clears the first), every record of the revision walked newest
+  first. `run.artifactApplication.patchHash` is never evidence: it is taken from a
+  second read of the file after its reconstruction was verified. Without a matching
+  digest, over the cap, or with the original gone, the preview says why and offers no
+  link; the result step's copy is never served. An artifacts or checks directory that
+  resolves outside the run is refused; a path inside it that cannot be resolved for lack of
+  permission is reported unreadable. A run from before these digests whose
+  delivery recorded none gets no preview link; the run page's `/patch` still serves its
+  retained file as before (it rebuilds only an approved check artifact).
+- **Findings** are the run's recorded `outstandingFindings`, each tied to its evidence:
+  a review finding to the revision the accepted review examined (`acceptedReviews`, the
+  engine's own selection), a deferred plan finding to the plan, a closure finding to the
+  confirmation step its return names (`closureReturns[].confirmationStep`) and the revision
+  that confirmation examined (read from its output, with or without the run's snapshot); a refused reconciliation's findings under its merged revision;
+  the last check of the shown revision only. A run that records no findings field, or no
+  accepted review, says findings are unknown; with no qualifying run the latest ended run
+  is shown, and with no ended run at all the preview says no findings are recorded.
+- **Checks** are `checksOutlook`: not run in place, none, unavailable (no target, an
+  undeclared modules tier, unreadable coverage; a playbook that records no candidate revision reads not run), or configured with `checkSchedule`,
+  each recording phase's default timing and the exceptions the engine applies, and the
+  configured command ids of each tier that runs (`commands`: smoke and targeted only when the
+  schedule runs them; the full or modules tier with its finalizers), shown by the dialog: beside the
+  reviews only when the engine runs checks concurrently (`checks.concurrent`,
+  `reviewPolicy.concurrentReviews`), else before the reviews go on; the resolved
+  `retryFailed` count and the cases that skip a retry (an earlier revision failed the same
+  way; for a modules drive, which compares no earlier revision, only its first drive skips
+  the retries, when its tests ran and failed or the stage reported its dependency install
+  failed; a failing retry is retried again within the limit, whatever failed); the early drive only while no check of
+  the revision has failed (a failed smoke gets its full drive only in the last round); in
+  the last round, the same-round re-review when every substantial finding awaits the check.
+  The CLI's tier lines name commands only, and smoke continuation is stated as conditional
+  (only a smoke that passed on its first drive and was kept for the same revision and target
+  is continued; otherwise, and on a refresh or after a failed continued drive, the full drive
+  runs from scratch; its order and service-start warnings are said only of a continued
+  drive); which tier runs when is each phase's schedule
+  (a phase with no occupied reviewer drives the full tier when the revision is recorded).
+  The dialog's chip and the preview CLI print timing only when checks will run.
+- The preview never says the patch applies cleanly.
+
 ## Structured output
 
 The machine-readable part of a response is found by a scanner that understands

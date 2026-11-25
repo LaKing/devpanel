@@ -1,3 +1,4 @@
+import { readRegularFile } from './persistence.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -35,7 +36,7 @@ const normalize = (modules) => [...new Set((modules ?? []).filter((m) => typeof 
 async function runEnded (held) {
   if (!held?.issuePath || !held?.owner?.runId) return false
   try {
-    const run = JSON.parse(await fs.readFile(path.join(held.issuePath, 'runs', held.owner.runId, 'run.json'), 'utf8'))
+    const run = JSON.parse(await readRegularFile(path.join(held.issuePath, 'runs', held.owner.runId, 'run.json'), 'utf8'))
     if (LIVE.includes(run.status)) return false
     // A continuation re-taking an ended run's locks (supervisor.answer, before continue, refresh or an
     // integrity restore moves the status back to pending) first writes its marker on the run record, and
@@ -48,7 +49,8 @@ async function runEnded (held) {
   }
 }
 
-const readJson = (file) => fs.readFile(file, 'utf8').then((t) => JSON.parse(t), () => null)
+// Non-blocking, regular files only: a FIFO in a lock record's place reads as no record, never waited on (the start preview reads these).
+const readJson = (file) => readRegularFile(file, 'utf8').then((t) => JSON.parse(t), () => null)
 
 /**
  * Take every module of `modules` for the run, or none: `{ held: [{module, token}], conflicts }`.

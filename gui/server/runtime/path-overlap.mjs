@@ -7,6 +7,7 @@ import { planOfRun } from './engine.mjs'
 import { escapingLinks, workspaceProjection } from './fingerprint.mjs'
 import { splitPatch } from './patch-check.mjs'
 import { priorRuns, stepText } from './prior-runs.mjs'
+import { readRegularFile } from './persistence.mjs'
 import * as store from './store.mjs'
 import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
 
@@ -128,7 +129,7 @@ async function patchPaths (file, runId, gaps) {
   const stat = await fs.stat(file).catch(() => null)
   if (!stat?.isFile()) return []
   if (stat.size > MAX_PATCH_BYTES) { gaps.push(`the patch of run ${runId} is too large to read (${stat.size} bytes)`); return [] }
-  return [...new Set(splitPatch(await fs.readFile(file, 'utf8')).flatMap((s) => [s.path, s.from]).filter(Boolean))]
+  return [...new Set(splitPatch(await readRegularFile(file, 'utf8')).flatMap((s) => [s.path, s.from]).filter(Boolean))]
 }
 
 const readWorktree = async (workspace) => {
@@ -139,7 +140,7 @@ const readWorktree = async (workspace) => {
 
 /** The paths an earlier run's candidate changes: retained worktree, delivered patch, then its latest check's patch. */
 export async function revisionPaths (issuePath, run, gaps) {
-  if (!run.revisions?.length) return []
+  if (!Array.isArray(run.revisions) || !run.revisions.length) return []
   const ws = run.workspace ?? {}
   if (ws.isolation === 'in-place') return run.delivery?.changedPaths ?? []
   if (ws.path && ws.state !== 'removed' && await fs.stat(ws.path).catch(() => null)) {
@@ -147,12 +148,13 @@ export async function revisionPaths (issuePath, run, gaps) {
     if (paths.length) return paths
   }
   const dir = store.runDir(issuePath, run.runId)
-  if (run.delivery?.artifactRef) {
+  if (typeof run.delivery?.artifactRef === 'string') {
     const paths = await patchPaths(path.join(dir, run.delivery.artifactRef), run.runId, gaps)
     if (paths.length) return paths
   }
-  for (const record of [...(run.checkResults ?? []), ...(run.checkHistory ?? [])].reverse()) {
-    if (!record.dir || !record.revision) continue
+  const list = (value) => Array.isArray(value) ? value.filter((c) => c && typeof c === 'object') : []
+  for (const record of [...list(run.checkResults), ...list(run.checkHistory)].reverse()) {
+    if (typeof record.dir !== 'string' || typeof record.revision !== 'string') continue
     const named = (record.migratedFrom ?? record.revision).replace('sha256:', '').slice(0, 16)
     const paths = await patchPaths(path.resolve(dir, record.dir, 'artifacts', `${named}.patch`), run.runId, gaps)
     if (paths.length) return paths
@@ -180,11 +182,17 @@ export async function planPaths (issuePath, run, gaps) {
 async function expectedPaths (issuePath) {
   const gaps = []
   if (!issuePath) return { known: false, source: null, fromRun: null, paths: [], gaps }
-  for (const run of (await priorRuns(issuePath, null)).reverse()) {
-    const revision = await revisionPaths(issuePath, run, gaps)
-    if (revision.length) return { known: true, source: 'previous-revision', fromRun: run.runId, paths: revision, gaps }
-    const plan = await planPaths(issuePath, run, gaps)
-    if (plan.length) return { known: true, source: 'plan', fromRun: run.runId, paths: plan, gaps }
+  // Read-only (store.readRunReadOnly): the start preview and readiness read earlier runs through here, and a
+  // damaged journal is reported, never persisted as a recovery finding. One run's malformed record is a gap.
+  for (const run of (await priorRuns(issuePath, null, { readRun: store.readRunReadOnly })).reverse()) {
+    try {
+      const revision = await revisionPaths(issuePath, run, gaps)
+      if (revision.length) return { known: true, source: 'previous-revision', fromRun: run.runId, paths: revision, gaps }
+      const plan = await planPaths(issuePath, run, gaps)
+      if (plan.length) return { known: true, source: 'plan', fromRun: run.runId, paths: plan, gaps }
+    } catch (error) {
+      gaps.push(`run ${run.runId} could not be read: ${error.message}`)
+    }
   }
   return { known: false, source: null, fromRun: null, paths: [], gaps }
 }
@@ -309,7 +317,7 @@ export function createPathOverlap ({ listProjects, listIssues }) {
           // This candidate's own issue; every other issue of its project may be touching the same files.
           if (other.id === project && issuePath && path.resolve(row.path) === path.resolve(issuePath)) continue
           const { runId, status } = row.latestRun
-          const run = await store.readRun(row.path, runId).catch(() => null)
+          const run = await store.readRunReadOnly(row.path, runId).catch(() => null)
           if (!run) { liveRuns++; uncompared.push({ project: other.id, issueId: row.id, runId, reason: 'its record could not be read' }); continue }
           const snapshot = await store.readSnapshot(row.path, runId).catch(() => null)
           const delivery = deliveryActionOf(snapshot)

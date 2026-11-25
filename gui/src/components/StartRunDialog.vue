@@ -5,6 +5,7 @@ import DialogHeader from './DialogHeader.vue'
 import { api } from '@/api'
 import { createSeq } from '@/freshness'
 import { startAdmitted } from '@/action-offers'
+import { createPreviewTracker } from '@/preview-request'
 
 /*
  * Two steps: pick a playbook with one click, then settle the settings for this
@@ -96,14 +97,15 @@ const notices = computed(() => (previewData.value?.prerequisites ?? []).filter((
 const overlapWarning = computed(() => (previewData.value?.prerequisites ?? []).find((p) => p.kind === 'path-overlap' && p.status === 'warning') ?? null)
 
 /* Only the newest preview request may write to the page. An older response is
-   an answer to a question nobody is asking any more. */
-let previewSeq = 0
+   an answer to a question nobody is asking any more, and an options change
+   supersedes a request for other options at once (src/preview-request.js). */
+const tracker = createPreviewTracker()
 
 async function loadPreview (id, reset = true) {
-  const seq = ++previewSeq
   if (reset) { runOptions.value = {}; parameterData.value = null }
   const options = JSON.parse(optionsKey.value)
   const key = optionsKey.value
+  const seq = tracker.begin(key)
   error.value = ''
   previewData.value = null
   previewedId.value = null
@@ -111,7 +113,7 @@ async function loadPreview (id, reset = true) {
   previewing.value = true
   try {
     const result = await api.previewPlaybook(id, { project: props.project, issue: props.issueId, runOptions: options })
-    if (seq !== previewSeq) return          // superseded while in flight
+    if (!tracker.isCurrent(seq)) return     // superseded while in flight
     previewData.value = result
     previewedId.value = id
     previewedOptions.value = key
@@ -122,17 +124,17 @@ async function loadPreview (id, reset = true) {
       if (result.tactic === 'triage' && runOptions.value.autoStart === undefined) runOptions.value = { ...runOptions.value, autoStart: true }
     }
   } catch (e) {
-    if (seq !== previewSeq) return
+    if (!tracker.isCurrent(seq)) return
     error.value = e.message
   } finally {
-    if (seq === previewSeq) previewing.value = false
+    if (tracker.isCurrent(seq)) { previewing.value = false; tracker.settle(seq) }
   }
 }
 
 watch(open, async (isOpen) => {
   if (!isOpen) {
     // Nothing in flight may land on the next opening.
-    previewSeq++
+    tracker.invalidate()
     return
   }
   // Every opening starts at the choice, with nothing previewed: the first step
@@ -170,7 +172,7 @@ function pick (id) {
 /** Back to the list. The choice stays marked; picking again previews afresh. */
 function changePlaybook () {
   if (starting.value) return
-  previewSeq++                 // an in-flight preview has nowhere to land
+  tracker.invalidate()         // an in-flight preview has nowhere to land
   previewing.value = false
   step.value = 'pick'
 }
@@ -181,18 +183,45 @@ function changePlaybook () {
  * is still the rule; what changed is that nobody has to remember the button to
  * get there. The button remains for an explicit re-check.
  */
-let previewTimer = null
 // A hold answers one start of one playbook; choosing another clears it.
 watch(chosen, () => { hold.value = null })
 
-watch(optionsKey, () => {
-  clearTimeout(previewTimer)
-  if (!chosen.value || !parameterData.value) return
-  previewTimer = setTimeout(() => {
+// A changed setting supersedes a preview in flight for other settings at once and
+// stops the one on screen matching; the reload follows the pause in typing.
+watch(optionsKey, (key) => {
+  if (previewedOptions.value !== key) previewedOptions.value = null
+  tracker.optionsChanged(key, chosen.value && parameterData.value ? () => {
     if (open.value && !previewMatches.value) loadPreview(chosen.value, false)
-  }, 500)
+  } : null)
 })
-onUnmounted(() => clearTimeout(previewTimer))
+onUnmounted(() => tracker.dispose())
+
+/* Retained work (server/runtime/retained-work.mjs): words for what the preview records. */
+const RETAINED_LABELS = { seed: 'automatic seed', 'retained-candidate': 'retained candidate', none: 'no reusable artifact' }
+const retainedLabel = (l) => RETAINED_LABELS[l] ?? l
+const ACCESS_LABELS = { accumulate: 'included through Accumulate', 'accumulate-if-enabled': 'available if you turn on Accumulate', download: 'available to download as context' }
+const accessLabel = (a) => ACCESS_LABELS[a] ?? a
+const SCHEDULE_LABELS = { 'when-recorded': 'checked when recorded', 'beside-reviews': 'checked beside the reviews', 'before-reviews': 'checked before the reviews go on', 'after-approval': 'checked after approval', 'smoke-beside-reviews-full-after-approval': 'smoke tier beside the reviews on each revision, the full drive after approval', 'smoke-before-reviews-full-after-approval': 'smoke tier before the reviews on each revision, the full drive after approval' }
+const scheduleLabel = (d) => SCHEDULE_LABELS[d] ?? d
+const shortRevision = (r) => r ? String(r).replace('sha256:', '').slice(0, 12) : 'none'
+const runLink = (runId) => ({ path: `/projects/${props.project}/${props.issueId}`, query: { run: runId } })
+function findingOrigin (p) {
+  if (!p) return 'origin unknown'
+  if (p.source === 'plan-review') return `against the plan (step ${p.raisedInStep ?? '?'})`
+  if (p.source === 'closure-confirmation') return p.confirmationStep ? `closure confirmation (step ${p.confirmationStep}) of revision ${shortRevision(p.revision)}, returned in step ${p.raisedInStep ?? '?'}` : `returned in step ${p.raisedInStep ?? '?'} after a closure confirmation whose step and revision are not recorded`
+  return p.revision ? `review of revision ${shortRevision(p.revision)}${p.step ? ` (step ${p.step})` : ''}` : 'review, revision not recorded'
+}
+const downloadError = ref('')
+async function downloadRetained (runId, link) {
+  downloadError.value = ''
+  try {
+    const blob = await api.downloadRetainedPatch(props.project, props.issueId, runId, { artifact: link.artifact, revision: link.revision })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url; a.download = `${runId}-${shortRevision(link.revision)}.patch`; a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  } catch (e) { downloadError.value = `The patch could not be downloaded (${e.message}). Preview again to see the current state.` }
+}
 
 const budgetFields = [
   { key: 'maxSteps', label: 'Maximum turns' },
@@ -586,10 +615,64 @@ async function start (override = false) {
           <div class="row">
             <span class="dim">checks {{ previewData.checks.requirement }}</span>
             <span class="dim">target {{ previewData.checks.target ? previewData.checks.target.kind : 'none' }}</span>
-            <span v-if="previewData.modulesTiming" class="dim" data-test="modules-timing">modules {{ previewData.modulesTiming === 'approved' ? 'after approval' : 'every revision' }}</span>
+            <span v-if="previewData.modulesTiming && previewData.checksOutlook?.state === 'configured'" class="dim" data-test="modules-timing">modules timing: {{ previewData.modulesTiming }} (configured)</span>
             <span class="dim">delivery {{ previewData.delivery.action }}</span>
             <span class="dim">autoClose {{ previewData.autoClose.minimumVerification }}</span>
           </div>
+          <!-- When checks run, as the engine decides it; no timing for checks that will not run (server/runtime/retained-work.mjs checksOutlook). -->
+          <div v-if="previewData.checksOutlook" class="mt-1" data-test="checks-outlook">
+            <p class="dim">checks {{ previewData.checksOutlook.state }}: {{ previewData.checksOutlook.detail }}</p>
+            <template v-if="previewData.checksOutlook.state === 'configured'">
+              <p v-for="cmd in previewData.checksOutlook.commands ?? []" :key="'cmd-' + cmd.tier" class="dim" data-test="check-commands">{{ cmd.tier }} commands: {{ cmd.ids.join(', ') || 'none declared' }}</p>
+              <p v-for="ph in previewData.checksOutlook.schedule" :key="ph.phase" class="dim">
+                {{ ph.phase }}: by default {{ scheduleLabel(ph.default) }}<template v-for="ex in ph.exceptions" :key="ex.id">. {{ ex.sentence }}</template>
+              </p>
+            </template>
+          </div>
+
+          <template v-if="previewData.retainedWork">
+            <h3 class="section">Retained work</h3>
+            <p v-if="previewData.retainedWork.state === 'unavailable'" class="dim" data-test="retained-unavailable">Retained work could not be read: {{ previewData.retainedWork.detail }}</p>
+            <div v-else data-test="retained-work">
+              <div class="row">
+                <v-chip v-for="l in previewData.retainedWork.labels" :key="l" size="x-small" variant="tonal" :color="l === 'none' ? undefined : 'primary'">{{ retainedLabel(l) }}</v-chip>
+              </div>
+              <div v-if="previewData.retainedWork.seed" class="mt-1">
+                <p>
+                  Automatic seed: run <router-link :to="runLink(previewData.retainedWork.seed.runId)">{{ previewData.retainedWork.seed.runId }}</router-link>,
+                  revision {{ shortRevision(previewData.retainedWork.seed.revision) }}
+                  <template v-if="!previewData.retainedWork.seed.applies">, not applied by this start ({{ previewData.retainedWork.seed.notApplied }})</template>
+                  <template v-else>; patch {{ previewData.retainedWork.seed.state }}, {{ previewData.retainedWork.seed.outcome }}</template>
+                </p>
+                <p class="dim"><a v-if="previewData.retainedWork.seed.link.artifact" href="#" data-test="retained-download" @click.prevent="downloadRetained(previewData.retainedWork.seed.runId, previewData.retainedWork.seed.link)">Download the patch of revision {{ shortRevision(previewData.retainedWork.seed.link.revision) }}</a><template v-else>No patch link: {{ previewData.retainedWork.seed.link.reason }}</template></p>
+              </div>
+              <div v-for="c in previewData.retainedWork.candidates" :key="c.runId + c.name" class="mt-1">
+                <p>
+                  {{ c.approved ? 'Approved patch' : 'Unapproved candidate' }} of run <router-link :to="runLink(c.runId)">{{ c.runId }}</router-link>,
+                  revision {{ shortRevision(c.revision) }}: {{ c.access.map(accessLabel).join('; ') }}
+                  <template v-if="!c.accumulate.included">(Accumulate would omit it: {{ c.accumulate.reason }})</template>
+                </p>
+                <p class="dim"><a v-if="c.link.artifact" href="#" data-test="retained-download" @click.prevent="downloadRetained(c.runId, c.link)">Download the patch of revision {{ shortRevision(c.link.revision) }}</a><template v-else>No patch link: {{ c.link.reason }}</template></p>
+              </div>
+              <p v-if="previewData.retainedWork.findings" class="dim" data-test="findings-state">Findings {{ previewData.retainedWork.findings.state }}: {{ previewData.retainedWork.findings.detail }}</p>
+              <div v-for="ev in previewData.retainedWork.evidence" :key="ev.runId" class="mt-1">
+                <p>Findings recorded on run {{ ev.runId }} ({{ ev.status }}), whose last revision is {{ shortRevision(ev.revision) }}:</p>
+                <p v-if="ev.findings.state === 'unknown'" class="dim">Findings unknown: {{ ev.findings.detail }}</p>
+                <p v-else-if="!ev.findings.items.length" class="dim">No open findings recorded.</p>
+                <p v-for="f in ev.findings.items" :key="f.id" class="dim">
+                  {{ f.id }} · {{ f.blocking === true ? 'blocking' : f.blocking === false ? 'not blocking' : 'blocking unknown' }}{{ f.severity ? ` · ${f.severity}` : '' }} · {{ findingOrigin(f.provenance) }}: {{ f.description }}
+                </p>
+                <template v-if="ev.findings.reconciliation">
+                  <p class="dim">Reconciliation {{ ev.findings.reconciliation.n }} refused merged revision {{ shortRevision(ev.findings.reconciliation.mergedRevision) }} (from approved {{ shortRevision(ev.findings.reconciliation.approvedRevision) }}):</p>
+                  <p v-for="f in ev.findings.reconciliation.items" :key="'r' + f.id" class="dim">{{ f.id }} · {{ f.blocking === true ? 'blocking' : f.blocking === false ? 'not blocking' : 'blocking unknown' }}: {{ f.description }}</p>
+                </template>
+                <p v-if="ev.priorCheck" class="dim">Last check of revision {{ shortRevision(ev.priorCheck.revision) }}: {{ ev.priorCheck.result ?? 'none recorded' }}<template v-if="ev.priorCheck.gating && ev.priorCheck.gating !== ev.priorCheck.result"> (gating {{ ev.priorCheck.gating }})</template>; it says nothing about the new candidate.</p>
+              </div>
+              <p v-for="(d, i) in previewData.retainedWork.diagnostics" :key="'d' + i" class="dim">{{ d.runId ? `${d.runId}${d.name ? ` ${d.name}` : ''}: ` : '' }}{{ d.reason }}</p>
+              <p class="dim">{{ previewData.retainedWork.note }}</p>
+              <p v-if="downloadError" class="dim">{{ downloadError }}</p>
+            </div>
+          </template>
           <p class="dim mt-1">requires {{ previewData.completion.requires.join(', ') }}</p>
 
           <v-alert v-if="blockers.length" type="error" variant="tonal" density="compact" class="mt-4" title="Cannot start">

@@ -626,8 +626,26 @@ export default async function (t) {
       t.eq('readiness, under the configuration', ready.configuration?.modulesTiming, 'approved')
       const dialog = await fs.readFile(path.join(CONFIG_ROOT, 'gui/src/components/StartRunDialog.vue'), 'utf8')
       t.ok('the start dialog shows it from the preview', dialog.includes('previewData.modulesTiming'))
+      // The chip shows the configured value; timing is said only from the derived outlook, only when checks will run.
+      t.ok('the raw after-approval/every-revision mapping is gone', !dialog.includes("'after approval' : 'every revision'"))
+      t.ok('timing comes from checksOutlook, inside its configured branch', dialog.includes("previewData.checksOutlook.state === 'configured'") && dialog.includes('previewData.checksOutlook.schedule'))
+      const chip = dialog.split('\n').find((l) => l.includes('data-test="modules-timing"')) ?? ''
+      t.ok('the configured-timing chip shows only when checks will run', chip.includes("previewData.checksOutlook?.state === 'configured'"), chip)
       const cli = await fs.readFile(path.join(CONFIG_ROOT, 'gui/server/runtime/preview-cli.mjs'), 'utf8')
       t.ok('the preview CLI prints it', cli.includes('p.modulesTiming'))
+      // Every tier, timing and continuation line comes after the outlook gate, so none is printed for checks that will not run.
+      const gate = cli.indexOf('if (checksRun) {')
+      const timed = ['${c.dim}smoke${c.off}', '${c.dim}full${c.off}', '${c.dim}continue${c.off}', '${c.dim}modules${c.off}', '${c.dim}timing${c.off}'].map((s) => cli.indexOf(s))
+      t.ok('the CLI prints the smoke tier only when a phase\'s schedule runs it first, and no tier line claims a time', cli.includes('if (smokeRuns) console.log(`  ${c.dim}smoke${c.off}      commands:') && !cli.includes('each recorded revision:') && !cli.includes('on the approved revision (and the exceptions below)'))
+      t.ok('the CLI states smoke continuation as conditional, with the from-scratch cases', cli.includes('the full drive may continue the smoke') && cli.includes('only when that smoke passed on its first drive and was kept for the same revision and target') && !cli.includes('the full drive continues the smoke'))
+      // auditor-1-cli-promises-smoke-continuation: the order and service warnings hold only for a continued drive.
+      const orderLine = cli.split('\n').find((l) => l.includes('${c.dim}order${c.off}')) ?? ''
+      const serviceLine = cli.split('\n').find((l) => l.includes('after the service started')) ?? ''
+      t.ok('the CLI\'s order and service-start warnings are conditional on continuation', orderLine.includes('if the drive continues the smoke') && serviceLine.includes('if the drive continues the smoke') && serviceLine.includes('would run after the service started') && !cli.includes('will run after the service started'), JSON.stringify({ orderLine, serviceLine }))
+      // auditor-1-dialog-omits-required-check-identities: the dialog lists the configured command ids inside the configured branch.
+      const configured = dialog.slice(dialog.indexOf("<template v-if=\"previewData.checksOutlook.state === 'configured'\">"))
+      t.ok('the dialog shows the configured check command ids', configured.includes('data-test="check-commands"') && configured.includes('previewData.checksOutlook.commands') && configured.includes("cmd.ids.join(', ')"))
+      t.ok('the CLI prints timing only inside the configured-outlook gate', gate > 0 && timed.every((i) => i > gate) && !cli.includes('every revision, beside the reviews'), JSON.stringify({ gate, timed }))
     }
 
     t.section('AC6, AC7: config:check reports the timing and resolves the catalogue with an approved project; a refused shape fails it')
