@@ -31,7 +31,10 @@ export function fencePolicy ({ platform = hostPlatform(), env = process.env } = 
 
 /** Why a harness cannot run on this host at all, or null (owner decision 3: every Gemini seat on macOS). */
 export function harnessRefusal (harness, { platform = hostPlatform() } = {}) {
-  if (harness !== 'gemini' || platform.bubblewrap) return null
+  if (platform.bubblewrap) return null
+  // Antigravity's rules do not confine reads and its workspace hooks run by themselves: only the fence holds it.
+  if (harness === 'antigravity') return `antigravity seats are refused on ${hostName(platform.id)}: the adapter gives a seat tools only inside the seat fence, which this host does not have`
+  if (harness !== 'gemini') return null
   return `gemini seats are refused on ${hostName(platform.id)}: the Gemini adapter's read-only confinement needs bubblewrap and the seat fence, which this host does not have (refused for every seat until a fence exists here)`
 }
 

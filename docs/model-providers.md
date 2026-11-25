@@ -333,3 +333,57 @@ by the live turn. Actual successful restricted calls or filesystem changes still
 fail verification. Missing evidence remains inconclusive. The installed-runtime
 check is pinned to the inspected 0.60.0 bundle layout and fails closed on an
 unsupported version; it is outside the offline test suite.
+
+## Antigravity: the same models under a login, not a key
+
+`harness/antigravity.mjs` runs the Antigravity CLI (`agy`). It reaches the Gemini models through the service user's
+own Antigravity login and that login's plan, so it needs no API key, and it offers effort levels, which the Gemini
+CLI does not. Roster entries on it are named `<model>-antigravity` (`gemini-4-neon-antigravity`): their wire `model`
+is the family (`gemini-4-neon`) and the adapter asks the CLI for `<model>-<effort>`, the id its catalogue lists
+(`agy models`); a turn that names no effort runs at `medium`.
+
+**Signing in.** Once, by hand, as the service user: run `agy` and sign in. The CLI keeps its state, the token
+included, under `~/.gemini/antigravity-cli`; no documented variable moves it. The adapter never runs a seat in that
+directory: every turn's CLI gets a home of its own (`HOME`), the seat's home in the run (`cli-homes/<seat>`) or one
+beside the ledger, and the login's token file is bound into it read-only inside the fence (linked, never copied,
+outside one). A seat's conversations therefore never appear in the person's own history, and a seat cannot change
+the login.
+
+**What a seat may do.** Read, at most, and only inside a proved seat fence:
+
+- a read seat (a consult seat, a seat that does not write source, a coordinator's `access: read` turn) reads files
+  under its roots;
+- every other turn, and any turn outside a fence, has no tools;
+- a seat that writes source is refused: the adapter gives no write or command tool yet.
+
+The fence is the boundary. The CLI's permission rules alone do not hold a seat: with `read_file` allowed only for
+its roots it still read `/etc/hostname`, and the rules have no action for web search, subagents, scheduled tasks or
+messages (a read seat did all three in a live probe before the allow-list below existed). So the tools are an
+allow-list by name, in the seat's own home (`prepareHome`, bound read-only):
+
+- the agent the session runs as (`--agent devpanel-seat`, `~/.gemini/config/agents/`) declares the read tools, and
+  only declared tools are offered to the model;
+- a `PreToolUse` hook (`~/.gemini/config/hooks.json`, matcher `*`) runs a gate before every call that denies any
+  tool not named to it. A gate that fails denies too (seen live: the call ends with "JSON hook … failed").
+
+The session settings (`--settings`) replace the login's own for the turn: they deny commands, writes, URLs and MCP
+and never allow reading outside the workspace. `init.permission_mode` and `init.model` in the event stream say what
+took effect; a turn that ran under another mode or model than the adapter asked for is refused and its answer
+unused. A workspace's `.agents/` (also `.agent`, `_agents`, `_agent`) can carry hooks, MCP servers and plugins the
+CLI runs by itself: those directories are masked in the fence.
+
+**What it does not have.**
+
+- No listing or search: on agy 1.5.16 `list_dir`, `find_by_name` and `grep_search` were not offered to the model in
+  a headless session although the agent declares them. A seat reads the files it is told of or finds named in other
+  files.
+- No cost: the CLI reports tokens only, so its turns draw on the unpriced allowance. `result.usage` is the
+  conversation's running total; a turn is charged the difference.
+- No fork of a conversation, no account, endpoint or key: only the service user's own login.
+- What the CLI says when the plan's quota runs out has not been seen, so nothing classifies it yet.
+
+**Verifying.** `DEVPANEL_LIVE=1 npm run live -- --harness antigravity --model gemini-4-neon` is the session check
+(a fresh and a resumed turn); `--efforts low,medium,high,xhigh` runs it per level. It reports the levels "not
+verified", because the CLI keeps no session record to read the level back from; the adapter's refusal of a turn
+whose `init` names another model id stands in for it. A consult with the entry seated
+(`npm run consult -- --seat consultant-3=gemini-4-neon-antigravity`) exercises the fenced read seat.

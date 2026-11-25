@@ -45,7 +45,9 @@ const BASE_ENV_PREFIXES = ['LC_', 'XDG_']
 export const PROVIDER_ENV_PREFIXES = Object.freeze({
   claude: ['ANTHROPIC_', 'CLAUDE_', 'DISABLE_'],
   codex: ['OPENAI_', 'CODEX_'],
-  gemini: ['GEMINI_', 'GOOGLE_', 'CLOUDSDK_']
+  gemini: ['GEMINI_', 'GOOGLE_', 'CLOUDSDK_'],
+  // The login is a file in the seat's home; no variable of the service is the CLI's to read (GOOGLE_* would switch its auth).
+  antigravity: []
 })
 
 export function childEnvironment (provider, source = process.env) {

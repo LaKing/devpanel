@@ -9,7 +9,7 @@ export default async function (t) {
   t.section('the real configuration resolves')
   const cfg = await loadConfig({ root: CONFIG_ROOT })
   t.ok('no discovery errors', cfg.errors.length === 0, cfg.errors.map((e) => e.message).join('; '))
-  t.eq('adapters discovered', cfg.harnesses, ['claude', 'codex', 'gemini'])
+  t.eq('adapters discovered', cfg.harnesses, ['antigravity', 'claude', 'codex', 'gemini'])
   const good = await resolvePlaybook('implementation', { root: CONFIG_ROOT })
   t.ok('implementation resolves', good.ok, errorMatching(good, /./)?.message)
   t.ok('resolved is deeply frozen', Object.isFrozen(good.resolved) && Object.isFrozen(good.resolved.participants.implementer))

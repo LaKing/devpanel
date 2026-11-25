@@ -122,7 +122,7 @@ Diagnostics go to `logs/devpanel.jsonl` (tail it), with the journal as a seconda
 
 | Path | Holds | Edited by |
 |---|---|---|
-| `harness/*.mjs` | runtime adapters (`claude`, `codex`, `gemini`); the contract is `harness/README.md` | developers |
+| `harness/*.mjs` | runtime adapters (`claude`, `codex`, `gemini`, `antigravity`); the contract is `harness/README.md` | developers |
 | `roster/*.yaml` | concrete models bound to a harness, with `efforts` and `verification.status` | operators |
 | `strategy-templates/<id>/` | `strategy.yaml` (roles, phases, loops, review policy, completion) + `prompts/*.md` + `intents/*.yaml` (prompt overlays per kind of work, keyed by step id) | operators |
 | `playbooks/*.yaml` | a strategy bound to participants, budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
@@ -668,7 +668,14 @@ whole with only those areas allowed back, and denies the shell for that turn; `a
 writing seat rather than approximated. The live `--fence` check passes only when each fenced capability was
 attempted and refused per `diagnostics.toolCalls`; a turn that attempted nothing is inconclusive. It
 exposes no effort control (`efforts: []`, an override is refused) and reports no cost, so its runs draw on the
-unpriced allowance. `docs/model-providers.md` is the reference; the panel supervisor is still claude/codex only. Both stream the
+unpriced allowance. `docs/model-providers.md` is the reference; the panel supervisor is still claude/codex only. `antigravity` is a fourth adapter
+(`harness/antigravity.mjs`, the `agy` CLI under the service user's own Antigravity login: the same Gemini models on that login's plan,
+with effort levels as part of the model id, no API key). Its sessions are discovered; each turn's CLI runs with `HOME` set to a home of its
+own (the seat's `cli-homes/<seat>`), the login's token bound in read-only. Its permission rules are not a fence (reads are not confined; web
+search, subagents and scheduled tasks have no rule), so a seat has tools only inside a proved fence and only by an allow-list the seat's home
+carries: the agent the session runs as declares them and a `PreToolUse` gate denies every other call (`prepareHome`); a workspace's `.agents/`
+directories are masked. A read seat reads files under its roots (no listing or search on agy 1.5.16), every other turn is tool-free, a seat
+that writes source is refused, and a host without bubblewrap refuses the harness (`harnessRefusal`). It reports no cost. Both stream the
 runtime's events (`--output-format stream-json --verbose` / `exec --json`) and report them through
 `observe.onActivity`; the engine records them on `pendingInvocation.activity` as liveness evidence only.
 Seat hygiene: new runs resolve with `fence: { hygiene: 1 }`; under it the child environment is an allow-list

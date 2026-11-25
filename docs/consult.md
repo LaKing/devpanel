@@ -66,7 +66,9 @@ seat keeps it, because its home is the person's. Text search is the exception on
 searches a repository with `git grep`, which never looks into ignored files whatever the settings say (seen live with
 Gemini CLI 0.60.0: `read_file` and listings reach an ignored file, `grep_search` does not find it). With `rg` on the
 PATH the CLI searches with it and honours the setting. A single-file root reaches it through the file's directory, which
-inside the fence holds only what the fence bound. The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
+inside the fence holds only what the fence bound. A seat on the `antigravity` harness reads files under its roots,
+ignored ones included, and has no listing, search or shell: it opens what the question names and what those files
+name (docs/model-providers.md "Antigravity"). The file is read at every consult, so a change needs no restart. It is not part of any run's snapshot or
 `configHash`: a run reads a consult's record, never this file. `npm run config:check` warns when a seat cannot be
 used. The host settings' `operatorLanguage` (an ISO 639-1 code, default `en`) is the language the question for a
 person is written in; everything else stays English.

@@ -1,0 +1,22 @@
+id: gemini-4-argon-antigravity
+title: Gemini 4 Argon (via Antigravity)
+harness: antigravity
+model: gemini-4-argon
+efforts: [low, medium, high]
+defaultEffort: medium
+contextWindow: 1048576
+verification:
+  status: unverified
+  notes: >
+    Listed by the Antigravity CLI's model catalogue with these effort levels; the
+    adapter asks for the level as part of the model id (gemini-4-argon-<effort>).
+    An installation verifies it with the live session check, signed in as its
+    service user, and keeps the evidence in its own copy of this entry.
+notes: >
+  Runs through the Antigravity CLI (`agy`) under the service user's own
+  Antigravity login, on that login's plan: no API key. Cost is unknown rather
+  than estimated: the CLI reports tokens only, so runs on this entry draw on the
+  unpriced allowance. A seat on this harness gets read tools at most, and only
+  inside the seat fence: it cannot write source, run a command or reach the web,
+  so it can be a consult seat, an auditor that reads, or a coordinator, never the
+  author. See docs/model-providers.md "Antigravity".

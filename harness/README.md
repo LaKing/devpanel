@@ -72,6 +72,16 @@ tells the engine which world it is in:
 | Crash mid-first-turn | reconcile by id | needs marker evidence |
 | Worst case | retry safely | `recovery-required` |
 
+### Antigravity: an allow-list of tools in the seat's own home
+
+`antigravity.mjs` drives the `agy` CLI under the service user's own login. Sessions are discovered (the conversation
+id arrives with `init`), the prompt goes in as one NDJSON event on stdin, and every turn runs with `HOME` set to a
+home of its own, where the CLI's whole state lives and the login's token is bound read-only. Its permission rules
+are not a fence: they do not confine reads and have no action for web search, subagents or scheduled tasks. A seat
+gets tools only inside a proved seat fence, and only those its agent declares and its `PreToolUse` gate lets through
+(both written into that home, bound read-only); a seat that writes source is refused. See docs/model-providers.md
+"Antigravity".
+
 ### Gemini: the fence is a policy file, not a mode
 
 Two of this contract's rules land differently on the Gemini CLI, and both are

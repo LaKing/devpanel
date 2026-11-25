@@ -144,7 +144,7 @@
         "disabled": {
           "type": "array",
           "uniqueItems": true,
-          "items": { "enum": ["claude", "codex", "gemini"] },
+          "items": { "enum": ["claude", "codex", "gemini", "antigravity"] },
           "description": "Runtimes this installation does not have. Their roster entries are left out of the configuration, so no playbook seat, supervisor or fallback can use them; a playbook that names one fails resolution saying so (override it in host-config/playbooks/)."
         }
       }
