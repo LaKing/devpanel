@@ -18,26 +18,34 @@ const anyLive = (runs) => otherLive(runs, null)
 const open = (issue) => Boolean(issue) && !issue.archived && !issue.packed
 
 /*
- * The full verification's freeze (issue read's admissionFrozen; undefined = not confirmed, refused).
- * supervisor.mjs:770: a run that writes the checkout continues only as the frozen cycle's own.
- * supervisor.mjs:1589: no finalize or reconcile delivery at all. supervisor.mjs:368: no writing start.
+ * The full verification's freeze (issue read's admissionFrozen, set only for a project the cycle verifies; undefined =
+ * not confirmed, refused). The server freezes only a *whole* run (run-exclusivity.mjs wholeFreeze, the run read's
+ * `admission.whole`): a contained run continues, finalizes and reconciles during the cycle, its writes waiting at the
+ * gates (cycle-gates.mjs). A whole run continues only as the frozen cycle's own; a run whose classification the page
+ * does not have counts as whole.
  */
 const freezeKnown = (issue) => Boolean(issue) && issue.admissionFrozen !== undefined
+const contained = (run) => run?.admission?.whole === false
 const admitsContinuation = (issue, run) => {
   const a = run?.admission
   if (!freezeKnown(issue) || !a) return false
   const f = issue.admissionFrozen
-  return !f || !a.writesCheckout || (a.cycleId != null && a.cycleId === f.cycleId)
+  return !f || !a.writesCheckout || contained(run) || (a.cycleId != null && a.cycleId === f.cycleId)
 }
-const admitsDelivery = (issue) => freezeKnown(issue) && !issue.admissionFrozen
-const admitsStartOf = (issue, run) => freezeKnown(issue) && (!issue.admissionFrozen || run?.admission?.writesCheckout === false)
+const admitsDelivery = (issue, run) => freezeKnown(issue) && (!issue.admissionFrozen || contained(run))
+/** An owner-input restart of the same configHash: admitted when the run does not write, or would be contained again. */
+const admitsStartOf = (issue, run) => freezeKnown(issue) && (!issue.admissionFrozen || run?.admission?.writesCheckout === false || contained(run))
 
 /** run-exclusivity.mjs writesCheckout, read off a preview: in place, a release tactic, or a delivery. Unknown writes. */
 export const previewWrites = (preview) => !preview || preview.workspace?.isolation === 'in-place' ||
   ['staging', 'deployment'].includes(preview.tactic) || (preview.delivery?.action ?? 'none') !== 'none'
 
-/** supervisor.mjs:368: while frozen, a playbook that writes the checkout does not start. */
-export const startAdmitted = (issue, preview) => freezeKnown(issue) && (!issue.admissionFrozen || !previewWrites(preview))
+/** A start the freeze would hold whole (wholeFreeze before provisioning): in place, a release, an unfenced host, links allowed. */
+export const previewWhole = (issue, preview) => !preview || preview.workspace?.isolation === 'in-place' ||
+  ['staging', 'deployment'].includes(preview.tactic) || issue?.admissionFrozen?.confined !== true || preview.workspace?.symlinks === 'allow'
+
+/** supervisor.mjs start: while frozen, only a playbook that writes the checkout and would be whole does not start. */
+export const startAdmitted = (issue, preview) => freezeKnown(issue) && (!issue.admissionFrozen || !previewWrites(preview) || !previewWhole(issue, preview))
 
 export const offers = {
   /** supervisor.mjs:1452-1454 pauseRun: only the run active here; :2372/:2374 offer pause. */
@@ -58,7 +66,7 @@ export const offers = {
   continuation: (action) => ({ issue, runs, run }) => open(issue) && !anyLive(runs) && admitsContinuation(issue, run) && actionsOf(run).includes(action),
 
   /** supervisor.mjs:1585-1597 finalize and reconcile-delivery: no active run, no freeze (:1589), issue open; offered by the run. */
-  finalize: (action) => ({ issue, runs, run }) => open(issue) && !anyLive(runs) && admitsDelivery(issue) && actionsOf(run).includes(action),
+  finalize: (action) => ({ issue, runs, run }) => open(issue) && !anyLive(runs) && admitsDelivery(issue, run) && actionsOf(run).includes(action),
 
   /**
    * supervisor.mjs:1677-1688 abandon: no active run, the run not live, and it needs abandonment (the page

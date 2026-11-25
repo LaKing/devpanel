@@ -3,13 +3,27 @@ export const systemClock = {
   now: () => Date.now(),
   iso: () => new Date().toISOString(),
   sleep: (ms) => new Promise((r) => { const h = setTimeout(r, Math.max(0, ms)); if (h.unref) h.unref() }),
-  /** Fire `fn` after `ms`; returns a cancel handle. */
+  /**
+   * Fire `fn` after `ms`; returns a cancel handle. A delay beyond Node's timer ceiling (2^31-1 ms, about 24.8 days,
+   * which setTimeout would turn into 1 ms) is waited out in steps of at most that ceiling, so a long configured bound
+   * never fires early (wait-limit-timer-overflow).
+   */
   after (ms, fn) {
-    const handle = setTimeout(fn, Math.max(0, ms))
-    if (handle.unref) handle.unref()
-    return () => clearTimeout(handle)
+    const due = Date.now() + Math.max(0, ms)
+    let handle = null
+    let cancelled = false
+    const arm = () => {
+      const left = due - Date.now()
+      if (left > TIMER_MAX) handle = setTimeout(arm, TIMER_MAX)
+      else handle = setTimeout(() => { if (!cancelled) fn() }, Math.max(0, left))
+      if (handle.unref) handle.unref()
+    }
+    arm()
+    return () => { cancelled = true; clearTimeout(handle) }
   }
 }
+/** The longest delay setTimeout honours. */
+export const TIMER_MAX = 2 ** 31 - 1
 
 export function manualClock (startMs = Date.parse('2026-09-10T00:00:00.000Z')) {
   let t = startMs

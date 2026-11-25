@@ -101,7 +101,7 @@ export async function listRuns (issuePath, { strict = false } = {}) {
  * One run, assembled into the shape a timeline needs: every turn with its role,
  * model, prompt, response, structured output and revision.
  */
-export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, liveCheckSince = null, strict = false, platform = hostPlatform() }) {
+export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, liveCheckSince = null, strict = false, platform = hostPlatform(), classify = null }) {
   let run
   try {
     run = await store.readRun(issuePath, runId)
@@ -225,7 +225,10 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     cleanupUnrecorded: (await unrecordedCleanup(path.dirname(issuePath), run)).length > 0,
     // What a full verification's freeze refuses for this run (supervisor.mjs answer :770): whether it writes the
     // checkout (an unreadable snapshot counts as writing) and the cycle it belongs to; the freeze is on the issue read.
-    admission: { writesCheckout: writesCheckout(snapshot), cycleId: run.fullVerification?.cycleId ?? null },
+    // `whole`: whether a full verification's freeze holds it whole (supervisor wholeOf; unreadable: true); a contained run's
+    // continuation, finalize and reconcile are admitted during a cycle and wait at the gates (cycle-gates.mjs).
+    admission: { writesCheckout: writesCheckout(snapshot), cycleId: run.fullVerification?.cycleId ?? null,
+      ...(classify ? { whole: await Promise.resolve().then(() => classify(snapshot, run.workspace ?? null)).catch(() => true) } : {}) },
     explanation: explainRun(run, { outputs, active, ownership, acceptedRisks, liveCheckSince }),
     // Only what the backend will actually accept. A button for anything else
     // would promise something the server refuses.

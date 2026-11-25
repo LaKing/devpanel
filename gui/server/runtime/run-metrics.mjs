@@ -68,6 +68,9 @@ export function checkIntervals (run) {
     ...(run.driveSlotWaits ?? []).map((w) => interval(ms(w.from), ms(w.to))),
     // A run waiting for a module another run holds (module-locks.mjs): no seat turn runs, like a slot wait.
     ...(run.moduleLockWaits ?? []).map((w) => interval(ms(w.from), ms(w.to))),
+    // A write waiting for a full verification's thaw (cycle-gates.mjs): no seat turn need run, like a slot wait.
+    // A drive's wait for one is already among driveSlotWaits (reason full-verification).
+    ...(run.cycleWaits ?? []).filter((w) => w.kind === 'write').map((w) => interval(ms(w.from), ms(w.to))),
     ...(run.checkHistory ?? []).flatMap((h) => (h.runs ?? []).map(span))
   ].filter(Boolean)
 }

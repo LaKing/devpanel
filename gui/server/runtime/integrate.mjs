@@ -121,6 +121,7 @@ export async function integrateRun (options) {
 async function integrateRunUnserialised ({ issuePath, runId, project, projectPath, configRoot, expectedRevision, targetBranch = null, expectedTargetHead = null, approvedBy = 'operator', clock = { iso: () => new Date().toISOString() }, hooks = {} }) {
   await store.requireCompleteEvents(issuePath, runId)
   const runRecord = await store.readRun(issuePath, runId).catch(() => null)
+  let cycleTicket = null
   if (!runRecord) throw refuse('no such run', 404)
   const refusal = integrateUnavailable(runRecord)
   if (refusal) throw refuse(refusal)
@@ -154,8 +155,21 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
   // merge onto what they saw, not onto whatever is there now.
   if (targetHeadBefore !== expectedTargetHead) throw refuse(`${branch} is at ${targetHeadBefore.slice(0, 12)}, not ${String(expectedTargetHead).slice(0, 12)} as approved; it moved since the approval was given. Read the target again and re-approve`)
 
+  // The full verification's write gate (cycle-gates.mjs), asked with the destination's canonical Git common directory
+  // before the first write into it (the store fetch, the temporary worktree and merge, the branch, the checkouts
+  // following it); its ticket is held until followCheckouts below is done.
+  if (hooks.cycleGate) {
+    cycleTicket = await hooks.cycleGate([sourceCommon])
+    // What the gate recorded on the run while it waited (supervisor writeGateFor) is kept by this operation's own writes.
+    const fresh = await store.readRun(issuePath, runId).catch(() => null)
+    if (fresh) Object.assign(runRecord, { cycleWait: fresh.cycleWait ?? null, ...(fresh.cycleWaits ? { cycleWaits: fresh.cycleWaits } : {}) })
+  }
   if (fromStore) {
-    try { await fetchFromStore({ source, store: candidateRepo, branch: delivery.branch, commit: delivery.commit }) } catch (error) { throw refuse(`the candidate could not be brought from the panel's Git store ${candidateRepo}: ${error.message}`) }
+    try { await fetchFromStore({ source, store: candidateRepo, branch: delivery.branch, commit: delivery.commit }) } catch (error) {
+      cycleTicket?.release()
+      cycleTicket = null
+      throw refuse(`the candidate could not be brought from the panel's Git store ${candidateRepo}: ${error.message}`)
+    }
   }
 
   const record = { approvedBy, revision: delivery.revision, repository: sourceCommon, ...(fromStore ? { store: candidateRepo } : {}), targetBranch: branch, targetHeadBefore, mergeCommit: null, method: null, at: clock.iso(), error: null }
@@ -169,9 +183,11 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
   // registered worktree that has the branch checked out is inspected first
   // (a dirty one refuses the whole operation) and brought up to the merge
   // afterwards, so no checkout is left with a HEAD its files do not match.
-  const occupants = (await worktreesOn(source, branch))
+  let occupants = []
   let temporary = null
   try {
+    // Inside the try, so a failed read still releases the cycle ticket (finally below).
+    occupants = await worktreesOn(source, branch)
     for (const wt of occupants) {
       const dirty = (await run('git', ['-C', wt, 'status', '--porcelain', '--untracked-files=no'])).stdout.split(NL).filter(Boolean).length
       if (dirty > 0) throw refuse(`${branch} is checked out in ${wt} with ${dirty} modified tracked path(s); publishing would leave that working tree inconsistent. Commit or stash them first`)
@@ -244,6 +260,9 @@ async function integrateRunUnserialised ({ issuePath, runId, project, projectPat
       await run('git', ['-C', source, 'worktree', 'remove', '--force', temporary]).catch(() => {})
       await fs.rm(temporary, { recursive: true, force: true }).catch(() => {})
     }
+    // Released on every path, and only after the last write into the repository (the temporary worktree's removal).
+    cycleTicket?.release()
+    cycleTicket = null
   }
 
   record.phase = 'complete'
@@ -288,11 +307,11 @@ async function followCheckouts (record, source) {
  * a `published` phase still owes the checkouts their update. Safe to call
  * repeatedly; a complete or aborted record is left alone.
  */
-export async function reconcileIntegration ({ issuePath, runId, clock = { iso: () => new Date().toISOString() }, platform = hostPlatform() }) {
-  return underRunLock(issuePath, runId, 'integration-reconcile', platform, () => reconcileIntegrationLocked({ issuePath, runId, clock }))
+export async function reconcileIntegration ({ issuePath, runId, clock = { iso: () => new Date().toISOString() }, platform = hostPlatform(), hooks = {} }) {
+  return underRunLock(issuePath, runId, 'integration-reconcile', platform, () => reconcileIntegrationLocked({ issuePath, runId, clock, hooks }))
 }
 
-async function reconcileIntegrationLocked ({ issuePath, runId, clock }) {
+async function reconcileIntegrationLocked ({ issuePath, runId, clock, hooks = {} }) {
   await store.requireCompleteEvents(issuePath, runId)
   const runRecord = await store.readRun(issuePath, runId).catch(() => null)
   const record = runRecord?.integration
@@ -312,7 +331,18 @@ async function reconcileIntegrationLocked ({ issuePath, runId, clock }) {
     }
   }
   if (record.phase === 'published') {
-    await followCheckouts(record, source)
+    // Following the checkouts writes their tracked files and index: a full verification snapshotting them is waited for.
+    const cycleTicket = hooks.cycleGate ? await hooks.cycleGate([record.repository ?? source]) : null
+    try {
+      // What the gate recorded on the run while it waited (supervisor writeGateFor) is kept by this write.
+      if (hooks.cycleGate) {
+        const fresh = await store.readRun(issuePath, runId).catch(() => null)
+        if (fresh) Object.assign(runRecord, { cycleWait: fresh.cycleWait ?? null, ...(fresh.cycleWaits ? { cycleWaits: fresh.cycleWaits } : {}) })
+      }
+      await followCheckouts(record, source)
+    } finally {
+      cycleTicket?.release()
+    }
     record.phase = 'complete'
   }
   record.reconciledAt = clock.iso()
@@ -331,12 +361,13 @@ async function reconcileIntegrationLocked ({ issuePath, runId, clock }) {
  * nothing was written, so damage is first observed, and recorded, by a reader
  * under the lock. Otherwise the run is read as every other reader reads it.
  */
-export async function sweepPendingIntegration ({ issuePath, runId, platform = hostPlatform() }) {
+export async function sweepPendingIntegration ({ issuePath, runId, platform = hostPlatform(), hooks = {} }) {
   const raw = await fs.readFile(path.join(store.runDir(issuePath, runId), 'run.json'), 'utf8').then(JSON.parse).catch(() => null)
   let settled = null
   if (['publishing', 'published'].includes(raw?.integration?.phase)) {
-    settled = await reconcileIntegration({ issuePath, runId, platform }).catch((refused) => ({ refused }))
-    if (settled.refused?.code === 'RUN_LOCKED') return { run: raw, settled, held: true }
+    settled = await reconcileIntegration({ issuePath, runId, platform, hooks }).catch((refused) => ({ refused }))
+    // Locked by another owner, or its checkouts snapshotted by a full verification now: a later sweep settles it.
+    if (['RUN_LOCKED', 'FULL_VERIFICATION_WAIT'].includes(settled.refused?.code)) return { run: raw, settled, held: true }
   }
   return { run: await store.readRun(issuePath, runId), settled, held: false }
 }

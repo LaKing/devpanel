@@ -30,11 +30,14 @@ import { FINALIZABLE_BLOCKS, HARNESS_LOAD_FAILURES, harnessUnavailable } from '.
 import { reconcileUnavailable } from './runtime/source-reconcile.mjs'
 import { planDeletedRun, retireRefs } from './runtime/ref-retention.mjs'
 import { autoReconcileRefusal } from './runtime/auto-reconcile.mjs'
-import { LockHeld, acquire, ownerLiveness } from './runtime/lock.mjs'
+import { LockHeld, acquire, ownerLiveness, withLock } from './runtime/lock.mjs'
 import { admissionLockFile, withIssueLock } from './issue-locks.mjs'
-import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, writesCheckout } from './run-exclusivity.mjs'
+import { NOT_EXCLUSIVE, conflictMessage, conflicts, exclusivityOf, wholeFreeze, wholeFreezeQuick, writesCheckout } from './run-exclusivity.mjs'
+import { gitStoreDir } from './runtime/git-store.mjs'
+import { createCycleGates } from './cycle-gates.mjs'
+import { fencePolicy } from './runtime/confinement-policy.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
-import { terminatePids } from './runtime/process.mjs'
+import { runProcess, terminatePids } from './runtime/process.mjs'
 import { openCleanup, noteLostTags, proveEntries, cleanupRefusal, readBarrier, liftBarrierEntries, syncBarrier, unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { createProbeExecutor } from './runtime/probe-budget.mjs'
 import { sweepPendingIntegration } from './runtime/integrate.mjs'
@@ -133,7 +136,12 @@ export function createSupervisor ({
   // (another start, or an issue being archived, restored or deleted) before it is refused, retryably.
   admissionWaitMs = 60000,
   // Seams for tests only (deleteRun's wait behind the issue's step lock).
-  seams = {}
+  seams = {},
+  // The host's seat fence policy (confinement-policy.mjs), read to tell a contained writing run from one the
+  // full verification freezes whole (run-exclusivity.mjs wholeFreeze); injected by tests.
+  seatFencePolicy = (p) => fencePolicy({ platform: p }),
+  // Where a run's base snapshot is written (runtime/git-store.mjs): a start during a cycle needs one (original AC7).
+  gitStoreOf = (project) => gitStoreDir(project)
 } = {}) {
   const availability = createAvailabilityStore(availabilityFile)
   const pathOverlap = createPathOverlap({ listProjects: () => issues.listProjects(), listIssues: (project) => issues.listIssues(project) })
@@ -165,7 +173,107 @@ export function createSupervisor ({
   let freeze = null
   // The projects the cycle verifies (full-verification.mjs cycleScope), fixed when it froze; null: every project.
   let frozenProjects = null
-  const freezeRefusal = () => Object.assign(err(409, `Admission is closed to writing runs of the projects the full verification verifies (cycle ${freeze.cycleId}, since ${freeze.at}): no run of those that can write the checkout starts, continues or delivers until the cycle ends.`, { code: 'FULL_VERIFICATION_FREEZE', cycleId: freeze.cycleId }), { started: false, retryable: true })
+  // Drives and checkout writes of contained runs wait at these (cycle-gates.mjs); everything else is as before.
+  const gates = createCycleGates()
+  /** Whether the freeze holds a writing run whole (run-exclusivity.mjs wholeFreeze), from its snapshot and workspace. */
+  const wholeOf = async (snapshot, workspace = null) => (await wholeFreeze({ snapshot, workspace, frozen: gates.current(), fence: seatFencePolicy(platform), platform, env: process.env })).whole
+  /** Whether a new writing run here could be contained: its turns fenced, no fallback to unfenced, and what the cycle snapshots readable. */
+  const startsConfined = () => seatFencePolicy(platform)?.mode === 'fence' && !(platform?.bubblewrap && process.env.DEVPANEL_FENCE_UNPROVED === 'run') && !gates.current()?.unknown
+  const snapshotOf = (record) => record.engine?.snapshot ?? record.reservation?.resolution?.resolved ?? record.snapshot ?? null
+  const workspaceOf = (record) => record.engine?.run?.workspace ?? record.reservation?.run?.workspace ?? null
+  /** Whole without any I/O (wholeFreezeQuick): asked synchronously, before any classification awaits. */
+  const quickWhole = (snapshot) => Boolean(wholeFreezeQuick({ snapshot, frozen: gates.current(), fence: seatFencePolicy(platform), platform, env: process.env }))
+  /**
+   * A record's classification for the cycle frozen now, bound to it (continuation-crosses-thaw): applied only while that
+   * cycle is still the active one; a cycle that thawed or was replaced meanwhile leaves the record unclassified for the
+   * next. While it is read the record's drives and writes wait at the gates (`classifying`); found whole, its waits end.
+   */
+  async function classifyFor (record, cycleId, snapshot = snapshotOf(record), workspace = workspaceOf(record)) {
+    if (!cycleId) return null
+    if (quickWhole(snapshot)) { Object.assign(record, { whole: true, classifiedFor: cycleId }); gates.release(record.runId); return true }
+    record.classifying = cycleId
+    let whole
+    try { whole = await wholeOf(snapshot, workspace) } catch { whole = true }
+    if (record.classifying === cycleId) delete record.classifying
+    if (gates.thawed.has(cycleId) || !gates.isActive(cycleId)) return null
+    Object.assign(record, { whole, classifiedFor: cycleId })
+    if (whole) gates.release(record.runId)
+    return whole
+  }
+  /** At registration: a classification made for another cycle (or none) is not this one's. */
+  function adoptClassification (record) {
+    if (record.whole !== undefined && record.classifiedFor !== (freeze?.cycleId ?? null)) { delete record.whole; delete record.classifiedFor }
+  }
+  /**
+   * The record's classification for the cycle frozen now, read until it belongs to that cycle (continuation-crosses-thaw,
+   * handoff-requests-new-cycle-before-classification): one made for an earlier cycle, or none (a cycle that froze or
+   * was replaced during the reading), is read again. `recheck` reads a contained decision once more against `workspace`
+   * (provisional-workspace-classification); a whole one stands. Not applicable although that cycle is still the frozen
+   * one: held whole, never read again in a loop. Nothing is awaited after its last look at `freeze`.
+   */
+  async function classifyNow (record, snapshot, workspace, { recheck = false } = {}) {
+    let reread = recheck
+    for (;;) {
+      adoptClassification(record)
+      const c = freeze?.cycleId
+      if (!c || !frozenFor(record.project) || ofCycle(record) || !writes(record)) return
+      if (record.whole === true || (record.whole === false && !reread)) return
+      reread = false
+      await classifyFor(record, c, snapshot, workspace)
+      if (record.whole === undefined && freeze?.cycleId === c) Object.assign(record, { whole: true, classifiedFor: c })
+    }
+  }
+  /** Whether the cycle frozen now classified this record whole: the only freeze request a handoff makes of its own. */
+  const wholeForNow = (record) => frozenFor(record.project) && !ofCycle(record) && writes(record) && record.whole === true && record.classifiedFor === freeze?.cycleId
+  /**
+   * Original AC7: a start may proceed during a cycle only if it needs no write before its delivery. Provisioning pins the
+   * base (refs/devpanel/base/<run>), writes its objects and registers a worktree in its destination repository: the
+   * host's Git store for a private-repository run (fence.repository 1) when it keeps one, else the project's own
+   * repository (launch.mjs cut, privateRepositories). A start whose destination is in what the cycle snapshots is
+   * refused; one that cannot be read counts as in it (snapshot-preflight-writes).
+   */
+  async function provisionDestination (project, projectPath, resolved) {
+    const store = resolved?.fence?.repository === 1 ? gitStoreOf(project) : null
+    if (store) return store
+    const out = await runProcess({ command: 'git', args: ['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'] }).catch(() => null)
+    const dir = out?.code === 0 ? String(out.stdout ?? '').trim() : ''
+    return dir ? await fs.realpath(dir).catch(() => dir) : null
+  }
+  async function provisionWritesSnapshot (project, projectPath, resolved) {
+    const destination = await provisionDestination(project, projectPath, resolved)
+    return destination ? gates.touchesSnapshot([destination]) : true
+  }
+  /**
+   * Provisioning of a run already reserved (admitted before the cycle, or resumed in preflight): a write ticket for its
+   * destination, taken at the gate with nothing awaited between it and provisionRun, so the cycle drains it (busy) or it
+   * waits for the cycle (snapshot-preflight-writes). The wait is on the reservation's record, excused like any cycle wait;
+   * a stop meanwhile ends it. An unreadable destination is asked as the project checkout itself.
+   */
+  async function provisionTicket (record, projectPath) {
+    const destination = await provisionDestination(record.project, projectPath, snapshotOf(record))
+    const gate = gates.gateFor(record)
+    const run = record.reservation.run
+    for (;;) {
+      const answer = gate.tryWrite([destination ?? projectPath], { action: 'provisioning' })
+      if (answer.ticket) return answer.ticket
+      const token = answer.wait
+      const id = `provisioning:${token.cycleId}:${token.seq}`
+      run.cycleWait = { kind: 'write', action: 'provisioning', cycleId: token.cycleId, repositories: token.repositories, since: token.from, id }
+      await writeReservation(record).catch(() => {})
+      emit?.({ type: 'run-cycle-wait', project: record.project, issueId: record.issueId, runId: record.runId, phase: 'start' })
+      try {
+        await gates.waitFor(token, record.controller.signal)
+      } finally {
+        if (run.cycleWait?.id === id) run.cycleWait = null
+        ;(run.cycleWaits ??= []).push({ kind: 'write', action: 'provisioning', cycleId: token.cycleId, repositories: token.repositories, from: token.from, to: token.ended?.to ?? new Date().toISOString(), endSeq: token.ended?.endSeq ?? null, id, outcome: token.ended ? 'thawed' : 'stopped' })
+        await writeReservation(record).catch(() => {})
+        emit?.({ type: 'run-cycle-wait', project: record.project, issueId: record.issueId, runId: record.runId, phase: 'end' })
+      }
+    }
+  }
+  /** A record the freeze waits for whole: in place, release, unreadable, reaching the snapshot; or not classified. */
+  const wholeRecord = (record) => record.whole !== false
+  const freezeRefusal = () => Object.assign(err(409, `Admission is closed to writing runs of the projects the full verification verifies (cycle ${freeze?.cycleId ?? 'ending'}, since ${freeze?.at ?? 'now'}): no run of those that can write the checkout starts, continues or delivers until the cycle ends.`, { code: 'FULL_VERIFICATION_FREEZE', cycleId: freeze?.cycleId ?? null }), { started: false, retryable: true })
   const freezeAsk = (cycleId) => ({ cycleId, at: new Date().toISOString() })
   /** Whether a project is in the scope of the cycle that froze; a project outside it is never frozen, asked or waited for. */
   const inScope = (project) => !frozenProjects || frozenProjects.has(project)
@@ -186,48 +294,246 @@ export function createSupervisor ({
   const deferredReconciles = new Map()
   /** Ask one run this process drives to stop at its next boundary for the cycle. Synchronous for an engine. */
   function freezeRecord (record) {
-    if (!freeze || ofCycle(record) || !writes(record) || !inScope(record.project)) return null
+    // Only a record this cycle classified whole is asked: one left unclassified by a cycle change is never asked for the newer cycle.
+    if (!freeze || !wholeForNow(record)) return null
     if (record.engine) return record.engine.requestFreeze(freeze.cycleId)
     record.freezeRequested = freezeAsk(freeze.cycleId)
     record.reservation.run.freezeRequested ??= record.freezeRequested
-    return store.writeRun(record.issuePath, record.runId, record.reservation.run)
+    return writeReservation(record)
+  }
+  /**
+   * The reservation's run.json, written in order: each write serializes the reservation as it stands when its turn
+   * comes, so a freeze request's write can never land after the thaw's clearing write (incomplete-cycle-bound).
+   */
+  function writeReservation (record) {
+    const next = (record.reservationWrites ?? Promise.resolve()).catch(() => {}).then(() => store.writeRun(record.issuePath, record.runId, record.reservation.run))
+    record.reservationWrites = next
+    return next
   }
   /** Close admission for a cycle and ask every live writing run to pause; returns the runs and pending writing operations asked. */
-  async function freezeAdmission (cycleId, { projects } = {}) {
+  async function freezeAdmission (cycleId, { projects, hosts = [], snapshotted = null } = {}) {
     if (freeze && freeze.cycleId !== cycleId) throw err(409, `admission is already closed for cycle ${freeze.cycleId}`)
+    if (gates.thawed.has(cycleId)) return []
     if (!freeze || projects !== undefined) frozenProjects = Array.isArray(projects) ? new Set(projects) : null
     freeze = { ...freezeAsk(cycleId), projects: frozenProjects ? [...frozenProjects] : null }
+    gates.setFreeze({ cycleId, projects: frozenProjects ? [...frozenProjects] : null, hosts, snapshotted })
+    // Each live writing run of the scope: classified now (whole or contained), and only a whole one is asked to stop.
+    const records = [...active.values()].filter((record) => !ofCycle(record) && writes(record) && inScope(record.project))
     const asked = []
     const persisted = []
-    for (const record of active.values()) {
-      if (ofCycle(record) || !writes(record) || !inScope(record.project)) continue
+    const ask = (record) => {
       persisted.push(Promise.resolve(freezeRecord(record)).catch((error) => console.warn(`[devpanel] the freeze request of ${record.project}/${record.issueId} run ${record.runId} was not persisted: ${error.message}`)))
       asked.push({ project: record.project, issueId: record.issueId, runId: record.runId })
     }
+    // Whole without any reading (in place, release, unreadable, unconfined): asked to stop now, synchronously, before any
+    // classification awaits, as before this freeze waited for anything (whole-freeze-installation). The others wait at
+    // the gates while they are read (`classifying`), none passing as if whole.
+    const reading = []
+    for (const record of records) {
+      if (quickWhole(snapshotOf(record))) { Object.assign(record, { whole: true, classifiedFor: cycleId }); ask(record) } else { delete record.whole; record.classifying = cycleId; reading.push(record) }
+    }
+    for (const record of reading) {
+      // Applied only while this cycle is the active one (classifyFor); a thaw meanwhile leaves the record alone.
+      const whole = await classifyFor(record, cycleId)
+      if (whole && !gates.thawed.has(cycleId)) ask(record)
+    }
+    // A freeze the cycle's bound interrupted meanwhile announces nothing; what it asked is taken back by the thaw.
+    if (gates.thawed.has(cycleId)) { await Promise.all(persisted); return [] }
     for (const p of pendingWrites.values()) if (inScope(p.project)) asked.push({ project: p.project, issueId: p.issueId, runId: p.runId, phase: p.phase, pending: true })
     await Promise.all(persisted)
-    emit?.({ type: 'admission-frozen', cycleId })
+    if (!gates.thawed.has(cycleId)) emit?.({ type: 'admission-frozen', cycleId })
     return asked
   }
   function thawAdmission (cycleId = null) {
     if (freeze && cycleId && freeze.cycleId !== cycleId) return false
+    const ended = cycleId ?? freeze?.cycleId ?? null
+    // The cycle's waits end, in the order they began; nothing of it is applied any more (cycle-gates.mjs).
+    if (ended) gates.thaw(ended)
     freeze = null
     frozenProjects = null
+    if (ended) for (const record of active.values()) clearFreezeRequest(record, ended)
     emit?.({ type: 'admission-thawed', cycleId })
     // What the freeze put off, once each.
     const deferred = [...deferredReconciles.values()]
     deferredReconciles.clear()
     for (const d of deferred) autoReconcile(d.project, d.issueId, d.runId, d.at)
+    // Held automatic integration recoveries: their wait ends with the thaw's stamps and the recovery runs again.
+    const integrations = [...deferredIntegrations.values()]
+    deferredIntegrations.clear()
+    for (const d of integrations) resumeIntegration(d)
     return true
+  }
+  /**
+   * After the thaw, one held integration recovery (integration-recovery): its wait's end is written under the issue's run
+   * lock, after the wait's start has landed (the sweep that held it wrote the start under that lock and released it only
+   * after), so the open wait can never be written after its end; then the recovery runs again. A lock held by another
+   * owner (the sweep that held it, still unwinding, or a live run) is waited for and asked again, never given up after one try.
+   */
+  const lockRetries = 12
+  const lockDelay = (i) => new Promise((resolve) => setTimeout(resolve, Math.min(500 * 2 ** i, 30_000)).unref?.())
+  function resumeIntegration (d) {
+    ;(async () => {
+      await d.recorded
+      for (let i = 0; ; i++) {
+        let lock
+        try {
+          lock = await acquire(path.join(d.issuePath, '.run.lock'), { purpose: 'integration-recovery-wait', runId: d.runId, mkdir: false, platform })
+        } catch (error) {
+          if (!(error instanceof LockHeld) || i + 1 >= lockRetries) throw error
+          await lockDelay(i)
+          continue
+        }
+        try {
+          await noteOperatorWait({ project: d.project, issueId: d.issueId, runId: d.runId, action: 'integration-recovery', repositories: d.repositories, token: d.token, phase: 'end' })
+        } finally {
+          await lock.release().catch(() => {})
+        }
+        break
+      }
+      let swept
+      for (let i = 0; ; i++) {
+        swept = await sweepPendingIntegration({ issuePath: d.issuePath, runId: d.runId, platform, hooks: { cycleGate: sweepGate(d.project, d.issueId, d.runId, d.issuePath) } })
+        // Held by another owner of the lock: asked again. Held by a newer cycle: that cycle's thaw runs it (sweepGate).
+        if (!(swept?.held && swept.settled?.refused?.code === 'RUN_LOCKED') || i + 1 >= lockRetries) break
+        await lockDelay(i)
+      }
+      noteIntegrationSweep(swept, d.project, { id: d.issueId, path: d.issuePath }, d.runId)
+    })().catch((error) => console.warn(`[devpanel] the held integration recovery of ${d.project}/${d.issueId} run ${d.runId} could not run after the thaw: ${error.message}`))
   }
   /**
    * The writing runs this process drives, and the writing operations still being admitted: until none is
    * left, a seat turn or a delivery may write the checkout. Read-only runs are not waited for.
    */
   const busy = () => [
-    ...[...active.values()].filter((r) => !ofCycle(r) && writes(r) && inScope(r.project)).map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, phase: r.phase })),
-    ...[...pendingWrites.values()].filter((p) => inScope(p.project)).map((p) => ({ project: p.project, issueId: p.issueId, runId: p.runId, phase: p.phase, pending: true }))
+    // Runs the cycle waits for whole (a contained run in seat turns is never listed: its turns write only its worktree).
+    ...[...active.values()].filter((r) => !ofCycle(r) && writes(r) && inScope(r.project) && wholeRecord(r)).map((r) => ({ project: r.project, issueId: r.issueId, runId: r.runId, phase: r.phase, kind: 'run' })),
+    ...[...pendingWrites.values()].filter((p) => inScope(p.project)).map((p) => ({ project: p.project, issueId: p.issueId, runId: p.runId, phase: p.phase, pending: true, kind: 'admission', since: p.since })),
+    // A write into a repository the cycle snapshots, under way; a drive in flight on a staging host it drives on, of any run.
+    ...gates.pending().filter((t) => (t.kind === 'write' && inScope(t.project) && gates.touchesSnapshot(t.repositories)) || (t.kind === 'drive' && gates.isCycleHost(t.host)))
+      .map((t) => ({ project: t.project, issueId: t.issueId, runId: t.runId, phase: t.kind, kind: t.kind, since: t.since, ...(t.host ? { host: t.host } : {}), ...(t.action ? { action: t.action } : {}) }))
   ]
+  /**
+   * Committing project actions of the scope still holding their action lock (project-actions.mjs records the
+   * effect in the lock itself, so one is visible from the moment it holds it, from the panel or the CLI).
+   */
+  async function busyActions () {
+    if (!freeze || !issues.ISSUES_DIR) return []
+    const projects = frozenProjects ? [...frozenProjects] : (await issues.listProjects().catch(() => [])).map((p) => p.id ?? p)
+    const found = []
+    for (const project of projects) {
+      const file = path.join(issues.ISSUES_DIR, project, '.actions', '.lock')
+      const held = await fs.readFile(file, 'utf8').then(JSON.parse, () => null)
+      if (!held || held.purpose !== 'project-action') continue
+      if (held.effect !== undefined && held.effect !== 'commit-checkout') continue
+      if (await ownerLiveness(held.owner, { platform }).catch(() => 'unknown') === 'dead') continue
+      found.push({ project, kind: 'project-action', action: held.action ?? null, since: held.acquiredAt ?? null })
+    }
+    return found
+  }
+  /** At a thaw: the ended cycle's freeze request leaves every place it sits (a live engine, a reservation in preflight). */
+  function clearFreezeRequest (record, cycleId) {
+    if (record.engine) {
+      Promise.resolve(record.engine.clearFreeze?.(cycleId)).catch((error) => console.warn(`[devpanel] the freeze request of run ${record.runId} could not be cleared: ${error.message}`))
+      if (record.freezeRequested?.cycleId === cycleId) delete record.freezeRequested
+      return
+    }
+    let changed = false
+    if (record.freezeRequested?.cycleId === cycleId) { delete record.freezeRequested; changed = true }
+    if (record.reservation?.run?.freezeRequested?.cycleId === cycleId) { delete record.reservation.run.freezeRequested; changed = true }
+    if (changed && record.reservation) writeReservation(record).catch((error) => console.warn(`[devpanel] the freeze request of run ${record.runId} could not be cleared: ${error.message}`))
+  }
+  /**
+   * The write gate of an operator's operation on a run's candidate (integrate, integration recovery, apply-artifact):
+   * `(repositories) => ticket`, waiting for a full verification that snapshots one of them; `onWait(token)` hears a wait begin.
+   */
+  function writeGateFor ({ project, issueId, runId, action }, onWait = null) {
+    const gate = gates.gateFor({ project, issueId, runId, writes: true, whole: false })
+    // `held`: a ticket of the same operation already admitted (a nested write passes on it when the cycle drains it).
+    return async (repositories, { held = null } = {}) => {
+      for (;;) {
+        const answer = gate.tryWrite(repositories, { action, held })
+        if (answer.ticket) return answer.ticket
+        const token = answer.wait
+        onWait?.(token)
+        // On the run record and in its explanation while it lasts, and among its excused waits once it ends (original AC3).
+        await noteOperatorWait({ project, issueId, runId, action, repositories, token, phase: 'start' })
+        try {
+          await gates.waitFor(token)
+        } finally {
+          await noteOperatorWait({ project, issueId, runId, action, repositories, token, phase: 'end' })
+        }
+      }
+    }
+  }
+  /**
+   * The automatic integration sweep's gate: it never waits. A publication whose checkouts a cycle snapshots is left for a
+   * later sweep (FULL_VERIFICATION_WAIT, held like a locked run), so the sweep loop goes on and nothing is written.
+   */
+  // Held automatic integration recoveries, re-run by the thaw (as deferred reconciles are), each wait on its run record.
+  const deferredIntegrations = new Map()
+  function sweepGate (project, issueId, runId, issuePath) {
+    const gate = gates.gateFor({ project, issueId, runId, writes: true, whole: false })
+    return async (repositories) => {
+      const answer = gate.tryWrite(repositories, { action: 'integration-sweep' })
+      if (answer.ticket) return answer.ticket
+      const key = `${project}/${issueId}/${runId}`
+      if (!deferredIntegrations.has(key)) {
+        // Written under the sweep's run lock, which is released only after it lands; the thaw awaits it before the end.
+        const entry = { project, issueId, runId, issuePath, repositories, token: answer.wait }
+        entry.recorded = noteOperatorWait({ project, issueId, runId, action: 'integration-recovery', repositories, token: answer.wait, phase: 'start' })
+        deferredIntegrations.set(key, entry)
+        await entry.recorded
+      }
+      throw Object.assign(new Error('a full verification snapshots this checkout: the publication is settled after it ends'), { code: 'FULL_VERIFICATION_WAIT' })
+    }
+  }
+  /** Whether an open wait is the one `id` opened (one recorded before ids were kept: by its cycle). */
+  const ownsWait = (open, id, cycleId) => Boolean(open) && (open.id ? open.id === id : open.cycleId === cycleId)
+  /** An operator operation's cycle wait, recorded through the run's live engine when it has one, else on its stored record. */
+  async function noteOperatorWait ({ project, issueId, runId, action, repositories, token, phase }) {
+    const stamps = { from: token.from, to: token.ended?.to ?? null, cycleId: token.cycleId, endSeq: token.ended?.endSeq ?? null }
+    const live = [...active.values()].find((r) => r.runId === runId && r.engine?.noteCycleWait)
+    try {
+      const id = `operator:${token.cycleId}:${token.seq}`
+      if (live) return await live.engine.noteCycleWait({ phase, id, action, repositories, ...stamps })
+      const holder = await holderOf(project, issueId)
+      const run = await store.readRun(holder.path, runId)
+      if (phase === 'start') run.cycleWait = { kind: 'write', action, cycleId: token.cycleId, repositories, since: token.from, id }
+      else {
+        // Only the wait this token opened is closed: a newer cycle's open wait, written meanwhile, stays (integration-recovery).
+        if (ownsWait(run.cycleWait, id, token.cycleId)) run.cycleWait = null
+        if (!(run.cycleWaits ?? []).some((w) => w.id === id)) (run.cycleWaits ??= []).push({ kind: 'write', action, repositories, ...stamps, id, to: stamps.to ?? new Date().toISOString(), outcome: token.ended ? 'thawed' : 'stopped' })
+      }
+      await store.writeRun(holder.path, runId, run)
+      emit?.({ type: 'run-cycle-wait', project, issueId, runId, phase })
+    } catch (error) {
+      console.warn(`[devpanel] the full verification wait of run ${runId} (${action}) could not be recorded: ${error.message}`)
+    }
+  }
+  /** Whether the freeze holds a stored run whole, read from its snapshot and record (an unreadable one is). */
+  async function wholeStoredRun (project, issueId, runId) {
+    const holder = await holderOf(project, issueId).catch(() => null)
+    const snapshot = holder ? await store.readSnapshot(holder.path, runId).catch(() => null) : null
+    const stored = holder ? await store.readRun(holder.path, runId).catch(() => null) : null
+    return wholeOf(snapshot, stored?.workspace ?? null)
+  }
+  /** A request whose cycle is no longer the active freeze is never applied (after a thaw, or read back after a restart). */
+  const activeRequest = (request) => Boolean(request && gates.isActive(request.cycleId))
+  /** Before a contained run's drive waits, everything it holds on staging goes (AC6): the idle runs of the scope, at the freeze. */
+  async function releaseIdle () {
+    const failed = []
+    // Only what stands on the hosts the cycle drives on: an instance on another host may be in use by a permitted drive.
+    const hosts = (gates.current()?.hosts ?? []).map((h) => h.host).filter(Boolean)
+    if (!hosts.length) return failed
+    for (const record of [...active.values()]) {
+      if (!freeze || !record.engine || wholeRecord(record) || !inScope(record.project)) continue
+      // Read again for each run, right before its cleanup: a drive admitted before the freeze (a ticket on a cycle host) keeps what it drives.
+      if (gates.pending().some((t) => t.kind === 'drive' && t.runId === record.runId && hosts.includes(t.host))) continue
+      const ok = await Promise.resolve(record.engine.releaseHeld?.('full-verification', { hosts })).catch(() => false)
+      if (ok === false) failed.push({ project: record.project, issueId: record.issueId, runId: record.runId, pendingRemovals: record.engine.run?.pendingRemovals ?? [] })
+    }
+    return failed
+  }
 
   /*
    * In-place runs whose open cleanup entries the project barrier file could not
@@ -342,7 +648,7 @@ export function createSupervisor ({
    * Reserve a run and return. Everything expensive happens afterwards, inside a
    * run the caller can already see and stop.
    */
-  async function start ({ project, issueId, playbookId, expectConfigHash = null, runOptions = {}, configRoot: root = configRoot, supervisorLaunchId = null, pregateOverride = null, cycle = null }) {
+  async function start ({ project, issueId, playbookId, expectConfigHash = null, runOptions = {}, configRoot: root = configRoot, supervisorLaunchId = null, pregateOverride = null, cycle = null, signal = null }) {
     if (shuttingDown) throw Object.assign(err(503, 'the server is shutting down'), { started: false, retryable: true })
     // The cycle's own runs pass; a start of another cycle never does. Whether any other start
     // writes is known once its playbook resolves, below: a read-only one is admitted while frozen.
@@ -366,6 +672,7 @@ export function createSupervisor ({
     let home = false
     let modulePool = null
     let moduleExpected = []
+    let startContained = false
     try { await admission(project, async () => {
       const issue = await holderOf(project, issueId)
       home = Boolean(issue.home)
@@ -386,8 +693,18 @@ export function createSupervisor ({
       const resolution = await resolveWithRelease(playbookId, { root, runOptions, projectId: project },
         async () => (stagedRelease = await selectStagedRelease({ project, projectPath, listIssues: (p, o) => issues.listIssues(p, o) })))
       // The full verification's freeze holds back what can write the checkout, nothing else.
-      if (frozenFor(project) && !cycle && resolution.ok && writesCheckout(resolution.resolved)) throw freezeRefusal()
-      if (resolution.ok && !writesCheckout(resolution.resolved)) pendingWrites.delete(k)
+      // Only a writing run the freeze holds whole is refused: a contained one starts, its drives and writes wait.
+      // Bound to the cycle that classified it; a cycle that thawed meanwhile refuses nothing, a newer one classifies again.
+      for (let c = freeze?.cycleId; c && frozenFor(project) && !cycle && resolution.ok && writesCheckout(resolution.resolved); c = freeze?.cycleId) {
+        const whole = await provisionWritesSnapshot(project, projectPath, resolution.resolved) || await wholeOf(resolution.resolved, null)
+        if (freeze?.cycleId !== c) continue
+        if (whole) throw freezeRefusal()
+        startContained = c
+        break
+      }
+      if (resolution.ok && (!writesCheckout(resolution.resolved) || startContained)) pendingWrites.delete(k)
+      // A cycle interrupted while its own start was being admitted creates no run.
+      if (signal?.aborted) throw Object.assign(err(409, 'the full verification cycle was interrupted before this start registered'), { code: 'CYCLE_INTERRUPTED', started: false })
       const noGreen = resolution.ok ? resolution.resolved.liveExecution.blockers.find((b) => b.kind === 'no-green-staging') : null
       if (noGreen) throw Object.assign(err(422, noGreen.reason, { code: 'NO_GREEN_STAGING', latestGreen: noGreen.latestGreen ?? null, unverifiable: noGreen.unverifiable ?? [] }), { started: false, retryable: false })
       if (resolution.ok) {
@@ -510,13 +827,25 @@ export function createSupervisor ({
       finished: null,
       home,
       cycleId: cycle,
-      writes: writesCheckout(reservation.resolution?.resolved)
+      writes: writesCheckout(reservation.resolution?.resolved),
+      ...(startContained ? { whole: false, classifiedFor: startContained } : {})
+    }
+    // Registration: a cycle's start that its bound interrupted meanwhile leaves no live run (its reservation is abandoned).
+    if (signal?.aborted) {
+      starting.delete(k)
+      pendingWrites.delete(k)
+      await abandonReservation(reservation, { status: 'cancelled' }).catch(() => {})
+      throw Object.assign(err(409, 'the full verification cycle was interrupted before this start registered'), { code: 'CYCLE_INTERRUPTED', started: false })
     }
     active.set(k, record)
     starting.delete(k)
     pendingWrites.delete(k)
-    // Admitted just before a freeze closed admission: a writing one is asked to pause like any other.
-    if (frozenFor(record.project) && !ofCycle(record) && writes(record)) await Promise.resolve(freezeRecord(record)).catch(() => {})
+    adoptClassification(record)
+    // Admitted just before a freeze closed admission: a writing one is classified for it, and asked to pause only if whole.
+    if (frozenFor(record.project) && !ofCycle(record) && writes(record)) {
+      await classifyNow(record, snapshotOf(record), workspaceOf(record))
+      await Promise.resolve(freezeRecord(record)).catch(() => {})
+    }
     emit?.({ type: 'run-reserved', project, issueId, runId: record.runId, status: 'preflighting' })
 
     // The record the start went ahead on, beside the run, for the agreement report.
@@ -668,6 +997,8 @@ export function createSupervisor ({
 
       // Written whatever the verdict: the probes were made, so what they cost is
       // part of this run's history even when it never runs.
+      // A freeze request's reservation write (or the thaw's) lands before the preflight's own writes of the same file.
+      await record.reservationWrites?.catch(() => {})
       await recordPreflight(reservation, {
         state, result, usage: probe.spent, detail: refusal?.message ?? null, depth: 'model'
       })
@@ -678,6 +1009,7 @@ export function createSupervisor ({
       if (state !== 'passed') {
         const stopped = state === 'cancelled' || record.controller.signal.aborted
         record.refusal = refusal
+        if (reservation.run.freezeRequested && !activeRequest(reservation.run.freezeRequested)) delete reservation.run.freezeRequested
         if (stopped && record.stoppedBy && (reservation.run.pauseRequested || reservation.run.freezeRequested)) {
           await pauseReservation(reservation)
           return
@@ -696,8 +1028,12 @@ export function createSupervisor ({
       }
 
       // ---- provisioning ----
+      await record.reservationWrites?.catch(() => {})
       let engine
+      let provisioning = null
       try {
+        provisioning = await provisionTicket(record, projectPath)
+        await record.reservationWrites?.catch(() => {})
         engine = await provisionRun(reservation, {
           projectPath, projectAlias,
           harnesses,
@@ -710,10 +1046,12 @@ export function createSupervisor ({
           emit: (event) => emit?.({ ...event, project, issueId, runId: record.runId })
         })
       } catch (error) {
-        // Stopped while its base snapshot waited for a delivery: nothing exists yet.
+        // Stopped while its base snapshot waited for a delivery or the cycle: nothing exists yet.
         if (error.name !== 'AbortError' || !record.controller.signal.aborted) throw error
         await settleStopped(record)
         return
+      } finally {
+        provisioning?.release()
       }
 
       await driveEngine(record, engine)
@@ -728,6 +1066,7 @@ export function createSupervisor ({
 
   /** A reservation stopped before any workspace exists: paused if a pause was asked for, else cancelled. */
   async function settleStopped ({ reservation, stoppedBy }) {
+    if (reservation.run.freezeRequested && !activeRequest(reservation.run.freezeRequested)) delete reservation.run.freezeRequested
     if (stoppedBy && (reservation.run.pauseRequested || reservation.run.freezeRequested)) {
       await pauseReservation(reservation)
       return
@@ -739,6 +1078,10 @@ export function createSupervisor ({
   /** The agent phase proper, shared by a fresh start and a resume after a decision. */
   async function driveEngine (record, engine) {
     if (failureAdvisor) engine.failureAdvisor = failureAdvisor
+    // The full verification's gates (cycle-gates.mjs): this run's drives and checkout writes ask them.
+    engine.cycleGate = gates.gateFor(record)
+    if (record.freezeRequested && !activeRequest(record.freezeRequested)) delete record.freezeRequested
+    await engine.dropStaleFreeze()
     if (consult) engine.consult = consult
     armAutoReconcile(engine, record.project)
     // No quota fallback is installed (engine.quotaFallback stays unset): a seat whose model is exhausted stops its run,
@@ -749,7 +1092,7 @@ export function createSupervisor ({
     if (record.stopping || record.controller.signal.aborted) {
       engine.cancel(record.stoppedBy ?? 'requested')
       if (record.stoppedBy && record.pauseRequested) engine.run.pauseRequested ??= { at: engine.clock.iso() }
-      if (record.stoppedBy && record.freezeRequested) engine.run.freezeRequested ??= record.freezeRequested
+      if (record.stoppedBy && activeRequest(record.freezeRequested)) engine.run.freezeRequested ??= record.freezeRequested
       if (await engine.pauseForShutdown({ between: 'provisioning-and-drive' })) return
       // No invocation has begun. drive() refuses an already-aborted controller,
       // so settle here instead of leaving a permanent "stopping" record.
@@ -762,7 +1105,14 @@ export function createSupervisor ({
     }
     if (record.pauseRequested && !engine.run.pauseRequested) await engine.requestPause()
     // Only a writing run is held by the full verification's freeze; a read-only one admitted during it runs on.
-    if ((record.freezeRequested || (frozenFor(record.project) && !ofCycle(record) && writes(record))) && !engine.run.freezeRequested) await engine.requestFreeze(record.freezeRequested?.cycleId ?? freeze.cycleId)
+    adoptClassification(record)
+    // Against the real workspace now, whatever was decided before it existed: admission and a preflight freeze classify with
+    // no workspace, and its writable paths (worktree, scratch, mounts) can lie inside a snapshotted checkout
+    // (provisional-workspace-classification). Only a whole decision stands as it is.
+    await classifyNow(record, engine.snapshot, engine.run.workspace, { recheck: true })
+    // Asked only for a cycle that classified it whole: an unclassified record is never asked for a newer cycle.
+    const request = activeRequest(record.freezeRequested) ? record.freezeRequested.cycleId : (wholeForNow(record) ? freeze.cycleId : null)
+    if (request && !engine.run.freezeRequested) await engine.requestFreeze(request)
     await engine.drive()
   }
 
@@ -782,14 +1132,25 @@ export function createSupervisor ({
     // Taken to write until its snapshot says otherwise: a freeze beginning now waits for it.
     pendingWrites.set(k, { project, issueId, runId, phase: 'continue', since: new Date().toISOString() })
     let engine = null
+    let answerContained = false
     try {
       let issue
       await admission(project, async () => {
         issue = await holderOf(project, issueId)
         const snapshot = await store.readSnapshot(issue.path, runId).catch(() => null)
         // No writing run continues during the cycle but the cycle's own; the cycle resumes what it paused itself.
-        if (frozenFor(project) && origin !== 'full-verification' && writesCheckout(snapshot) && (await store.readRun(issue.path, runId).catch(() => null))?.fullVerification?.cycleId !== freeze.cycleId) throw freezeRefusal()
-        if (!writesCheckout(snapshot)) pendingWrites.delete(k)
+        if (frozenFor(project) && origin !== 'full-verification' && writesCheckout(snapshot)) {
+          const stored = await store.readRun(issue.path, runId).catch(() => null)
+          // Read again after each await: a cycle that thawed meanwhile refuses nothing (continuation-crosses-thaw).
+          for (let c = freeze?.cycleId; c && frozenFor(project) && stored?.fullVerification?.cycleId !== c; c = freeze?.cycleId) {
+            const whole = await wholeOf(snapshot, stored?.workspace ?? null)
+            if (freeze?.cycleId !== c) continue
+            if (whole) throw freezeRefusal()
+            answerContained = c
+            break
+          }
+        }
+        if (!writesCheckout(snapshot) || answerContained) pendingWrites.delete(k)
         if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
         const holder = await exclusiveHolder(project, issueId, exclusivityOf(snapshot))
         if (holder) throw err(409, conflictMessage(holder), holder)
@@ -864,14 +1225,18 @@ export function createSupervisor ({
         engine.run.preflight = { ...engine.run.preflight, state: 'pending', startedAt: engine.clock.iso(), endedAt: null }
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
         const reservation = { runId, runLock: engine.runLock, resolution: { resolved: engine.snapshot }, run: engine.run, issuePath: issue.path, clock: engine.clock }
-        const record = { runId, issuePath: issue.path, project, issueId, phase: 'preflight', engine: null, reservation, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: writesCheckout(engine.snapshot) }
+        const record = { runId, issuePath: issue.path, project, issueId, phase: 'preflight', engine: null, reservation, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: writesCheckout(engine.snapshot), ...(answerContained ? { whole: false, classifiedFor: answerContained } : {}) }
         const harnesses = await loadHarnesses()
         const projectPath = await resolveProjectPath(project, { projectsDir })
         active.set(k, record)
         starting.delete(k)
         pendingWrites.delete(k)
-        // Admitted just before a freeze closed admission: a writing one is asked to pause like any other.
-        if (frozenFor(record.project) && !ofCycle(record) && writes(record)) await Promise.resolve(freezeRecord(record)).catch(() => {})
+        adoptClassification(record)
+        // Admitted just before a freeze closed admission: a writing one is classified for it, and asked to pause only if whole.
+        if (frozenFor(record.project) && !ofCycle(record) && writes(record)) {
+          await classifyNow(record, snapshotOf(record), workspaceOf(record))
+          await Promise.resolve(freezeRecord(record)).catch(() => {})
+        }
         emit?.({ type: 'run-resumed', project, issueId, runId, decision })
         record.finished = drive(record, { harnesses, configRoot, projectPath, projectAlias: projectDir(project, projectsDir) })
         return { runId, status: 'preflighting', decision }
@@ -882,12 +1247,16 @@ export function createSupervisor ({
         engine.run.workspace.retainedReason = null
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
       }
-      const record = { runId, issuePath: issue.path, project, issueId, phase: 'run', engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: writesCheckout(engine.snapshot) }
+      const record = { runId, issuePath: issue.path, project, issueId, phase: 'run', engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: writesCheckout(engine.snapshot), ...(answerContained ? { whole: false, classifiedFor: answerContained } : {}) }
       active.set(k, record)
       starting.delete(k)
       pendingWrites.delete(k)
-      // Admitted just before a freeze closed admission: a writing one is asked to pause like any other.
-      if (frozenFor(record.project) && !ofCycle(record) && writes(record)) await Promise.resolve(freezeRecord(record)).catch(() => {})
+      adoptClassification(record)
+      // Admitted just before a freeze closed admission: a writing one is classified for it, and asked to pause only if whole.
+      if (frozenFor(record.project) && !ofCycle(record) && writes(record)) {
+        await classifyNow(record, snapshotOf(record), workspaceOf(record))
+        await Promise.resolve(freezeRecord(record)).catch(() => {})
+      }
       emit?.({ type: 'run-resumed', project, issueId, runId, decision })
       record.finished = (async () => {
         try {
@@ -1019,15 +1388,28 @@ export function createSupervisor ({
   function autoReconcile (project, issueId, runId, at) {
     const mark = `${runId}:${at}`
     // The full verification's freeze puts it off, never spends it: it runs once admission opens again.
-    const defer = () => { attemptedReconciles.delete(mark); deferredReconciles.set(mark, { project, issueId, runId, at }) }
+    // Queued only while a cycle is frozen for the project now: the thaw that drains the queue clears the freeze in the same
+    // tick, so one that thawed meanwhile (during the refusal's own cleanup, say) gets it run again at once, never left
+    // behind a queue nobody drains (continuation-crosses-thaw).
+    const defer = () => {
+      attemptedReconciles.delete(mark)
+      if (frozenFor(project)) deferredReconciles.set(mark, { project, issueId, runId, at })
+      else autoReconcile(project, issueId, runId, at)
+    }
     ;(async () => {
-      if (frozenFor(project)) return defer()
+      // A run the freeze holds whole is put off as before; a contained run's reconcile is admitted and waits at its gate.
+      for (let c = freeze?.cycleId; c && frozenFor(project); c = freeze?.cycleId) {
+        const whole = await wholeStoredRun(project, issueId, runId)
+        if (freeze?.cycleId !== c) continue
+        // Put off only while the cycle that read it is still frozen; one that thawed meanwhile has drained its queue.
+        if (whole) return defer()
+        break
+      }
       if (attemptedReconciles.has(mark)) throw new Error('the attempt ended without deciding it')
       const issue = await issues.getIssue(project, issueId)
       if (issue.packed) throw new Error('the issue was archived')
       const refusal = autoReconcileRefusal(await store.readRun(issue.path, runId), await reconcilePolicyOf(project))
       if (refusal) throw new Error(refusal)
-      if (frozenFor(project)) return defer()
       if (attemptedReconciles.size >= 2000) attemptedReconciles.delete(attemptedReconciles.values().next().value)
       attemptedReconciles.add(mark)
       try {
@@ -1445,6 +1827,28 @@ export function createSupervisor ({
     } catch (error) { console.warn(`stage instances of run ${run.runId} could not be destroyed: ${error.message}`) }
   }
 
+  /**
+   * Removing a legacy linked worktree writes its registration into the project's own repository: a write ticket for that
+   * repository, taken at the gate with nothing awaited between it and the removal, so the cycle sees the removal in flight
+   * (busy) or the removal sees the cycle (linked-delivery-writes-before-gate). A cycle that snapshots the repository
+   * refuses at once: the worktree is kept (retained, removable later), never removed without a ticket and never waited for.
+   * `{ ticket }` (release it after the removal), `{ kept: reason }`, or `{}` when the removal writes no shared repository.
+   */
+  async function removalAdmission (record, ws, projectPath) {
+    if (!ws?.path || ws.state === 'removed' || ws.isolation !== 'git-worktree' || ws.repository?.kind === 'private') return {}
+    const out = await runProcess({ command: 'git', args: ['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'] }).catch(() => null)
+    const dir = out?.code === 0 ? String(out.stdout ?? '').trim() : ''
+    const common = dir ? await fs.realpath(dir).catch(() => dir) : projectPath
+    // Kept for any run but the cycle's own, whole or contained: a settling run is not one the cycle drains.
+    if (frozenFor(record.project) && !ofCycle(record) && gates.touchesSnapshot([common])) {
+      return { kept: `${record.engine?.run?.status ?? 'ended'}: kept while full verification ${freeze.cycleId} snapshots its repository; its registration there is removed by a later removal of the workspace` }
+    }
+    const answer = gates.gateFor(record).tryWrite([common], { action: 'workspace-removal' })
+    if (answer.ticket) return { ticket: answer.ticket }
+    gates.cancel(answer.wait)
+    return { kept: `${record.engine?.run?.status ?? 'ended'}: kept while full verification ${answer.wait.cycleId} snapshots its repository` }
+  }
+
   async function settleWorkspace (record) {
     const { engine, reservation } = record
 
@@ -1467,8 +1871,13 @@ export function createSupervisor ({
         unchanged: false, proven: false, reason: `the comparison itself failed: ${error.message}`
       }))
       const disposition = workspaceDisposition(run, verdict)
-      if (disposition.discard) await discardWorkspace(engine)
-      else await releaseOwnership(engine, { reason: `${run.status}: ${disposition.reason}` })
+      // A legacy linked worktree is registered in the project's own repository: removing it writes there. While a cycle
+      // snapshots that repository the worktree is kept (retained, removable later) instead of removed without a ticket
+      // (linked-delivery-writes-before-gate). A private run's directories are its own and go as before.
+      const admitted = disposition.discard ? await removalAdmission(record, run.workspace, engine.projectPath) : {}
+      if (disposition.discard && !admitted.kept) {
+        try { await discardWorkspace(engine) } finally { admitted.ticket?.release() }
+      } else await releaseOwnership(engine, { reason: admitted.kept ?? `${run.status}: ${disposition.reason}` })
     } catch { /* ownership still goes back below */ }
     await engine.runLock?.release().catch(() => {})
   }
@@ -1608,9 +2017,17 @@ export function createSupervisor ({
     if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw err(400, 'Invalid run id')
     const k = key(project, issueId)
     if (starting.has(k) || active.has(k)) throw err(409, 'a run is already active for this issue')
-    // A delivery writes the checkout: none starts during the full verification (refused before
-    // anything is read, so it never becomes pending), and one admitted now is pending until active.
-    if (frozenFor(project)) throw freezeRefusal()
+    // During the full verification only a run the freeze holds whole is refused (one whose snapshot cannot be read
+    // included, before anything else is read); a contained run's delivery is admitted, and its writes into what the
+    // cycle snapshots wait for the thaw (cycle-gates.mjs).
+    let contained = null
+    for (let c = freeze?.cycleId; c && frozenFor(project); c = freeze?.cycleId) {
+      const whole = await wholeStoredRun(project, issueId, runId)
+      if (freeze?.cycleId !== c) continue
+      if (whole) throw freezeRefusal()
+      contained = c
+      break
+    }
     starting.add(k)
     pendingWrites.set(k, { project, issueId, runId, phase: action, since: new Date().toISOString() })
     let engine = null
@@ -1619,7 +2036,8 @@ export function createSupervisor ({
       await admission(project, async () => {
         issue = await issues.getIssue(project, issueId)
         if (issue.packed) throw err(409, 'This issue is archived. Restore it before starting or continuing a run.')
-        const holder = await exclusiveHolder(project, issueId, exclusivityOf(await store.readSnapshot(issue.path, runId).catch(() => null)))
+        const snapshot = await store.readSnapshot(issue.path, runId).catch(() => null)
+        const holder = await exclusiveHolder(project, issueId, exclusivityOf(snapshot))
         if (holder) throw err(409, conflictMessage(holder), holder)
         inquiryAdmission(issue)
         const harnesses = await loadHarnesses()
@@ -1648,7 +2066,13 @@ export function createSupervisor ({
         engine.run.workspace.retainedReason = null
         await store.writeRun(engine.issuePath, engine.runId, engine.run)
       }
-      const record = { runId, issuePath: issue.path, project, issueId, phase: action, engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: true }
+      const record = { runId, issuePath: issue.path, project, issueId, phase: action, engine, reservation: null, controller: new AbortController(), stopping: false, finished: null, home: Boolean(issue.home), cycleId: engine.run.fullVerification?.cycleId ?? null, writes: true, ...(contained ? { whole: false, classifiedFor: contained } : {}) }
+      // At registration the classification is the current cycle's (continuation-crosses-thaw): one made for an earlier
+      // cycle, or none (a cycle that froze while the engine was loading, when this was not yet in `active`), is read
+      // again against this run's workspace, until the cycle frozen after the reading is the one it was read for.
+      // `pendingWrites` still names the operation meanwhile, so the cycle waits for it.
+      await classifyNow(record, engine.snapshot, engine.run.workspace)
+      engine.cycleGate = gates.gateFor(record)
       active.set(k, record)
       starting.delete(k)
       pendingWrites.delete(k)
@@ -1660,39 +2084,52 @@ export function createSupervisor ({
       // The re-check before delivery, with nothing awaited between it and the delivery call: a freeze
       // that began while this was being prepared refuses it here, delivering nothing; otherwise the
       // delivery starts in this tick, already in `active`, and the cycle waits for it.
-      if (frozenFor(project)) {
+      if (frozenFor(project) && wholeRecord(record)) {
         await settleWorkspace(record).catch(() => {})
         active.delete(k)
         throw freezeRefusal()
       }
-      let returned = false
-      let delivering
-      try {
-        delivering = reconcile ? engine.reconcileDelivery({ policy, actor }) : engine.finalize({ mayReturnDelivery: true, budgets })
+      // The operation answers `waiting` as soon as one of its writes waits for a full verification, and goes on in
+      // the background: it ends by itself at the thaw, announced like any end (cycle-gates.mjs).
+      let signalWaiting
+      const waiting = new Promise((resolve) => { signalWaiting = resolve })
+      engine.onCycleWait = (token) => signalWaiting(token)
+      const delivering = (async () => {
         emit?.({ type: reconcile ? 'run-reconciling' : 'run-finalizing', project, issueId, runId })
-        const done = await delivering
-        if (!reconcile) returned = done === 'returned'
-      } catch (error) {
-        await failRecord(record, error)
+        try {
+          const done = await (reconcile ? engine.reconcileDelivery({ policy, actor }) : engine.finalize({ mayReturnDelivery: true, budgets }))
+          return { returned: !reconcile && done === 'returned' }
+        } catch (error) {
+          await failRecord(record, error)
+          return { returned: false }
+        }
+      })()
+      const afterDelivery = async ({ returned }) => {
+        if (returned) {
+          const decision = { deliveryReturn: engine.run.deliveryReturns?.length ?? null }
+          record.finished = (async () => {
+            try {
+              if (oweReleased(engine.run)) await store.writeRun(engine.issuePath, engine.runId, engine.run)
+              emit?.({ type: 'run-resumed', project, issueId, runId, decision })
+              await driveEngine(record, engine)
+            } catch (error) {
+              await failRecord(record, error)
+            } finally {
+              await settle()
+            }
+          })()
+          return { runId, status: 'pending', decision }
+        }
+        await settle()
+        return { runId, status: engine.run.status, outcome: engine.run.outcome, blockedReason: engine.run.blockedReason,
+          ...(reconcile ? { reconciliation: engine.run.reconciliations?.at(-1) ?? null } : {}) }
       }
-      if (returned) {
-        const decision = { deliveryReturn: engine.run.deliveryReturns?.length ?? null }
-        record.finished = (async () => {
-          try {
-            if (oweReleased(engine.run)) await store.writeRun(engine.issuePath, engine.runId, engine.run)
-            emit?.({ type: 'run-resumed', project, issueId, runId, decision })
-            await driveEngine(record, engine)
-          } catch (error) {
-            await failRecord(record, error)
-          } finally {
-            await settle()
-          }
-        })()
-        return { runId, status: 'pending', decision }
+      const first = await Promise.race([delivering.then((done) => ({ done })), waiting.then((token) => ({ token }))])
+      if (first.token) {
+        record.finished = delivering.then(afterDelivery).catch((error) => console.warn(`[devpanel] ${action} of ${project}/${issueId} run ${runId} after the full verification: ${error.message}`))
+        return { runId, status: 'waiting', cycleId: first.token.cycleId, waitingFor: reconcile ? 'reconcile' : 'delivery' }
       }
-      await settle()
-      return { runId, status: engine.run.status, outcome: engine.run.outcome, blockedReason: engine.run.blockedReason,
-        ...(reconcile ? { reconciliation: engine.run.reconciliations?.at(-1) ?? null } : {}) }
+      return afterDelivery(first.done)
     } catch (error) {
       starting.delete(k)
       pendingWrites.delete(k)
@@ -2018,7 +2455,7 @@ export function createSupervisor ({
           // A publication the previous process did not finish is settled from
           // its record, under the run lock, before anything else is offered on
           // the run (sweepPendingIntegration).
-          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform }).catch((error) => {
+          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform, hooks: { cycleGate: sweepGate(projectId, issue.id, runId, issue.path) } }).catch((error) => {
             if (error.code !== 'ENOENT') unread.push({ project: projectId, issue, runId })
             return null
           })
@@ -2027,6 +2464,28 @@ export function createSupervisor ({
           if (noteIntegrationSweep(swept, projectId, issue, runId)) continue
           const run = swept?.run
           if (!run) continue
+          // No cycle and no waiting operation survive a restart: a wait left open on the record ends as stopped (the
+          // operator asks again), so no run reads as waiting for an operation that no longer exists.
+          // Only under the issue's run lock, and only when no live (or unknown) owner holds it: a wait another live process
+          // keeps open is its own (orphaned-operator-cycle-wait).
+          if (run.cycleWait && !held(await lockOwner(issue.path, runId))) {
+            let lock = null
+            try {
+              lock = await acquire(path.join(issue.path, '.run.lock'), { purpose: 'cycle-wait-close', runId, platform, mkdir: false })
+              const current = await store.readRun(issue.path, runId)
+              if (current.cycleWait) {
+                const open = current.cycleWait
+                current.cycleWait = null
+                ;(current.cycleWaits ??= []).push({ kind: open.kind ?? 'write', action: open.action ?? null, cycleId: open.cycleId ?? null, repositories: open.repositories ?? [], from: open.since ?? null, to: new Date().toISOString(), endSeq: null, outcome: 'stopped' })
+                await store.writeRun(issue.path, runId, current)
+                Object.assign(run, { cycleWait: null, cycleWaits: current.cycleWaits })
+              }
+            } catch (error) {
+              console.warn(`[devpanel] the stale full verification wait of ${projectId}/${issue.id} run ${runId} was left: ${error.message}`)
+            } finally {
+              await lock?.release().catch(() => {})
+            }
+          }
           // The barrier as the run records say: open entries a failed write
           // left off it are put back (or held here), settled ones lifted.
           await keepOnBarrier(path.dirname(issue.path), run)
@@ -2159,7 +2618,7 @@ export function createSupervisor ({
         for (const runId of names) {
           // A publication the previous process did not finish: settled under
           // the run lock first; a held lock leaves the run to a later poll.
-          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform }).catch(() => null)
+          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform, hooks: { cycleGate: sweepGate(projectId, issue.id, runId, issue.path) } }).catch(() => null)
           if (noteIntegrationSweep(swept, projectId, issue, runId)) continue
           const run = swept?.run
           if (!run) continue
@@ -2326,7 +2785,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, busy, moduleLockReading, modulesCoverage }
+  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, frozenFor, wholeOf, startsConfined: () => startsConfined(), busy, busyActions, releaseIdle, gates, cycleGateFor: (record) => gates.gateFor(record), writeGateFor, moduleLockReading, modulesCoverage }
 }
 
 /**

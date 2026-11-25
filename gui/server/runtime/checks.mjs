@@ -10,11 +10,13 @@ import { pinConnection, sshConnection, shellQuote } from './ssh.mjs'
 import { holdDriveSlot } from './drive-slots.mjs'
 import { fingerprint, treeIdentity } from './fingerprint.mjs'
 import { runProcess } from './process.mjs'
+import { repositoryGitArgs } from './engine-git.mjs'
 import { hostPlatform } from './platform.mjs'
 import { exitedOnItsOwn } from './modules-tier.mjs'
 import { driveCommands, instanceTimings, instanceVerdict } from './instance-drive.mjs'
 import { instanceStep, manifestsKey, syncOf } from './dependency-sync.mjs'
-import { destroyInstance, holdInstance, liveManifests, liveStageMark, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
+import { destroyInstance, holdInstance, holdsInstance, liveManifests, liveStageMark, LOCAL_HOST, markLive, releaseInstance } from './stage-instances.mjs'
+import { awaitCycle } from '../cycle-gates.mjs'
 import { foreignEvents, holdsSync, revertOwnSync, stageEvents, stageMark } from './sync-records.mjs'
 import { fencePolicy } from './confinement-policy.mjs'
 import { discardReconstruction, reconstructInto, worktreeDiffDelivery } from './launch.mjs'
@@ -86,6 +88,17 @@ export async function runChecks ({
   prepared = null,
   // Told as a wait for a test-drive slot begins and ends (drive-slots.mjs).
   onDriveWait = null,
+  // The full verification (cycle-gates.mjs): the run's gate, asked before a slot or an instance is taken on a
+  // staging host; `beforeCycleWait(token)` must confirm the run holds nothing on that host before it waits
+  // (false: the drive does not wait and ends unavailable); `resolved` is the cycle's own pinned connection.
+  driveGate = null,
+  beforeCycleWait = null,
+  resolved = null,
+  // A removal this drive could not confirm before a full verification wait, handed back to the run's record (engine.keepPendingRemoval).
+  onRemovalPending = null,
+  // The full verification's write gate (engine.writeGate): the candidate's patch and reconstruction worktree are written into
+  // the repository that owns the workspace, a source a cycle may snapshot for a legacy linked worktree.
+  writeGate = null,
   // Injected by tests: the slot directory and how long resolving and polling take, and
   // `afterStageRead`, awaited between a held instance's journal reading and its use.
   driveTiming = {}
@@ -106,6 +119,26 @@ export async function runChecks ({
     dir: path.relative(runDir, dir)
   }
   const finish = () => { result.durationMs = clock.now() - startedAt; return result }
+  // Before any wait for the full verification (a drive's, or its reconstruction's write): the kept smoke instance this
+  // drive claimed to continue is removed and confirmed; false when it still stands. It then runs from scratch after the thaw.
+  const dropContinued = async () => {
+    if (!continueFrom) return true
+    const discarded = await discardInstance({ target, instance: continueFrom.instance })
+    result.cycleWaitRemoval = { kept: continueFrom.instance?.remoteDir ?? null, passed: Boolean(discarded.passed), ...(discarded.error ? { error: discarded.error } : {}) }
+    if (!discarded.passed) {
+      // The engine cleared run.keptInstance when this drive claimed it: the failed removal stays on the record
+      // (run.pendingRemovals) so every later drive tries it again before it may wait (kept-smoke-instance).
+      await onRemovalPending?.({ kind: 'kept-smoke', instance: continueFrom.instance, reason: 'full-verification-wait', lastError: discarded.error ?? discarded.stderr ?? 'not removed' })
+      return false
+    }
+    continueFrom = null
+    result.continuation = { continued: false, reason: 'full-verification-wait', detail: 'the kept smoke instance was removed before the drive waited for the full verification' }
+    return true
+  }
+  const ownerRepository = async () => {
+    const out = await runProcess({ command: 'git', args: [...repositoryGitArgs(workspacePath, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'] }).catch(() => null)
+    return String(out?.stdout ?? '').trim() || (gitDir ?? workspacePath)
+  }
 
   if (!target || !['local', 'ssh'].includes(target.kind)) {
     result.error = 'no usable check target'
@@ -120,15 +153,23 @@ export async function runChecks ({
     let patch
     if (prepared) await fs.cp(prepared.tree, rebuilt, { recursive: true, verbatimSymlinks: true })
     else {
-      if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
-      else {
-        const built = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
-        patch = built.file
-        // The digest deliver() took of the bytes it wrote and verified, kept with the record so a later
-        // reader can prove the retained artifact is those bytes (retained-work.mjs).
-        result.artifact = { ref: path.relative(runDir, built.file), patchHash: built.patchHash ?? null }
+      // Asked before the first shared Git write and given back once the reconstruction is registered: a drive never holds a
+      // write ticket while it waits for a slot or the cycle (the drive gate would take it for a drained write). Before it
+      // may wait, the smoke instance this drive claimed to continue is removed and confirmed (AC6), else it does not wait.
+      const ticket = writeGate ? await writeGate([await ownerRepository()], { beforeWait: () => dropContinued() }) : null
+      try {
+        if (base) { patch = path.join(dir, 'base.patch'); await fs.writeFile(patch, '') }
+        else {
+          const built = await buildPatch({ workspacePath, baseCommit, baseline, fingerprint: fp, revision, runDir, dir, gitDir })
+          patch = built.file
+          // The digest deliver() took of the bytes it wrote and verified, kept with the record so a later
+          // reader can prove the retained artifact is those bytes (retained-work.mjs).
+          result.artifact = { ref: path.relative(runDir, built.file), patchHash: built.patchHash ?? null }
+        }
+        await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
+      } finally {
+        ticket?.release()
       }
-      await reconstructInto({ dir: rebuilt, workspacePath, baseCommit, patchFile: patch, gitDir })
     }
     let check = await fingerprint(rebuilt, prepared ? { clock } : { baseCommit, baseline, clock })
     if (prepared) Object.assign(result, { prepared: prepared.identity })
@@ -154,11 +195,17 @@ export async function runChecks ({
 
     // 2. Commands, in the isolated candidate, or on the target host.
     // A tier on a stage instance (instance-drive.mjs) runs between taking the instance and settling what the drive left of it.
-    const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming, entries: changedEntries }
+    // Before any wait for the full verification the drive gives up a kept smoke instance it was to continue: removed
+    // and confirmed, else it does not wait (AC6). It then runs from scratch after the thaw.
+    const releaseHeld = (driveGate || beforeCycleWait) ? async (token) => {
+      if (!(await dropContinued())) return false
+      return beforeCycleWait ? beforeCycleWait(token) : true
+    } : null
+    const instanced = { target, result, runId, runDir, clock, signal, onWait: onDriveWait, driveTiming, entries: changedEntries, gate: driveGate, beforeCycleWait: releaseHeld }
     if (target.kind === 'local') {
       await withStageInstance({ ...instanced, host: LOCAL_HOST }, (driven) => runCommandsLocally({ target: driven, cwd: rebuilt, dir, result, clock, signal, platform, runId, onDriveWait }))
     } else {
-      const drive = await holdDriveSlot({ target, result, clock, runId, signal, onWait: onDriveWait, ...driveTiming })
+      const drive = await holdDriveSlot({ target, result, clock, runId, signal, onWait: onDriveWait, ...driveTiming, gate: target.stageInstance ? null : driveGate, beforeCycleWait: releaseHeld, resolved })
       try {
         await withStageInstance({ ...instanced, host: drive.host, connection: drive.connection }, (driven) => runCommandsOverSsh({ connection: drive.connection, host: drive.host, target: driven, rebuilt, dir, runDir, result, materialized, clock, signal, candidateEntries: check.entries, keep, continueFrom, runId, onDriveWait }))
       } finally {
@@ -194,8 +241,30 @@ export async function runChecks ({
   } catch (error) {
     result.error = error.name === 'AbortError' ? 'cancelled' : error.message
     result.result = 'unavailable'
+    if (error.code === 'HELD_INSTANCE_NOT_REMOVED') {
+      result.cycleWait = { removal: result.cycleWaitRemoval ?? { passed: false } }
+      result.retrySkipped = { reason: 'held-instance-not-removed' }
+    }
   } finally {
-    await discardReconstruction({ dir: rebuilt, workspacePath, gitDir })
+    // A composed tree (prepared) was never registered: only its directory goes, no Git command touches the repository.
+    // The reconstruction's removal writes the repository that owns the workspace: asked again, without waiting. A cycle
+    // that snapshots it refuses at once, and the registration is left for a later prune (only the directory goes): never
+    // removed without a ticket, and never a wait that would hold what the drive left on staging (a kept smoke instance,
+    // the run's stage instance) through the cycle (reconstruction-wait-keeps-smoke-instance).
+    if (prepared) await fs.rm(rebuilt, { recursive: true, force: true }).catch(() => {})
+    else {
+      let ticket = null
+      let gated = true
+      if (writeGate) {
+        try { ticket = await writeGate([await ownerRepository()], { noWait: true }) } catch (error) { gated = false; result.reconstructionLeft = { reason: error.message, ...(error.cycleId ? { cycleId: error.cycleId } : {}) } }
+      }
+      try {
+        if (gated) await discardReconstruction({ dir: rebuilt, workspacePath, gitDir })
+        else await fs.rm(rebuilt, { recursive: true, force: true }).catch(() => {})
+      } finally {
+        ticket?.release()
+      }
+    }
   }
   return finish()
 }
@@ -215,13 +284,43 @@ export async function runChecks ({
  * while another run synced or reverted the stage under it is `unavailable` and
  * environmental (`result.environmental`): the failure is the stage's, not the candidate's.
  */
-export async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming, entries = [] }, run) {
+export async function withStageInstance ({ target, host, connection = null, result, runId, runDir, clock, signal, onWait, driveTiming, entries = [], gate = null, beforeCycleWait = null }, run) {
   const instance = target.stageInstance
   if (!instance) return run(target)
   const slotsDir = driveTiming.slotsDir ?? null
-  const hold = () => holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
-    ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir })
-  let slot = await hold()
+  // The full verification (cycle-gates.mjs). A drive on an instance it already holds is admitted once here; refused,
+  // it removes the instance (confirmed) before it waits, and then starts again as a fresh drive, which holdInstance
+  // admits before every slot attempt. Only the replacement below, by a drive already admitted, passes its ticket.
+  let admitted = null
+  if (gate && holdsInstance(instance.name)) {
+    const answer = gate.tryDrive(host)
+    if (answer.ticket) admitted = answer.ticket
+    else {
+      let open = null
+      const beginWait = async (reason, { from = null, cycleId = null } = {}) => { open = { id: crypto.randomUUID(), from: from ?? clock.iso(), reason, cycleId }; await onWait?.({ phase: 'start', id: open.id, host, reason, from: open.from, dir: result.dir, ...(cycleId ? { cycleId } : {}) }) }
+      const endWait = async ({ to = null, endSeq = null } = {}) => { if (!open) return; const o = open; open = null; await onWait?.({ phase: 'end', id: o.id, host, reason: o.reason, from: o.from, to: to ?? clock.iso(), dir: result.dir, ...(o.cycleId ? { cycleId: o.cycleId } : {}), ...(endSeq ? { endSeq } : {}) }) }
+      const removeHeld = async (token) => {
+        const destroyed = await destroyInstance(instance.name, { reason: 'full-verification-wait', clock })
+        result.cycleWaitRemoval = { instance: instance.name, passed: Boolean(destroyed?.passed), ...(destroyed?.error ? { error: destroyed.error } : {}) }
+        if (!destroyed?.passed) return false
+        return beforeCycleWait ? beforeCycleWait(token) : true
+      }
+      const waited = await awaitCycle(answer.wait, { gates: gate, signal, beginWait, endWait, beforeWait: removeHeld })
+      if (!waited) throw Object.assign(new Error('a held stage instance could not be removed before waiting for the full verification, so this drive did not wait and holds nothing'), { code: 'HELD_INSTANCE_NOT_REMOVED' })
+    }
+  }
+  const hold = (held) => holdInstance({ instance, host, kind: target.kind, ssh: target.ssh ?? null, connection, runId, runDir, clock, signal, onWait, dir: result.dir,
+    ...(driveTiming.pollMs ? { pollMs: driveTiming.pollMs } : {}), slotsDir, gate, heldTicket: held, beforeCycleWait })
+  let slot
+  try {
+    slot = await hold(admitted)
+  } catch (error) {
+    admitted?.release()
+    throw error
+  }
+  admitted ??= slot.ticket ?? null
+  // The ticket is released however this drive ends, a failed replacement or journal reading included (instance-ticket-leak).
+  try {
   // The drive's journal mark is taken before the instance's history is read, so the two readings overlap: an event
   // either reaches the replacement below or lies at or after the mark and so in `disturbedBy`, never neither.
   let mark = await stageMark(host, slotsDir)
@@ -236,7 +335,8 @@ export async function withStageInstance ({ target, host, connection = null, resu
     if (by.length) replaced = { ...await destroyInstance(instance.name, { reason: 'stage-dependencies-replaced', clock }), by }
     else if (manifests !== null && liveManifests(instance.name) !== manifests) replaced = await destroyInstance(instance.name, { reason: 'dependencies-changed', clock })
     // A replaced instance is created by this drive, after everything the journal holds now.
-    if (replaced) { slot = await hold(); mark = await stageMark(host, slotsDir) }
+    // The replacement is this admitted drive's own: it passes its ticket and never waits on the cycle.
+    if (replaced) { slot = await hold(admitted); mark = await stageMark(host, slotsDir) }
   }
   const record = result.stageInstance = { name: instance.name, root: instance.root, host, slot: slot.slot, cap: slot.cap, fresh: slot.fresh, ...(slot.waitMs ? { slotWaitMs: slot.waitMs } : {}), ...(replaced ? { replaced: { reason: replaced.reason, at: replaced.at, durationMs: replaced.durationMs, passed: replaced.passed, ...(replaced.error ? { error: replaced.error } : {}), ...(replaced.by ? { by: replaced.by } : {}) } } : {}) }
   try {
@@ -263,6 +363,9 @@ export async function withStageInstance ({ target, host, connection = null, resu
       const who = disturbedBy.map((d) => `${d.event} by run ${d.runId ?? 'unknown'} (${d.owner}${d.files.length ? `: ${d.files.join(', ')}` : ''})`).join(', ')
       result.error = `another run's dependency ${who} stopped every instance on ${host} during this drive, so its failure says nothing about the candidate${result.error ? ` (the drive said: ${result.error})` : ''}`
     }
+  }
+  } finally {
+    admitted?.release()
   }
 }
 

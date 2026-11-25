@@ -13,6 +13,8 @@ import { supportedActions } from '../server/supervisor.mjs'
 import * as store from '../server/runtime/store.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
 import { sandbox } from './helpers.mjs'
+import { createSupervisor } from '../server/supervisor.mjs'
+import { explainRun } from '../server/runtime/run-explanation.mjs'
 
 export const name = 'commit delivery and approved integration — into the right repository, bound to the revision, never half-merged'
 
@@ -96,6 +98,129 @@ export default async function (t) {
     t.ok('the run no longer offers integrate', !supportedActions(await store.readRun(c.issuePath, c.runId)).includes('integrate'))
     const again = await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfgRoot, expectedRevision: c.fp.fingerprint, targetBranch: 'integration', expectedTargetHead: head }).catch((e) => ({ error: e.message }))
     t.ok('a second approval is refused', /already integrated/.test(again.error ?? ''), again.error)
+  }
+
+  t.section('G10 integrate into a repository a full verification snapshots: admitted, it waits before its first write, the wait on the run record, then merges after the thaw')
+  {
+    const c = await committedCandidate({ issueId: '2026-09-12-int-cycle' })
+    await run('git', ['-C', c.projectPath, 'branch', 'integration', 'main'])
+    const cfgRoot = await sandbox(async (dir) => {
+      await fs.mkdir(path.join(dir, 'projects'), { recursive: true })
+      await fs.writeFile(path.join(dir, 'projects', 'p.yaml'), `id: p${NL}sourceRepository: ${c.projectPath}${NL}integrationBranch: integration${NL}`)
+    })
+    const common = await fs.realpath((await run('git', ['-C', c.projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
+    const dir = await temp('devpanel-int-cycle-')
+    const holder = { id: path.basename(c.issuePath), path: c.issuePath }
+    const sup = createSupervisor({ issues: { getRunHolder: async () => holder, getIssue: async () => holder, listIssues: async () => [], listProjects: async () => [{ id: 'p' }] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir })
+    // The snapshot names the repository by its common directory; integrate is handed the declared checkout.
+    await sup.freeze('c10', { projects: ['p'], snapshotted: { repositories: [common], worktrees: [] } })
+    let waited = null
+    const gate = sup.writeGateFor({ project: 'p', issueId: holder.id, runId: c.runId, action: 'integrate' }, (token) => { waited = token })
+    const integrating = integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfgRoot, expectedRevision: c.fp.fingerprint, targetBranch: 'integration', expectedTargetHead: c.ws.baseCommit, hooks: { cycleGate: gate } })
+    const deadline = Date.now() + 10000
+    while (!(waited && (await store.readRun(c.issuePath, c.runId)).cycleWait) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    t.eq('it waits for this cycle, gated on the canonical common directory', [waited?.cycleId, waited?.repositories], ['c10', [common]])
+    t.eq('nothing was written into the repository yet: the branch where it was, no temporary worktree', [(await run('git', ['-C', c.projectPath, 'rev-parse', 'integration'])).stdout.trim(), (await run('git', ['-C', c.projectPath, 'worktree', 'list'])).stdout.trim().split(NL).length], [c.ws.baseCommit, 2])
+    const waiting = await store.readRun(c.issuePath, c.runId)
+    t.eq('the wait is on the run record', [waiting.cycleWait?.kind, waiting.cycleWait?.action, waiting.cycleWait?.cycleId], ['write', 'integrate', 'c10'])
+    t.ok('and in its explanation, whatever its status', /Waiting for full verification c10 before its delivery/.test(explainRun(waiting).headline), explainRun(waiting).headline)
+    sup.thaw('c10')
+    const result = await integrating
+    t.eq('after the thaw it merges', [result.error, (await run('git', ['-C', c.projectPath, 'rev-parse', 'integration'])).stdout.trim()], [null, result.integration?.mergeCommit])
+    const after = await store.readRun(c.issuePath, c.runId)
+    t.eq('the wait is closed and kept, stamped by the gate, beside the integration', [after.cycleWait ?? null, (after.cycleWaits ?? []).map((w) => [w.kind, w.action, w.cycleId, w.endSeq, w.outcome]), Boolean(after.integration?.mergeCommit)], [null, [['write', 'integrate', 'c10', 1, 'thawed']], true])
+  }
+
+  t.section('integration-recovery: an automatic recovery a cycle held records its wait under the run lock; the thaw ends it under that lock, waiting for another holder, and only then runs the recovery again')
+  {
+    const { acquire } = await import('../server/runtime/lock.mjs')
+    const crash = () => { throw Object.assign(new Error('simulated process death'), { simulatedCrash: true }) }
+    const c = await committedCandidate({ issueId: '2026-09-12-int-recovery' })
+    await run('git', ['-C', c.projectPath, 'branch', 'integration', 'main'])
+    const elsewhere = path.join(await temp('recovery-wt-'), 'wt')
+    await run('git', ['-C', c.projectPath, 'worktree', 'add', '--quiet', elsewhere, 'integration'])
+    const cfgRoot = await sandbox(async (dir) => {
+      await fs.mkdir(path.join(dir, 'projects'), { recursive: true })
+      await fs.writeFile(path.join(dir, 'projects', 'p.yaml'), `id: p${NL}sourceRepository: ${c.projectPath}${NL}integrationBranch: integration${NL}`)
+    })
+    await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfgRoot, expectedRevision: c.fp.fingerprint, targetBranch: 'integration', expectedTargetHead: c.ws.baseCommit, hooks: { afterPublish: crash } }).catch(() => null)
+    t.eq('a publication left unfinished (published, its checkout not followed)', (await store.readRun(c.issuePath, c.runId)).integration?.phase, 'published')
+    const common = await fs.realpath((await run('git', ['-C', c.projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
+    const dir = await temp('devpanel-int-recovery-')
+    const holder = { id: path.basename(c.issuePath), path: c.issuePath }
+    const sup = createSupervisor({ issues: { getRunHolder: async () => holder, getIssue: async () => holder, listIssues: async (p) => (p === 'p' ? [holder] : []), listProjects: async () => [{ id: 'p' }] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir })
+    await sup.freeze('cR', { projects: ['p'], snapshotted: { repositories: [common], worktrees: [] } })
+    await sup.reconcile()
+    const held = await store.readRun(c.issuePath, c.runId)
+    t.eq('the sweep held it: nothing followed, the wait open on the run record', [held.integration?.phase, held.cycleWait?.action, held.cycleWait?.cycleId, await fs.readFile(path.join(elsewhere, 'a.txt'), 'utf8')], ['published', 'integration-recovery', 'cR', 'one' + NL])
+    // Another owner holds the issue's run lock when the cycle thaws: the end is not written past it, and not given up on.
+    const lock = await acquire(path.join(c.issuePath, '.run.lock'), { purpose: 'test-holder', runId: c.runId, mkdir: false })
+    sup.thaw('cR')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const during = await store.readRun(c.issuePath, c.runId)
+    t.eq('while the lock is held the wait stays open and nothing is followed', [during.cycleWait?.action ?? null, (during.cycleWaits ?? []).length, during.integration?.phase], ['integration-recovery', 0, 'published'])
+    await lock.release()
+    const deadline = Date.now() + 15000
+    let after = during
+    while (Date.now() < deadline) {
+      after = await store.readRun(c.issuePath, c.runId)
+      if (after.integration?.phase === 'complete') break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    t.eq('once free: the wait ends with the thaw\'s stamps, then the recovery runs again and follows the checkout', [after.cycleWait ?? null, (after.cycleWaits ?? []).map((w) => [w.action, w.cycleId, w.endSeq, w.outcome]), after.integration?.phase, await fs.readFile(path.join(elsewhere, 'a.txt'), 'utf8')], [null, [['integration-recovery', 'cR', 1, 'thawed']], 'complete', 'two' + NL])
+    await run('git', ['-C', c.projectPath, 'worktree', 'remove', '--force', elsewhere])
+  }
+
+  t.section('integration-recovery: a delayed recovery of one cycle never clears or ends the open wait a newer cycle recorded meanwhile')
+  {
+    const { acquire } = await import('../server/runtime/lock.mjs')
+    const crash = () => { throw Object.assign(new Error('simulated process death'), { simulatedCrash: true }) }
+    const c = await committedCandidate({ issueId: '2026-09-12-int-recovery-2' })
+    await run('git', ['-C', c.projectPath, 'branch', 'integration', 'main'])
+    const elsewhere = path.join(await temp('recovery2-wt-'), 'wt')
+    await run('git', ['-C', c.projectPath, 'worktree', 'add', '--quiet', elsewhere, 'integration'])
+    const cfgRoot = await sandbox(async (dir) => {
+      await fs.mkdir(path.join(dir, 'projects'), { recursive: true })
+      await fs.writeFile(path.join(dir, 'projects', 'p.yaml'), `id: p${NL}sourceRepository: ${c.projectPath}${NL}integrationBranch: integration${NL}`)
+    })
+    await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfgRoot, expectedRevision: c.fp.fingerprint, targetBranch: 'integration', expectedTargetHead: c.ws.baseCommit, hooks: { afterPublish: crash } }).catch(() => null)
+    const common = await fs.realpath((await run('git', ['-C', c.projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
+    const dir = await temp('devpanel-int-recovery2-')
+    const holder = { id: path.basename(c.issuePath), path: c.issuePath }
+    const sup = createSupervisor({ issues: { getRunHolder: async () => holder, getIssue: async () => holder, listIssues: async (p) => (p === 'p' ? [holder] : []), listProjects: async () => [{ id: 'p' }] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir })
+    const snapshotted = { repositories: [common], worktrees: [] }
+    await sup.freeze('c1', { projects: ['p'], snapshotted })
+    await sup.reconcile()
+    t.eq('cycle c1 held the recovery, its wait open', (await store.readRun(c.issuePath, c.runId)).cycleWait?.cycleId, 'c1')
+    // c1's recovery is delayed behind the run lock while c1 thaws and c2 freezes; c2's sweep takes the lock first.
+    const lock = await acquire(path.join(c.issuePath, '.run.lock'), { purpose: 'test-holder', runId: c.runId, mkdir: false })
+    sup.thaw('c1')
+    await sup.freeze('c2', { projects: ['p'], snapshotted })
+    await lock.release()
+    await sup.reconcile()
+    const between = await store.readRun(c.issuePath, c.runId)
+    t.eq('c2\'s sweep recorded its own open wait', [between.cycleWait?.cycleId, between.cycleWait?.action], ['c2', 'integration-recovery'])
+    // Let c1's delayed recovery take the lock and write its end.
+    const deadline = Date.now() + 15000
+    let settled = between
+    while (Date.now() < deadline) {
+      settled = await store.readRun(c.issuePath, c.runId)
+      if ((settled.cycleWaits ?? []).some((w) => w.cycleId === 'c1')) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    settled = await store.readRun(c.issuePath, c.runId)
+    t.eq('c1\'s end is kept, and c2\'s wait is still open: nothing followed yet', [(settled.cycleWaits ?? []).map((w) => [w.cycleId, w.outcome]), settled.cycleWait?.cycleId ?? null, settled.integration?.phase], [[['c1', 'thawed']], 'c2', 'published'])
+    sup.thaw('c2')
+    const end = Date.now() + 15000
+    let after = settled
+    while (Date.now() < end) {
+      after = await store.readRun(c.issuePath, c.runId)
+      if (after.integration?.phase === 'complete') break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    t.eq('c2\'s thaw ends its own wait and runs the recovery', [after.cycleWait ?? null, (after.cycleWaits ?? []).map((w) => [w.cycleId, w.outcome]), after.integration?.phase, await fs.readFile(path.join(elsewhere, 'a.txt'), 'utf8')], [null, [['c1', 'thawed'], ['c2', 'thawed']], 'complete', 'two' + NL])
+    await run('git', ['-C', c.projectPath, 'worktree', 'remove', '--force', elsewhere])
   }
 
   t.section('3. a clean checkout of the target merges in place; a dirty one is refused')

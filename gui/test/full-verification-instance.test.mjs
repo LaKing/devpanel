@@ -10,6 +10,9 @@ import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
 import { readVerificationFile, VERIFICATION_PAGE_CHARS } from '../server/runtime/check-log.mjs'
 import { engineFixture } from './fakes/fixture.mjs'
 
+// The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
+const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
+
 export const name = 'full verification on a stage instance — no release to a protected host, an instance of the cycle\'s own destroyed at every end, the evidence kept, the delivery trigger, the supervisor told, and a freeze that holds back only writing runs and deliveries'
 
 const BASE = '/opt/stage-base'
@@ -127,7 +130,7 @@ export default async function (t) {
   const temps = []
   const temp = async (p) => { const d = await fs.mkdtemp(path.join(os.tmpdir(), p)); temps.push(d); return d }
   const cycle = async (s, verificationDir, clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))) => {
-    const fv = createFullVerification({ ...s.options, clock, verificationDir })
+    const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock, verificationDir })
     return { fv, run: async () => { const started = await fv.startNow({ by: 'tester' }); await fv.settle(); return readJson(path.join(verificationDir, started.date, 'cycle.json')) } }
   }
   try {
@@ -204,7 +207,7 @@ export default async function (t) {
       const s = seams({ issuesDir, infra: { 'app-project': instanceInfra(), 'shop-project': instanceInfra() }, outcome: (target, x) => outcome(target, x), deliveries,
         covered: (project, candidates) => ({ covered: (candidates ?? []).filter((r) => !indeterminate.has(r)), indeterminate: (candidates ?? []).filter((r) => indeterminate.has(r)) }) })
       const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
-      const fv = createFullVerification({ ...s.options, clock, verificationDir, afterDeliveries: () => threshold })
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock, verificationDir, afterDeliveries: () => threshold })
       const check = async () => { const c = await fv.deliveryCheck(); await fv.settle(); return c?.stages?.[0] }
       delivered('app-project', 6, '2026-11-14T08:00:00.000Z')
       delivered('shop-project', 3, '2026-11-14T08:00:00.000Z')
@@ -380,7 +383,7 @@ export default async function (t) {
       const s = seams({ issuesDir, infra: { 'app-project': instanceInfra() }, outcome: passing() })
       let ready = false
       const told = []
-      const fv = createFullVerification({ ...s.options, verificationDir, clock: manualClock(Date.parse('2026-11-14T08:00:00.000Z')),
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, verificationDir, clock: manualClock(Date.parse('2026-11-14T08:00:00.000Z')),
         onEnded: (notice) => { if (!ready) throw new Error('the top-level supervisor is not ready yet'); told.push(notice) } })
       await fv.recover()
       const owed = await readJson(path.join(verificationDir, '2026-11-13', 'cycle.json'))
@@ -402,7 +405,7 @@ export default async function (t) {
       const s = seams({ issuesDir, infra: { 'app-project': instanceInfra() }, outcome: passing() })
       let ready = false
       const told = []
-      const fv = createFullVerification({ ...s.options, verificationDir, clock: manualClock(Date.parse('2026-11-14T08:00:00.000Z')),
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, verificationDir, clock: manualClock(Date.parse('2026-11-14T08:00:00.000Z')),
         onEnded: (notice) => { if (!ready) throw new Error('the top-level supervisor is not ready yet'); told.push(notice) } })
       const a = await fv.startNow({ by: 'tester' })
       await fv.settle()
@@ -667,7 +670,7 @@ export default async function (t) {
       await fs.writeFile(path.join(verificationDir, '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', date: '2026-11-14', state: 'outcome', projects: [entry], outcome: { verdict: 'green', committed: false, bump: { chain: [step], untestedCommitted: [] } } }))
       const s = pool({ commitUntested: { [FRAMEWORK]: ['lib/half.js'] } })
       s.options.headOf = async () => 'f0+1'
-      const fv = createFullVerification({ ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
       await fv.recover()
       const after = await readJson(path.join(verificationDir, '2026-11-14', 'cycle.json'))
       const recovered = after.outcome.bump.chain[0]
@@ -782,7 +785,7 @@ export default async function (t) {
       await fs.mkdir(path.join(verificationDir, '2026-11-14'), { recursive: true })
       await fs.writeFile(path.join(verificationDir, '2026-11-14', 'cycle.json'), JSON.stringify({ id: '2026-11-14.1', date: '2026-11-14', state: 'running', projects: [deriving, deferred, site] }))
       const s = pool()
-      const fv = createFullVerification({ ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, issues: { ...s.options.issues, ISSUES_DIR: dir }, clock: manualClock(Date.parse('2026-11-14T10:00:00.000Z')), verificationDir })
       await fv.recover()
       const after = await readJson(path.join(verificationDir, '2026-11-14', 'cycle.json'))
       t.eq('only the instance entry\'s drive is destroyed; nothing is released; no run home is asked for', [s.calls.destroys, s.calls.releases], [['fv-x-site-project'], []])

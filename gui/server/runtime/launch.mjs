@@ -59,18 +59,20 @@ const BIG = { maxBuffer: GIT_OUTPUT_LIMIT }
  */
 export const worktreeDiffDelivery = {
   actions: Object.freeze(['worktree-diff', 'commit', 'apply-to-source']),
-  async deliver ({ action, revision, fingerprint: fp = null, baseCommit, baseline = new Map(), workspacePath, workspace, runDir, clock = systemClock, label = null, gitDir = workspace?.gitDir ?? null }) {
+  // `hooks.cycleGate(repositories)`: the full verification's write gate (cycle-gates.mjs), awaited before a write into
+  // a repository; it resolves a ticket, released once the write is done.
+  async deliver ({ action, revision, fingerprint: fp = null, baseCommit, baseline = new Map(), workspacePath, workspace, runDir, clock = systemClock, label = null, gitDir = workspace?.gitDir ?? null, hooks = {} }) {
     if (action === 'apply-to-source') {
       fp ??= await fingerprint(workspacePath, { baseCommit, baseline, clock, projection: workspaceProjection(workspace) })
       // The applied change is also a verified commit on devpanel/<issue>/<run>
       // in the repository that owns the worktree: what lands in the checkout
       // is never only a working-tree state. The checkout's HEAD and index are
       // still untouched; the operator commits or merges as they see fit.
-      const receipt = await commitDelivery({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir, workspace })
-      return applyToSource({ workspace, baseline, revision, fingerprint: fp, receipt, runDir, clock })
+      const receipt = await commitDelivery({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir, workspace, cycleGate: hooks.cycleGate })
+      return applyToSource({ workspace, baseline, revision, fingerprint: fp, receipt, runDir, clock, hooks: hooks.cycleGate ? { cycleGate: hooks.cycleGate } : {} })
     }
     if (action === 'commit') {
-      const receipt = await commitDelivery({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir, workspace })
+      const receipt = await commitDelivery({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir, workspace, cycleGate: hooks.cycleGate })
       // Integration merges the translation onto the source base; a candidate
       // that has none cannot be integrated, and says why (0d).
       if (receipt.publication?.translation === 'refused' && receipt.reconstruction?.verified) {
@@ -80,6 +82,23 @@ export const worktreeDiffDelivery = {
     }
     if (action !== 'worktree-diff') throw new Error(`delivery action "${action}" is not supported`)
     if (!baseCommit) throw new Error('delivery needs the base commit the workspace was created from')
+    // A legacy linked worktree prepares the patch (git add into a temporary index) and verifies it (a registered
+    // reconstruction worktree) in the source repository's common dir: the full verification's gate first, held until
+    // the reconstruction is removed. A private run does both in its own engine directory, which no cycle snapshots.
+    const sharedTicket = hooks.cycleGate && workspace?.repository?.kind !== 'private'
+      ? await hooks.cycleGate([(await run('git', [...repositoryGitArgs(workspacePath, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim()])
+      : null
+    try {
+      return await worktreeDiffPatch({ revision, fp, baseCommit, baseline, workspacePath, workspace, runDir, clock, gitDir })
+    } finally {
+      sharedTicket?.release()
+    }
+  }
+}
+
+/** The worktree-diff delivery itself: the patch from a throwaway index, written as an artifact and verified by reconstruction. */
+async function worktreeDiffPatch ({ revision, fp, baseCommit, baseline, workspacePath, workspace, runDir, clock, gitDir }) {
+  {
 
     // Projected like the engine's own revisions: tooling mount targets never ship.
     const entries = fp?.entries ?? (await fingerprint(workspacePath, { baseCommit, baseline, clock, projection: workspaceProjection(workspace) })).entries
@@ -134,7 +153,23 @@ export function runEpoch (runDir) {
  * here touches any branch anyone has checked out; integration is a separate,
  * approved step.
  */
-async function commitDelivery ({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir = null, workspace = null }) {
+async function commitDelivery (args) {
+  const { workspacePath, gitDir = null, workspace = null, cycleGate = null } = args
+  const repository = (await run('git', [...repositoryGitArgs(workspacePath, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim()
+  const privateRepository = workspace?.repository?.kind === 'private' ? workspace.repository : null
+  // A linked worktree writes into the source repository's common dir from the patch's preparation (git add into a
+  // temporary index, the reconstruction worktree) through the commit, its branch and the verification worktree and their
+  // removal: the full verification's gate first, held until all of it is done. A private run's commit lands in its own
+  // engine directory, which no cycle snapshots; its publication asks the gate itself below.
+  const branchTicket = cycleGate && !privateRepository ? await cycleGate([repository]) : null
+  try {
+    return await commitDeliveryHeld({ ...args, repository, privateRepository })
+  } finally {
+    branchTicket?.release()
+  }
+}
+
+async function commitDeliveryHeld ({ revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, label, gitDir = null, workspace = null, cycleGate = null, repository, privateRepository }) {
   const patchReceipt = await worktreeDiffDelivery.deliver({ action: 'worktree-diff', revision, fingerprint: fp, baseCommit, baseline, workspacePath, runDir, clock, gitDir })
   if (patchReceipt.reconstruction?.verified !== true) return { ...patchReceipt, commit: null, branch: null, repository: null }
 
@@ -165,7 +200,6 @@ async function commitDelivery ({ revision, fingerprint: fp, baseCommit, baseline
   }
   const branch = `devpanel/${path.basename(path.dirname(runDir)) === 'runs' ? path.basename(path.dirname(path.dirname(runDir))) : 'candidate'}/${path.basename(runDir).slice(-8)}`
   await run('git', [...repositoryGitArgs(workspacePath, gitDir), 'update-ref', `refs/heads/${branch}`, commit])
-  const repository = (await run('git', [...repositoryGitArgs(workspacePath, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim()
 
   // Verify the COMMIT, not just the patch: check it out and fingerprint it.
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-commit-verify-'))
@@ -178,15 +212,21 @@ async function commitDelivery ({ revision, fingerprint: fp, baseCommit, baseline
     await discardReconstruction({ dir, workspacePath, gitDir })
   }
   const reconstruction = { ...patchReceipt.reconstruction, commit: committed, verified: patchReceipt.reconstruction.verified && committed.verified }
-  const privateRepository = workspace?.repository?.kind === 'private' ? workspace.repository : null
   if (!privateRepository) return { ...patchReceipt, reconstruction, commit, branch, repository }
   // Private repositories (0d): the verified commit is published into the
   // source repository, translated onto the source base, before any receipt
   // names it. The receipt names the source repository and the commit
   // integration would merge; the reviewed commit is kept beside it.
   if (!reconstruction.verified) return { ...patchReceipt, reconstruction, commit, branch, repository: null }
-  const publication = await publishCandidate({ repository: privateRepository, runId: path.basename(runDir), runDir, reviewed: commit, filteredBase: baseCommit,
-    sourceBase: workspace.sourceBase ?? baseCommit, branch, materialized: [...(workspace.symlinks?.materialized ?? []), ...(workspace.base?.nested ?? []).map((n) => n.path)] })
+  // Publication writes refs and the branch into the source repository (or the Git store): the full verification's gate first.
+  const publicationTicket = cycleGate ? await cycleGate([privateRepository.source].filter(Boolean)) : null
+  let publication
+  try {
+    publication = await publishCandidate({ repository: privateRepository, runId: path.basename(runDir), runDir, reviewed: commit, filteredBase: baseCommit,
+      sourceBase: workspace.sourceBase ?? baseCommit, branch, materialized: [...(workspace.symlinks?.materialized ?? []), ...(workspace.base?.nested ?? []).map((n) => n.path)] })
+  } finally {
+    publicationTicket?.release()
+  }
   if (!publication.published) {
     return { ...patchReceipt, reconstruction: { ...reconstruction, verified: false, detail: publication.reason }, commit, branch, repository: null, publication }
   }
@@ -322,22 +362,26 @@ export const gitWorktreeProvider = {
     const readsLiveTree = policy.base === 'working-tree' || policy.symlinks === 'materialize'
     const guard = readsLiveTree ? await holdSnapshotLocks({ projectPath, policy, runId, clock, signal, discover }) : null
     try {
-      return await gitWorktreeProvider.cut({ projectPath, runId, root, policy, guard })
+      return await gitWorktreeProvider.cut({ projectPath, runId, root, policy, guard, signal })
     } finally {
       await guard?.release()
     }
   },
-  async cut ({ projectPath, runId, root, policy, guard }) {
-    const git = (args, opts = {}) => run('git', ['-C', projectPath, ...args], { ...BIG, ...opts })
+  async cut ({ projectPath, runId, root, policy, guard, signal = null }) {
+    // Stopped (a full verification interrupted at its bound, late-cycle-work): no further Git command of the cut runs,
+    // so nothing is written into the repository after the stop.
+    const stop = () => { if (signal?.aborted) throw Object.assign(new Error('stopped while the snapshot was being cut'), { name: 'AbortError', code: 'SNAPSHOT_STOPPED' }) }
+    const git = (args, opts = {}) => { stop(); return run('git', ['-C', projectPath, ...args], { ...BIG, ...opts }) }
     // The panel's own Git store (git-store.mjs), when the host keeps one: the
     // snapshot's objects and refs and the worktree's registration go there, and
     // the project repository is only read. Private repositories only (0d): a
     // legacy run's worktree stays registered in the project.
+    // Asked again after the read and before each of the store's own writes: a stop meanwhile creates or rewrites nothing.
     const gitStore = policy.repository === 1 && policy.store
-      ? await ensureGitStore({ dir: policy.store, sourceRepository: (await git(['rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim() })
+      ? await ensureGitStore({ dir: policy.store, sourceRepository: (await git(['rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim(), stop })
       : null
     const objectEnv = gitStore ? { GIT_OBJECT_DIRECTORY: gitStore.objects, GIT_ALTERNATE_OBJECT_DIRECTORIES: gitStore.sourceObjects } : {}
-    const repo = gitStore ? (args, opts = {}) => run('git', ['--git-dir', gitStore.dir, ...args], { ...BIG, ...opts }) : git
+    const repo = gitStore ? (args, opts = {}) => { stop(); return run('git', ['--git-dir', gitStore.dir, ...args], { ...BIG, ...opts }) } : git
     const headCommit = (await git(['rev-parse', 'HEAD'])).stdout.trim()
     const { dirtyPaths, untrackedPaths } = await statusCounts(projectPath)
 
@@ -545,7 +589,7 @@ export const gitWorktreeProvider = {
       // agree on what "unchanged" means.
       const indexFile = path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-materialize-')), 'index')
       const env = engineGitEnv({ GIT_INDEX_FILE: indexFile, ...snapshotIdentity })
-      const wt = (args) => run('git', ['-C', dir, ...args], { ...BIG, env })
+      const wt = (args) => { stop(); return run('git', ['-C', dir, ...args], { ...BIG, env }) }
       try {
         await wt(['read-tree', baseCommit])
         // The copied targets stay on disk in full (a dependency tree a test drive
@@ -582,7 +626,8 @@ export const gitWorktreeProvider = {
     let repository = null
     if (policy.repository === 1) {
       try {
-        ;({ gitDir, gitEntry, repository } = await privateRepositories({ projectPath, dir, runDir: path.join(root, runId), runId, baseCommit, snapshotRef, linkedGitDir: gitDir, store: gitStore?.dir ?? null }))
+        stop()
+        ;({ gitDir, gitEntry, repository } = await privateRepositories({ projectPath, dir, runDir: path.join(root, runId), runId, baseCommit, snapshotRef, linkedGitDir: gitDir, store: gitStore?.dir ?? null, stop }))
         snapshotRef = repository.snapshotRef
       } catch (error) {
         // Nothing has run in it: take the fresh checkout down with whatever of
@@ -627,9 +672,11 @@ export const gitWorktreeProvider = {
  * one: base pinning), so the depth-1 fetch and the candidate's parent stay
  * reachable after the run's directories are gone.
  */
-async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommit, snapshotRef, linkedGitDir, store = null }) {
+async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommit, snapshotRef, linkedGitDir, store = null, stop = () => {} }) {
   const env = engineGitEnv()
-  const g = (args) => run('git', [...HARDENED, ...args], { ...BIG, env })
+  // `stop` (the cut's): once its signal is aborted no further command or write runs, the source's ref and the
+  // registration's removal included (late-cycle-work).
+  const g = (args) => { stop(); return run('git', [...HARDENED, ...args], { ...BIG, env }) }
   // With the panel's Git store, the store is the run's source repository: the
   // snapshot is pinned and fetched there, and publication writes there.
   const source = store ?? await fs.realpath((await g(['-C', projectPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'])).stdout.trim())
@@ -661,7 +708,9 @@ async function privateRepositories ({ projectPath, dir, runDir, runId, baseCommi
   // The work tree now names the worker directory; its registration in the
   // source repository goes, so nothing there refers to the run any more.
   const gitEntry = `gitdir: ${worker}${String.fromCharCode(10)}`
+  stop()
   await fs.writeFile(path.join(dir, '.git'), gitEntry)
+  stop()
   await fs.rm(linkedGitDir, { recursive: true, force: true })
   // Both indexes describe the base, so status and diff start clean.
   for (const gitDir of [engine, worker]) {

@@ -9,9 +9,16 @@ import { slugify } from '../server/issues.js'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { TARGET_MISSING } from '../server/config/release-plan.mjs'
 import { createSupervisor } from '../server/supervisor.mjs'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { sandbox } from './helpers.mjs'
+import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
+import { startRun, worktreeDiffDelivery, releaseWorkspace } from '../server/runtime/launch.mjs'
 import YAML from 'yaml'
+
+// The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
+const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
 
 export const name = 'full verification — the schedule on a fake clock, the scoped freeze and its wait, one run per stage, the record, the hand start'
 
@@ -150,7 +157,7 @@ export default async function (t) {
       const verificationDir = path.join(issuesDir, '.verification')
       const w = world({ issuesDir })
       const clock = manualClock(Date.parse('2026-11-07T04:00:00.000Z'))
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock, settings: () => BERLIN, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => BERLIN, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
       fv.start()
       clock.advance(60 * 60 * 1000 - 1)
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -203,7 +210,7 @@ export default async function (t) {
       const paused = [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen' }, { project: 'app-project', issueId: '2026-11-01-held', runId: 'r-held', manualPending: true }]
       const w = world({ issuesDir, busy: [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen', phase: 'run' }], paused })
       const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, log: { warn () {} } })
       await fv.startNow({ by: 'tester' })
       const waiting = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.waitingOn?.length ? r : null }, 'the wait to be recorded')
       t.eq('frozen and waiting on the live run, with nothing started', [waiting.state, waiting.waitingOn.map((b) => b.runId), w.calls.starts.length], ['frozen', ['r-frozen'], 0])
@@ -232,7 +239,7 @@ export default async function (t) {
       let lastEmit = null
       const emit = (event) => { order.push({ at: 'emit' }); lastEmit = event }
       const onEnded = async () => { order.push({ at: 'announce-rejected' }); throw new Error('the supervisor is away') }
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, emit, onEnded, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, emit, onEnded, log: { warn () {} } })
       const started = await fv.startNow({ by: 'tester' })
       await fv.settle()
       const rejectedAt = order.findIndex((o) => o.at === 'announce-rejected')
@@ -246,7 +253,7 @@ export default async function (t) {
       const issuesDir = await temp('devpanel-fv-failstart-')
       const w = world({ issuesDir })
       const events = []
-      const fv = createFullVerification({ supervisor: { ...w.supervisor, freeze: async () => { throw new Error('freeze refused') } }, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, emit: (e) => events.push(e), log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: { ...w.supervisor, freeze: async () => { throw new Error('freeze refused') } }, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, emit: (e) => events.push(e), log: { warn () {} } })
       let failed = null
       try { await fv.startNow({ by: 'tester' }) } catch (error) { failed = error.message }
       t.eq('a start that failed after taking an id says so with an event, and is not active', [failed, events.length, events[0]?.type, (await fv.latest()).active], ['freeze refused', 1, 'verification:changed', false])
@@ -259,13 +266,13 @@ export default async function (t) {
       await fs.mkdir(path.join(verificationDir, '2026-11-06'), { recursive: true })
       await fs.writeFile(path.join(verificationDir, '2026-11-06', 'cycle.json'), JSON.stringify({ id: '2026-11-06.1', state: 'ended' }))
       await fs.mkdir(path.join(verificationDir, '2026-11-07', 'cycle.json'), { recursive: true })   // reading it fails (EISDIR)
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       const unreadable = await fv.latest().then(() => null, (error) => error)
       t.eq('an unreadable newest cycle is a 503 naming its date, never the older cycle', [unreadable?.status, /2026-11-07/.test(unreadable?.message ?? '')], [503, true])
       await fs.rm(path.join(verificationDir, '2026-11-07'), { recursive: true })
       await fs.mkdir(path.join(verificationDir, '2026-11-07'))
       t.eq('a date with no cycle record yet is passed over (nothing unreadable)', (await fv.latest()).cycle?.id, '2026-11-06.1')
-      const listing = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(verificationDir, '2026-11-06', 'cycle.json'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const listing = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(verificationDir, '2026-11-06', 'cycle.json'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       t.eq('an unlistable verification directory is a 503 too', (await listing.latest().then(() => null, (error) => error))?.status, 503)
     }
 
@@ -275,7 +282,7 @@ export default async function (t) {
       const w = world({ issuesDir })
       const clock = manualClock(Date.parse('2026-11-07T04:00:00.000Z'))
       let settings = null
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock, settings: () => settings, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => settings, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       fv.start()
       for (let i = 0; i < 49; i++) clock.advance(60 * 60 * 1000)
       await new Promise((resolve) => setTimeout(resolve, 20))
@@ -299,7 +306,7 @@ export default async function (t) {
       await fs.writeFile(path.join(verificationDir, '2026-11-06', 'cycle.json'), JSON.stringify({ id: '2026-11-06.1', date: '2026-11-06', state: 'running', projects: [] }))
       const paused = [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen' }]
       const w = world({ issuesDir, paused })
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T08:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T08:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       const recovered = await fv.recover()
       const record = await readJson(path.join(verificationDir, '2026-11-06', 'cycle.json'))
       t.eq('interrupted, with an end', [record.state, typeof record.endedAt], ['interrupted', 'string'])
@@ -344,7 +351,7 @@ export default async function (t) {
       const w = world({ issuesDir })
       w.issues.listProjects = async () => projects.map((id) => ({ id }))
       const infrastructureOf = async (project) => { if (project === 'bad-project') throw new Error('projects/bad-project.yaml: /infrastructure must have required property staging'); return w.infrastructureOf(project) }
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       await fv.startNow({ by: 'tester' })
       const record = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.state === 'ended' ? r : null }, 'the cycle to end')
       t.eq(`${label}: the cycle is ${expected}`, [record.verdict, record.projects.find((p) => p.project === 'bad-project')?.refusal?.code ?? null], [expected, projects.includes('bad-project') ? 'INFRASTRUCTURE_INVALID' : null])
@@ -387,7 +394,7 @@ export default async function (t) {
       // Run homes are not issues: only listRunHomes names them.
       w.issues.listIssues = async () => []
       w.issues.listRunHomes = async (project) => paused.filter((p) => p.project === project).map((p) => ({ id: p.issueId, path: `/fixture/${project}/.${p.issueId}`, home: true, latestRun: { runId: p.runId, status: 'paused' } }))
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
       await fv.startNow({ by: 'tester' })
       const record = await until(async () => { const r = await readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null); return r?.state === 'ended' ? r : null }, 'the cycle to end')
       t.eq('the earlier cycle\'s frozen run is resumed by the cycle', w.calls.resumes, [{ project: 'app-project', issueId: 'verification-2026-11-05', runId: 'old-frozen', actor: 'service', origin: 'full-verification' }])
@@ -401,7 +408,7 @@ export default async function (t) {
       const issuesDir = w.issuesDir
       const verificationDir = path.join(issuesDir, '.verification')
       w.issues.listProjects = async () => projects.map((id) => ({ id }))
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} }, ...extra })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} }, ...extra })
       const run = async () => {
         const started = await fv.startNow({ by: 'tester' })
         await fv.settle()
@@ -678,12 +685,12 @@ export default async function (t) {
     t.section('23. a release starts only on the target the freeze decided, after a complete fresh reading shows its host unprotected')
     {
       const projects = ['app-project', 'shop-project']
-      const caseOf = async (label, { fresh = null, resolveOf = null } = {}) => {
+      const caseOf = async (label, { fresh = null, resolveOf = null, resolveHost = null } = {}) => {
         const w = await worldIn(`devpanel-fv-guard-${label}-`)
         let reads = 0
         const cycleInputs = async () => (++reads === 1 ? inputsOf(w, projects) : (fresh ? fresh(w) : inputsOf(w, projects)))
         const resolve = resolveOf ? (id, options) => resolveOf(w, id, options) : w.resolve
-        const record = await (await cycleOf(w, { cycleInputs, resolve }, { projects })).run()
+        const record = await (await cycleOf(w, { cycleInputs, resolve, ...(resolveHost ? { resolveHost } : {}) }, { projects })).run()
         const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
         return { w, record, by, codes: projects.map((p) => by[p].refusal?.code ?? by[p].verdict), started: w.calls.starts.map((s) => s.project) }
       }
@@ -691,6 +698,12 @@ export default async function (t) {
       t.eq('unchanged plain release stages start and finish green (no false drift)', [plain.codes, plain.started, plain.record.verdict], [['green', 'green'], ['app-project', 'shop-project'], 'green'])
       const drifted = await caseOf('drift', { resolveOf: async (w, id, options) => { const r = await w.resolve(id, options); return options.projectId === 'shop-project' ? { ...r, resolved: { ...r.resolved, infrastructure: { staging: environment('stage', 'ssh-config:stage-z') } } } : r } })
       t.eq('a stage whose resolved target moved since the freeze is refused STAGE_DRIFTED and never started; the other starts', [drifted.codes, drifted.started], [['green', 'STAGE_DRIFTED'], ['app-project']])
+      // G4: each stage host is resolved once and pinned at the freeze; a release whose host resolves elsewhere when it would start is refused.
+      let resolutions = 0
+      const moved = await caseOf('moved', { resolveHost: async (ssh) => ({ host: ++resolutions === 1 ? 'stage-a.pinned' : 'stage-a.elsewhere', pinned: null }) })
+      t.eq('G4 a release whose host moved since the freeze is refused STAGE_HOST_MOVED and never started', [moved.codes, moved.started, moved.record.scope.hosts], [['STAGE_HOST_MOVED', 'STAGE_HOST_MOVED'], [], [{ hostRef: 'ssh-config:stage-a', host: 'stage-a.pinned' }]])
+      const unresolvable = await caseOf('unresolved', { resolveHost: async () => { throw new Error('no such host') } })
+      t.eq('G4 a stage whose host cannot be resolved at the freeze is refused STAGE_HOST_UNRESOLVED', [unresolvable.codes, unresolvable.started], [['STAGE_HOST_UNRESOLVED', 'STAGE_HOST_UNRESOLVED'], []])
       const unreadable = await caseOf('unreadable', { fresh: (w) => inputsOf(w, projects, {}, { unreadable: [{ path: '/host-config/projects', code: 'EACCES' }] }) })
       t.eq('a fresh reading with something unreadable declines every release', [unreadable.codes, unreadable.started], [['STAGE_UNVERIFIABLE', 'STAGE_UNVERIFIABLE'], []])
       const broken = await caseOf('broken', { fresh: (w) => inputsOf(w, [...projects, 'peer-project'], { 'peer-project': { error: 'invalid file' } }) })
@@ -743,7 +756,7 @@ export default async function (t) {
           // Through the production path: createFullVerification without injected readers.
           const w = world({ issuesDir: await temp('devpanel-fv-unreadable-issues-') })
           const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
-          const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: plainRoot, discovery: null, env, log: { warn () {} } })
+          const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: plainRoot, discovery: null, env, log: { warn () {} } })
           let refused = null
           try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
           t.eq('the cycle is refused 503 FULL_VERIFICATION_SCOPE_UNREADABLE naming the directory', [refused?.status, refused?.code, refused?.unreadable?.map((u) => u.path)], [503, 'FULL_VERIFICATION_SCOPE_UNREADABLE', [path.join(dataRoot, 'host-config')]])
@@ -804,7 +817,7 @@ export default async function (t) {
       t.eq('a file named host-config in the data root is not a candidate: nothing reported, the in-tree path chosen', hostConfigSelection({ root: configRoot, env: { DEVPANEL_DATA_ROOT: dataRoot } }), { dir: path.join(configRoot, 'host-config'), unreadable: [] })
       const w = world({ issuesDir: await temp('devpanel-fv-enotdir-issues-') })
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: file, discovery: null, env: {}, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: file, discovery: null, env: {}, log: { warn () {} } })
       let refused = null
       try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
       t.eq('through the production path the cycle refuses FULL_VERIFICATION_SCOPE_UNREADABLE, nothing frozen', [refused?.code, refused?.unreadable?.map((u) => u.code), w.calls.freezes], ['FULL_VERIFICATION_SCOPE_UNREADABLE', ['ENOTDIR'], []])
@@ -826,7 +839,7 @@ export default async function (t) {
       process.env.DEVPANEL_PROJECTS_DIR = laterRoot
       try {
         const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
-        const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, discovery: null, env: {}, log: { warn () {} } })
+        const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, discovery: null, env: {}, log: { warn () {} } })
         const started = await fv.startNow({ by: 'tester' }).catch((error) => ({ refused: error.code ?? error.message }))
         await fv.settle()
         t.ok('the cycle starts from the issue store\'s root, not refused over the later setting', Boolean(started.id), JSON.stringify(started))
@@ -882,7 +895,7 @@ export default async function (t) {
       t.eq('and the scope from that same reading is empty', cycleScope(inputs), [])
       const w = world({ issuesDir: await temp('devpanel-fv-no-target-issues-'), frameworkOf: {} })
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
-      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, ...w.seams, projectsConfig: undefined, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, ...w.seams, projectsConfig: undefined, log: { warn () {} } })
       const started = await fv.startNow({ by: 'tester' })
       await fv.settle()
       const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
@@ -917,7 +930,7 @@ export default async function (t) {
       const w = world({ issuesDir: await temp('devpanel-fv-late-target-issues-') })
       const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
       const actions = []
-      const fv = createFullVerification({ supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, versionOf: async () => null, runAction: async (a) => { actions.push(a); return { status: 'completed' } }, log: { warn () {} } })
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, versionOf: async () => null, runAction: async (a) => { actions.push(a); return { status: 'completed' } }, log: { warn () {} } })
       const started = await fv.startNow({ by: 'tester' })
       await fv.settle()
       const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
@@ -929,7 +942,178 @@ export default async function (t) {
       t.ok('the late target is real: the Deployment resolution no longer reports TARGET_MISSING', now.ok && !(now.resolved.liveExecution?.blockers ?? []).some((b) => b.reason === TARGET_MISSING), JSON.stringify(now.resolved?.liveExecution?.blockers ?? now.errors))
       real.active.clear()
     }
+
+    // Note 001: whatever the frozen cycle waits for is bounded; at the bound it ends interrupted, not run, and admission opens.
+    const pinned = async (ssh) => ({ host: ssh.hostRef.replace(/^ssh-config:/, ''), pinned: null })
+    const cycleFile = (verificationDir) => readJson(path.join(verificationDir, '2026-11-07', 'cycle.json')).catch(() => null)
+
+    t.section('33. G17 the busy wait is bounded on the injected clock: interrupted, nothing driven or committed, what was in flight named, admission thawed')
+    {
+      const issuesDir = await temp('devpanel-fv-bound-busy-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const stuck = { project: 'app-project', issueId: 'stuck', runId: 'r-stuck', phase: 'run', kind: 'run' }
+      const w = world({ issuesDir, busy: [stuck] })
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 10_000, graceMs: 0, log: { warn () {} } })
+      await fv.startNow({ by: 'tester' })
+      await until(async () => (await cycleFile(verificationDir))?.waitingOn?.length, 'the wait to be recorded')
+      clock.advance(9_000)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      t.eq('before the bound it still waits, frozen', [(await cycleFile(verificationDir)).state, w.calls.thaws.length], ['frozen', 0])
+      clock.advance(1_500)
+      const ended = await until(async () => { const r = await cycleFile(verificationDir); return r?.state === 'interrupted' ? r : null }, 'the cycle to be interrupted')
+      t.eq('interrupted at the busy wait, by the configured bound', [ended.interruption?.reason, ended.interruption?.label, ended.verdict], ['wait-bound', 'busy', null])
+      t.eq('no stage started, no checkpoint ran, the outcome was skipped', [w.calls.starts.length, w.calls.actions.length, ended.outcome?.skipped, ended.outcome?.interrupted, ended.outcome?.committed], [0, 0, 'interrupted', true, false])
+      t.ok('what was still in flight is named, never lifted silently', (ended.interruption?.inFlight ?? []).some((b) => b.runId === 'r-stuck'), JSON.stringify(ended.interruption))
+      t.eq('admission thawed once, for this cycle', w.calls.thaws, [ended.id])
+    }
+
+    t.section('34. G17 a bound inside the freeze itself ends the cycle the same way')
+    {
+      const issuesDir = await temp('devpanel-fv-bound-freeze-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const w = world({ issuesDir })
+      w.supervisor.freeze = function (cycleId) { w.calls.freezes.push(cycleId); this.frozenState = { cycleId }; return new Promise(() => {}) }
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 5_000, graceMs: 0, log: { warn () {} } })
+      const starting = fv.startNow({ by: 'tester' })
+      await until(() => w.calls.freezes.length === 1, 'the freeze to be asked')
+      clock.advance(5_001)
+      await starting
+      const ended = await until(async () => { const r = await cycleFile(verificationDir); return r?.state === 'interrupted' ? r : null }, 'the cycle to be interrupted')
+      t.eq('interrupted inside the freeze, nothing driven, admission thawed', [ended.interruption?.label, w.calls.starts.length, w.calls.thaws.length, w.supervisor.frozen()], ['freeze', 0, 1, null])
+    }
+
+    t.section('35. G15 the cycle starts sooner: a contained run in seat turns is not waited for; another run\'s drive in flight on its host is, and the record says so')
+    {
+      const dir = await temp('devpanel-fv-sooner-')
+      const real = createSupervisor({ issues: { getRunHolder: async () => { throw new Error('none') }, getIssue: async () => { throw new Error('none') }, listIssues: async () => [], listProjects: async () => [] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir, seatFencePolicy: () => ({ mode: 'fence' }) })
+      const asked = []
+      // A contained writing run of a verified project, taking seat turns: confined (namespace 1, a proved fence), its own worktree.
+      const snapshot = { tactic: 'implementation', workspace: { isolation: 'worktree', symlinks: 'reject' }, fence: { namespace: 1 }, delivery: { action: 'apply-to-source' } }
+      real.active.set('app-project/contained', { runId: 'r-contained', project: 'app-project', issueId: 'contained', phase: 'run', writes: true, engine: { snapshot, run: { status: 'running', workspace: { path: path.join(dir, 'wt') } }, requestFreeze () { asked.push('r-contained'); return null } } })
+      // An out-of-scope run's drive already in flight on the cycle's host (original AC5: no other run's drive).
+      const drive = real.gates.gateFor({ project: 'elsewhere-project', runId: 'r-drive', writes: true, whole: false }).tryDrive('stage-a').ticket
+      const issuesDir = await temp('devpanel-fv-sooner-issues-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const w = world({ issuesDir })
+      const fake = w.supervisor
+      const supervisor = { ...fake, freeze: (...a) => { fake.calls = true; return real.freeze(...a) }, thaw: (id) => { real.thaw(id); return fake.thaw.call(fake, id) }, frozen: () => real.frozen(), busy: () => real.busy(), busyActions: () => real.busyActions(), releaseIdle: () => [] }
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, snapshottedOf: async () => ({ repositories: [path.join(dir, 'source', '.git')], worktrees: [path.join(dir, 'source')], unknown: false }), pollMs: 1000, log: { warn () {} } })
+      await fv.startNow({ by: 'tester' })
+      const waiting = await until(async () => { const r = await cycleFile(verificationDir); return r?.waitingOn?.length ? r : null }, 'the wait to be recorded')
+      t.eq('the contained run is neither asked to pause nor waited for', [asked, waiting.asked.map((a) => a.runId)], [[], []])
+      t.eq('the cycle waits only for the drive on its host, of a run outside its scope', waiting.waitingOn.map((b) => [b.kind, b.runId, b.host]), [['drive', 'r-drive', 'stage-a']])
+      drive.release()
+      // Advanced until the cycle ends, never once: the poll it needs may be scheduled only after the record write settles.
+      let ended = null
+      for (let i = 0; i < 200 && !ended; i++) {
+        clock.advance(1000)
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        const r = await cycleFile(verificationDir)
+        if (r?.state === 'ended') ended = r
+      }
+      t.eq('once it ended the cycle went on; the record says what it waited for and for how long', [ended.waited?.for, ended.waited?.ms >= 1000, w.calls.starts.length > 0], [['drive'], true, true])
+      t.eq('the contained run never paused for the cycle', asked, [])
+      real.active.clear()
+    }
+
+    t.section('37. only hosts the cycle drives are pinned and frozen: a pool member verified through its instances adds no host')
+    {
+      const issuesDir = await temp('devpanel-fv-hosts-')
+      const w = world({ issuesDir, frameworkOf: { 'app-project': 'framework-project' } })
+      w.issues.listProjects = async () => ['framework-project', 'app-project'].map((id) => ({ id }))
+      const verificationDir = path.join(issuesDir, '.verification')
+      const pinnedRefs = []
+      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: async (ssh) => { pinnedRefs.push(ssh.hostRef); return pinned(ssh) }, snapshottedOf: async () => ({ repositories: [], worktrees: [] }), log: { warn () {} } })
+      const started = await fv.startNow({ by: 'tester' })
+      await fv.settle()
+      const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
+      t.ok('the framework is in the scope (its pool is verified)', record.scope.projects.includes('framework-project'), JSON.stringify(record.scope.projects))
+      t.eq('but only the driven stage\'s host is pinned and frozen', [pinnedRefs.includes('ssh-config:stage-c'), record.scope.hosts.map((h) => h.hostRef)], [false, ['ssh-config:stage-a']])
+      // A member whose instance stage is refused up front (no full suite) has a host of its own the cycle never drives.
+      const refusedRefs = []
+      const issuesDir2 = await temp('devpanel-fv-hosts-refused-')
+      const w2 = world({ issuesDir: issuesDir2, frameworkOf: { 'app-project': 'framework-project' } })
+      w2.issues.listProjects = async () => ['framework-project', 'app-project'].map((id) => ({ id }))
+      const infra2 = async (project) => project === 'framework-project' ? { staging: environment('stage', 'ssh-config:stage-x'), testDrive: { modules: { instance: {} } } } : w2.infrastructureOf(project)
+      const fv2 = createFullVerification({ supervisor: w2.supervisor, issues: w2.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir2, '.verification'), resolve: w2.resolve, infrastructureOf: infra2, readRun: w2.readRun, ...w2.seams, resolveHost: async (ssh) => { refusedRefs.push(ssh.hostRef); return pinned(ssh) }, snapshottedOf: async () => ({ repositories: [], worktrees: [] }), log: { warn () {} } })
+      const started2 = await fv2.startNow({ by: 'tester' })
+      await fv2.settle()
+      const record2 = await readJson(path.join(issuesDir2, '.verification', started2.date, 'cycle.json'))
+      t.eq('a refused stage\'s own host is neither pinned nor frozen', [refusedRefs.includes('ssh-config:stage-x'), record2.scope.hosts.map((h) => h.hostRef).includes('ssh-config:stage-x')], [false, false])
+    }
+
+    t.section('36. G14 a real apply-to-source delivery that became ready during the cycle is applied only after the cycle\'s checkpoint (green) or after its red end, and is not in the commit')
+    for (const verdict of ['green', 'red']) {
+      const exec = promisify(execFile)
+      // A contained writing run of app-project on the fake harness, delivering apply-to-source into the checkout the cycle snapshots.
+      const base = scriptFor()
+      let engine = null
+      const f = await engineFixture({ playbook: 'implementation', delivery: 'apply-to-source', script: async (turn) => {
+        if (turn.stepId === 'implement') await fs.writeFile(path.join(engine.run.workspace.path, 'server.mjs'), 'export default 1\n')
+        return base(turn.stepId.startsWith('audit-implement-') ? { ...turn, stepId: 'audit-implementation' } : turn)
+      } })
+      const src = await fs.realpath(f.projectPath)
+      const common = await fs.realpath(path.join(src, '.git'))
+      const options = { base: 'working-tree', participants: { 'auditor-1': { model: 'opus-5' } } }
+      const resolved = await resolvePlaybook(f.playbookId, { root: f.configRoot, projectId: 'devpanel-project', runOptions: options })
+      engine = await startRun({ ...f, issue: { ...f.issue, project: 'devpanel-project' }, deliveryProvider: worktreeDiffDelivery, expectConfigHash: resolved.resolved.configHash, runOptions: options })
+      const dir = await temp(`devpanel-fv-g14-${verdict}-`)
+      const real = createSupervisor({ issues: { getRunHolder: async () => { throw new Error('none') }, getIssue: async () => { throw new Error('none') }, listIssues: async () => [], listProjects: async () => [] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir, seatFencePolicy: () => ({ mode: 'fence' }) })
+      // The engine's write gate, as the supervisor installs it on a contained run of a verified project.
+      engine.cycleGate = real.cycleGateFor({ project: 'app-project', issueId: 'g14', runId: engine.runId, writes: true, whole: false })
+      const w = world({ issuesDir: await temp(`devpanel-fv-g14-${verdict}-issues-`), frameworkOf: { 'shop-project': 'app-project' }, ...(verdict === 'red' ? { checks: { 'app-project': { gating: 'failed', result: { result: 'failed', dir: 'checks/full-verification' } } } } : {}) })
+      w.issues.listProjects = async () => ['app-project', 'shop-project'].map((id) => ({ id }))
+      const order = []
+      let releaseStages
+      const stagesMayStart = new Promise((resolve) => { releaseStages = resolve })
+      const fake = w.supervisor
+      const supervisor = { ...fake,
+        freeze: (...a) => real.freeze(...a),
+        thaw: (id) => { order.push('thaw'); real.thaw(id); return fake.thaw.call(fake, id) },
+        frozen: () => real.frozen(), busy: () => real.busy(), busyActions: () => real.busyActions(), releaseIdle: () => [],
+        async start (args) { await stagesMayStart; return fake.start(args) } }
+      let deliveredAtCheckpoint = null
+      const seams = { ...w.seams, async runAction (a) {
+        // The checkpoint commits what the checkout holds now.
+        order.push(`checkpoint:${a.project}`)
+        if (a.project === 'app-project') {
+          deliveredAtCheckpoint = await fs.stat(path.join(src, 'server.mjs')).then(() => true, () => false)
+          await exec('git', ['-C', src, 'add', '-A'])
+          await exec('git', ['-C', src, 'commit', '-qm', 'checkpoint', '--allow-empty'])
+        }
+        return w.seams.runAction(a)
+      } }
+      const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...seams, resolveHost: pinned, snapshottedOf: async () => ({ repositories: [common], worktrees: [src] }), pollMs: 1000, log: { warn () {} } })
+      await fv.startNow({ by: 'tester' })
+      // The run's seat turns go on during the cycle; its delivery reaches the write gate and waits there.
+      const driving = engine.drive().then(() => order.push('delivered'))
+      await until(() => engine.run.cycleWait?.kind === 'write' || ['completed', 'blocked', 'failed'].includes(engine.run.status), 'the delivery to wait for the cycle', 60000)
+      t.eq(`${verdict}: the real delivery waits at the gate for this cycle, the checkout untouched`, [engine.run.cycleWait?.action, engine.run.cycleWait?.repositories, await fs.stat(path.join(src, 'server.mjs')).then(() => true, () => false)], ['delivery', [common], false])
+      releaseStages()
+      for (let i = 0; i < 100 && !order.includes('delivered'); i++) { clock.advance(1000); await new Promise((resolve) => setTimeout(resolve, 30)) }
+      await driving
+      const ended = await until(async () => { const r = await cycleFile(verificationDir); return ['ended', 'failed'].includes(r?.state) ? r : null }, 'the cycle to end')
+      t.eq(`${verdict}: the cycle's verdict, and the run completed after it`, [ended.verdict, engine.run.status], [verdict, 'completed'], engine.run.blockedReason)
+      if (verdict === 'green') {
+        t.ok('green: the checkpoint ran first, the delivery only after the thaw', order.indexOf('checkpoint:app-project') >= 0 && order.indexOf('checkpoint:app-project') < order.indexOf('thaw') && order.indexOf('thaw') < order.indexOf('delivered'), JSON.stringify(order))
+        const committed = (await exec('git', ['-C', src, 'show', '--name-only', '--format=', 'HEAD'])).stdout.split('\n').filter(Boolean)
+        t.eq('the checkout did not hold the delivery when the checkpoint committed, and the commit does not either', [deliveredAtCheckpoint, committed.includes('server.mjs')], [false, false])
+      } else {
+        t.ok('red: no checkpoint ran; the delivery landed after the red end thawed admission', !order.some((o) => o.startsWith('checkpoint:')) && order.indexOf('thaw') < order.indexOf('delivered'), JSON.stringify(order))
+        t.eq('nothing was committed', (await exec('git', ['-C', src, 'rev-list', '--count', 'HEAD'])).stdout.trim(), '1')
+      }
+      t.eq(`${verdict}: the delivery is in the checkout afterwards, uncommitted`, (await exec('git', ['-C', src, 'status', '--porcelain', '--', 'server.mjs'])).stdout.trim(), '?? server.mjs')
+      t.eq(`${verdict}: its wait is on the run record, ended by the thaw`, (engine.run.cycleWaits ?? []).map((x) => [x.kind, x.action, x.outcome]), [['write', 'delivery', 'thawed']])
+      await releaseWorkspace(engine).catch(() => {})
+    }
+
   } finally {
+    await cleanupFixtures()
     for (const d of temps) await fs.rm(d, { recursive: true, force: true })
   }
 }

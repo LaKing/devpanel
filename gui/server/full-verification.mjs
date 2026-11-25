@@ -1,4 +1,6 @@
 import fs from 'node:fs/promises'
+import { renameSync, rmSync } from 'node:fs'
+import crypto from 'node:crypto'
 import path from 'node:path'
 
 import { systemClock } from './runtime/clock.mjs'
@@ -21,6 +23,8 @@ import { recordDrive } from './runtime/selftest-history.mjs'
 import { destroyRunInstances } from './runtime/stage-instances.mjs'
 import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
+import { resolveDriveHost } from './runtime/drive-slots.mjs'
+import { snapshotRepositories } from './runtime/source-lock.mjs'
 import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries, NOT_MATERIALIZED } from './staging-coverage.mjs'
 import { deliveryCounts } from './verification-trigger.mjs'
 import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
@@ -99,6 +103,9 @@ function localParts (ms, timeZone) {
 }
 
 /** YYYY-MM-DD in the zone. */
+/** What a bounded wait answers when its bound came first. */
+const TIMED_OUT = Symbol('timed-out')
+
 export function localDate (ms, timeZone) {
   const p = localParts(ms, timeZone)
   return `${String(p.year).padStart(4, '0')}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`
@@ -450,7 +457,7 @@ export function createFullVerification ({
   discovery = undefined,
   env = process.env,
   /** Run a project action to its end; resolves with its operation record (project-actions.mjs). */
-  runAction = async ({ project, actionId, args }) => (await startProjectAction({ project, actionId, args, root: configRoot, actor: 'full-verification', emit: emitAction ?? (() => {}) })).done,
+  runAction = async ({ project, actionId, args, signal = null }) => (await startProjectAction({ project, actionId, args, root: configRoot, actor: 'full-verification', emit: emitAction ?? (() => {}), signal })).done,
   emitAction = null,
   /** A project's version: its root `version` file's first line, else package.json's version, else null. */
   versionOf = async (project) => {
@@ -485,7 +492,35 @@ export function createFullVerification ({
   recordSnapshot = (args) => snapshotRecord(args),
   compareSnapshots = (args) => snapshotDiff(args),
   headOf = async (checkout) => (await readGit(['-C', checkout, 'rev-parse', 'HEAD'])).trim(),
-  compareCommit = (args) => committedBeyond(args)
+  compareCommit = (args) => committedBeyond(args),
+  // The gates (cycle-gates.mjs): each stage's HostName, resolved once at the freeze and pinned for the gate and for every
+  // drive of the cycle; what the cycle snapshots (S), compared with a writer's repositories.
+  resolveHost = (ssh) => resolveDriveHost(ssh, { windowMs: 0, retryMs: 0 }),
+  snapshottedOf = async (projects) => {
+    const repositories = new Set(), worktrees = new Set()
+    for (const project of projects) {
+      const dir = await projectPathOf(project)
+      worktrees.add(await fs.realpath(dir))
+      // Each project's own snapshot policy (its resolved workspace and fence, as its stage snapshots it); one that does not
+      // resolve is read with the strictest reading, materialized links and owner selection.
+      const resolution = await Promise.resolve().then(() => resolve('deployment', { root: configRoot, runOptions: { environment: 'staging' }, projectId: project })).catch(() => null)
+      const resolved = resolution?.ok ? resolution.resolved : null
+      const policy = resolved
+        ? { ...(resolved.workspace ?? {}), base: 'working-tree', requireCleanBase: false, selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, nested: hostSettings().nestedRepositories }
+        : { base: 'working-tree', symlinks: 'materialize', selection: 1, nested: hostSettings().nestedRepositories }
+      const found = await snapshotRepositories(dir, policy)
+      for (const r of found.repositories) repositories.add(r)
+      // The checkouts the snapshot reads, not dirname(common dir): a linked worktree is not its main checkout.
+      for (const w of found.worktrees ?? []) worktrees.add(w)
+      const store = gitStoreDir(project)
+      if (store) repositories.add(store)
+    }
+    return { repositories: [...repositories].sort(), worktrees: [...worktrees].sort(), unknown: false }
+  },
+  // Note 001: whatever the frozen cycle waits for is bounded (fullVerification.maxWaitMinutes, default 240); at the bound
+  // the cycle ends interrupted, not run, and admission opens. `graceMs`: how long the stops it asks for are waited for.
+  maxWaitMs = null,
+  graceMs = 60_000
 } = {}) {
   const infrastructureOf = injectedInfrastructureOf ?? ((project) => projectInfrastructure(project, { root: configRoot }))
   const projectsConfig = injectedProjectsConfig ?? (async () => (await loadConfig({ root: configRoot })).projects)
@@ -508,26 +543,127 @@ export function createFullVerification ({
   let stopped = false
   // Per project, how its entry's snapshot was taken (checkout, policy, where): the recheck before the chain takes it again.
   const snapshotInputs = new Map()
+  // The cycle running now: each stage host's pinned connection (by hostRef), and its interruption.
+  let pinnedHosts = new Map()
+  // Each cycle's own cancellation, interruption and pinned hosts (controlOf), bound to its record: a task of an earlier
+  // cycle still settling never reads a later cycle's signal or pins (late-cycle-work). `tasks`: what its bounded awaits
+  // still run, followed through the interruption's grace and named when admission opens.
+  const controls = new WeakMap()
+  const NEVER = new Promise(() => {})
+  const controlOf = (record) => controls.get(record) ?? { abort: null, interrupted: NEVER, notify: null, tasks: new Map(), pinned: new Map() }
+  const signalOf = (record) => controlOf(record).abort?.signal ?? null
+  const pinOf = (record, hostRef) => controlOf(record).pinned.get(hostRef) ?? null
+  /** An await the frozen cycle races against its interruption only (no bound of its own: what it waits for is bounded elsewhere). */
+  const orInterrupted = (record, promise) => Promise.race([promise, controlOf(record).interrupted])
+  const maxWait = () => maxWaitMs ?? (hostSettings().verificationTrigger?.maxWaitMinutes ?? 240) * 60_000
+  class CycleInterrupted extends Error {}
+  /** A bound reached (note 001): the whole cycle is interrupted; its stage runs are asked to stop and nothing starts after. */
+  function interrupt (record, label) {
+    if (record.interruption) return
+    record.interruption = { reason: 'wait-bound', label, at: clock.iso(), boundMinutes: Math.round(maxWait() / 60_000) }
+    controlOf(record).abort?.abort()
+    for (const e of record.projects ?? []) {
+      if (e.runId && ['running', 'starting'].includes(e.state)) Promise.resolve(supervisor.stop?.({ project: e.project, issueId: e.issueId, runId: e.runId })).catch(() => {})
+    }
+    controlOf(record).notify?.()
+  }
+  /** An await of the frozen cycle, bounded from its start: at the bound the cycle is interrupted and this await abandoned. */
+  async function bounded (record, label, promise) {
+    const c = controlOf(record)
+    const task = Promise.resolve(promise)
+    const id = Symbol(label)
+    c.tasks.set(id, { label, since: clock.iso() })
+    const done = () => { c.tasks.delete(id) }
+    task.then(done, done)
+    const disarm = clock.after(maxWait(), () => interrupt(record, label))
+    try {
+      return await Promise.race([task, c.interrupted])
+    } finally {
+      disarm?.()
+    }
+  }
 
   const wait = (ms) => new Promise((resolve) => clock.after(ms, resolve))
   const changed = (record) => emit?.({ type: 'verification:changed', id: record.id, state: record.state })
 
+  /*
+   * A cycle's record writes do not wait for one another (late-cycle-record-write): each serializes the record as it is
+   * when called, under a sequence number per cycle, into a temporary file of its own, and publishes it only if no later
+   * write of that cycle has landed. The checks and the rename happen in one synchronous block, so a write that stalled
+   * (before the bound, say) can neither hold back the interrupted result or the announcement nor land after them, and it
+   * goes only to the file that holds its cycle at that moment: cycle.json while that cycle is the latest, else the
+   * cycle.<n>.json a later cycle of its date rotated it to, never over another cycle's record. A rotation in progress
+   * is waited for and the destination read again.
+   */
+  const writeSeq = new Map() // cycle id -> { issued, landed }
+  const issuedIds = new Set()
+  // A cycle's entries as they stood when it settled (its outcome handled, or its interruption recorded): every later
+  // write puts them back, in memory and on disk, so a stage that returns after the bound changes nothing of them.
+  const sealedEntries = new Map() // cycle id -> projects
+  const seal = (record) => { sealedEntries.set(record.id, JSON.stringify(record.projects ?? [])) }
+  /** How long the end's announcement may take, the listener and its record write each (a stall cannot leave the cycle running). */
+  const ANNOUNCE_MS = 30_000
+  const within = (promise, ms) => Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(TIMED_OUT), ms).unref?.())])
+  let rotations = 0
+  let rotating = null
+  /** A record write after the thaw: awaited a few seconds at most (a write that stalls cannot hold the cycle's end). */
+  const settleWrite = (record) => Promise.race([
+    write(record).catch((error) => log.warn?.(`[devpanel] the full verification record ${record.id} could not be written: ${error.message}`)),
+    new Promise((resolve) => setTimeout(resolve, 5000).unref?.())
+  ])
   async function write (record) {
-    await writeJson(path.join(verificationDir, record.date, 'cycle.json'), record)
+    if (sealedEntries.has(record.id)) record.projects = JSON.parse(sealedEntries.get(record.id))
+    const seqs = writeSeq.get(record.id) ?? { issued: 0, landed: 0 }
+    writeSeq.set(record.id, seqs)
+    const seq = ++seqs.issued
+    const data = JSON.stringify(record, null, 2) + '\n'
+    const dir = path.join(verificationDir, record.date)
+    await fs.mkdir(dir, { recursive: true })
+    const tmp = path.join(dir, `.cycle-${crypto.randomUUID()}.tmp`)
+    let published = false
+    try {
+      const handle = await fs.open(tmp, 'wx', 0o600)
+      try { await handle.writeFile(data); await handle.sync() } finally { await handle.close() }
+      for (;;) {
+        if (seq <= seqs.landed) return false
+        while (rotating) await rotating
+        const generation = rotations
+        const file = current === record ? path.join(dir, 'cycle.json') : await recordFileOf(record)
+        // From here to the rename nothing is awaited: no later write of this cycle and no rotation can come between.
+        if (rotating || generation !== rotations) continue
+        if (seq <= seqs.landed) return false
+        if (!file) return false
+        renameSync(tmp, file)
+        published = true
+        seqs.landed = seq
+        break
+      }
+    } finally {
+      if (!published) { try { rmSync(tmp, { force: true }) } catch {} }
+    }
     changed(record)
+    return true
   }
 
   /** Keep an earlier cycle of the same date as cycle.<n>.json; cycle.json is always the latest. */
-  async function rotate (date) {
-    const dir = path.join(verificationDir, date)
-    await fs.mkdir(dir, { recursive: true })
-    const names = await fs.readdir(dir)
-    const kept = names.filter((n) => /^cycle\.\d+\.json$/.test(n)).length
-    if (names.includes('cycle.json')) {
-      await fs.rename(path.join(dir, 'cycle.json'), path.join(dir, `cycle.${kept + 1}.json`))
-      return kept + 2
-    }
-    return kept + 1
+  function rotate (date) {
+    const run = (async () => {
+      const dir = path.join(verificationDir, date)
+      await fs.mkdir(dir, { recursive: true })
+      const names = await fs.readdir(dir)
+      const kept = names.filter((n) => /^cycle\.\d+\.json$/.test(n)).length
+      if (names.includes('cycle.json')) {
+        await fs.rename(path.join(dir, 'cycle.json'), path.join(dir, `cycle.${kept + 1}.json`))
+        return kept + 2
+      }
+      return kept + 1
+    })()
+    // A write resolving its destination meanwhile waits for the rotation and reads it again.
+    let settled
+    const token = new Promise((resolve) => { settled = resolve })
+    rotating = token
+    rotations++
+    return run.finally(() => { rotations++; if (rotating === token) rotating = null; settled() })
   }
 
   /**
@@ -669,10 +805,50 @@ export function createFullVerification ({
     }
     running = true
     current = record
+    const control = { abort: new AbortController(), interrupted: null, notify: null, tasks: new Map(), pinned: null }
+    control.interrupted = new Promise((resolve, reject) => { control.notify = () => reject(new CycleInterrupted('the full verification reached its wait bound')) })
+    control.interrupted.catch(() => {})
+    controls.set(record, control)
     try {
-      record.id = `${date}.${await rotate(date)}`
-      record.asked = await supervisor.freeze(record.id, { projects: record.scope.projects })
-      await write(record)
+      // Never an id this process already gave a cycle: one whose cycle.json never landed would otherwise be reused, and a
+      // late write of the older cycle would match the newer one's file (late-cycle-record-write).
+      let ordinal = await rotate(date)
+      while (issuedIds.has(`${date}.${ordinal}`)) ordinal++
+      record.id = `${date}.${ordinal}`
+      issuedIds.add(record.id)
+      // The gates' inputs, from the same reading: each stage host resolved once and pinned (an unresolvable one is
+      // refused as the cycle starts its stages), and what the cycle snapshots (unreadable: every write of the scope waits).
+      pinnedHosts = new Map()
+      control.pinned = pinnedHosts
+      const unresolved = []
+      // Only the hosts of stages this cycle drives: not one verified through its instances, nor one refused before it runs
+      // (a release to a host with dynamic instances, an instance stage with no full suite, a release with no staging target).
+      const eligibleInfras = new Map([...inputs.infras].filter(([, i]) => i && !i.error))
+      const eligibleProtected = protectedHosts(eligibleInfras)
+      const drives = (id, infra) => {
+        if (!infra || infra.error) return false
+        const entry = stageOf(id, infra)
+        if (entry.verifiedThrough || !entry.stage || hostRefusal(entry, eligibleProtected)) return false
+        return entry.mode === 'instance' ? Boolean(infra.testDrive?.modules?.instance?.fullSuite) : !targetMissing(infra)
+      }
+      for (const id of record.scope.projects) {
+        const infra = inputs.infras.get(id)
+        const ssh = drives(id, infra) ? infra.staging?.ssh : null
+        if (!ssh?.hostRef || pinnedHosts.has(ssh.hostRef) || unresolved.some((u) => u.hostRef === ssh.hostRef)) continue
+        try {
+          pinnedHosts.set(ssh.hostRef, { hostRef: ssh.hostRef, ...(await resolveHost(ssh)) })
+        } catch (error) { unresolved.push({ hostRef: ssh.hostRef, error: error.message }) }
+      }
+      const snapshotted = await Promise.resolve().then(() => snapshottedOf(record.scope.projects)).catch((error) => ({ repositories: [], worktrees: [], unknown: true, error: error.message }))
+      record.scope.hosts = [...pinnedHosts.values()].map((h) => ({ hostRef: h.hostRef, host: h.host }))
+      if (unresolved.length) record.scope.unresolvedHosts = unresolved
+      record.scope.snapshotted = { repositories: snapshotted.repositories.length, unknown: Boolean(snapshotted.unknown), ...(snapshotted.error ? { error: snapshotted.error } : {}) }
+      record.asked = await bounded(record, 'freeze', supervisor.freeze(record.id, { projects: record.scope.projects, hosts: [...pinnedHosts.values()], snapshotted })).catch((error) => {
+        if (error instanceof CycleInterrupted) return []
+        throw error
+      })
+      // Bounded too (note 001): a write that never settles cannot keep admission closed.
+      await bounded(record, 'record', write(record)).catch((error) => { if (!(error instanceof CycleInterrupted)) throw error })
     } catch (error) {
       running = null
       current = null
@@ -690,18 +866,62 @@ export function createFullVerification ({
     return frozen
   }
 
+  /**
+   * A cycle its bound interrupted (note 001): not run, no outcome. Its stage runs were asked to stop; they, pending stage
+   * starts and checkpoint actions get `graceMs` to settle. Whatever is still in flight when admission opens is named on
+   * the record and in the announcement: the freeze is never lifted silently while a write is in progress.
+   */
+  async function settleInterruption (record) {
+    const until = clock.now() + graceMs
+    const c = controlOf(record)
+    const live = () => (record.projects ?? []).filter((e) => e.runId && e.issueId && supervisor.isActive?.(e.project, e.issueId))
+    // Stage runs, and the cycle's own pending work (a stage start, an instance drive, a checkpoint, the outcome) get the grace.
+    while ((live().length || c.tasks.size) && clock.now() < until) await wait(Math.min(pollMs, Math.max(1, until - clock.now())))
+    for (const e of record.projects ?? []) {
+      if (['running', 'starting'].includes(e.state)) Object.assign(e, { state: 'interrupted', verdict: e.verdict ?? null, coverageEstablished: false })
+      else if (!e.state && !e.verdict && e.stage && !e.verifiedThrough) Object.assign(e, { state: 'not-run', verdict: null, coverageEstablished: false })
+    }
+    record.verdict = null
+    // A bound reached inside the checkpoint chain keeps what the chain recorded; otherwise no outcome ran.
+    record.outcome ??= { skipped: 'interrupted', committed: false }
+    record.outcome.interrupted = true
+    record.interruption.inFlight = [
+      ...live().map((e) => ({ project: e.project, issueId: e.issueId, runId: e.runId, kind: 'stage-run' })),
+      ...[...c.tasks.values()].map((t) => ({ kind: 'cycle-task', label: t.label, since: t.since })),
+      ...supervisor.busy(),
+      // A reading that does not answer within a second is named as unread, never awaited: admission opens next.
+      ...(await Promise.race([Promise.resolve(supervisor.busyActions?.()).catch(() => []), new Promise((resolve) => setTimeout(() => resolve([{ kind: 'project-actions', unread: true }]), 1000))]) ?? [])
+    ]
+  }
+
   async function cycle (record, inputs) {
     snapshotInputs.clear()
     try {
-      // No run of an issue left in this process: no seat turn is running.
-      for (;;) {
-        if (stopped) throw new Error('full verification stopped while waiting for active runs to settle')
-        const busy = supervisor.busy()
-        if (!busy.length) break
-        if (JSON.stringify(busy) !== JSON.stringify(record.waitingOn)) { record.waitingOn = busy; await write(record) }
-        await wait(pollMs)
+      // No write into a checkout it snapshots in flight, and no drive in flight on a host it drives on: a seat turn of a
+      // contained run is not waited for (cycle-gates.mjs). Bounded from the freeze (note 001).
+      const waitedFor = new Set()
+      const disarmBusy = clock.after(Math.max(0, maxWait() - Math.max(0, clock.now() - Date.parse(record.frozenAt))), () => interrupt(record, 'busy'))
+      try {
+        if (record.interruption) throw new CycleInterrupted('interrupted')
+        // A contained run holds nothing on staging while the cycle runs; what could not be removed is named.
+        const held = await orInterrupted(record, Promise.resolve(supervisor.releaseIdle?.()).catch(() => []))
+        if (held?.length) record.heldInstances = held
+        for (;;) {
+          if (stopped) throw new Error('full verification stopped while waiting for active runs to settle')
+          if (record.interruption) throw new CycleInterrupted('interrupted')
+          const actions = (await orInterrupted(record, Promise.resolve(supervisor.busyActions?.()).catch(() => []))) ?? []
+          // Read after the awaited scan, and nothing is awaited between it and the transition to running below.
+          const busy = [...supervisor.busy(), ...actions]
+          if (!busy.length) break
+          for (const b of busy) waitedFor.add(b.kind ?? b.phase ?? 'run')
+          if (JSON.stringify(busy) !== JSON.stringify(record.waitingOn)) { record.waitingOn = busy; await orInterrupted(record, write(record)) }
+          await orInterrupted(record, wait(pollMs))
+        }
+      } finally {
+        disarmBusy?.()
       }
       record.waitingOn = []
+      record.waited = { from: record.frozenAt, to: clock.iso(), ms: Math.max(0, clock.now() - Date.parse(record.frozenAt)), for: [...waitedFor] }
       record.seatsIdleAt = clock.iso()
       record.state = 'running'
       record.startedAt = clock.iso()
@@ -732,7 +952,10 @@ export function createFullVerification ({
       // The scope gate: a stage the frozen reading left out of the scope is never started in this cycle, whatever the
       // configuration says later; it is refused with the reason that reading gave (TARGET_MISSING), else as outside the freeze.
       const inScope = new Set(record.scope?.projects ?? [])
-      const refusalOf = (entry) => hostRefusal(entry, protectedOnes) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
+      const unresolvedHost = (entry) => (record.scope?.unresolvedHosts ?? []).find((u) => u.hostRef === entry.host)
+      const refusalOf = (entry) => hostRefusal(entry, protectedOnes) ?? (unresolvedHost(entry)
+        ? { code: 'STAGE_HOST_UNRESOLVED', message: `the staging host ${entry.host} could not be resolved when the cycle froze (${unresolvedHost(entry).error}); its drives could not be pinned, so this stage is not started in this cycle` }
+        : null) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
         ? { code: 'FULL_SUITE_UNDECLARED', message: `${entry.project} runs on dynamic stage instances but declares no testDrive.modules.instance.fullSuite: the whole suite has no instance command, and the base instance is never used instead` }
         : null) ?? (record.scope && !inScope.has(entry.project)
         ? (entry.mode !== 'instance' && targetMissing(infras.get(entry.project))
@@ -743,49 +966,71 @@ export function createFullVerification ({
         const refusal = refusalOf(entry)
         if (refusal) Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false })
       }
-      await write(record)
+      await bounded(record, 'record', write(record))
       const runOne = (entry) => entry.mode === 'instance' ? runInstanceStage(record, entry, infras.get(entry.project)) : runStage(record, entry, protectedOnes)
       const hosts = new Map()
       for (const entry of record.projects.filter((e) => drivable(e) && e.state !== 'deferred')) hosts.set(entry.host, [...(hosts.get(entry.host) ?? []), entry])
       // One stage at a time per staging host; hosts side by side (drive slots and instance slots still decide each drive).
       await Promise.all([...hosts.values()].map(async (entries) => {
-        for (const entry of entries) await runOne(entry)
+        for (const entry of entries) {
+          if (record.interruption) { if (!entry.state) Object.assign(entry, { state: 'not-run', verdict: null, coverageEstablished: false }); continue }
+          await bounded(record, `stage ${entry.project}`, runOne(entry)).catch((error) => {
+            if (!(error instanceof CycleInterrupted)) throw error
+          })
+        }
       }))
+      if (record.interruption) throw new CycleInterrupted('interrupted')
       // Then each deferred framework: derived from the instance entries whose snapshot materialized its checkout, or,
       // when none did, refused or driven exactly as it would have been.
       for (const [framework, instances] of [...pools].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+        if (record.interruption) throw new CycleInterrupted('interrupted')
         const entry = record.projects.find((e) => e.project === framework)
-        const dir = await Promise.resolve().then(() => projectPathOf(framework)).catch(() => null)
-        const checkouts = dir ? [dir, await fs.realpath(dir).catch(() => dir)] : []
-        const sources = record.projects.filter((e) => instances.includes(e.project) && (e.snapshot?.links ?? []).some((l) => checkouts.includes(l.owner)))
-        if (sources.length) { await deriveEntry(record, entry, sources, checkouts); continue }
-        delete entry.state
-        entry.derivation = { state: 'not-derived', instances, reason: `no instance entry of this cycle has a snapshot that materializes ${framework}'s checkout, so it is driven itself` }
-        const refusal = refusalOf(entry)
-        if (refusal) { Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false }); await write(record); continue }
-        await runOne(entry)
+        // Its lookup, derivation and refusal write are bounded like its drive (note 001).
+        const next = await bounded(record, `deferred ${framework}`, (async () => {
+          const dir = await Promise.resolve().then(() => projectPathOf(framework)).catch(() => null)
+          const checkouts = dir ? [dir, await fs.realpath(dir).catch(() => dir)] : []
+          const sources = record.projects.filter((e) => instances.includes(e.project) && (e.snapshot?.links ?? []).some((l) => checkouts.includes(l.owner)))
+          if (sources.length) { await deriveEntry(record, entry, sources, checkouts); return 'derived' }
+          delete entry.state
+          entry.derivation = { state: 'not-derived', instances, reason: `no instance entry of this cycle has a snapshot that materializes ${framework}'s checkout, so it is driven itself` }
+          const refusal = refusalOf(entry)
+          if (refusal) { Object.assign(entry, { state: 'refused', verdict: 'red', refusal, coverageEstablished: false }); await write(record); return 'refused' }
+          return 'drive'
+        })())
+        if (next !== 'drive') continue
+        if (record.interruption) throw new CycleInterrupted('interrupted')
+        await bounded(record, `stage ${entry.project}`, runOne(entry))
       }
       // Every entry that is not verified through its instances counts, a project whose
       // configuration could not be read included: one red entry makes the cycle red.
       const judged = record.projects.filter((e) => !e.verifiedThrough)
       record.verdict = judged.some((e) => e.verdict !== 'green') ? 'red' : judged.length ? 'green' : 'no-stages'
     } catch (error) {
-      record.error = error.message
-      record.verdict = 'red'
+      if (!record.interruption) {
+        record.error = error.message
+        record.verdict = 'red'
+      }
     } finally {
       // The outcome is handled while admission is still closed, so no run delivers into a checkout
       // the bump commits. It never throws: admission always reopens after it.
-      await outcome(record)
+      // Bounded like every other frozen await (the checkpoint chain, its after-commit comparisons, the record writes):
+      // at the bound the cycle settles as interrupted and admission opens, whatever the outcome still does.
+      if (!record.interruption) await bounded(record, 'outcome', outcome(record)).catch((error) => { if (!(error instanceof CycleInterrupted)) record.error ??= `outcome: ${error.message}` })
+      if (record.interruption) await settleInterruption(record)
+      seal(record)
       record.state = 'resuming'
       supervisor.thaw(record.id)
-      await write(record).catch(() => {})
+      // After the thaw no write is awaited unbounded: a write stalled since before the bound holds the record's chain, and
+      // the later writes (this one, the end below) still land after it, in order, whenever it settles (late-cycle-record-write).
+      await settleWrite(record)
       await resumeFrozen(record, { scope: record.scope?.projects ?? null }).catch((error) => { record.error ??= `resuming: ${error.message}` })
       activeInputs = null
-      record.state = record.error ? 'failed' : 'ended'
+      pinnedHosts = new Map()
+      record.state = record.interruption ? 'interrupted' : record.error ? 'failed' : 'ended'
       record.endedAt = clock.iso()
       // Owed to the top-level supervisor until it was told, so a restart in between still tells it (announcePending).
       record.announce = 'pending'
-      await write(record).catch((error) => log.warn?.(`[devpanel] the full verification record ${record.id} could not be written: ${error.message}`))
+      await settleWrite(record)
       await announce(record)
     }
   }
@@ -798,15 +1043,18 @@ export function createFullVerification ({
   async function announce (record) {
     if (!onEnded || record.announce !== 'pending') return false
     // The file that holds this cycle now: cycle.json, or the cycle.<n>.json a later cycle of its date rotated it to.
-    const file = await recordFileOf(record).catch(() => null)
+    // Each step bounded: a listener or a record write that stalls leaves the notice owed, never the cycle running.
+    const file = await within(recordFileOf(record).catch(() => null), ANNOUNCE_MS)
     try {
-      await onEnded(endedNotice(record, file))
+      const told = await within(Promise.resolve(onEnded(endedNotice(record, file === TIMED_OUT ? null : file))), ANNOUNCE_MS)
+      if (told === TIMED_OUT) throw new Error(`no answer within ${ANNOUNCE_MS / 1000} s; it stays owed`)
     } catch (error) {
       log.warn?.(`[devpanel] the end of full verification ${record.id} could not be announced: ${error.message}`)
       return false
     }
     Object.assign(record, { announce: 'delivered', announcedAt: clock.iso() })
-    await writeRecord(record).catch((error) => log.warn?.(`[devpanel] the announcement of full verification ${record.id} could not be recorded: ${error.message}`))
+    const recorded = await within(writeRecord(record).catch((error) => log.warn?.(`[devpanel] the announcement of full verification ${record.id} could not be recorded: ${error.message}`)), ANNOUNCE_MS)
+    if (recorded === TIMED_OUT) log.warn?.(`[devpanel] the announcement of full verification ${record.id} is still being recorded after ${ANNOUNCE_MS / 1000} s; the cycle ends meanwhile`)
     return true
   }
 
@@ -821,10 +1069,8 @@ export function createFullVerification ({
     return null
   }
 
-  /** Write a record back to the file it was read from (cycle.json, or an earlier cycle.<n>.json of its date). */
+  /** Write a record back to the file it was read from (cycle.json, or an earlier cycle.<n>.json of its date): one of its cycle's sequenced writes. */
   async function writeRecord (record) {
-    const file = await recordFileOf(record)
-    if (file) { await writeJson(file, record); changed(record); return }
     await write(record)
   }
 
@@ -930,8 +1176,13 @@ export function createFullVerification ({
       const policy = { ...(resolved.workspace ?? {}), base: 'working-tree', requireCleanBase: false, selection: resolved.fence?.selection ?? 0, repository: resolved.fence?.repository ?? 0, store: gitStoreDir(entry.project), nested: hostSettings().nestedRepositories }
       // A reading of the checkouts the snapshot reads, just before and just after it: was somebody editing them?
       const before = await readMotion({ projectDir, policy }).catch((error) => ({ error: error.message }))
+      // Interrupted while it resolved or read (late-cycle-work): nothing is provisioned after the bound.
+      if (record.interruption || signalOf(record)?.aborted) throw new CycleInterrupted('interrupted before provisioning')
       // The candidate: the development checkout as it stands now, as a run's working-tree base takes it.
-      workspace = await provision({ projectPath: projectDir, runId: driveId, root: home, clock, policy })
+      workspace = await provision({ projectPath: projectDir, runId: driveId, root: home, clock, policy, signal: signalOf(record) })
+      // Recorded before anything else can throw, so the cleanup below finds and releases it.
+      entry.workspace = { path: workspace.path, repository: workspace.repository ?? null }
+      if (record.interruption || signalOf(record)?.aborted) throw new CycleInterrupted('interrupted while provisioning')
       const after = await readMotion({ projectDir, policy, extra: (workspace.symlinks?.owners ?? []).map((o) => o.owner?.path).filter(Boolean) }).catch((error) => ({ error: error.message }))
       noteMotion(entry, before, after)
       Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: await snapshotOf({ workspace, policy, projectDir }), snapshotAt: clock.iso(), state: 'running' })
@@ -943,6 +1194,7 @@ export function createFullVerification ({
         .catch((error) => ({ error: error.message })))
       await write(record)
       const check = await fullVerificationDrive({ target, workspace, runDir: home, runId: driveId, project: entry.project, stage: entry.stage, verificationDir, clock, mode: 'instance', ...(drive ? { drive } : {}),
+        signal: signalOf(record), resolved: pinOf(record, infra.staging?.ssh?.hostRef),
         onDriveWait: async (w) => {
           if (w.phase === 'start') entry.waiting = { reason: w.reason, since: w.from }
           else { entry.waits = [...(entry.waits ?? []), { reason: entry.waiting?.reason ?? null, from: w.from, to: w.to }]; delete entry.waiting }
@@ -978,7 +1230,10 @@ export function createFullVerification ({
       const destroyed = await Promise.resolve().then(() => destroyInstances(driveId, { reason: 'cycle-ended', clock })).catch((error) => [{ name: entry.instance.name, passed: false, error: error.message }])
       const mine = (destroyed ?? []).find((d) => d?.name === entry.instance.name)
       entry.instance = { ...entry.instance, destroyed: mine ? { passed: mine.passed, at: mine.at ?? clock.iso(), ...(mine.error ? { error: mine.error } : {}) } : (entry.instance.destroyed ?? { passed: true, at: clock.iso(), held: false }) }
-      if (workspace) await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: projectDir })).then(() => { entry.workspace.released = true }, (error) => { entry.workspace.retained = error.message })
+      if (workspace) {
+        entry.workspace ??= { path: workspace.path, repository: workspace.repository ?? null }
+        await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: projectDir })).then(() => { entry.workspace.released = true }, (error) => { entry.workspace.retained = error.message })
+      }
     }
     entry.endedAt ??= clock.iso()
     entry.durationMs = Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt))
@@ -1005,7 +1260,8 @@ export function createFullVerification ({
       await write(record).catch(() => {})
       for (const [i, group] of rerunCommands(plan.tests, settings).entries()) {
         const rerunTarget = { ...target, commands: [fill(group.command, target.stageInstance)] }
-        const result = await (drive ?? runChecks)({ target: rerunTarget, revision: null, base: true, dirName: `${RERUN_DIR}-${i + 1}`, baseCommit: workspace.baseCommit, workspacePath: workspace.path, gitDir: workspace.gitDir ?? null, runDir: home, clock, runId: driveId })
+        const result = await (drive ?? runChecks)({ target: rerunTarget, revision: null, base: true, dirName: `${RERUN_DIR}-${i + 1}`, baseCommit: workspace.baseCommit, workspacePath: workspace.path, gitDir: workspace.gitDir ?? null, runDir: home, clock, runId: driveId,
+          signal: signalOf(record), resolved: pinOf(record, infra.staging?.ssh?.hostRef) })
         const judged = judgeRerun({ drive: result, command: rerunTarget.commands[0], tests: group.tests, reports: await readReports({ runDir: home, check: result, target: rerunTarget }), target: rerunTarget })
         entry.rerun.drives.push({ dir: result.dir ?? null, command: group.command.id, result: result.result ?? null, at: result.at ?? clock.iso(), tests: group.tests.map((t) => t.test) })
         entry.rerun.tests.push(...judged.map((t) => ({ ...t, first: 'failed', dir: result.dir ?? null })))
@@ -1058,13 +1314,20 @@ export function createFullVerification ({
       let after = null
       // The last step before the start, after every awaited reading: the target and a fresh, complete protected-host read.
       await releaseGuard(entry, frozen, resolution.resolved, hosts)
-      const started = await supervisor.start({ project: entry.project, issueId: home.id, playbookId: 'deployment', expectConfigHash: resolution.resolved.configHash, runOptions, configRoot, cycle: record.id })
+      // Release scripts open their own SSH connections: the stage's host must still be the one pinned at the freeze.
+      const pin = pinOf(record, entry.host)
+      if (pin) {
+        const now = await Promise.resolve().then(() => resolveHost(resolution.resolved.infrastructure?.staging?.ssh ?? { hostRef: entry.host })).catch((error) => ({ error: error.message }))
+        if (now.host !== pin.host) throw Object.assign(new Error(`the staging host ${entry.host} resolves to ${now.host ?? `nothing (${now.error})`} now, not to ${pin.host} as when the cycle froze; not released`), { code: 'STAGE_HOST_MOVED' })
+      }
+      const started = await supervisor.start({ project: entry.project, issueId: home.id, playbookId: 'deployment', expectConfigHash: resolution.resolved.configHash, runOptions, configRoot, cycle: record.id, signal: signalOf(record) })
       Object.assign(entry, { runId: started.runId, runDir: path.join(home.path, 'runs', started.runId), state: 'running', startedAt: clock.iso() })
       await write(record)
       let run = null
       let readFailures = 0
       for (;;) {
         if (stopped) throw new Error('full verification stopped while waiting for stage run')
+        if (record.interruption) throw new CycleInterrupted('interrupted while waiting for the stage run')
         run = await readRun(home.path, started.runId).catch(() => null)
         if (!run) {
           if (++readFailures >= 30 && !supervisor.isActive(entry.project, home.id)) throw new Error(`stage run ${started.runId} record could not be read`)
@@ -1210,7 +1473,7 @@ export function createFullVerification ({
     if (!allSteps.length) { result.reason = named.length ? 'no pool this cycle verified names a framework, so there is nothing to bump' : 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
     // Before any checkpoint: every green entry's checkouts snapshotted again and compared with what it tested.
     const green = record.projects.filter((e) => !e.verifiedThrough && e.verdict === 'green')
-    for (const entry of green) await recheck(record, entry)
+    for (const entry of green) await bounded(record, `recheck ${entry.project}`, recheck(record, entry))
     await write(record).catch(() => {})
     const checkoutOf = async (project) => {
       const dir = await Promise.resolve().then(() => projectPathOf(project)).catch(() => null)
@@ -1234,12 +1497,17 @@ export function createFullVerification ({
     }
     const steps = allSteps.filter((s) => !withheld.has(s.framework))
     for (const [i, s] of steps.entries()) {
+      // Interrupted meanwhile: nothing further is started (late-cycle-work).
+      if (record.interruption) {
+        result.notRun = steps.slice(i).map((n) => ({ project: n.project, framework: n.framework, args: n.args }))
+        break
+      }
       const checkout = await checkoutOf(s.project)
       const step = { project: s.project, framework: s.framework, action: 'checkpoint', args: s.args, status: 'running', versionBefore: await versionOf(s.project).catch(() => null), headBefore: checkout ? await headOf(checkout).catch(() => null) : null, startedAt: clock.iso() }
       result.chain.push(step)
       await write(record).catch(() => {})
       try {
-        const operation = await runAction({ project: s.project, actionId: 'checkpoint', args: s.args })
+        const operation = await bounded(record, `checkpoint ${s.project}`, runAction({ project: s.project, actionId: 'checkpoint', args: s.args, signal: signalOf(record) }))
         Object.assign(step, { operationId: operation?.id ?? null, status: operation?.status ?? 'failed', exitCode: operation?.exitCode ?? null })
         if (step.status !== 'completed') step.reason = operation?.error ?? (operation?.timedOut ? 'the action reached its deadline' : `the action ended ${step.status}${step.exitCode != null ? ` with exit code ${step.exitCode}` : ''}`)
       } catch (error) {
@@ -1275,9 +1543,12 @@ export function createFullVerification ({
     const checkouts = await Promise.all(checkoutsOf(input.projectDir, entry.snapshot).map((c) => fs.realpath(c).catch(() => c)))
     let workspace = null
     const runId = `${input.runId}-recheck`
+    const signal = signalOf(record)
     try {
       await fs.mkdir(input.root, { recursive: true })
-      workspace = await provision({ projectPath: input.projectDir, runId, root: input.root, clock, policy: input.policy })
+      // Interrupted meanwhile (the outcome's bound): no new cut is begun, and the cut stops at its next Git command (late-cycle-work).
+      if (record.interruption || signal?.aborted) throw new CycleInterrupted('interrupted before the recheck snapshot')
+      workspace = await provision({ projectPath: input.projectDir, runId, root: input.root, clock, policy: input.policy, signal })
       if (workspace.baseCommit === entry.snapshot.baseCommit) entry.recheck = { at, state: 'unchanged', commit: workspace.baseCommit, checkouts }
       else {
         const diff = await compareSnapshots({ repository: entry.snapshot.repository, from: entry.snapshot.baseCommit, to: workspace.baseCommit, projectDir: input.projectDir, links: entry.snapshot.links ?? [] })
@@ -1286,8 +1557,14 @@ export function createFullVerification ({
     } catch (error) {
       entry.recheck = { at, state: 'failed', error: error.message, checkouts }
     } finally {
-      if (workspace) await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: input.projectDir })).catch(() => {})
-      if (workspace && entry.snapshot.repository) await forgetRef(entry.snapshot.repository, `refs/devpanel/base/${runId}`)
+      // Interrupted (the bound passed, admission may be open again): no removal or ref deletion is begun any more, since
+      // either writes the repository the cycle no longer holds (late-cycle-work). What is left is named on the entry.
+      const stopped = () => Boolean(record.interruption || signal?.aborted)
+      if (workspace && stopped()) entry.recheck = { ...entry.recheck, left: { workspace: workspace.path, ref: `refs/devpanel/base/${runId}`, reason: 'the cycle was interrupted; nothing more is written into its repository' } }
+      else {
+        if (workspace) await Promise.resolve().then(() => releaseWorkspace({ ...workspace, projectPath: input.projectDir })).catch(() => {})
+        if (workspace && entry.snapshot.repository && !stopped()) await forgetRef(entry.snapshot.repository, `refs/devpanel/base/${runId}`)
+      }
     }
   }
 

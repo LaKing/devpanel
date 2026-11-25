@@ -620,15 +620,24 @@ module pool of each (its framework and every instance naming it; a pool with no 
 not verified and stays outside), decided from one reading of the configuration when it starts and kept as
 `scope` in its record. A run of any other project is never paused, never has a turn withheld
 and is never refused a start, continuation, delivery, finalize or reconcile because of a
-cycle. Within the scope, *writing* runs stop: a run whose playbook delivers, releases
-(staging, deployment) or works in place (run-exclusivity.mjs `writesCheckout`). None starts,
-continues, finalizes or reconciles, no seat turn of one begins beyond the one in flight, and
-live ones pause at their next step boundary as `paused: full-verification` and resume when the
-cycle ends; a run an operator had also asked to pause stays paused for that operator. An
-operator's pause is a pause inside and outside the scope. Read-only runs (Analysis, Triage,
-inquiries) keep running and may start. The cycle takes its snapshot only when no writing run of
-its scope has a seat turn or a delivery in flight. Details are in execution-contract.md "Full
-verification freeze".
+cycle. Within the scope a *writing* run (one whose playbook delivers, releases (staging,
+deployment) or works in place, run-exclusivity.mjs `writesCheckout`) is either contained or whole.
+A *contained* run, fenced in its own worktree with no link or writable mount into what the cycle
+snapshots, goes on: its start is refused during a cycle when its base snapshot would write into what the cycle
+snapshots (the project's repository or its Git store, both snapshotted, so in practice it waits for the end), its seat turns
+continue, and it may be resumed, continued, finalized or reconciled; only its check drive on a
+staging host the cycle drives on and its writes into a checkout the cycle snapshots wait, and they
+go on by themselves when the cycle ends. A *whole* run is stopped as before: a run in place or a
+release run (both write the checkout or the stage directly), and one whose turns cannot be fenced
+on this host or whose links or mounts reach the snapshot. None of those starts, continues,
+finalizes or reconciles, no seat turn of one begins beyond the one in flight, and live ones pause
+at their next step boundary as `paused: full-verification` and resume when the cycle ends; a run
+an operator had also asked to pause stays paused for that operator. An operator's pause is a pause
+inside and outside the scope. Read-only runs (Analysis, Triage, inquiries) keep running and may
+start. The cycle takes its snapshot once no whole writing run, no write into what it snapshots and
+no drive on a host it drives on is in flight; it does not wait for a contained run's seat turns.
+Whatever it waits for is bounded (`fullVerification.maxWaitMinutes`, default 240). Details are in
+execution-contract.md "Full verification freeze".
 
 **What runs, on a stage host with dynamic instances** (a project there declares
 `testDrive.modules.instance`, project-infrastructure.md "The full verification on a stage

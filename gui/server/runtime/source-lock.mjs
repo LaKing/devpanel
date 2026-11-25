@@ -86,10 +86,14 @@ async function checkoutLinks (projectPath, excluded) {
  */
 export async function snapshotRepositories (projectPath, policy = {}) {
   const repositories = new Set(), unidentified = [], noRepository = []
+  // The checkouts the snapshot actually reads (the project, each nested root and materialized owner root, each link's
+  // target), beside their Git repositories: a linked worktree is not its main checkout (full-verification's S).
+  const worktrees = new Set([projectPath])
   const source = await commonDirectory(projectPath)
   if (source) repositories.add(source)
   else unidentified.push(projectPath)
   const add = async (dir) => {
+    worktrees.add(dir)
     const repository = await repositoryRootedAt(dir)
     if (repository) repositories.add(repository)
     else unidentified.push(dir)
@@ -119,6 +123,7 @@ export async function snapshotRepositories (projectPath, policy = {}) {
   }
   if (policy.symlinks === 'materialize') {
     links.push(...await checkoutLinks(projectPath, excluded))
+    for (const link of links) if (link.resolved) worktrees.add(link.resolved)
     if (policy.selection === 1) {
       const { roots: forbidden } = await forbiddenRootsReport()
       const authorize = authorizer({ known: await knownProjectRoots(), grants: policy.materializeGrants ?? [], forbidden, exempt: await homeExemption() })
@@ -139,7 +144,8 @@ export async function snapshotRepositories (projectPath, policy = {}) {
       }
     }
   }
-  return { repositories: [...repositories].sort(), unidentified: [...new Set(unidentified)], noRepository: [...new Set(noRepository)].sort() }
+  const real = await Promise.all([...worktrees].map((dir) => fs.realpath(dir).catch(() => path.resolve(dir))))
+  return { repositories: [...repositories].sort(), worktrees: [...new Set(real)].sort(), unidentified: [...new Set(unidentified)], noRepository: [...new Set(noRepository)].sort() }
 }
 
 const REMEDY = 'A snapshot holds the delivery lock of every repository it reads, so it never captures a half-applied delivery. Give this account write access to that repository\'s Git directory, leave the path out of the snapshot (workspace excludes), or use a base that reads no live tree ("head" or a commit, without materialize).'

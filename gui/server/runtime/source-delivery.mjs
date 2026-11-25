@@ -106,10 +106,13 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
   if (unsupported) return applyToOwners({ workspace, baseline, revision, candidate, receipt, runDir, clock, hooks, sourceTarget, readDestination })
 
   let locks = []
+  let cycleTicket = null
   const file = path.join(runDir, 'source-application.json')
   try {
     const target = await sourceTarget(workspace.source.path)
     if (target.path !== workspace.source.path || target.repository !== workspace.source.repository) return refuse('source-drift', `The destination repository changed. ${remedy}`)
+    // The full verification's write gate (cycle-gates.mjs): a write into a repository the cycle snapshots waits for its thaw.
+    cycleTicket = hooks.cycleGate ? await hooks.cycleGate([target.repository]) : null
     locks = await acquireSourceLocks([target.repository], { purpose: 'source-delivery', runId: path.basename(runDir), clock, waitMs: hooks.sourceLockWaitMs })
     if (JSON.stringify(await sourceTarget(target.path)) !== JSON.stringify(target)) return refuse('source-drift', `The source changed while acquiring its lock. ${remedy}`)
     for (const link of workspace.symlinks?.escaping ?? []) {
@@ -228,5 +231,6 @@ export async function applyToSource ({ workspace, baseline, revision, fingerprin
     return refuse(application.state === 'applying' ? 'recovery-required' : 'failed', `${error.message}. ${remedy}`)
   } finally {
     await releaseSourceLocks(locks)
+    cycleTicket?.release()
   }
 }

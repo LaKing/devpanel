@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
+import { waitingNotice } from '../action-outcome.js'
 import { useRoute, useRouter } from 'vue-router'
 
 import { wallClockAt, wallClockPrefill, wallClockUsedMinutes } from '@/wall-clock'
@@ -371,7 +372,9 @@ async function finalizeRun () {
     const r = await guard({ label: 'Finalize run', offered: offerOn(offers.finalize('finalize')) }, (t) => api.finalizeRun(t.project, t.issueId, t.runId))
     if (!r.sent) return
     const result = r.value
-    if (result.status !== 'completed') actionError.value = `Closure was evaluated again and is still blocked: ${result.blockedReason}`
+    const waiting = waitingNotice(result)
+    if (waiting) actionNotice.value = waiting
+    else if (result.status !== 'completed') actionError.value = `Closure was evaluated again and is still blocked: ${result.blockedReason}`
     await load()
   } catch (error) { actionError.value = error.message } finally { finalizing.value = false }
 }
@@ -388,7 +391,9 @@ async function reconcileDelivery () {
     if (!r.sent) return
     const result = r.value
     const attempt = result.reconciliation
-    if (result.status !== 'completed') actionError.value = attempt && attempt.state !== 'accepted'
+    const waiting = waitingNotice(result)
+    if (waiting) actionNotice.value = waiting
+    else if (result.status !== 'completed') actionError.value = attempt && attempt.state !== 'accepted'
       ? `Not reconciled (${attempt.state}): ${attempt.error ?? ''}${attempt.conflicts?.length ? ` Paths: ${attempt.conflicts.join(', ')}` : ''}`
       : `Reconciled, but delivery is still blocked: ${result.blockedReason}`
     await load()
@@ -562,6 +567,8 @@ async function applyArtifact () {
       identity: () => ({ revision: run.value?.delivery?.revision }),
       offered: offerOn(offers.applyArtifact)
     }, (t) => api.applyArtifact(t.project, t.issueId, t.runId, revision))
+    const waiting = r.sent ? waitingNotice(r.value) : null
+    if (waiting) actionNotice.value = waiting
     if (r.sent) await load()
   } catch (error) { actionError.value = error.message } finally { applyingArtifact.value = false }
 }
@@ -603,6 +610,9 @@ async function reconcileIntegration () {
   try {
     const r = await guard({ label: 'Finish it now', identity: integrationPhase, offered: offerOn(offers.reconcileIntegration) },
       (t) => api.reconcileIntegration(t.project, t.issueId, t.runId))
+    // Accepted and waiting for a full verification (202 waiting): a notice, never an error.
+    const waiting = r.sent ? waitingNotice(r.value) : null
+    if (waiting) actionNotice.value = waiting
     if (r.sent) await load()
   } catch (e) { integrationError.value = e.message }
 }
@@ -634,7 +644,9 @@ async function integrate () {
     }, (t) => api.integrateRun(t.project, t.issueId, t.runId, { expectedRevision: revision, targetBranch: target.branch, expectedTargetHead: target.head }))
     if (!r.sent) { integrationError.value = r.notice; return }
     const result = r.value
-    if (result.error) integrationError.value = result.error
+    const waiting = waitingNotice(result)
+    if (waiting) actionNotice.value = waiting
+    else if (result.error) integrationError.value = result.error
     integrationTargetInfo.value = null
     await load()
   } catch (e) { integrationError.value = e.message } finally { integrating.value = false }

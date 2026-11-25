@@ -454,12 +454,13 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   project is never paused, withheld, refused or waited for; an unreadable listing or configuration refuses the cycle
   `FULL_VERIFICATION_SCOPE_UNREADABLE`, nothing frozen; the thaw resumes only the scope's pauses, others in `leftPaused`;
   only pools wholly in scope are checkpointed; a release whose resolved target drifted is `STAGE_DRIFTED`, one a fresh reading
-  cannot clear `STAGE_UNVERIFIABLE`) (`run-exclusivity.mjs writesCheckout`: delivery, release or in place; starts,
-  continuations, finalize and reconcile refused `FULL_VERIFICATION_FREEZE`, an automatic reconcile deferred to the thaw,
-  operations still in admission tracked as `pendingWrites` and re-checked before delivery; Analysis, Triage and inquiries
-  go on; `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last
+  cannot clear `STAGE_UNVERIFIABLE`) (`run-exclusivity.mjs writesCheckout`: delivery, release or in place; for a *whole*
+  run, starts, continuations, finalize and reconcile refused `FULL_VERIFICATION_FREEZE`, an automatic reconcile deferred to
+  the thaw, operations still in admission tracked as `pendingWrites` and re-checked before delivery; a writing start whose provisioning destination (project repository or Git store) is in the snapshot is refused, so in practice none starts; a contained run already started
+  continues, finalizes and reconciles, its writes waiting at the gates; Analysis, Triage and inquiries
+  go on; so does a *contained* writing run (`run-exclusivity.mjs wholeFreeze`: confined turns, own worktree, no link or mount into what the cycle snapshots), whose seat turns continue while only its drive on a cycle host (pinned HostName) and its writes into a snapshotted repository wait at `server/cycle-gates.mjs` until the thaw (holding no slot or stage instance, on `run.cycleWait`/`run.cycleWaits`, excused from the wall clock, ended in begin order by `endSeq`; operator operations answer 202 `waiting`); in-place, release, unreadable and unconfined runs stay *whole*, and for them `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last
   statement before the runtime call; live runs pause as `full-verification`, `manualPending` when an operator pause
-  was pending too), waits until no writing run or pending operation is left, then per stage, one at a time per staging
+  was pending too), waits until no whole writing run, pending operation, write into what it snapshots, committing project action (lock detail; the panel refuses one with 409, the CLI keeps today's behaviour) or drive of any run on its hosts is left (`waited`), each frozen await bounded by `fullVerification.maxWaitMinutes` (default 240; at the bound `interrupted`, not run, outcome skipped, admission thawed naming what was in flight), then per stage, one at a time per staging
   host: on a host with dynamic instances (a project there declares `testDrive.modules.instance`) no run and no release —
   the checkout snapshotted (`gitWorktreeProvider`), `modules.instance.fullSuite` driven on an instance of the cycle's own
   (`instanceCycleTarget` through `runChecks`, an instance slot waited for), and before the destroy, when the suite failed on

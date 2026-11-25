@@ -143,6 +143,18 @@ export default async (t) => {
     t.eq('a writing start refuses while frozen', startAdmitted(frozen, writes), false)
     t.ok('a reading start is admitted', startAdmitted(frozen, reads))
     t.ok('nothing frozen: a writing start is admitted', startAdmitted(issue, writes))
+
+    // Phase 2 (cycle-gates.mjs): only a whole run is frozen; a contained one goes on, its writes waiting at the server's gates.
+    const contained = run({ status: 'blocked', supportedActions: ['finalize', 'reconcile-delivery', 'resume'], admission: { writesCheckout: true, cycleId: null, whole: false } })
+    t.ok('a contained run finalizes during a cycle (the server answers waiting)', offers.finalize('finalize')({ issue: frozen, runs: [contained], run: contained }))
+    t.ok('and reconciles', offers.finalize('reconcile-delivery')({ issue: frozen, runs: [contained], run: contained }))
+    t.ok('and resumes', offers.continuation('resume')({ issue: frozen, runs: [contained], run: contained }))
+    const whole = run({ status: 'blocked', supportedActions: ['finalize', 'resume'], admission: { writesCheckout: true, cycleId: null, whole: true } })
+    t.eq('a whole run still does neither', [offers.finalize('finalize')({ issue: frozen, runs: [whole], run: whole }), offers.continuation('resume')({ issue: frozen, runs: [whole], run: whole })], [false, false])
+    t.ok('owner input restarting a contained run is admitted', offers.ownerInput({ issue: frozen, run: run({ ownerInput: { questions: [] }, admission: { writesCheckout: true, cycleId: null, whole: false } }) }))
+    const fenced = { ...frozen, admissionFrozen: { cycleId: 'c1', at: 'x', confined: true } }
+    t.ok('on a host whose turns are fenced a writing start in its own worktree is admitted', startAdmitted(fenced, writes))
+    t.eq('an in-place, a release, or a links-allowed start is still refused', [startAdmitted(fenced, { ...writes, workspace: { isolation: 'in-place' } }), startAdmitted(fenced, { ...writes, tactic: 'deployment' }), startAdmitted(fenced, { ...writes, workspace: { isolation: 'worktree', symlinks: 'allow' } })], [false, false, false])
   }
 
   t.section('A late Delete response keeps a newer selection (AC4)')

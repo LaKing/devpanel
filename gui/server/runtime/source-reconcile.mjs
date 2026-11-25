@@ -308,12 +308,30 @@ export async function keepCandidate ({ candidate, workspace, revision, runDir, d
 }
 
 /** An accepted reconciliation's candidate, rebuilt into a temporary worktree for closure. */
-export async function rebuildReconciled ({ workspace, reconciliation, runDir }) {
+export async function rebuildReconciled ({ workspace, reconciliation, runDir, writeGate = null }) {
   const gitDir = workspace.gitDir ?? null
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-reconciled-'))
-  const release = () => discardReconstruction({ dir, workspacePath: workspace.path, gitDir })
+  // The rebuild registers a worktree in the repository that owns the workspace (for a legacy linked worktree, the
+  // project's own, which a full verification may snapshot): its add waits at the cycle's write gate; its removal never
+  // waits, and when refused leaves the registration for a later prune (reconciled-closure-rebuild).
+  const owner = async () => {
+    const out = await new Promise((resolve) => execFile('git', [...repositoryGitArgs(workspace.path, gitDir), 'rev-parse', '--path-format=absolute', '--git-common-dir'], (error, stdout) => resolve(error ? '' : String(stdout).trim())))
+    return out || gitDir || workspace.path
+  }
+  const release = async () => {
+    let ticket = null
+    if (writeGate) {
+      try { ticket = await writeGate([await owner()], { noWait: true }) } catch { await fs.rm(dir, { recursive: true, force: true }).catch(() => {}); return }
+    }
+    try { await discardReconstruction({ dir, workspacePath: workspace.path, gitDir }) } finally { ticket?.release() }
+  }
   try {
-    await reconstructInto({ dir, workspacePath: workspace.path, baseCommit: reconciliation.sourceBase, patchFile: path.join(runDir, reconciliation.patch), gitDir })
+    const ticket = writeGate ? await writeGate([await owner()]) : null
+    try {
+      await reconstructInto({ dir, workspacePath: workspace.path, baseCommit: reconciliation.sourceBase, patchFile: path.join(runDir, reconciliation.patch), gitDir })
+    } finally {
+      ticket?.release()
+    }
     const read = async (name) => new Map(Object.entries(JSON.parse(await fs.readFile(path.join(runDir, path.dirname(path.dirname(reconciliation.patch)), name), 'utf8'))))
     const baseline = await read('baseline.json')
     baseline.modes = await read('baseline-modes.json')

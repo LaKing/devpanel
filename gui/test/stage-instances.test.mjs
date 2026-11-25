@@ -17,6 +17,9 @@ import { createSupervisor } from '../server/supervisor.mjs'
 import { createFullVerification, driveIdOf } from '../server/full-verification.mjs'
 import { runChecks } from '../server/runtime/checks.mjs'
 
+// The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
+const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
+
 export const name = 'stage instances — one per run: the name, create on the first drive and reuse after, the exits that mean "needs an install" and "host full", an instance in doubt, the cap, the sweep that spares live owners, and the destroy at every end and pause'
 
 const fence = (o) => '```json\n' + JSON.stringify(o) + '\n```'
@@ -354,7 +357,7 @@ export default async function (t) {
       await holdInstance({ instance: other, host: LOCAL_HOST, kind: 'local', runId: 'other-run' })
       const issuesDir = await temp('devpanel-instance-cycle-issues-')
       const verificationDir = path.join(issuesDir, '.verification')
-      const fv = createFullVerification({
+      const fv = createFullVerification({ resolveHost: fakeResolve,
         supervisor: { freeze: async () => [], thaw: () => true, frozen: () => null, busy: () => [], isActive: () => false, start: async () => { throw new Error('no release run') }, resume: async () => ({}) },
         issues: { ISSUES_DIR: issuesDir, listProjects: async () => [{ id: P }], listIssues: async () => [], createIssue: async () => ({ id: 'red' }), addStepFile: async () => {} },
         clock: f.clock, settings: () => null, verificationDir, pollMs: 50, log: { warn () {} },

@@ -29,6 +29,7 @@ import * as store from './store.mjs'
 import { readChat, instructionsBlock, underChatLock, selectInstructions, turnIdentity, legacyTurnRecord } from './coordinator-chat.mjs'
 import { extractOutput, describeContract } from './structured-output.mjs'
 import { runChecks, compareWithBaseline, discardInstance } from './checks.mjs'
+import { destroyRunInstances } from './stage-instances.mjs'
 import { MAX_DIAGNOSTIC_DRIVES, DiagnosticRefusal, diagnosticRequestProblem, freezePatch, offersDiagnosticDrive, diagnosticOffer, diagnosticResult, diagnosticDrivesBlock } from './diagnostic-drive.mjs'
 import { baselineCacheFor, tierTarget, continuationPlan } from './baseline-cache.mjs'
 import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-tier.mjs'
@@ -1727,15 +1728,140 @@ export class Engine {
   }
 
   /** A drive's wait for a slot on its staging host begins or ends (drive-slots.mjs). */
-  async noteDriveWait ({ phase, id, host, reason, from, to, dir }) {
+  async noteDriveWait ({ phase, id, host, reason, from, to, dir, cycleId = null, endSeq = null }) {
+    const cycle = reason === 'full-verification'
     if (phase === 'start') {
       this.openDriveWaits.set(id, { from: Date.parse(from) })
-      await this.persist({ type: 'checks-waiting', host, reason, dir })
+      // A wait for the full verification is on the record and in the explanation while it lasts (cycle-gates.mjs).
+      if (cycle) this.run.cycleWait = { kind: 'drive', cycleId, host, since: from }
+      await this.persist({ type: cycle ? 'cycle-wait' : 'checks-waiting', host, reason, dir, ...(cycle ? { kind: 'drive', cycleId } : {}) })
       return
     }
     this.openDriveWaits.delete(id)
-    ;(this.run.driveSlotWaits ??= []).push({ host, from, to, dir })
-    await this.persist({ type: 'checks-wait-ended', host, dir })
+    ;(this.run.driveSlotWaits ??= []).push({ host, from, to, dir, ...(reason ? { reason } : {}), ...(cycleId ? { cycleId } : {}) })
+    if (cycle) {
+      this.run.cycleWait = null
+      ;(this.run.cycleWaits ??= []).push({ kind: 'drive', cycleId, host, from, to, endSeq, outcome: this.controller.signal.aborted ? 'stopped' : 'thawed' })
+    }
+    await this.persist({ type: cycle ? 'cycle-wait-ended' : 'checks-wait-ended', host, dir, ...(cycle ? { kind: 'drive', cycleId, endSeq } : {}) })
+  }
+
+  /**
+   * A wait for the full verification before a write into a repository the cycle snapshots
+   * (cycle-gates.mjs): open while it lasts, excused from the wall clock live (openDriveWaits) and once
+   * closed (run.cycleWaits, read by run-metrics checkIntervals), stamped by the gate.
+   */
+  async noteCycleWait ({ phase, id, action = null, repositories = [], from, to = null, cycleId = null, endSeq = null }) {
+    if (phase === 'start') {
+      this.openDriveWaits.set(id, { from: Date.parse(from) })
+      this.run.cycleWait = { kind: 'write', action, cycleId, repositories, since: from, id }
+      await this.persist({ type: 'cycle-wait', kind: 'write', action, cycleId })
+      return
+    }
+    this.openDriveWaits.delete(id)
+    // Only the wait this id opened is closed; another one opened meanwhile (a newer cycle's) stays open.
+    const open = this.run.cycleWait
+    if (open && (open.id ? open.id === id : open.kind === 'write' && open.cycleId === cycleId)) this.run.cycleWait = null
+    ;(this.run.cycleWaits ??= []).push({ kind: 'write', action, cycleId, repositories, from, to, endSeq, id, outcome: this.controller.signal.aborted ? 'stopped' : 'thawed' })
+    await this.persist({ type: 'cycle-wait-ended', kind: 'write', action, cycleId, endSeq })
+  }
+
+  /**
+   * The write gate handed to delivery providers and writers (`hooks.cycleGate`): before a write into
+   * `repositories`, a ticket (go on; release it after the write) or a wait for the refusing cycle,
+   * then a ticket. Without a gate, nothing waits.
+   */
+  async cycleWrite (repositories, { action = null, beforeWait = null, noWait = false } = {}) {
+    const gate = this.cycleGate
+    if (!gate) return { release () {} }
+    let asked = false
+    for (;;) {
+      // An operation that already holds a write ticket (a reconcile's delivery) passes: the cycle waits for it.
+      const answer = gate.tryWrite(repositories, { action, held: this.heldWriteTicket ?? null })
+      if (answer.ticket) return answer.ticket
+      const token = answer.wait
+      // A write that must not wait at all (a check's cleanup, which would otherwise wait holding what its drive left on
+      // staging): refused at once, nothing written, the caller leaves the write for later.
+      if (noWait) {
+        gate.cancel?.(token)
+        throw Object.assign(new Error('a full verification snapshots this repository; the write was left for later'), { code: 'CYCLE_WRITE_DEFERRED', cycleId: token.cycleId })
+      }
+      // What must not stand while this waits (a drive's claimed smoke instance, AC6), removed first; still standing, no wait.
+      if (beforeWait && !asked) {
+        asked = true
+        if (!(await beforeWait(token))) {
+          throw Object.assign(new Error('what this run holds on staging could not be removed before waiting for the full verification, so it did not wait'), { code: 'HELD_INSTANCE_NOT_REMOVED' })
+        }
+      }
+      const id = uuid()
+      this.onCycleWait?.(token)
+      await this.noteCycleWait({ phase: 'start', id, action, repositories, from: token.from, cycleId: token.cycleId })
+      try {
+        await gate.waitFor(token, this.controller.signal)
+      } finally {
+        await this.noteCycleWait({ phase: 'end', id, action, repositories, from: token.from, to: token.ended?.to ?? this.clock.iso(), cycleId: token.cycleId, endSeq: token.ended?.endSeq ?? null })
+      }
+    }
+  }
+
+  /** The gate a drive asks: a drive inside an operation that already holds a write ticket passes (deadlock rule). */
+  gateForDrives () {
+    const gate = this.cycleGate
+    if (!gate) return null
+    return { ...gate, tryDrive: (host, options = {}) => gate.tryDrive(host, { ...options, held: options.held ?? this.heldWriteTicket ?? null }) }
+  }
+
+  /** The repositories a write into the source touches: its common dir, a private run's source (or Git store), link owners. */
+  sourceRepositories () {
+    const ws = this.run.workspace ?? {}
+    return [...new Set([ws.source?.repository, ws.repository?.kind === 'private' ? ws.repository.source : null,
+      ...(ws.symlinks?.owners ?? []).map((o) => o.owner?.repository)].filter(Boolean))]
+  }
+
+  /** hooks.cycleGate for a writer: `await gate(repositories)` returns a ticket to release after the write. */
+  writeGate (action) {
+    return this.cycleGate ? (repositories, { beforeWait = null, noWait = false } = {}) => this.cycleWrite(repositories, { action, beforeWait, noWait }) : null
+  }
+
+  /**
+   * Everything this run holds on staging, removed and confirmed before a drive waits for the full
+   * verification (AC6): the kept smoke instance, its stage instances, and every removal an earlier
+   * attempt left pending (`run.pendingRemovals`). False when any is still standing.
+   */
+  async releaseHeld (reason, { hosts = null } = {}) {
+    // Only what stands on the named hosts (a cycle's hosts, or the host a drive waits for): a drive this run has on
+    // another host keeps its instance (excess-idle-cleanup). A record that names no host is taken to be on one.
+    const on = (host) => !hosts || !host || hosts.includes(host)
+    if (this.run.keptInstance && on(this.run.keptInstance.host)) await this.discardKeptInstance(reason)
+    for (const entry of [...(this.run.pendingRemovals ?? [])].filter((e) => e.kind === 'kept-smoke' && on(e.instance?.host))) {
+      const outcome = await discardInstance({ target: this.run.checkRefresh?.target ?? this.snapshot.checks?.target, instance: entry.instance })
+      await this.settleRemoval(entry, outcome)
+    }
+    const destroyed = await destroyRunInstances(this.runId, { reason, clock: this.clock, hosts }).catch((error) => [{ passed: false, error: error.message }])
+    let ok = true
+    for (const d of destroyed) {
+      const entry = (this.run.stageInstances ?? []).findLast((i) => i.name === d.name && !i.destroyed?.passed)
+      if (entry) entry.destroyed = { reason: d.reason, at: d.at, durationMs: d.durationMs, passed: d.passed, ...(d.error ? { error: d.error } : {}) }
+      this.run.pendingRemovals = (this.run.pendingRemovals ?? []).filter((e) => !(e.kind === 'stage-instance' && e.name === d.name))
+      if (!d.passed) {
+        ok = false
+        ;(this.run.pendingRemovals ??= []).push({ kind: 'stage-instance', name: d.name ?? null, host: d.host ?? null, since: this.clock.iso(), lastError: d.error ?? null })
+      }
+    }
+    if (destroyed.length) await this.persist({ type: 'held-released', reason, passed: ok })
+    return ok && !(this.run.pendingRemovals ?? []).some((e) => on(e.host ?? e.instance?.host))
+  }
+
+  /** A removal a drive could not confirm (checks.mjs onRemovalPending): on the record until a later attempt confirms it. */
+  async keepPendingRemoval (entry) {
+    ;(this.run.pendingRemovals ??= []).push({ ...entry, since: this.clock.iso() })
+    await this.persist({ type: 'removal-pending', kind: entry.kind, reason: entry.reason ?? null })
+  }
+
+  async settleRemoval (entry, outcome) {
+    if (outcome?.passed) this.run.pendingRemovals = (this.run.pendingRemovals ?? []).filter((e) => e !== entry)
+    else entry.lastError = outcome?.error ?? outcome?.stderr ?? 'not removed'
+    await this.persist({ type: 'removal-retried', kind: entry.kind, passed: Boolean(outcome?.passed) })
   }
 
   /**
@@ -2525,7 +2651,14 @@ export class Engine {
   }
 
   async discardInstanceRecord (kept, reason) {
+    // On the record before the removal is tried, and off it only once it is confirmed: a failed removal stays
+    // visible to every later drive, which tries it again before it may wait for a full verification.
+    const pending = { kind: 'kept-smoke', instance: kept, reason, since: this.clock.iso(), lastError: null }
+    ;(this.run.pendingRemovals ??= []).push(pending)
+    await this.persist()
     const outcome = await discardInstance({ target: this.run.checkRefresh?.target ?? this.snapshot.checks.target, instance: kept })
+    if (outcome.passed) this.run.pendingRemovals = this.run.pendingRemovals.filter((e) => e !== pending)
+    else pending.lastError = outcome.error ?? outcome.stderr ?? 'not removed'
     const record = { remoteDir: kept.remoteDir, revision: kept.revision, reason, at: this.clock.iso(), ...outcome }
     ;(this.run.discardedInstances ??= []).push(record)
     await this.persist({ type: 'instance-discarded', ...record })
@@ -2549,7 +2682,12 @@ export class Engine {
       signal: this.controller.signal,
       platform: this.platform,
       runId: this.runId,
-      onDriveWait: (wait) => this.noteDriveWait(wait)
+      onDriveWait: (wait) => this.noteDriveWait(wait),
+      // The full verification (cycle-gates.mjs): a drive on a host the cycle drives waits for it, holding nothing.
+      driveGate: this.gateForDrives(),
+      beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: token?.host ? [token.host] : null }),
+      onRemovalPending: (entry) => this.keepPendingRemoval(entry),
+      writeGate: this.writeGate('check-reconstruction')
     }
     // The modules tier has no base drive, cache, comparison or stability record: it
     // drives the candidate (a failure retried as any check's), and a failed test in its
@@ -2788,7 +2926,7 @@ export class Engine {
     const target = tier === 'modules' ? this.modulesDriveFor(configured, fp).target : tierTarget(configured, configured.tiers ? tier : null)
     let result
     try {
-      result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), dirName, variant: { patchFile } }))
+      result = await this.whileChecking(() => runChecks({ target, revision: current, fingerprint: fp, baseCommit: ws.baseCommit, baseline, workspacePath: ws.path, gitDir: ws.gitDir ?? null, runDir, clock: this.clock, signal: this.controller.signal, platform: this.platform, runId: this.runId, onDriveWait: (wait) => this.noteDriveWait(wait), driveGate: this.gateForDrives(), beforeCycleWait: (token) => this.releaseHeld('full-verification-wait', { hosts: token?.host ? [token.host] : null }), onRemovalPending: (entry) => this.keepPendingRemoval(entry), writeGate: this.writeGate('check-reconstruction'), dirName, variant: { patchFile } }))
     } catch (error) {
       result = { result: 'unavailable', error: error.message, target: target.kind, commands: [] }
     }
@@ -3505,7 +3643,7 @@ export class Engine {
           // The full verification's freeze (execution-contract.md "Full verification
           // freeze"): the last statement before the runtime starts, with nothing awaited
           // between it and the call, so a freeze is either seen here or the turn is in flight.
-          if (this.run.freezeRequested) return { withheld: true }
+          if (this.run.freezeRequested && this.freezeActive()) return { withheld: true }
           const running = adapter.invoke({
         // A reading triage turn has its own session: later coordinator turns
         // resume the coordinator's, which never held the source text.
@@ -3705,8 +3843,34 @@ export class Engine {
    */
   requestFreeze (cycleId) {
     if (!['running', 'pending', 'preflighting'].includes(this.run.status) || this.run.freezeRequested) return null
+    // A cycle that has thawed asks nothing any more (a late request of an interrupted installation).
+    if (this.cycleGate && !this.cycleGate.isActive(cycleId)) return null
     this.run.freezeRequested = { cycleId, at: this.clock.iso() }
     return this.persist({ type: 'freeze-requested', cycleId })
+  }
+
+  /** Whether the freeze request this run holds is still the active cycle's (no gate: as before, it is). */
+  freezeActive () {
+    const request = this.run.freezeRequested
+    if (!request) return false
+    return this.cycleGate ? this.cycleGate.isActive(request.cycleId) : true
+  }
+
+  /** The thaw of `cycleId` takes back its request (supervisor thaw). */
+  async clearFreeze (cycleId) {
+    if (!this.run.freezeRequested || this.run.freezeRequested.cycleId !== cycleId) return false
+    this.run.freezeRequested = null
+    await this.persist({ type: 'freeze-request-cleared', cycleId })
+    return true
+  }
+
+  /** A request whose cycle is no longer active is dropped, never applied (after a thaw, or read back after a restart). */
+  async dropStaleFreeze () {
+    const request = this.run.freezeRequested
+    if (!request || this.freezeActive()) return false
+    this.run.freezeRequested = null
+    await this.persist({ type: 'freeze-request-dropped', cycleId: request.cycleId ?? null })
+    return true
   }
 
   /** A turn prepared but not started because the freeze arrived: no step, nothing in flight. */
@@ -3725,6 +3889,7 @@ export class Engine {
   }
 
   async pauseAtBoundary () {
+    await this.dropStaleFreeze()
     if (!this.run.pauseRequested && !this.run.freezeRequested) return false
     const freeze = this.run.freezeRequested
     const manual = Boolean(this.run.pauseRequested)
@@ -4983,7 +5148,9 @@ export class Engine {
           const drive = this.fullVerificationDrive ?? fullVerificationDrive
           const check = await this.whileChecking(() => drive({ target: this.snapshot.fullVerification.target, workspace: this.run.workspace, runDir: store.runDir(this.issuePath, this.runId), runId: this.runId,
             project: this.run.issue.project, stage: this.snapshot.infrastructure?.staging?.id ?? null, verificationDir: this.verificationDir ?? path.join(issuesRoot(), '.verification'),
-            clock: this.clock, signal: this.controller.signal, platform: this.platform, onDriveWait: (wait) => this.noteDriveWait(wait) }))
+            clock: this.clock, signal: this.controller.signal, platform: this.platform, onDriveWait: (wait) => this.noteDriveWait(wait),
+            // The cycle's own stage drive connects to the host the cycle pinned at its freeze (cycle-gates.mjs).
+            resolved: this.cycleGate?.pinned?.(this.snapshot.fullVerification.target?.ssh?.hostRef) ?? null }))
           this.run.fullVerification = { ...(this.run.fullVerification ?? {}), check }
           await this.persist({ type: 'full-verification-check', result: check.result?.result ?? null, gating: check.gating, baseline: check.baseline })
           if (check.gating !== 'passed') {
@@ -5314,6 +5481,7 @@ export class Engine {
       if (stopRequested()) { await this.settleAbort(); return }
       // A turn's unproved cleanup, then a pending operator pause or full-verification freeze, as at the top of the
       // loop: the next drive's gate asks. A Stop that arrives while either is written still settles as cancelled.
+      await this.dropStaleFreeze()
       if (this.cleanupHold() || this.run.pauseRequested || this.run.freezeRequested) {
         if (this.cleanupHold()) await this.blockForCleanup()
         else await this.pauseAtBoundary()
@@ -5489,6 +5657,19 @@ export class Engine {
     const approved = this.run.reconciliations?.[0]?.approved ?? { revision: this.run.closure.revision, artifactRef: this.run.delivery.artifactRef, baseCommit: this.run.workspace.baseCommit }
     const n = (this.run.reconciliations?.length ?? 0) + 1
     const entry = { n, at: this.clock.iso(), by: actor, from: approved.revision, approved, policy, state: 'merging', previousBlock: this.run.blockedReason, previousDelivery: this.run.delivery ?? null }
+    // The whole reconcile writes into the source (refs, then its delivery): it waits for a full verification
+    // that snapshots any of those repositories, then holds its ticket to the end (cycle-gates.mjs).
+    const reconcileTicket = await this.cycleWrite(this.sourceRepositories(), { action: 'reconcile' })
+    this.heldWriteTicket = reconcileTicket
+    try {
+      return await this.reconcileHeld({ policy, actor, runDir, approved, n, entry })
+    } finally {
+      this.heldWriteTicket = null
+      reconcileTicket.release()
+    }
+  }
+
+  async reconcileHeld ({ policy, actor, runDir, approved, n, entry }) {
     this.run.reconciliations = [...(this.run.reconciliations ?? []), entry]
     await this.persist({ type: 'reconcile-started', n, from: approved.revision })
     const merge = await mergeOntoSource({ workspace: this.run.workspace, baseline: this.baseline ?? new Map(), revision: approved.revision, patchFile: path.join(runDir, approved.artifactRef),
@@ -5799,6 +5980,17 @@ export class Engine {
       await writeJson(path.join(kept, 'previous-baseline-modes.json'), Object.fromEntries(baseline.modes ?? []))
     }
     await this.hook('beforeDeliveryRebase')
+    // The rebase writes refs/devpanel/delivery-return/* into the source (or the Git store): a full verification that
+    // snapshots it is waited for first, and the ticket is held until the return is written (cycle-gates.mjs).
+    const returnTicket = await this.cycleWrite(this.sourceRepositories(), { action: 'delivery-return' })
+    try {
+      return await this.returnRebased({ phase, byStep, policy, resume, runDir, ws, n, from, baseline })
+    } finally {
+      returnTicket.release()
+    }
+  }
+
+  async returnRebased ({ phase, byStep, policy, resume, runDir, ws, n, from, baseline }) {
     const rebase = await rebaseOntoSource({ workspace: { ...ws, baseCommit: from.baseCommit, ...(ws.repository ? { sourceBase: from.sourceBase } : {}) }, baseline, revision: from.revision,
       patchFile: path.join(runDir, from.artifactRef), policy: policy ?? {}, runDir, runId: this.runId, n, clock: this.clock, extraPaths: resume?.paths ?? [] })
     if (rebase.state !== 'rebased') return { refusal: rebase.reason }
@@ -5895,7 +6087,7 @@ export class Engine {
     const latest = this.run.revisions.at(-1)?.fingerprint ?? null
     const reconciled = latest ? (this.run.reconciliations ?? []).findLast((r) => r.state === 'accepted' && r.revision === latest) ?? null : null
     if (!reconciled) return this.closeOn(null, options)
-    const candidate = await rebuildReconciled({ workspace: this.run.workspace, reconciliation: reconciled, runDir: store.runDir(this.issuePath, this.runId) })
+    const candidate = await rebuildReconciled({ workspace: this.run.workspace, reconciliation: reconciled, runDir: store.runDir(this.issuePath, this.runId), writeGate: this.writeGate('reconciled-rebuild') })
     try {
       return await this.closeOn({ ...candidate, reconciliation: reconciled }, options)
     } finally {
@@ -6151,7 +6343,9 @@ export class Engine {
           workspacePath: ws.path,
           workspace: ws,
           runDir: store.runDir(this.issuePath, this.runId),
-          clock: this.clock
+          clock: this.clock,
+          // A write into a repository the full verification snapshots waits for its thaw (cycle-gates.mjs).
+          hooks: { cycleGate: this.writeGate('delivery') }
         })
       } catch (error) {
         failure = error

@@ -124,7 +124,8 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     // The full verification (server/full-verification.mjs); null: no scheduled cycle.
     fullVerification: data.fullVerification?.at ? { at: data.fullVerification.at, timeZone: data.fullVerification.timeZone } : null,
     // The full verification's delivery trigger (server/verification-trigger.mjs): a cycle per this many deliveries on a stage; 0 is off.
-    verificationTrigger: { afterDeliveries: data.fullVerification?.afterDeliveries ?? 10 },
+    // maxWaitMinutes: how long whatever a frozen full verification waits for may take before the cycle ends interrupted (note 001).
+    verificationTrigger: { afterDeliveries: data.fullVerification?.afterDeliveries ?? 10, maxWaitMinutes: data.fullVerification?.maxWaitMinutes ?? 240 },
     projectDiscovery: data.projectDiscovery ? { pattern: data.projectDiscovery.pattern, markers: data.projectDiscovery.markers ?? DEFAULT_PROJECT_MARKERS } : null,
     proxyLogin: {
       usersDir: data.proxyLogin?.usersDir ? data.proxyLogin.usersDir.replaceAll('{hostname}', os.hostname()) : null,

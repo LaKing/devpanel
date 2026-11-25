@@ -8,6 +8,7 @@ import { slotDirectory } from './drive-slots.mjs'
 import { acquire, LockHeld } from './lock.mjs'
 import { runProcess } from './process.mjs'
 import { pinConnection, sshConnection, shellQuote } from './ssh.mjs'
+import { awaitCycle } from '../cycle-gates.mjs'
 
 /*
  * The stage instances this panel has on its staging hosts (docs/project-infrastructure.md
@@ -114,29 +115,43 @@ async function clearSlot (file, record, { connection = null, reason, clock }) {
  * Throws when stopped, or when an earlier instance of the same name cannot be removed (the
  * stage would refuse to create over it): the drive is then unavailable, holding nothing.
  */
-export async function holdInstance ({ instance, host, kind, ssh = null, connection = null, runId = null, runDir = null, clock = systemClock, signal = null, onWait = null, dir: resultDir = null, pollMs = POLL_MS, slotsDir = null }) {
+export async function holdInstance ({ instance, host, kind, ssh = null, connection = null, runId = null, runDir = null, clock = systemClock, signal = null, onWait = null, dir: resultDir = null, pollMs = POLL_MS, slotsDir = null,
+  // The full verification (cycle-gates.mjs): a fresh drive asks `gate` before every slot attempt; `held` is the
+  // ticket of a drive already admitted (`heldTicket`: its own replacement), which never waits on the cycle.
+  gate = null, heldTicket = null, beforeCycleWait = null }) {
   const cap = instanceCap(instance)
   const mine = held.get(instance.name)
   if (mine) return { fresh: false, slot: mine.record.slot, cap, waitMs: 0 }
   const dir = slotDirectory(host, slotsDir)
   await fs.mkdir(dir, { recursive: true })
   let wait = null
-  const beginWait = async (reason) => {
+  const beginWait = async (reason, { from = null, cycleId = null } = {}) => {
     if (wait) return
-    wait = { id: crypto.randomUUID(), startedAt: clock.now(), from: clock.iso() }
-    await onWait?.({ phase: 'start', id: wait.id, host, reason, from: wait.from, dir: resultDir })
+    wait = { id: crypto.randomUUID(), startedAt: clock.now(), from: from ?? clock.iso(), reason, cycleId }
+    await onWait?.({ phase: 'start', id: wait.id, host, reason, from: wait.from, dir: resultDir, ...(cycleId ? { cycleId } : {}) })
   }
-  const endWait = async () => {
+  const endWait = async ({ to = null, endSeq = null } = {}) => {
     if (!wait) return 0
-    const { id, from, startedAt } = wait
+    const { id, from, startedAt, reason, cycleId } = wait
     wait = null
-    await onWait?.({ phase: 'end', id, host, from, to: clock.iso(), dir: resultDir })
+    await onWait?.({ phase: 'end', id, host, reason, from, to: to ?? clock.iso(), dir: resultDir, ...(cycleId ? { cycleId } : {}), ...(endSeq ? { endSeq } : {}) })
     return Math.max(0, clock.now() - startedAt)
   }
+  let ticket = null
   let ownFailures = 0
   try {
     for (;;) {
       if (signal?.aborted) throw aborted()
+      // A fresh drive is admitted by the full verification's gate before every slot attempt.
+      if (gate && !heldTicket && !ticket) {
+        const answer = gate.tryDrive(host)
+        if (answer.wait) {
+          const waited = await awaitCycle(answer.wait, { gates: gate, signal, beginWait, endWait, beforeWait: beforeCycleWait })
+          if (!waited) throw Object.assign(new Error('a held stage instance could not be removed before waiting for the full verification, so this drive did not wait and holds nothing'), { code: 'HELD_INSTANCE_NOT_REMOVED' })
+          continue
+        }
+        ticket = answer.ticket
+      }
       const recorded = await slotsOf(dir)
       const records = new Map(await Promise.all(recorded.map(async (slot) => [slot, await readRecord(recordFile(dir, slot))])))
       // An earlier instance of this name goes first: nothing may be created while it stands.
@@ -164,12 +179,25 @@ export async function holdInstance ({ instance, host, kind, ssh = null, connecti
           const record = { name: instance.name, root: instance.root, runId, runDir, kind, ssh, host, slot, destroy: { run: instance.destroy.run, ...(instance.destroy.timeoutSeconds ? { timeoutSeconds: instance.destroy.timeoutSeconds } : {}) }, heldAt: clock.iso() }
           await fs.writeFile(file, JSON.stringify(record, null, 2))
           held.set(instance.name, { lock, file, record, connection })
-          return { fresh: true, slot, cap, waitMs: await endWait() }
+          const admitted = ticket
+          ticket = null
+          let waitMs
+          try {
+            waitMs = await endWait()
+          } catch (error) {
+            // The wait's end could not be recorded: nothing of this drive is held, its ticket included (instance-ticket-leak).
+            admitted?.release()
+            held.delete(instance.name)
+            throw error
+          }
+          return { fresh: true, slot, cap, waitMs, ...(admitted ? { ticket: admitted } : {}) }
         } catch (error) {
           await lock.release()
           throw error
         }
       }
+      ticket?.release()
+      ticket = null
       await beginWait(blocked ? 'instance-leftover' : 'instances-full')
       await new Promise((resolve, reject) => {
         const onAbort = () => { clearTimeout(timer); reject(aborted()) }
@@ -178,6 +206,7 @@ export async function holdInstance ({ instance, host, kind, ssh = null, connecti
       })
     }
   } catch (error) {
+    ticket?.release()
     await endWait().catch(() => {})
     throw error
   }
@@ -217,7 +246,7 @@ export async function destroyInstance (name, { reason, clock = systemClock } = {
 }
 
 /** Every record under the slots root whose lock nobody live holds, removed; `runId` narrows it to one run. */
-async function clearUnheld ({ runId = null, reason, clock, slotsDir = null }) {
+async function clearUnheld ({ runId = null, reason, clock, slotsDir = null, hosts = null }) {
   const root = path.dirname(slotDirectory(LOCAL_HOST, slotsDir))
   const cleared = []
   for (const host of await fs.readdir(root).catch(() => [])) {
@@ -229,7 +258,7 @@ async function clearUnheld ({ runId = null, reason, clock, slotsDir = null }) {
       if (!lock) continue
       try {
         const record = await readRecord(file)
-        if (record && (!runId || record.runId === runId)) cleared.push(await clearSlot(file, record, { reason, clock }))
+        if (record && (!runId || record.runId === runId) && (!hosts || hosts.includes(record.host))) cleared.push(await clearSlot(file, record, { reason, clock }))
       } finally { await lock.release() }
     }
   }
@@ -241,11 +270,13 @@ async function clearUnheld ({ runId = null, reason, clock, slotsDir = null }) {
  * process of it left. Called at each end of a run and when it pauses; a run with none costs
  * a directory listing.
  */
-export async function destroyRunInstances (runId, { reason, clock = systemClock, slotsDir = null } = {}) {
-  const mine = [...held.values()].filter((h) => h.record.runId === runId).map((h) => h.record.name)
+export async function destroyRunInstances (runId, { reason, clock = systemClock, slotsDir = null, hosts = null } = {}) {
+  // `hosts`: only the instances on these hosts (a full verification's, engine.releaseHeld); none: every one.
+  const on = (host) => !hosts || hosts.includes(host)
+  const mine = [...held.values()].filter((h) => h.record.runId === runId && on(h.record.host)).map((h) => h.record.name)
   const destroyed = []
   for (const name of mine) destroyed.push(await destroyInstance(name, { reason, clock }))
-  return [...destroyed, ...await clearUnheld({ runId, reason, clock, slotsDir })]
+  return [...destroyed, ...await clearUnheld({ runId, reason, clock, slotsDir, hosts })]
 }
 
 /**

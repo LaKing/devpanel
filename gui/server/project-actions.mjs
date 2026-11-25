@@ -238,7 +238,7 @@ const inflight = new Map()
  * final record. An operation already running on the project is refused (409):
  * two checkpoints interleaved on one checkout is exactly what nobody wants.
  */
-export async function startProjectAction ({ project, actionId, args = [], root, projectsDir = projectsRoot(), issuesDir = ISSUES_DIR(), emit = () => {}, signal = null, actor = 'operator' }) {
+export async function startProjectAction ({ project, actionId, args = [], root, projectsDir = projectsRoot(), issuesDir = ISSUES_DIR(), emit = () => {}, signal = null, actor = 'operator', frozenFor = null }) {
   if (typeof actionId !== 'string' || !ID_RE.test(actionId)) throw fail('no such action', 404)
   if (!Array.isArray(args) || !args.every((a) => typeof a === 'string' && ARG_RE.test(a))) throw fail('action arguments must be bare flags such as --minor')
   const listing = await listProjectActions(project, { root, projectsDir, issuesDir })
@@ -247,13 +247,28 @@ export async function startProjectAction ({ project, actionId, args = [], root, 
 
   let lock
   try {
-    lock = await acquire(path.join(actionsDir(issuesDir, project), '.lock'), { purpose: 'project-action' })
+    // The effect is published with the lock: a full verification freezing now sees a committing action from the moment
+    // it holds the lock, from the panel or the CLI, and waits for it before its snapshot (supervisor.mjs busyActions).
+    lock = await acquire(path.join(actionsDir(issuesDir, project), '.lock'), { purpose: 'project-action', detail: { action: action.id, effect: action.effect ?? null } })
   } catch (error) {
     if (error instanceof LockHeld) {
       const running = listing.running
       throw Object.assign(fail(`an action is already running on ${project}${running ? ` (${running.action}, operation ${running.id})` : ''}`, 409), { operationId: running?.id ?? null })
     }
     throw error
+  }
+
+  // Panel and supervisor admission (`frozenFor`, the supervisor's in-process freeze) refuse an action declared to commit the
+  // checkout of a project a full verification verifies; the command line keeps today's behaviour (execution-contract.md
+  // "Full verification freeze"). Read after the lock is held, so no freeze can begin unseen in between.
+  if (action.effect === 'commit-checkout' && frozenFor?.(project)) {
+    await lock.release().catch(() => {})
+    throw Object.assign(fail(`${project} is in a full verification cycle: an action that commits its checkout is refused until the cycle ends`, 409), { code: 'FULL_VERIFICATION_FREEZE' })
+  }
+  // A cycle's own checkpoint whose cycle was interrupted before it spawned does not run.
+  if (signal?.aborted) {
+    await lock.release().catch(() => {})
+    throw Object.assign(fail('stopped before the action started', 409), { code: 'ACTION_STOPPED' })
   }
 
   try {
@@ -307,6 +322,15 @@ export async function startProjectAction ({ project, actionId, args = [], root, 
   const commandLine = args.length ? `${action.run} ${args.join(' ')}` : action.run
   const done = (async () => {
     try {
+      // Checked with nothing awaited between it and the spawn: a full verification interrupted while the operation record
+      // was written never starts its checkpoint (late-cycle-work).
+      if (signal?.aborted) {
+        operation.status = 'interrupted'
+        operation.cancelled = true
+        operation.error = 'stopped before the action started'
+        await append('exit', 'stopped before the action started; nothing ran')
+        return operation
+      }
       const result = await runProcess({
         command: '/bin/bash',
         // Arguments reach the action's command line as separate words, never re-parsed.

@@ -7,6 +7,7 @@ import { issuesRoot } from '../project-path.mjs'
 import { acquire, LockHeld } from './lock.mjs'
 import { runProcess } from './process.mjs'
 import { pinConnection, resolvedHostname, sshConnection } from './ssh.mjs'
+import { awaitCycle } from '../cycle-gates.mjs'
 
 /*
  * The staging host's CPU and memory are the shared resource: each drive boots a
@@ -74,52 +75,61 @@ const settingsDiffer = (a, b) => {
  * cancelled, having connected to nothing and holding no slot.
  */
 export async function holdDriveSlot ({ target, result, clock, runId = null, signal = null, onWait = null, exclusive = target?.tier === 'modules' && !target?.stageInstance,
-  attemptMs = RESOLVE_ATTEMPT_MS, retryMs = RESOLVE_RETRY_MS, windowMs = RESOLVE_WINDOW_MS, pollMs = SLOT_POLL_MS, slotsDir = null }) {
+  attemptMs = RESOLVE_ATTEMPT_MS, retryMs = RESOLVE_RETRY_MS, windowMs = RESOLVE_WINDOW_MS, pollMs = SLOT_POLL_MS, slotsDir = null,
+  // The full verification (cycle-gates.mjs): `gate` admits the drive on its resolved host or answers a wait
+  // token; `beforeCycleWait` must confirm nothing is held before a cycle wait; `resolved` is a connection the
+  // cycle pinned at its freeze ({host, pinned}), used instead of resolving the reference again.
+  gate = null, beforeCycleWait = null, resolved = null }) {
   const cap = hostSettings().testDrive.maxConcurrentDrives
   const record = { host: null, cap, waitMs: 0, waitedFrom: null, resolveAttempts: 0 }
   result.driveSlot = record
   let waitId = null, startedAt = null
-  const beginWait = async (reason) => {
+  let waitReason = null
+  let waitCycle = null
+  const beginWait = async (reason, { from = null, cycleId = null } = {}) => {
     if (waitId) return
     waitId = crypto.randomUUID()
     startedAt = clock.now()
-    record.waitedFrom = clock.iso()
-    await onWait?.({ phase: 'start', id: waitId, host: record.host, reason, from: record.waitedFrom, dir: result.dir })
+    waitReason = reason
+    waitCycle = cycleId
+    record.waitedFrom = from ?? clock.iso()
+    await onWait?.({ phase: 'start', id: waitId, host: record.host, reason, from: record.waitedFrom, dir: result.dir, ...(cycleId ? { cycleId } : {}) })
   }
-  const endWait = async () => {
+  const endWait = async ({ to = null, endSeq = null } = {}) => {
     if (!waitId) return
     const id = waitId
+    const reason = waitReason
+    const cycleId = waitCycle
     waitId = null
     record.waitMs = Math.max(0, clock.now() - startedAt)
-    await onWait?.({ phase: 'end', id, host: record.host, from: record.waitedFrom, to: clock.iso(), dir: result.dir })
+    await onWait?.({ phase: 'end', id, host: record.host, reason, from: record.waitedFrom, to: to ?? clock.iso(), dir: result.dir, ...(cycleId ? { cycleId } : {}), ...(endSeq ? { endSeq } : {}) })
   }
+  let ticket = null
+  // Waits for the cycle that refused the admission; throws when something held could not be removed first.
+  const cycleWait = async (token) => {
+    const entry = { cycleId: token.cycleId, from: token.from }
+    record.cycleWaits = [...(record.cycleWaits ?? []), entry]
+    const waited = await awaitCycle(token, { gates: gate, signal, beginWait, endWait, beforeWait: beforeCycleWait })
+    if (!waited) throw Object.assign(new Error('a held stage instance could not be removed before waiting for the full verification, so this drive did not wait and holds nothing'), { code: 'HELD_INSTANCE_NOT_REMOVED' })
+    Object.assign(entry, { to: token.ended?.to ?? null, endSeq: token.ended?.endSeq ?? null })
+  }
+  // A ticket for this attempt (true), or a wait for the refusing cycle (false: the caller loops).
+  const admit = async (host) => {
+    if (!gate || ticket) return true
+    const answer = gate.tryDrive(host)
+    if (answer.wait) { await cycleWait(answer.wait); return false }
+    ticket = answer.ticket
+    return true
+  }
+  const dropTicket = () => { ticket?.release(); ticket = null }
 
   try {
-    // The only read of the host, user and identity references this drive makes.
-    const connection = await sshConnection(target.ssh)
-    const until = Date.now() + windowMs
-    let host = null, pinned = null, last = null
-    for (;;) {
-      record.resolveAttempts++
-      const plain = await readConfig(connection, { signal, attemptMs })
-      if (plain.error) last = plain.error
-      else {
-        host = resolvedHostname(plain.output)
-        if (!host) last = 'its output names no usable hostname'
-        else {
-          pinned = pinConnection(connection, host)
-          const fixed = await readConfig(pinned, { signal, attemptMs })
-          if (fixed.error) last = fixed.error
-          else {
-            const differing = settingsDiffer(plain.output, fixed.output)
-            if (differing.length) throw new Error(`pinning the SSH host of this drive to ${host} would change its connection (${differing.join(', ')}), so no connection was made. A \`Match host\` rule that reads the alias stops matching once the hostname is fixed: use \`Match originalhost\`, or move the rule below the \`Host\` block that sets HostName.`)
-            break
-          }
-        }
-      }
-      if (Date.now() + retryMs > until) throw new Error(`the SSH host of ${target.ssh.hostRef} could not be resolved with ssh -G for ${Math.round(windowMs / 1000)}s, so no connection was made: ${last}`)
-      await beginWait('resolving')
-      await pause(retryMs, signal)
+    let host, pinned
+    if (resolved?.host && resolved?.pinned) {
+      ({ host, pinned } = resolved)
+      record.pinnedByCycle = true
+    } else {
+      ({ host, pinned } = await resolveDriveHost(target.ssh, { signal, attemptMs, retryMs, windowMs, onAttempt: () => { record.resolveAttempts++ }, onRetry: () => beginWait('resolving') }))
     }
     record.host = host
     const dir = slotDirectory(host, slotsDir)
@@ -133,13 +143,16 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
     }
     // Held from here on: a failure before the caller has the handle must not keep them.
     const handOver = async (locks) => {
+      const held = ticket
+      ticket = null
       try {
         await endWait()
       } catch (error) {
         for (const l of locks) await l.release()
+        held?.release()
         throw error
       }
-      return { connection: pinned, host, release: async () => { for (const l of [...locks].reverse()) await l.release() } }
+      return { connection: pinned, host, release: async () => { try { for (const l of [...locks].reverse()) await l.release() } finally { held?.release() } } }
     }
     if (target?.stageInstance) {
       // A drive on its run's own stage instance loads nothing into the shared one and boots
@@ -160,6 +173,17 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
       try {
         for (;;) {
           if (signal?.aborted) throw aborted()
+          if (gate && !ticket) {
+            const answer = gate.tryDrive(host)
+            if (answer.wait) {
+              // No admission lock is held through a cycle wait.
+              await admission?.release()
+              admission = null
+              await cycleWait(answer.wait)
+              continue
+            }
+            ticket = answer.ticket
+          }
           admission ??= await take('exclusive.lock', EXCLUSIVE)
           if (admission) {
             const slots = []
@@ -171,6 +195,7 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
             if (slots.length === cap) return await handOver([admission, ...slots])
             for (const l of slots) await l.release()
           }
+          dropTicket()
           await beginWait(admission ? 'host-busy' : 'exclusive')
           await pause(pollMs, signal)
         }
@@ -181,10 +206,16 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
     }
     for (;;) {
       if (signal?.aborted) throw aborted()
+      // The full verification's gate, checked at every attempt: a drive queued here when a cycle
+      // begins takes no slot before the thaw (cycle-gates.mjs).
+      if (!(await admit(host))) continue
       // Admission: a slot is taken only while holding the admission lock, so once a
       // modules drive holds it no other drive is admitted; it is never held while waiting.
       const admission = await take('exclusive.lock', 'test-drive-admission')
       if (!admission) {
+        // Queued behind the admission lock: its ticket goes back, so the next attempt asks the gate again and a freeze that
+        // began meanwhile holds it (queued-drive).
+        dropTicket()
         // Another drive's admission lasts milliseconds and is no wait; a modules drive's is.
         const holder = await fs.readFile(path.join(dir, 'exclusive.lock'), 'utf8').then((text) => JSON.parse(text).purpose, () => null)
         if (holder !== EXCLUSIVE) { await pause(ADMISSION_POLL_MS, signal); continue }
@@ -199,11 +230,47 @@ export async function holdDriveSlot ({ target, result, clock, runId = null, sign
         await admission.release()
       }
       if (lock) return await handOver([lock])
+      dropTicket()
       await beginWait('host-full')
       await pause(pollMs, signal)
     }
   } catch (error) {
+    dropTicket()
     await endWait().catch(() => {})   // what stopped the drive is the error it reports
     throw error
+  }
+}
+
+/**
+ * Resolve an SSH reference to its HostName with `ssh -G`, and the connection pinned to it, retrying
+ * within a window. The full verification pins its stages with this once, at its freeze, and its own
+ * drives use that pinned connection (holdDriveSlot `resolved`).
+ */
+export async function resolveDriveHost (ssh, { signal = null, attemptMs = RESOLVE_ATTEMPT_MS, retryMs = RESOLVE_RETRY_MS, windowMs = RESOLVE_WINDOW_MS, onAttempt = null, onRetry = null } = {}) {
+  // The only read of the host, user and identity references this drive makes.
+  const connection = await sshConnection(ssh)
+  const until = Date.now() + windowMs
+  let last = null
+  for (;;) {
+    onAttempt?.()
+    const plain = await readConfig(connection, { signal, attemptMs })
+    if (plain.error) last = plain.error
+    else {
+      const host = resolvedHostname(plain.output)
+      if (!host) last = 'its output names no usable hostname'
+      else {
+        const pinned = pinConnection(connection, host)
+        const fixed = await readConfig(pinned, { signal, attemptMs })
+        if (fixed.error) last = fixed.error
+        else {
+          const differing = settingsDiffer(plain.output, fixed.output)
+          if (differing.length) throw new Error(`pinning the SSH host of this drive to ${host} would change its connection (${differing.join(', ')}), so no connection was made. A \`Match host\` rule that reads the alias stops matching once the hostname is fixed: use \`Match originalhost\`, or move the rule below the \`Host\` block that sets HostName.`)
+          return { host, pinned }
+        }
+      }
+    }
+    if (Date.now() + retryMs > until) throw new Error(`the SSH host of ${ssh.hostRef} could not be resolved with ssh -G for ${Math.round(windowMs / 1000)}s, so no connection was made: ${last}`)
+    await onRetry?.()
+    await pause(retryMs, signal)
   }
 }

@@ -707,7 +707,7 @@ async function start (override = false) {
         </template>
 
         <v-alert v-if="frozenOut" type="warning" variant="tonal" density="compact" class="mt-4" data-test="start-frozen">
-          A full verification has closed admission to runs that write the checkout (cycle {{ freshness.issue()?.admissionFrozen?.cycleId ?? 'unknown' }}); this playbook writes it, so it cannot start until the cycle ends.
+          A full verification has closed admission to runs that write the checkout (cycle {{ freshness.issue()?.admissionFrozen?.cycleId ?? 'unknown' }}); this playbook writes it and would be held whole (in place, a release, links allowed, or turns that cannot be fenced here), so it cannot start until the cycle ends. A fenced run in its own worktree may start: only its drives and deliveries wait.
         </v-alert>
         <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mt-4">{{ error }}</v-alert>
         <v-alert v-if="hold" type="warning" variant="tonal" density="compact" class="mt-4" title="Held by the pre-gate">

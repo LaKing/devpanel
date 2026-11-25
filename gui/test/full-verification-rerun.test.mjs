@@ -10,6 +10,9 @@ import { manualClock } from '../server/runtime/clock.mjs'
 import { instanceName } from '../server/runtime/instance-drive.mjs'
 import { modulesErrors } from '../server/infrastructure.mjs'
 
+// The fixtures' stage hosts are aliases no ssh configuration resolves: each cycle pins them as named (no connection is made).
+const fakeResolve = async (ssh) => ({ host: String(ssh?.hostRef ?? '').replace(/^ssh-config:/, ''), pinned: null })
+
 export const name = 'full verification rerun — a failed test reruns alone on the same instance before it is destroyed: flaky when it passes (green, recorded, in the history and an issue), red when it fails again or proves nothing; never for a non-test failure, over the bound, opted out or without a command that selects named tests'
 
 const HOST = 'ssh-config:stage-host'
@@ -118,7 +121,7 @@ export default async function (t) {
   const clock = () => manualClock(Date.parse('2026-11-15T09:00:00.000Z'))
   const cycle = async (s, at = clock()) => {
     const verificationDir = path.join(s.options.issues.ISSUES_DIR, '.verification')
-    const fv = createFullVerification({ ...s.options, clock: at, verificationDir })
+    const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock: at, verificationDir })
     const started = await fv.startNow({ by: 'tester' })
     await fv.settle()
     return { fv, verificationDir, record: await readJson(path.join(verificationDir, started.date, 'cycle.json')) }

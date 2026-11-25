@@ -3687,6 +3687,126 @@ runs, and only for the projects it verifies. A run writes when what it can do to
 be read is taken to write. Analysis, Triage and inquiries only read: the freeze neither asks,
 refuses nor waits for them, and they may start.
 
+**Whole and contained runs** (`run-exclusivity.mjs wholeFreeze`, `server/cycle-gates.mjs`). Inside
+the scope, a writing run is frozen *whole* (everything below: refused, asked to pause, waited
+for) only when it works in place, releases (staging, deployment), cannot be read, or *reaches
+what the cycle snapshots* (S: the repositories and work trees `snapshotRepositories` names for
+every scope project, plus the Git store, read once at freeze; unreadable, every run reaches it).
+A run reaches S when its turns are not confined (the run did not resolve `fence.namespace: 1`,
+the host's seat fence is not `mode: fence`, or an unproved fence may fall back to running
+unfenced, `DEVPANEL_FENCE_UNPROVED=run` with bubblewrap: the service account owns the checkouts,
+so nothing short of the fence proves it cannot write them), when a `symlinks: allow` link
+escapes into an S work tree (not provisioned yet: taken to), or when one of its writable mounts
+(worktree, worker Git directory, scratch directory `scratchPath`) lies inside an S work tree that does not ignore it;
+links and mounts are compared as real paths (a link through another link into S counts).
+In place and release runs stay whole because they write the checkout or the stage directly.
+Every other writing run of the scope is *contained*: its seat turns write only its own worktree,
+so they go on (no pause, no withheld turn, `run.freezeRequested` is never asked of it), and only
+two things of it wait, at gates, until the cycle thaws:
+
+- its **check drive on a staging host the cycle drives on** (each stage's HostName resolved once
+  and pinned at the freeze; unresolvable: `STAGE_HOST_UNRESOLVED`; a release whose host moved
+  since: `STAGE_HOST_MOVED`). A waiting drive holds no drive slot, admission lock, stage
+  instance or kept smoke instance: before it waits, the run removes and confirms them
+  (`engine.releaseHeld`, `run.pendingRemovals` kept until a removal is confirmed); one that cannot
+  be removed settles the drive `unavailable` (`retrySkipped: held-instance-not-removed`) and
+  nothing waits;
+- every **write into a repository in S**: `apply-to-source` and owner deliveries (their locked
+  repositories), `commit` on a linked worktree, publication into `repository.source`, delivery
+  return, reconcile (the whole reconcile, its own drive included), operator finalize, integrate
+  and integration recovery (until `followCheckouts` ends), apply-artifact. A write elsewhere,
+  `worktree-diff` delivery and `commit` into a private repository proceed.
+
+A wait is a wait, not a pause: nothing to answer, on the record (`run.cycleWait` while it lasts;
+`run.cycleWaits[]` and, for a drive, `driveSlotWaits` with `reason: full-verification` once
+closed) and in the explanation ("Waiting for full verification <id> before its drive" / "before
+its delivery"); excused from the wall clock like a slot wait, live (`openDriveWaits`) and
+persisted (run-metrics `checkIntervals`). It ends by itself at the thaw: `thaw` stamps every
+token of the cycle in the order the waits began (`to`, `endSeq`) in one synchronous step, each
+waiter persists only its own stamps, and none waits for another. A gate is asked synchronously
+and its ticket stays in `pending()` until released, so a freeze that begins meanwhile waits for
+the drive or write instead (deadlock rule: whole runs and the cycle's own runs always pass, and so does a nested
+admission whose holder the cycle drains: a live drive ticket on a cycle host, such as a drive's own instance
+replacement, or a live write ticket into S, such as a reconcile's drive; a ticket the cycle does not drain lets
+nothing past). A run identifiable as whole without any reading (in place, release, unreadable, unconfined) is asked to stop
+synchronously as the freeze begins, before anything is awaited; the others are read, and until the freeze has classified a
+live run (`classifying`), its admissions wait; one found whole is released at once (`release`, stamped `released`) and
+asks again. A classification belongs to the cycle that made it (`classifiedFor`): start, answer, finalize and the
+automatic reconcile apply it only while that cycle is still frozen; a thaw meanwhile refuses nothing, a newer cycle
+classifies again. Each writer asks with the destination it writes:
+integrate with the canonical Git common directory of the declared source, before its first write (the store fetch,
+the temporary worktree); a linked worktree's `commit` before its first object; a checkout path inside an S work tree
+counts as S. A standalone `worktree-diff` of a legacy linked worktree and a check's reconstruction (its patch and registered
+worktree, and their removal) ask the write gate for the repository owning the workspace before writing; a private run's
+engine directory is never in S. Operator operations that wait (finalize, reconcile, integrate, integration recovery, apply-artifact)
+put the wait on the run's record (`run.cycleWait`, then `run.cycleWaits`), through its engine when it has one, and
+its explanation says so whatever the run's status; the panel offers Finalize, Reconcile and continuations of a
+contained run during a cycle (`admission.whole` on the run read, `admissionFrozen.confined` on the issue read for a
+start). Operator operations that wait (finalize, reconcile, integrate,
+apply-artifact) answer 202 `{status: 'waiting', cycleId, waitingFor}` and go on by themselves; a
+restart drops such a waiting operation, which is then asked for again; the next start closes the wait it left open on the
+run record as `stopped`, under the issue's run lock and only when no live or unknown owner holds it. The automatic
+integration sweep never waits: a publication whose checkouts a cycle snapshots is held, its wait recorded on the run, and
+the thaw ends the wait and runs the recovery again, as it runs deferred reconciles.
+
+**Starts during a cycle** (original AC7). A contained writing run of a scope project may start during a cycle only when
+its base snapshot needs no write into what the cycle snapshots. Provisioning writes `refs/devpanel/base/<run>`, a
+worktree registration and, for a working-tree base, objects into its destination repository: the project's Git store
+(`gitStore`, runtime/git-store.mjs) for a private-repository run (`fence.repository: 1`) when the host keeps one, else
+the project's own repository. A start whose destination is in what the cycle snapshots, or whose destination cannot be
+read, is refused 409 `FULL_VERIFICATION_FREEZE` until the cycle ends (supervisor.mjs `provisionWritesSnapshot`). The
+cycle snapshots every scope project's repository and its Git store, so in practice no writing run of a scope project
+starts during a cycle; the answer to original AC7 is that it may not. Runs already started go on as contained runs.
+
+| Operation, of a scope project | frozen, driving, outcome | thawed or interrupted |
+|---|---|---|
+| Seat turn of a contained run | proceed | proceed |
+| Seat turn of a whole run | withheld; pauses `full-verification` | resumed by the cycle; a request of a thawed cycle is dropped, never applied |
+| Start of a contained run whose provisioning destination (Git store or project repository) is outside what the cycle snapshots | proceed | proceed |
+| Start of a writing run whose provisioning destination is in what the cycle snapshots, or unreadable (it writes the base ref, objects and worktree registration there) | refuse 409 | proceed |
+| Provisioning of a run reserved before the cycle (or resumed in preflight): a write ticket for its destination right before provisioning (supervisor.mjs `provisionTicket`), drained by the cycle when taken first | destination in the snapshot: wait (`run.cycleWait`, action `provisioning`); else proceed | proceed |
+| Removing a settled run's legacy linked worktree, or a check's reconstruction worktree, or Finalize's rebuild of a reconciled candidate | a ticket for the owning repository; refused, the worktree or registration is kept for a later removal or prune, never waited for (a rebuild's add waits) | proceed |
+| Start or continuation of a run that is or would be whole | refuse 409 `FULL_VERIFICATION_FREEZE` | proceed |
+| Resume, answer, Continue, refresh-checks of a contained run | proceed; drives and writes gated | proceed |
+| A drive already holding its ticket on a cycle host when the freeze begins (its instance replacement included) | finishes; the cycle waits for it | — |
+| A new drive of a contained run on a cycle host | waits, holding nothing on staging | proceeds, in the order the waits began |
+| A drive on another host, or a local target | proceed | proceed |
+| `worktree-diff` delivery; `commit` into a private repository | proceed | proceed |
+| `apply-to-source`, linked-worktree `commit`, publication, delivery return, reconcile | into S: wait; else proceed | proceed |
+| Finalize, integrate, integration recovery, apply-artifact | admitted (202); writes as above | proceed |
+| Project action `effect: commit-checkout`, panel or supervisor admission | refuse 409 | proceed |
+| The same action from `project-action-cli.mjs` | admitted, as before | proceed |
+| The cycle's own runs, drives and checkpoint actions | exempt | — |
+| Analysis, Triage, inquiry; any run of a project outside the scope | never gated (a drive in flight on a cycle host is still waited for) | — |
+
+**Project actions.** `startProjectAction` called with the supervisor's in-process `frozenFor`
+(the panel's route) refuses an action declaring `effect: commit-checkout` on a scope project with
+409 `FULL_VERIFICATION_FREEZE`, read after the action lock is held, and releases the lock. An
+action started from the command line (`project-action-cli.mjs`) keeps its behaviour during a
+cycle (an orchestrator's decision of 2026-11-25: a CLI checkpoint during a cycle is the
+operator's call); there is no cross-process freeze marker. The action lock records `{action,
+effect}`, so a committing action holding it when the cycle freezes, from the panel or the CLI, is
+listed by `busyActions()` and waited for before the snapshot. One started from the CLI after the
+snapshot can commit during the cycle: the pre-chain recheck withholds the pool's checkpoint only
+for a move it observes, so a CLI commit after that recheck is not caught there (the after-commit
+comparison still reports what the commit holds beyond what was tested).
+
+**Bounds** (note 001). Whatever the frozen cycle waits for is bounded by
+`fullVerification.maxWaitMinutes` (host settings, default 240, as the coding playbooks' wall
+clock): the freeze itself, the wait for what is in flight, each stage end to end, the pre-chain
+recheck and each checkpoint action. The record writes, the busy readings and the outcome
+(its checkpoints and after-commit comparisons) race the same interruption. Each cycle's signal, interruption and
+pinned hosts belong to its own record, so a task of an earlier cycle never uses a later one's. At the bound the
+cycle is interrupted (`record.interruption {reason: wait-bound, label}`): its stage runs are asked to stop, pending
+stage starts and checkpoint actions are cancelled where they register (a checkpoint is checked with nothing
+awaited between the check and its spawn), the cycle's own pending work is followed through the grace and named, stages not started are
+`not-run` and running ones `interrupted`, the outcome is skipped (`outcome.skipped:
+interrupted`), and after a grace of 60 s admission thaws, naming what was still in flight
+(`interruption.inFlight`, `admission-thawed {interrupted: true}`): the freeze is never lifted
+silently while a write is in progress. A thaw clears the cycle's freeze requests wherever they
+sit (engine, reservation, persisted record); a request whose cycle is not active is dropped
+where it is used (`freeze-request-dropped`), and after a restart none is.
+
 **Its scope.** Before anything is frozen or recorded, the cycle reads the project listing and
 the configuration once, together (`readCycleConfig`: the listing read now, uncached; one
 `loadConfig` in the host-config directory chosen now; each project's infrastructure from that
@@ -3703,13 +3823,15 @@ resolves or starts, with the reason that reading gave (`TARGET_MISSING`, else
 `OUTSIDE_FREEZE_SCOPE`), whatever the configuration says later.
 A run of a project outside the scope is never asked to pause, never has a turn withheld, and
 is never refused a start, continuation, delivery, finalize or reconcile because of the cycle;
-the cycle does not wait for it. A read that fails for another reason than absence (an
+the cycle does not wait for it, except for a drive it already has in flight on a staging host the
+cycle drives on (original AC5 of the phase-2 issue: no other run's drive in flight there). A read that fails for another reason than absence (an
 unreadable projects root, project directory or marker, host-config directory or `projects/`
 category) refuses the cycle with 503 `FULL_VERIFICATION_SCOPE_UNREADABLE` before anything is
 frozen; a project file that loads but fails its schema is a red `INFRASTRUCTURE_INVALID`
 entry, as before. `supervisor.freeze(cycleId, { projects })` sets the freeze for that scope (an
 empty list freezes no project; only a call that omits the scope argument holds every project, as
-before) and asks every writing run of it this process drives to stop:
+before) and asks every *whole* writing run of it this process drives to stop (the rules below are
+those of whole runs; a contained run is held only at its gates, above):
 
 - **No writing run starts.** `supervisor.start()` refuses a start whose resolved playbook writes,
   and every start of another cycle, with 409 `FULL_VERIFICATION_FREEZE` (`started: false`,
@@ -3737,9 +3859,14 @@ before) and asks every writing run of it this process drives to stop:
   full-verification` with `pause.cycleId`. A plain resume continues such a pause, like a
   manual one. When an operator's pause was pending as well, the pause records
   `manualPending: true`: the cycle leaves that run paused for the operator.
-- **The cycle takes its snapshot** once no writing run or pending writing operation of a project
-  in its scope is left in the process (`supervisor.busy()`, filtered by the scope; runs of other
-  projects are not waited for), so no seat turn or delivery of the scope writes the checkout. On a
+- **Before its snapshot the cycle frees the cycle hosts**: each contained run's kept smoke instance, stage instances and
+  pending removals on those hosts only (`releaseIdle`, read again per run; a run with a drive in flight there keeps it).
+- **The cycle takes its snapshot** once nothing that could write what it snapshots is in flight
+  (`supervisor.busy()` and `busyActions()`): no whole writing run and no pending writing
+  operation of its scope, no write ticket into S, no committing project action holding its lock,
+  and no drive in flight on a staging host it drives on, of any run, one of a project outside
+  the scope included. It no longer waits for a contained run's seat turns. The record says what
+  it waited for and how long (`waitingOn` while it waits, then `waited {from, to, ms, for}`). On a
   stage host with dynamic instances it starts no run at all: it snapshots the checkout itself
   (`gitWorktreeProvider`, under the delivery locks), drives `modules.instance.fullSuite` on an
   instance of its own (`runtime/full-verification-drive.mjs instanceCycleTarget`, through

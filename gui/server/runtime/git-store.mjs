@@ -41,20 +41,26 @@ export function gitStoreDir (project, settings = hostSettings()) {
  * repository's objects (rewritten when the project moved). Returns
  * { dir, objects, sourceObjects }, all real paths.
  */
-export async function ensureGitStore ({ dir, sourceRepository }) {
+export async function ensureGitStore ({ dir, sourceRepository, stop = () => {} }) {
+  // `stop` (a snapshot cut's, late-cycle-work): throws once its signal is aborted, asked before every write here.
   const source = await fs.realpath(sourceRepository)
   const sourceObjects = path.join(source, 'objects')
   if (!await fs.stat(path.join(dir, 'objects')).then((s) => s.isDirectory(), () => false)) {
+    stop()
     await fs.mkdir(path.dirname(dir), { recursive: true })
+    stop()
     await git(['-c', 'init.defaultBranch=devpanel', 'init', '-q', '--bare', dir])
     // Nothing the panel writes here is garbage: runs name their snapshots by ref,
     // and a store never needs repacking against its source.
+    stop()
     await git(['--git-dir', dir, 'config', 'gc.auto', '0'])
   }
   const real = await fs.realpath(dir)
   const alternates = path.join(real, 'objects', 'info', 'alternates')
   if ((await fs.readFile(alternates, 'utf8').catch(() => '')).trim() !== sourceObjects) {
+    stop()
     await fs.mkdir(path.dirname(alternates), { recursive: true })
+    stop()
     await fs.writeFile(alternates, sourceObjects + NL)
   }
   return { dir: real, objects: path.join(real, 'objects'), sourceObjects }

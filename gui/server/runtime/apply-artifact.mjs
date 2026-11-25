@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import os from 'node:os'
@@ -8,6 +9,11 @@ import { acquireIssueLock } from '../issue-locks.mjs'
 import { fingerprint, LEGACY_FINGERPRINT_RULE } from './fingerprint.mjs'
 import { reconstructInto, discardReconstruction, verifyReconstruction } from './launch.mjs'
 import { applyToSource, sourceTarget } from './source-delivery.mjs'
+/** A checkout's canonical Git common directory, or null when it cannot be read. */
+const sourceCommonOf = (dir) => new Promise((resolve) => execFile('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'], (error, stdout) => resolve(error ? null : fs.realpath(String(stdout).trim()).catch(() => String(stdout).trim()))))
+
+/** The full verification waits a record holds (cycle-gates.mjs), to carry into a later write of an older copy. */
+const waitsOf = (run) => ({ cycleWait: run.cycleWait ?? null, ...(run.cycleWaits ? { cycleWaits: run.cycleWaits } : {}) })
 
 const refuse = message => Object.assign(new Error(message), { status: 409 })
 
@@ -239,12 +245,20 @@ export async function approvedCheckPatch ({ issuePath, runId, projectPath = null
 }
 
 /** Explicit operator action for completed patch-only runs, including removed worktrees. */
-export async function applyRunArtifact ({ issuePath, runId, projectPath, expectedRevision }) {
+export async function applyRunArtifact ({ issuePath, runId, projectPath, expectedRevision, hooks = {} }) {
   if (typeof runId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(runId)) throw refuse('Invalid run id')
   // ISSUE_BUSY or ISSUE_MOVED (409, retryable): never brings back a folder packed or deleted meanwhile.
   const lock = await acquireIssueLock(path.join(issuePath, '.run.lock'), { purpose: 'apply-artifact', runId, doing: 'Applying the patch' })
   let temporary
+  // The full verification's gate (cycle-gates.mjs), asked with the checkout's common directory before the reconstruction
+  // registers a worktree there and held until that worktree is removed (artifact-application); the application's own
+  // writes pass on it (a held ticket the cycle drains), and ask the gate themselves for any other repository.
+  let cycleTicket = null
   try {
+    if (hooks.cycleGate) {
+      const common = await sourceCommonOf(projectPath)
+      cycleTicket = await hooks.cycleGate(common ? [common] : [projectPath])
+    }
     await store.requireCompleteEvents(issuePath, runId)
     const { run, dir, file } = await retainedPatch(issuePath, runId)
     const delivery = run.delivery
@@ -262,16 +276,20 @@ export async function applyRunArtifact ({ issuePath, runId, projectPath, expecte
     const reconstruction = await verifyReconstruction({ workspacePath: temporary, baseCommit: workspace.baseCommit, baseline, patchFile: file, expected: expectedRevision,
       expectedPaths: new Set(candidate.entries.filter(e => e.status !== 'unchanged').map(e => e.path)) })
     const patchHash = 'sha256:' + crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex')
+    // hooks.cycleGate: the full verification's write gate, passed to the source delivery (cycle-gates.mjs).
     const receipt = await applyToSource({ workspace, baseline, revision: expectedRevision, fingerprint: candidate,
-      receipt: { ...delivery, reconstruction, patchHash }, runDir: dir })
+      receipt: { ...delivery, reconstruction, patchHash }, runDir: dir, hooks: hooks.cycleGate ? { cycleGate: (repositories) => hooks.cycleGate(repositories, { held: cycleTicket }) } : {} })
     // Preserve the historical delivery and snapshot. This is a separately
     // authorized application of that artifact, not a rewritten old run.
     run.artifactApplication = receipt.application
+    // A full verification wait recorded on the run meanwhile (supervisor writeGateFor) is kept.
+    if (hooks.cycleGate) Object.assign(run, waitsOf(await store.readRun(issuePath, runId).catch(() => ({}))))
     await store.writeRun(issuePath, runId, run)
     await store.appendEvent(issuePath, runId, { type: 'artifact-applied', revision: expectedRevision, application: receipt.application })
     return { runId, application: receipt.application, error: receipt.application.verified ? null : receipt.application.error }
   } finally {
     if (temporary) await discardReconstruction({ dir: temporary, workspacePath: projectPath })
+    cycleTicket?.release()
     await lock.release()
   }
 }

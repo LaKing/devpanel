@@ -224,7 +224,7 @@ app.get('/api/projects/:project/actions', route(async (req, res) => {
 }))
 app.post('/api/projects/:project/actions/:action', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
-  const { operation, done } = await startProjectAction({ project: req.params.project, actionId: req.params.action, root: process.env.DEVPANEL_CONFIG_ROOT, actor: req.actor ?? 'operator', emit: emitProjectAction })
+  const { operation, done } = await startProjectAction({ project: req.params.project, actionId: req.params.action, root: process.env.DEVPANEL_CONFIG_ROOT, actor: req.actor ?? 'operator', emit: emitProjectAction, frozenFor: (project) => supervisor.frozenFor(project) })
   done.catch((error) => console.error(`[devpanel] project action ${req.params.project}/${req.params.action} failed: ${error?.message ?? error}`))
   res.status(202).json({ operation })
 }))
@@ -255,8 +255,9 @@ app.post('/api/projects/:project/issues', route(async (req, res) => {
 app.get('/api/projects/:project/issues/:id', route(async (req, res) => {
   // admissionFrozen: the full verification's freeze in effect ({cycleId, at}) or null, read with the issue so the
   // page refuses before sending what supervisor.mjs refuses while frozen (start :368, answer :770, finalize :1589).
-  const frozen = supervisor.frozen?.() ?? null
-  res.json({ ...(await getIssue(req.params.project, req.params.id)), admissionFrozen: frozen ? { cycleId: frozen.cycleId ?? null, at: frozen.at ?? null } : null })
+  // Only for a project the cycle verifies; `confined` says whether a new run here could be contained (its turns fenced).
+  const frozen = supervisor.frozenFor?.(req.params.project) ? supervisor.frozen() : null
+  res.json({ ...(await getIssue(req.params.project, req.params.id)), admissionFrozen: frozen ? { cycleId: frozen.cycleId ?? null, at: frozen.at ?? null, confined: supervisor.startsConfined() } : null })
 }))
 
 // Where the issue came from, what came out of it, and what it waits for or holds up (issue-family.mjs).
@@ -384,18 +385,41 @@ app.get('/api/projects/:project/issues/:id/runs/:runId/integration-target', rout
   res.json(await integrationTarget({ project, projectPath: projectPath(project), configRoot: process.env.DEVPANEL_CONFIG_ROOT, runId, issuePath: issue.path }))
 }))
 
+/*
+ * An operator's write into a run's destination (integrate, integration recovery, apply-artifact) during a full
+ * verification that snapshots it: the request answers 202 `{ status: 'waiting', cycleId }` as soon as the write waits,
+ * and the operation goes on by itself at the thaw, its result emitted as usual (cycle-gates.mjs).
+ */
+async function untilWaitingOrDone (req, res, { action, run: operation, emitted, sendDone }) {
+  const { project, id, runId } = req.params
+  let signalWaiting
+  const waiting = new Promise((resolve) => { signalWaiting = resolve })
+  const cycleGate = supervisor.writeGateFor({ project, issueId: id, runId, action }, (token) => signalWaiting(token))
+  const pending = operation(cycleGate)
+  const first = await Promise.race([pending.then((result) => ({ result })), waiting.then((token) => ({ token }))])
+  if (first.token) {
+    pending.then(emitted).catch((error) => console.warn(`[devpanel] ${action} of ${project}/${id} run ${runId} after the full verification: ${error.message}`))
+    return res.status(202).json({ status: 'waiting', cycleId: first.token.cycleId, waitingFor: action })
+  }
+  emitted(first.result)
+  return sendDone(first.result)
+}
+
 app.post('/api/projects/:project/issues/:id/runs/:runId/integrate', route(async (req, res) => {
   const { project, id, runId } = req.params
   const { expectedRevision, targetBranch = null, expectedTargetHead = null } = req.body ?? {}
   if (!expectedRevision) throw Object.assign(new Error('expectedRevision is required: approve the revision you reviewed'), { status: 400 })
   if (supervisor.isActive(project, id)) throw runLocked('a run is active on this issue; wait for it to settle', { liveness: 'alive' })
   const issue = await unpackedIssue(project, id)
-  const result = await integrateRun({
-    issuePath: issue.path, runId, project, projectPath: projectPath(project),
-    configRoot: process.env.DEVPANEL_CONFIG_ROOT, expectedRevision, targetBranch, expectedTargetHead, approvedBy: 'operator'
+  await untilWaitingOrDone(req, res, {
+    action: 'integrate',
+    run: (cycleGate) => integrateRun({
+      issuePath: issue.path, runId, project, projectPath: projectPath(project),
+      configRoot: process.env.DEVPANEL_CONFIG_ROOT, expectedRevision, targetBranch, expectedTargetHead, approvedBy: 'operator', hooks: { cycleGate }
+    }),
+    emitted: (result) => io.emit('run:event', { type: 'integrated', project, issueId: id, runId, ok: !result.error }),
+    sendDone: (result) => res.status(result.error ? 409 : 200).json(result)
   })
-  io.emit('run:event', { type: 'integrated', project, issueId: id, runId, ok: !result.error })
-  res.status(result.error ? 409 : 200).json(result)
 }))
 
 app.get('/api/projects/:project/issues/:id/runs/:runId/patch', route(async (req, res) => {
@@ -435,18 +459,23 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/apply-artifact', route(a
   const { project, id, runId } = req.params
   if (supervisor.isActive(project, id)) throw Object.assign(new Error('Wait for the active run to settle'), { status: 409 })
   const issue = await unpackedIssue(project, id)
-  const result = await applyRunArtifact({ issuePath: issue.path, runId,
-    projectPath: projectPath(project), expectedRevision: req.body?.expectedRevision })
-  io.emit('run:event', { type: 'artifact-applied', project, issueId: id, runId, application: result.application })
-  res.status(result.error ? 409 : 200).json(result)
+  await untilWaitingOrDone(req, res, {
+    action: 'apply-artifact',
+    run: (cycleGate) => applyRunArtifact({ issuePath: issue.path, runId, projectPath: projectPath(project), expectedRevision: req.body?.expectedRevision, hooks: { cycleGate } }),
+    emitted: (result) => io.emit('run:event', { type: 'artifact-applied', project, issueId: id, runId, application: result.application }),
+    sendDone: (result) => res.status(result.error ? 409 : 200).json(result)
+  })
 }))
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/integration/reconcile', route(async (req, res) => {
   const { project, id, runId } = req.params
   const issue = await unpackedIssue(project, id)
-  const result = await reconcileIntegration({ issuePath: issue.path, runId })
-  io.emit('run:event', { type: 'integration-reconciled', project, issueId: id, runId, phase: result.phase })
-  res.json(result)
+  await untilWaitingOrDone(req, res, {
+    action: 'integration-reconcile',
+    run: (cycleGate) => reconcileIntegration({ issuePath: issue.path, runId, hooks: { cycleGate } }),
+    emitted: (result) => io.emit('run:event', { type: 'integration-reconciled', project, issueId: id, runId, phase: result.phase }),
+    sendDone: (result) => res.json(result)
+  })
 }))
 
 app.post('/api/supervisor/finish', route(async (_req, res) => res.status(202).json(await topSupervisor.finish())))
@@ -749,7 +778,8 @@ app.get('/api/projects/:project/issues/:id/runs/:runId', route(async (req, res) 
     issueId: req.params.id,
     isActive: supervisor.isActive(req.params.project, req.params.id),
     liveCheckSince: supervisor.liveCheckSince(req.params.project, req.params.id, req.params.runId),
-    strict: true
+    strict: true,
+    classify: supervisor.wholeOf
   }))
 }))
 
@@ -888,7 +918,8 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/finalize', route(async (
   const { project, id, runId } = req.params
   const result = await supervisor.finalize({ project, issueId: id, runId, budgets: req.body?.budgets ?? {} })
   io.emit('issues:changed', { reason: 'run-finalized', project, id })
-  res.json(result)
+  // Accepted and waiting for a full verification (cycle-gates.mjs): 202, as for integrate and apply-artifact.
+  res.status(result?.status === 'waiting' ? 202 : 200).json(result)
 }))
 
 // Merge the approved patch onto source that drifted on its own paths, revalidate, deliver (source-reconcile.mjs).
@@ -896,7 +927,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/reconcile-delivery', rou
   const { project, id, runId } = req.params
   const result = await supervisor.reconcileDelivery({ project, issueId: id, runId, actor: req.actor ?? req.body?.actor ?? 'operator' })
   io.emit('issues:changed', { reason: 'run-reconciled', project, id })
-  res.json(result)
+  res.status(result?.status === 'waiting' ? 202 : 200).json(result)
 }))
 
 app.post('/api/projects/:project/issues/:id/runs/:runId/abandon', route(async (req, res) => {

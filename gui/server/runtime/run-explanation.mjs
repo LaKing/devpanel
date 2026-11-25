@@ -456,9 +456,21 @@ function splitSuggestion (run, outputs) {
   return { text, parts, theme, limitRaises: raises.length }
 }
 
+/** A wait for a full verification (cycle-gates.mjs): a wait, not a pause; nothing to answer, it ends at the thaw. */
+function cycleWaitStanding (cycleWait) {
+  return { tone: 'waiting', headline: `Waiting for full verification ${cycleWait.cycleId ?? ''} before its ${cycleWait.kind === 'drive' ? 'drive' : 'delivery'}`.replace('  ', ' '),
+    detail: cycleWait.kind === 'drive'
+      ? `Its check drive on ${cycleWait.host ?? 'a staging host'} waits until the full verification on that host ends (since ${String(cycleWait.since ?? '').slice(11, 19)} UTC).`
+      : `Its ${cycleWait.action ?? 'write'} into a checkout the full verification snapshots waits until the cycle ends (since ${String(cycleWait.since ?? '').slice(11, 19)} UTC).`,
+    next: 'It continues by itself when the cycle ends; the wait does not count against its time limit.' }
+}
+
 /** Where a run stands, for a person. See the header for the fields. */
 export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [], liveCheckSince = null } = {}) {
   if (!run) return null
+  // An operator's write on a run that is not running (finalize or reconcile of a blocked run, integrate, apply-artifact)
+  // waiting for a full verification: the wait is what the run is doing now, whatever its status says.
+  if (run.cycleWait && run.status !== 'running') return { ...cycleWaitStanding(run.cycleWait), status: run.status }
   const standing = withReleaseCoverage(run, withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership, liveCheckSince }), outputs, ownership))
   const unaccepted = riskStatement(run, acceptedRisks)
   if (!unaccepted) return standing
@@ -604,6 +616,8 @@ function standingOf (run, { outputs, active, ownership, liveCheckSince = null })
           detail: `${run.moduleLocks.owed?.length ? 'The answer is recorded. ' : ''}Before it goes on this run needs ${lockWait.modules.join(', ')}, and ${holders.length ? `run ${holders.join(', ')}` : 'another run'} holds ${lockWait.modules.length === 1 ? 'it' : 'part of them'} now.`,
           next: 'It continues by itself once the modules are free; the wait does not count against its time limit.' }
       }
+      // A wait for a full verification (cycle-gates.mjs): a wait, not a pause; nothing to answer, it ends at the thaw.
+      if (run.cycleWait && !active.length) return cycleWaitStanding(run.cycleWait)
       const working = active.map((a) => ROLE(a.role))
       const doing = working.length ? `${Cap(working.join(' and '))} ${working.length === 1 ? 'is' : 'are'} working.` : 'Between turns.'
       // After a delivery return the author is reconciling a conflict with the project; the later of the two returns is what the run is doing.

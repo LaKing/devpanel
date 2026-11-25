@@ -12,6 +12,7 @@ import { explainRun } from '../server/runtime/run-explanation.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import { runMetrics } from '../server/runtime/run-metrics.mjs'
 import { engineFixture, scriptFor, simulateProcessDeath, cleanupFixtures } from './fakes/fixture.mjs'
+import { createCycleGates } from '../server/cycle-gates.mjs'
 
 const exec = promisify(execFile)
 const git = async (dir, ...args) => (await exec('git', ['-C', dir, ...args])).stdout
@@ -35,7 +36,7 @@ const NO_MARKERS = '      - id: no-markers\n        run: "! grep -q \'<<<<<<<\' 
  * after the reviews and before delivery. `policy`: what the host's reconcile
  * policy reads as (null: no host, as in an engine nothing supervises).
  */
-async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', commands = NO_MARKERS, first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null, setup = null, symlinks = null } = {}) {
+async function scenario ({ author = null, beforeDelivery = null, policy = {}, playbook = 'implementation', commands = NO_MARKERS, first = { worktree: { 'server.mjs': CANDIDATE }, source: { 'server.mjs': SOURCE, 'other.txt': 'landed meanwhile\n' } }, hooks = null, setup = null, symlinks = null, gate = null } = {}) {
   let engine = null
   let confirms = 0
   const prompts = []
@@ -72,6 +73,8 @@ async function scenario ({ author = null, beforeDelivery = null, policy = {}, pl
   engine = await startRun({ ...f, issue: { ...f.issue, project: 'devpanel-project' }, deliveryProvider: worktreeDiffDelivery, expectConfigHash: resolved.resolved.configHash, runOptions: options })
   if (policy !== null) engine.reconcilePolicy = () => policy
   Object.assign(engine.hooks, hooks ?? {})
+  // A full verification's write gate (cycle-gates.mjs), as the supervisor installs it on a contained run.
+  if (gate) engine.cycleGate = gate(engine)
   let died = null
   await engine.drive().catch((error) => { if (!error.simulatedCrash) throw error; died = error })
   const reopen = async () => {
@@ -184,6 +187,41 @@ export default async function (t) {
       t.ok('the closure says why nothing went back to the author', /budget is spent/.test(run.closure?.deliveryNotReturned ?? ''), run.closure?.deliveryNotReturned)
       t.eq('no return step, and no step past the budget', [run.steps.some((s) => s.decision?.key === 'implement-review:return'), agents(run)], [false, limit])
       await done(engine)
+    }
+
+    t.section('G8d a delivery return into a snapshotted source waits for the full verification; the base moves only after the thaw')
+    {
+      const gates = createCycleGates()
+      let observed = null
+      let frozeOnce = false
+      const s = await scenario({
+        author: async (round, file) => { await fs.writeFile(file, RECONCILED) },
+        gate: (engine) => {
+          const g = gates.gateFor({ project: 'devpanel-project', runId: engine.runId, writes: true, whole: false })
+          return { ...g, tryWrite (repositories, options = {}) {
+            // The cycle freezes after the refused delivery ended and before its return asks, snapshotting that source.
+            if (options.action === 'delivery-return' && !frozeOnce) {
+              frozeOnce = true
+              gates.setFreeze({ cycleId: 'r1', projects: ['devpanel-project'], snapshotted: { repositories: [...repositories], worktrees: [] } })
+              const poll = setInterval(() => {
+                if (engine.run.cycleWait?.action !== 'delivery-return') return
+                clearInterval(poll)
+                observed = { returns: engine.run.deliveryReturns?.length ?? 0, pending: engine.run.pendingDeliveryReturn ?? null, base: engine.run.workspace.baseCommit, waiters: gates.waiters().map((w) => w.action) }
+                gates.thaw('r1')
+              }, 10)
+            }
+            const answer = g.tryWrite(repositories, options)
+            return answer
+          } }
+        }
+      })
+      const run = s.engine.run
+      t.ok('the return waited for the cycle before it moved anything', observed !== null, JSON.stringify({ status: run.status, blocked: run.blockedReason, waits: run.cycleWaits }))
+      t.eq('while it waited: no return recorded, no journal, the base unmoved, only the return in the queue', [observed?.returns, observed?.pending, observed?.base === run.deliveryReturns?.[0]?.from?.baseCommit, observed?.waiters], [0, null, true, ['delivery-return']])
+      t.eq('after the thaw the return ran and the reconciled revision was delivered', `${run.status} ${run.outcome} ${run.deliveryReturns?.length}`, 'completed resolved 1', `${run.blockedReason} ${run.delivery?.error}`)
+      t.eq('the wait is on the record, stamped by the gate', (run.cycleWaits ?? []).map((w) => [w.kind, w.action, w.cycleId, w.endSeq, w.outcome]), [['write', 'delivery-return', 'r1', 1, 'thawed']])
+      t.eq('the source holds the reconciliation', await source(s.f), RECONCILED)
+      await done(s.engine)
     }
 
     t.section('2. the bound: a third conflict blocks as before, saying why')

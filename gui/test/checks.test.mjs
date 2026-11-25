@@ -92,6 +92,26 @@ export default async function (t) {
     t.eq('the reconstruction worktree is gone', stdout.trim().split(NL).length, 2)
   }
 
+  t.section('reconstruction-wait-keeps-smoke-instance: the reconstruction\'s cleanup never waits for a cycle; refused, it leaves the registration for a later prune')
+  {
+    const c = await candidate()
+    const asked = []
+    // The cycle froze after the reconstruction was registered: its write was admitted, the cleanup's is refused at once.
+    const writeGate = async (repositories, options = {}) => {
+      asked.push({ repositories, noWait: Boolean(options.noWait) })
+      if (options.noWait) throw Object.assign(new Error('a full verification snapshots this repository; the write was left for later'), { code: 'CYCLE_WRITE_DEFERRED', cycleId: 'cx' })
+      return { release () {} }
+    }
+    const result = await runChecks({
+      target: { kind: 'local', commands: [{ id: 'value', run: 'test "$(cat value.txt)" = 2' }] },
+      revision: c.fp.fingerprint, fingerprint: c.fp, baseCommit: c.ws.baseCommit, baseline: c.baseline, workspacePath: c.ws.path, runDir: c.runDir, writeGate
+    })
+    t.eq('the drive passed and the cleanup asked without waiting', [result.result, asked.map((a) => a.noWait)], ['passed', [false, true]], result.error)
+    t.eq('refused, the registration is left and named', [result.reconstructionLeft?.cycleId, (await run('git', ['-C', c.projectPath, 'worktree', 'list'])).stdout.trim().split(NL).length], ['cx', 3])
+    await run('git', ['-C', c.projectPath, 'worktree', 'prune'])
+    t.eq('its directory is gone, so a later prune removes the registration', (await run('git', ['-C', c.projectPath, 'worktree', 'list'])).stdout.trim().split(NL).length, 2)
+  }
+
   t.section('1b. compareBaseline: the base commit checked alone, and a per-command line diff')
   {
     const c = await candidate()

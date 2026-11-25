@@ -99,9 +99,9 @@ export function cycleGate (check, { failures = null, selftest = null } = {}) {
 }
 
 /** Drive the full tier on the run's snapshot and judge it against the previous green cycle. */
-export async function fullVerificationDrive ({ target, workspace, runDir, runId, project, stage, verificationDir, clock, signal = null, platform, onDriveWait = null, drive = runChecks, mode = 'release' }) {
+export async function fullVerificationDrive ({ target, workspace, runDir, runId, project, stage, verificationDir, clock, signal = null, platform, onDriveWait = null, drive = runChecks, mode = 'release', resolved = null }) {
   const check = await drive({ target, revision: null, base: true, dirName: DRIVE_DIR, baseCommit: workspace.baseCommit, workspacePath: workspace.path, gitDir: workspace.gitDir ?? null,
-    runDir, clock, signal, platform, runId, onDriveWait })
+    runDir, clock, signal, platform, runId, onDriveWait, ...(resolved ? { resolved } : {}) })
   const previous = await previousGreen({ verificationDir, project, stage, exceptRunId: runId, mode })
   let base = null
   let baseline = null

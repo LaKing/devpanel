@@ -71,6 +71,7 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
   const finish = () => ({ ...receipt, application })
   const refuse = (state, message) => { application = { ...application, state, error: message }; return finish() }
   let locks = []
+  let cycleTicket = null
   let temporary, rebuilt
   const journal = path.join(runDir, 'source-application.json')
   try {
@@ -102,6 +103,8 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     }
     const routeList = [...routes.values()].sort((a, b) => a.path.localeCompare(b.path))
     const repositories = [...new Set([source.repository, ...routeList.map(r => r.repository)])].sort()
+    // The full verification's write gate (cycle-gates.mjs), with the exact repositories this delivery locks.
+    cycleTicket = hooks.cycleGate ? await hooks.cycleGate(repositories) : null
     locks = await acquireSourceLocks(repositories, { purpose: 'source-delivery', runId: path.basename(runDir), clock, waitMs: hooks.sourceLockWaitMs })
     const snapshots = new Map()
     for (const route of [{ path: source.path, repository: source.repository }, ...routeList]) {
@@ -274,5 +277,6 @@ export async function applyToOwners ({ workspace, baseline, revision, candidate,
     if (rebuilt) await exec('git', [...reconstructionRepository(workspace), 'worktree', 'remove', '--force', rebuilt]).catch(() => {})
     if (temporary) await fs.rm(temporary, { recursive: true, force: true }).catch(() => {})
     await releaseSourceLocks(locks)
+    cycleTicket?.release()
   }
 }
