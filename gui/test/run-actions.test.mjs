@@ -4,7 +4,7 @@ import path from 'node:path'
 import { startRun, releaseOwnership } from '../server/runtime/launch.mjs'
 import { acceptCheckUnavailable, continueUnavailable, integrateUnavailable, refreshChecksUnavailable, refreshFacts, resumeUnavailable, retryInputUnavailable } from '../server/runtime/run-control.mjs'
 import { reconcileUnavailable } from '../server/runtime/source-reconcile.mjs'
-import { getRun } from '../server/runs-api.mjs'
+import { getRun, listRuns } from '../server/runs-api.mjs'
 import { summarisePackedRun, summariseRun } from '../server/supervisor-summary.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import { engineFixture, scriptFor, blocking, cleanupFixtures } from './fakes/fixture.mjs'
@@ -94,6 +94,30 @@ export default async function (t) {
     t.eq('no check target anywhere: a 409', [noTarget?.status, /configured target/.test(noTarget?.message ?? '')], [409, true])
     engine.run.blockedReason = 'rounds-exhausted'
     await releaseOwnership(engine)
+
+    t.section('the panel\'s run list: an unreadable record fails the read, never reads as no runs (AC2)')
+    t.eq('the run detail says whether the run writes the checkout, for the freeze rule', detail.admission, { writesCheckout: true, cycleId: null })
+    t.eq('cleanup recorded or absent: cleanupUnrecorded false', [detail.cleanupUnrecorded, (await listRuns(f.issuePath, { strict: true }))[0]?.cleanupUnrecorded], [false, false])
+    await fs.mkdir(path.join(f.issuePath, 'runs', 'reserved-not-written'), { recursive: true })
+    t.eq('a run directory with no run.json yet is not a run, strict or not', (await listRuns(f.issuePath, { strict: true })).map((r) => r.runId), [engine.runId])
+    await fs.mkdir(path.join(f.issuePath, 'runs', 'broken'), { recursive: true })
+    await fs.writeFile(path.join(f.issuePath, 'runs', 'broken', 'run.json'), '{')
+    const failed = await listRuns(f.issuePath, { strict: true }).then(() => null, (error) => error)
+    t.eq('a malformed run.json fails the strict read with 503 naming the run', [failed?.status, /broken/.test(failed?.message ?? '')], [503, true])
+    t.eq('other callers keep reading what they can', (await listRuns(f.issuePath)).map((r) => r.runId), [engine.runId])
+    await fs.rm(path.join(f.issuePath, 'runs', 'broken'), { recursive: true })
+
+    // AC2: outputs that exist but cannot be read fail the panel's list and detail, never read as no outputs.
+    const outputsDir = path.join(f.issuePath, 'runs', engine.runId, 'outputs')
+    await fs.rename(outputsDir, `${outputsDir}.kept`)
+    await fs.writeFile(outputsDir, 'not a directory')   // readdir fails with ENOTDIR
+    const listFailed = await listRuns(f.issuePath, { strict: true }).then(() => null, (error) => error)
+    t.eq('an unreadable outputs directory fails the strict list (503)', listFailed?.status, 503)
+    const detailFailed = await getRun(f.issuePath, engine.runId, { issues: f.issues, project: 'devpanel-project', issueId: f.issue.id, strict: true }).then(() => null, (error) => error)
+    t.eq('…and the strict run detail (503)', [detailFailed?.status, /outputs/.test(detailFailed?.message ?? '')], [503, true])
+    t.eq('other callers still read the run', (await listRuns(f.issuePath)).map((r) => r.runId), [engine.runId])
+    await fs.rm(outputsDir)
+    await fs.rename(`${outputsDir}.kept`, outputsDir)
   }
 
   t.section('a packed issue changes nothing')

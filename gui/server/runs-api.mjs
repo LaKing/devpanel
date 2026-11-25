@@ -14,6 +14,12 @@ import { explainRun } from './runtime/run-explanation.mjs'
 import { closureWithAcceptances, readAcceptedRisks } from './runtime/residual-risks.mjs'
 import { ownerLiveness } from './runtime/lock.mjs'
 import { hostPlatform } from './runtime/platform.mjs'
+import { openCleanup, unrecordedCleanup } from './runtime/cleanup-barrier.mjs'
+import { writesCheckout } from './run-exclusivity.mjs'
+
+/** A recovery still owed: the same facts issues.js markArchived refuses an archive for. */
+const recoveryPending = (run) => Boolean(run.recovery?.required || run.blockedReason === 'recovery-required' ||
+  Object.values(run.participants ?? {}).some((p) => p.pendingInvocation || p.state === 'recovery-required'))
 import { readAutoStart } from './auto-start.mjs'
 
 /*
@@ -34,14 +40,20 @@ async function issueDir (issues, project, id) {
   return issue
 }
 
-/** Every run recorded against an issue, newest first. */
-export async function listRuns (issuePath) {
+/**
+ * Every run recorded against an issue, newest first. With `strict` (the panel's run list) a run directory
+ * or record that exists but cannot be read is an error (503), never left out: a page must not read an
+ * incomplete list as current (issues.js markArchived refuses the same failure). Only a missing runs/ or a
+ * run directory with no run.json yet (reserved, not written) is absent.
+ */
+export async function listRuns (issuePath, { strict = false } = {}) {
   let names = []
   try {
     names = (await fs.readdir(store.runsDir(issuePath), { withFileTypes: true }))
       .filter((e) => e.isDirectory() && !e.name.startsWith('worktree-') && !e.name.startsWith('workspace-'))
       .map((e) => e.name)
-  } catch {
+  } catch (error) {
+    if (strict && error.code !== 'ENOENT') throw err(503, `the issue's runs cannot be listed: ${error.message}`)
     return []
   }
 
@@ -50,7 +62,7 @@ export async function listRuns (issuePath) {
   for (const runId of names) {
     try {
       const run = await store.readRun(issuePath, runId)
-      const outputs = await store.readOutputs(issuePath, runId)
+      const outputs = await store.readOutputs(issuePath, runId, { strict })
       runs.push({
         runId: run.runId,
         supervisorLaunchId: run.supervisorLaunchId ?? null,
@@ -59,6 +71,11 @@ export async function listRuns (issuePath) {
         outcome: run.outcome,
         ...runResult(run, outputs),
         blockedReason: run.blockedReason,
+        // What archiving the issue would be refused for (issues.js markArchived): the page checks Close against it.
+        reconcilePending: reconcilePending(run),
+        recoveryPending: recoveryPending(run),
+        // Open cleanup entries the project barrier does not hold (supervisor.mjs deleteRun, issues.js requireCleanupRecorded).
+        cleanupUnrecorded: (await unrecordedCleanup(path.dirname(issuePath), run)).length > 0,
         explanation: explainRun(run, { outputs, acceptedRisks }),
         startedAt: run.startedAt,
         endedAt: run.endedAt,
@@ -70,7 +87,12 @@ export async function listRuns (issuePath) {
         // Only a blocked run can offer refresh-checks, which needs its snapshot.
         supportedActions: supportedActions(run, run.status === 'blocked' ? { refresh: refreshFacts(await store.readSnapshot(issuePath, run.runId).catch(() => null)) } : {})
       })
-    } catch { /* a half-written run directory is not a run */ }
+    } catch (error) {
+      // A half-written run directory (no run.json yet) is not a run; any other failure is one under strict.
+      if (strict && !(error.code === 'ENOENT' && error.path === path.join(store.runsDir(issuePath), runId, 'run.json'))) {
+        throw err(503, `run ${runId} cannot be read: ${error.message}`)
+      }
+    }
   }
   return runs.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
 }
@@ -79,7 +101,7 @@ export async function listRuns (issuePath) {
  * One run, assembled into the shape a timeline needs: every turn with its role,
  * model, prompt, response, structured output and revision.
  */
-export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, liveCheckSince = null, platform = hostPlatform() }) {
+export async function getRun (issuePath, runId, { issues, project, issueId, isActive = false, liveCheckSince = null, strict = false, platform = hostPlatform() }) {
   let run
   try {
     run = await store.readRun(issuePath, runId)
@@ -101,7 +123,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
 
   const [snapshot, outputs, prompts, events] = await Promise.all([
     store.readSnapshot(issuePath, runId).catch(() => null),
-    store.readOutputs(issuePath, runId),
+    // With `strict` (the panel's run detail) outputs that exist but cannot be read fail the read (503), never read as none.
+    store.readOutputs(issuePath, runId, { strict }).catch((error) => { throw err(503, `this run's outputs cannot be read: ${error.message}`) }),
     store.readPrompts(issuePath, runId),
     store.inspectRunJournal(issuePath, runId)
   ])
@@ -198,7 +221,12 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     ...runResult(run, outputs),
     blockedReason: run.blockedReason,
     reconcilePending: reconcilePending(run),
-    explanation: explainRun(run, { outputs, active, ownership, acceptedRisks }),
+    recoveryPending: recoveryPending(run),
+    cleanupUnrecorded: (await unrecordedCleanup(path.dirname(issuePath), run)).length > 0,
+    // What a full verification's freeze refuses for this run (supervisor.mjs answer :770): whether it writes the
+    // checkout (an unreadable snapshot counts as writing) and the cycle it belongs to; the freeze is on the issue read.
+    admission: { writesCheckout: writesCheckout(snapshot), cycleId: run.fullVerification?.cycleId ?? null },
+    explanation: explainRun(run, { outputs, active, ownership, acceptedRisks, liveCheckSince }),
     // Only what the backend will actually accept. A button for anything else
     // would promise something the server refuses.
     actions,
@@ -209,6 +237,8 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     ...(run.checkAcceptanceRequest ? { checkAcceptanceRequest: run.checkAcceptanceRequest } : {}),
     ...(refusedAcceptance(run) ? { checkAcceptanceRefusal: refusedAcceptance(run) } : {}),
     recovery: run.recovery,
+    // Which unproved cleanup entries an acknowledgement would cover now: the page binds its dialog to them.
+    openCleanup: openCleanup(run).map((e) => e.tag),
     abandonment: run.abandonment ? { at: run.abandonment.at, by: run.abandonment.by } : null,
     pause: run.pause ?? null,
     pauseRequested: run.pauseRequested ?? null,

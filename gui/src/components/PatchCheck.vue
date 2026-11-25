@@ -1,7 +1,8 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { childReporter, createSeq } from '@/freshness'
 
 /*
  * Whether a run's patch would apply to the checkout NOW, asked every time the issue page shows
@@ -22,14 +23,35 @@ const loading = ref(false)
 
 const delivered = computed(() => props.run.delivery?.application?.state === 'complete' || props.run.artifactApplication?.verified === true || Boolean(props.run.integration?.mergeCommit))
 
+/* On the issue page: only the newest check for the run still shown applies, and it reports into the page indicator. */
+const freshness = inject('issueFreshness', null)
+const seq = createSeq()
+const reporter = childReporter(freshness?.registry, 'Patch check')
+onUnmounted(() => reporter.dispose())
+
 async function check () {
+  const runId = props.run.runId
+  const ticket = seq.next(runId)
   loading.value = true
-  error.value = ''
-  try { result.value = await api.patchCheck(props.project, props.issueId, props.run.runId) } catch (e) { error.value = e.message } finally { loading.value = false }
+  const settle = reporter.start()
+  try {
+    const next = await api.patchCheck(props.project, props.issueId, runId)
+    if (!seq.isLatest(ticket, props.run.runId)) return
+    result.value = next
+    error.value = ''
+    settle('ok')
+  } catch (e) {
+    if (!seq.isLatest(ticket, props.run.runId)) return
+    // The last result stays, with its time, beside the error.
+    error.value = e.message
+    settle('failed', e)
+  } finally { if (seq.isLatest(ticket, props.run.runId)) loading.value = false }
 }
 
-// Again when the run changes, or when its patch was just applied from this page.
-watch(() => [props.run.runId, props.run.artifactApplication?.verified, props.run.delivery?.application?.state], check, { immediate: true })
+watch(() => props.run.runId, () => { result.value = null; error.value = '' })
+// Again when the run changes, when its patch was just applied from this page, after each page refresh and on Retry:
+// "applies now" is never older than the page.
+watch(() => [props.run.runId, props.run.artifactApplication?.verified, props.run.delivery?.application?.state, freshness?.synced.value, freshness?.retry.value], check, { immediate: true })
 
 const conflicts = computed(() => (result.value?.owners ?? []).filter((o) => o.state === 'conflicts'))
 const files = computed(() => conflicts.value.flatMap((o) => o.conflicts ?? []))
@@ -38,7 +60,7 @@ const applied = computed(() => (result.value?.owners ?? []).filter((o) => o.stat
 const view = computed(() => {
   const r = result.value
   if (loading.value && !r) return { icon: '$circleOutline', text: 'Checking whether the patch applies to the checkout…' }
-  if (error.value) return { icon: '$alertCircle', text: `The patch could not be checked: ${error.value}` }
+  if (error.value && !r) return { icon: '$alertCircle', text: `The patch could not be checked: ${error.value}` }
   if (!r) return null
   if (r.state === 'applies') return { icon: '$checkCircle', color: 'success', text: delivered.value ? 'The patch would apply again: the checkout no longer contains it.' : 'The patch applies cleanly to the checkout now.' }
   if (r.state === 'applied') return { icon: '$checkCircle', color: 'success', text: 'The patch is already in the checkout.' }
@@ -56,6 +78,7 @@ const at = computed(() => (result.value?.checkedAt ? new Date(result.value.check
       <v-icon :icon="view.icon" size="16" :color="view.color" />
       <span>{{ view.text }}</span>
       <span v-if="at" class="pcheck__at" title="A textual git check at this moment; it does not test the code">checked {{ at }}</span>
+      <span v-if="error && result" class="pcheck__at">· checking again failed: {{ error }}</span>
       <v-btn icon="$refresh" size="x-small" variant="text" :loading="loading" aria-label="Check again" title="Check again" @click="check" />
     </div>
     <ul v-if="files.length && result?.state === 'conflicts'" class="pcheck__files">

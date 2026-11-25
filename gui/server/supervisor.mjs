@@ -421,15 +421,22 @@ export function createSupervisor ({
       // no run behind. Only an operator may start past a hold, and only with a
       // reason; the start then goes ahead and the override is kept with the run.
       if (pregate && resolution.ok && resolution.resolved.tactic === 'triage') {
+        let expectKey = null
         if (pregateOverride != null) {
           const reason = typeof pregateOverride.reason === 'string' ? pregateOverride.reason.trim() : ''
           if (!reason || reason.length > OVERRIDE_REASON_MAX) throw err(400, `starting past the pre-gate needs a reason of 1-${OVERRIDE_REASON_MAX} characters`)
           if (pregateOverride.by !== 'operator') throw err(403, 'only an operator can start past the pre-gate')
+          expectKey = typeof pregateOverride.expectKey === 'string' ? pregateOverride.expectKey : null
           pregateOverride = { by: 'operator', reason, at: new Date().toISOString() }
         }
         try {
           pregateRecord = await pregate.check({ project, issueId })
+          // An override names the hold it was shown; with none holding now there is nothing to override.
+          if (expectKey) throw err(409, 'the pre-gate no longer holds this issue', { code: 'PREGATE_CHANGED' })
         } catch (error) {
+          if (error instanceof PregateHold && expectKey && error.record?.key !== expectKey) {
+            throw err(409, 'the pre-gate decision changed since it was shown', { code: 'PREGATE_CHANGED', pregate: error.pregate })
+          }
           if (!(error instanceof PregateHold) || !pregateOverride) throw error
           pregateRecord = error.record
           pregateOverride.held = { gate: error.pregate.gate, confidence: error.pregate.confidence }

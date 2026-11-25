@@ -1,7 +1,8 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, inject, ref } from 'vue'
 
 import { api } from '@/api'
+import { offers } from '@/action-offers'
 import { connection } from '@/socket'
 
 /*
@@ -18,6 +19,7 @@ const props = defineProps({
   issueId: { type: String, required: true },
   disabled: { type: Boolean, default: false }
 })
+const freshness = inject('issueFreshness', null)
 const emit = defineEmits(['added'])
 
 const name = ref('')
@@ -67,17 +69,37 @@ async function submit () {
     // The step is created first, with whatever text and links were given, so
     // there is somewhere for the files to go — and so a failed upload leaves a
     // step holding the note rather than nothing at all.
-    let step = await api.createStep(props.project, props.issueId, {
+    const body = {
       name: name.value.trim() || null,
       text: text.value.trim() || null,
       format: format.value,
       links: links.value.length ? links.value : null
-    })
+    }
+    // On the issue page: added only to the issue this was written on, and only while it takes additions.
+    // Every write goes to this captured location, and each one (the step, then every file) passes the guard.
+    const location = { project: props.project, issueId: props.issueId }
+    const write = async (label, send) => {
+      if (!freshness) return { sent: true, value: await send() }
+      return freshness.guard({
+        label, runId: null, before: location,
+        identity: () => ({ project: freshness.issue()?.project ?? location.project, issueId: freshness.issue()?.id ?? location.issueId }),
+        offered: freshness.offerOn(offers.addToIssue)
+      }, () => send())
+    }
+    const created = await write('Add to issue', () => api.createStep(location.project, location.issueId, body))
+    if (!created.sent) { error.value = created.notice; return }
+    let step = created.value
 
     const queue = chosen.value
     for (const [index, file] of queue.entries()) {
       progress.value = `uploading ${index + 1} of ${queue.length} — ${file.name}`
-      step = await api.addStepFile(props.project, props.issueId, step.number, file)
+      const uploaded = await write(`Attach ${file.name}`, () => api.addStepFile(location.project, location.issueId, step.number, file))
+      if (!uploaded.sent) {
+        error.value = `${uploaded.notice} The note was added as step ${step.number}; ${queue.length - index} file(s) were not.`
+        emit('added', step)
+        return
+      }
+      step = uploaded.value
     }
 
     reset()

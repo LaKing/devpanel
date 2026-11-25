@@ -15,7 +15,7 @@ deliver, deploy or archive; whoever acts on its answer does so within their own 
 
 | Asker | What goes to the panel | Where |
 |---|---|---|
-| A run's seat | an owner hold (`ownerHolds`: `access`, `security`, `documented-promise`) | `engine.consultFirst`, before the pause |
+| A run's seat | an owner hold (`ownerHolds`: `access`, `security`, `documented-promise`) | `engine.consultFirst`: for a hold stated in plan review, before the plan loop's next turn, end of rounds or budget block; else before the pause |
 | A run's coordinator | an `operatorRequest` of category `owner-gate` or `requirement-conflict`; `technical` (below) | `engine.applyOperatorRequests` |
 | Triage | each question of a `needs-owner-input` ending | `consult/owner-questions.mjs`, after the run's end |
 | The top-level supervisor | its own question (`consult`), and the wording of what it asks the operator | `top-supervisor.mjs` |
@@ -176,6 +176,14 @@ failure records the model in the availability store.
 - **escalated** or **unavailable**: the run pauses as before, and `run.pause` carries `consult` (outcome, reason,
   positions) and, when escalated, `brief`. The issue page shows the brief first; the technical wording stays below.
 - The outcome is the panel's rule. Nothing a coordinator writes turns an escalation into an answer.
+- **A hold stated in plan review** is asked before the plan loop goes on: before its next turn, its end of rounds
+  or a budget block (execution-contract.md "Owner holds"). Resolved, the next brief, plan and audits read the
+  decision in `decisions`; escalated, the run pauses with the brief before that turn; when the panel answers
+  unavailable it pauses with `pause.consult` and no brief, and with no panel configured or the panel switched off it
+  pauses with neither. After a seat is cut at the wall-clock deadline, the panel is asked once the round has
+  settled and before the budget block is written. It is asked once, also
+  after a restart or a refresh, and a crash replays to one consult. A repeat under the same id with exactly the
+  same question keeps its answer; a reworded question is asked again.
 
 The time a consult takes is excused from the wall clock like a wait for a person, credited per stretch it ran.
 Stopping the run cancels the panel's turns and leaves `run.consulting` naming the consult, so a resume goes on with

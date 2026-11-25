@@ -1,7 +1,8 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { createTracker, guardPass, judgeAction, pageCurrent, runGuard } from '@/freshness'
 import { connection } from '@/socket'
 
 /*
@@ -12,22 +13,86 @@ import { connection } from '@/socket'
  * runs of other projects go on, and each stage is verified.
  */
 
-const state = ref(null)
+const props = defineProps({
+  /** On the Full verification page: the page's snapshot. The card then reads nothing itself. */
+  latest: { type: Object, default: undefined },
+  /** The page's guard, so "Full verification now" is checked against the page's own refresh. */
+  guard: { type: Function, default: null },
+  /** Refresh the page after a start. */
+  reload: { type: Function, default: null }
+})
+
+const own = ref(null)
+const state = computed(() => (props.latest !== undefined ? props.latest : own.value))
 const error = ref('')
 const starting = ref(false)
 const confirming = ref(false)
 
-async function load () {
-  try { state.value = await api.verificationLatest(); error.value = '' } catch (err) { error.value = err.message }
+/*
+ * On the dashboard the card reads for itself: only its newest read applies, and a
+ * verification event, a reconnect or a tab return invalidates a read in flight.
+ */
+const freshState = reactive({})
+const tracker = createTracker(freshState)
+async function readLatest () {
+  const ticket = tracker.begin()
+  try {
+    const next = await api.verificationLatest()
+    if (!tracker.isLatest(ticket)) return 'superseded'
+    own.value = next
+    error.value = ''
+    tracker.succeed(ticket, { epoch: connection.epoch })
+    return 'ok'
+  } catch (err) {
+    if (tracker.fail(ticket, err)) error.value = err.message
+    return 'failed'
+  }
 }
+const load = () => (props.latest === undefined ? readLatest() : null)
+const invalidate = () => { if (props.latest === undefined) { tracker.invalidate(); load() } }
+
+/** The dashboard's own guard: the same rule as the page's, over its own read. */
+async function ownGuard (spec, send) {
+  const result = await runGuard(() => guardPass({
+    refresh: 'always',
+    // The dashboard left: nothing more is checked or sent.
+    alive: () => !disposed,
+    current: () => pageCurrent(freshState, connection),
+    load: readLatest,
+    seq: () => freshState.seq,
+    check () {
+      const verdict = judgeAction({ offered: spec.offered(), before: spec.before, after: spec.identity() })
+      return verdict.send ? null : { reason: verdict.reason }
+    },
+    send: () => send()
+  }))
+  if (result.kind === 'send') return { sent: true, value: await result.value }
+  return { sent: false, notice: result.reason === 'unconfirmed' ? `Could not confirm the current state (${freshState.error ?? 'no answer'}); nothing was sent.` : NOT_SENT }
+}
+const NOT_SENT = 'A cycle is already running (or the cycle changed); nothing was sent.'
+
+/* What the confirmation was opened on: a cycle that started or changed since refuses the start. */
+const identityOf = (s) => ({ cycleId: s?.cycle?.id ?? null, active: Boolean(s?.active) })
+let shown = null
+watch(confirming, (open) => { if (open) shown = identityOf(state.value) })
 
 async function startNow () {
   starting.value = true
-  try { await api.startVerification(); confirming.value = false; await load() } catch (err) { error.value = err.message } finally { starting.value = false }
+  try {
+    const spec = { label: 'Full verification now', before: shown, identity: () => identityOf(state.value), offered: () => !state.value?.active }
+    const r = await (props.guard ?? ownGuard)(spec, () => api.startVerification())
+    confirming.value = false
+    if (!r.sent) { error.value = r.notice; return }
+    await (props.reload ?? load)()
+  } catch (err) { error.value = err.message } finally { starting.value = false }
 }
 
+let disposed = false
+onUnmounted(() => { disposed = true; tracker.reset() })
 onMounted(load)
-watch(() => connection.verification?.at, load)
+watch(() => connection.verification?.seq, invalidate)
+watch(() => connection.epoch, invalidate)
+watch(() => connection.resumes, invalidate)
 
 const cycle = computed(() => state.value?.cycle ?? null)
 const verdictColor = (v) => (v === 'green' ? 'success' : v === 'red' ? 'error' : undefined)

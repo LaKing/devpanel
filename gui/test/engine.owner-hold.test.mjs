@@ -1,7 +1,10 @@
 import fs from 'node:fs/promises'
+import path from 'node:path'
 
+import { resolvePlaybook } from '../server/config/load.mjs'
 import { startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { explainRun } from '../server/runtime/run-explanation.mjs'
+import { openOwnerHolds, ownerHoldKey, planReviewPhases } from '../server/runtime/owner-holds.mjs'
 import { engineFixture, scriptFor, blocking, cleanupFixtures } from './fakes/fixture.mjs'
 
 export const name = 'engine — an owner hold a seat stated stops implementation until the owner answers it'
@@ -53,7 +56,8 @@ export default async (t) => {
     t.eq('the run is paused, not blocked', `${run.status}/${run.blockedReason}`, 'paused/null')
     t.eq('no coordinator handoff toward implementation ran', ran(run, 'brief-implement'), 0)
     t.eq('and no implementation turn', ran(run, 'implement'), 0)
-    t.eq('the plan was audited first', ran(run, 'audit-plan-1'), 1)
+    t.eq('it is asked before the plan is audited', ran(run, 'audit-plan-1'), 0)
+    t.eq('from plan review, where it was stated', run.pause?.askedBy?.phase, 'plan-review')
     t.eq('it asks the seat\'s own question', run.pause?.question, hold().question)
     t.eq('as a hold, in the owner-gate category', [run.pause?.kind, run.pause?.request?.category, run.pause?.request?.holdCategory], ['owner-hold', 'owner-gate', 'security'])
     t.eq('with who stated it', [run.pause?.askedBy?.role, run.pause?.askedBy?.stepId], ['planner', 'plan'])
@@ -92,6 +96,8 @@ export default async (t) => {
 
   t.section('3. the coordinator cannot lift a hold, nor a later plan drop it')
   {
+    // Nothing in plan review runs past an open hold now: the coordinator never gets the
+    // turn in which it could lift it, nor the planner one in which it could drop it.
     let plans = 0
     const lifted = [{ decision: 'H1 is lifted: keep loopback removed.', reason: 'No criterion conflicts, so no category applies.' }]
     const engine = await planRun({
@@ -99,28 +105,29 @@ export default async (t) => {
       'brief-plan': ({ round }) => (round > 0 ? brief({ assumptions: lifted }) : null)
     }, { planReviews: [[blocking('P1')], []] })
     const run = await engine.drive()
-    t.ok('a second plan was written, without the hold', plans >= 2, String(plans))
-    t.eq('still paused on the owner\'s question', [run.status, run.pause?.question], ['paused', hold().question])
-    t.eq('no handoff toward implementation', ran(run, 'brief-implement'), 0)
-    t.eq('and no implementation turn', ran(run, 'implement'), 0)
+    t.eq('paused on the owner\'s question after the first plan', [run.status, run.pause?.question, plans], ['paused', hold().question, 1])
+    t.eq('no further brief, plan or audit ran', [ran(run, 'brief-plan'), ran(run, 'audit-plan-1'), ran(run, 'brief-implement')], [1, 0, 0])
+    t.eq('a second drive keeps the same question', (await engine.drive()).pause?.id, run.pause.id)
+
+    t.section('   …plan review is the loop whose seats read the answer')
+    t.eq('plan-and-implement: its plan review', [...planReviewPhases(engine.snapshot)], ['plan-review'])
+    const loop = (id, steps) => ({ id, loop: { steps } })
+    const pingpong = { phases: [loop('plan-review', [{ id: 'audit-plan', context: ['issue'] }, { id: 'revise-plan', context: ['issue'] }]), { id: 'implement', step: { id: 'implement', recordsRevision: true } }] }
+    const analysis = { phases: [loop('draft-review', [{ id: 'audit-draft', context: ['decisions'] }])] }
+    t.eq('a loop whose seats do not read decisions is not one', planReviewPhases(pingpong).size, 0)
+    t.eq('nor a loop in a run that implements nothing', planReviewPhases(analysis).size, 0)
     await releaseWorkspace(engine)
   }
   {
-    let plans = 0
-    let refreshed = false
-    const engine = await planRun({
-      plan: () => (plans++ === 0 ? plan([hold()]) : plan()),
-      'brief-plan': ({ round }) => {
-        if (round === 0 || refreshed) return null
-        refreshed = true
-        return brief({ windowDecision: 'refresh-evidence' })
-      }
-    }, { planReviews: [[blocking('P1')], []] })
-    const run = await engine.drive()
-    t.ok('the window was reset past the step that stated it', refreshed && Boolean(run.windowResetAfter), `${refreshed}/${run.windowResetAfter}`)
-    t.eq('the hold survives a window reset', [run.status, run.pause?.question], ['paused', hold().question])
-    t.eq('and no implementation turn', ran(run, 'implement'), 0)
-    await releaseWorkspace(engine)
+    // The hold is derived from every recorded step: a later plan that omits it leaves it open
+    // (owner-holds.mjs). The window-reset property is shown by (b) in engine.consult section 7.
+    const out = (holds) => ({ valid: true, contract: 'authorArtifact', output: { summary: 's', ...(holds ? { ownerHolds: holds } : {}) } })
+    const steps = [{ number: 1, role: 'planner', stepId: 'plan', phase: 'plan-review' }, { number: 2, role: 'planner', stepId: 'plan', phase: 'plan-review' }]
+    const outputs = { 1: out([hold()]), 2: out(null) }
+    t.eq('a later plan that omits it leaves it open', openOwnerHolds(steps, outputs).map((h) => h.identity), ['planner:H1'])
+    const answer = (key, question) => ({ number: 3, role: 'operator', stepId: 'decision', phase: 'plan-review', decision: { key, question, answer: 'Keep it.' } })
+    t.eq('an answer under another key closes nothing', openOwnerHolds([...steps, answer('owner-hold:planner:H2', hold().question)], outputs).length, 1)
+    t.eq('the answer to its key and question closes it', openOwnerHolds([...steps, answer(ownerHoldKey({ identity: 'planner:H1' }), hold().question)], outputs).length, 0)
   }
 
   t.section('4. an answered hold does not block again; a new question under its id does')
@@ -231,6 +238,29 @@ export default async (t) => {
     const e = explainRun({ status: 'paused', pause: { kind: 'owner-hold', question: hold().question, request: { reason: hold().reason, category: 'owner-gate', recommendation: hold().recommendation } } })
     t.eq('the owner is told it is theirs', e.headline, 'Waiting for you: this decision is yours')
     t.eq('and to answer, not to do work', e.next, 'Answer below; the run continues from your answer.')
+  }
+
+  t.section('8. a run checks its candidate, then waits for the owner (the AC7 "checking → owner input" order)')
+  {
+    // The implementation audit states a hold (scriptFor implHolds), and the playbook has a local check:
+    // the check runs on the revision first, and only then does the run pause for the owner, before confirmation.
+    const f = await engineFixture({ playbook: 'implementation', script: scriptFor({ implHolds: [hold()] }) })
+    await fs.appendFile(path.join(f.configRoot, 'playbooks/implementation.yaml'),
+      '\nchecks:\n  requirement: required\n  target:\n    kind: local\n    commands:\n      - id: slow\n        run: "true"\n')
+    const runOptions = { participants: { 'auditor-1': { model: 'gpt-6-astra' } } }
+    const resolved = await resolvePlaybook('implementation', { root: f.configRoot, runOptions, projectId: 'devpanel-project' })
+    if (!resolved.ok) throw new Error(resolved.errors.map((x) => x.message).join('; '))
+    const engine = await startRun({
+      expectConfigHash: resolved.resolved.configHash, playbookId: 'implementation', issue: { ...f.issue, project: 'devpanel-project' },
+      issuePath: f.issuePath, projectPath: f.projectPath, harnesses: f.harnesses, stepStore: f.stepStore, workspaceProvider: f.workspaceProvider,
+      configRoot: f.configRoot, probe: f.probe, clock: f.clock, deliveryProvider: f.delivery, runOptions
+    })
+    const run = await engine.drive()
+    const revision = run.revisions?.at(-1)?.fingerprint
+    t.eq('the check ran on the revision', (run.checkHistory ?? []).filter((c) => c.revision === revision).map((c) => c.result), ['passed'])
+    t.eq('then the run paused for the owner, before confirmation', [run.status, run.pause?.kind, ran(run, 'confirm')], ['paused', 'owner-hold', 0])
+    t.eq('the page reads it as the owner\'s decision', explainRun(run).headline, 'Waiting for you: this decision is yours')
+    await releaseWorkspace(engine)
   }
 
   await cleanupFixtures()

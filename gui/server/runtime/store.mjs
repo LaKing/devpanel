@@ -591,11 +591,15 @@ export async function readPrompts (issuePath, runId) {
 export const writeOutput = (issuePath, runId, number, data) =>
   writeJson(path.join(runDir(issuePath, runId), 'outputs', `${number}.json`), data)
 
-export async function readOutputs (issuePath, runId) {
+/** A run's structured outputs. With `strict` (the panel's refresh) only a missing outputs/ reads as none; any other failure throws. */
+export async function readOutputs (issuePath, runId, { strict = false } = {}) {
   const dir = path.join(runDir(issuePath, runId), 'outputs')
   const out = {}
   let names = []
-  try { names = await fs.readdir(dir) } catch { return out }
+  try { names = await fs.readdir(dir) } catch (error) {
+    if (strict && error.code !== 'ENOENT') throw error
+    return out
+  }
   for (const name of names.filter((n) => n.endsWith('.json'))) {
     out[name.replace(/\.json$/, '')] = await readJson(path.join(dir, name))
   }

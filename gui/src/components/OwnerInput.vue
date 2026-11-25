@@ -1,8 +1,9 @@
 <script setup>
 import QuestionBrief from '@/components/QuestionBrief.vue'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, inject, reactive, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { offers } from '@/action-offers'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
 
 /*
@@ -20,6 +21,8 @@ const props = defineProps({
   run: { type: Object, required: true }
 })
 const emit = defineEmits(['answered'])
+const freshness = inject('issueFreshness', null)
+const askedIdentity = (r) => r?.ownerInput && !r.ownerInput.answer ? { verdict: r.ownerInput.verdict ?? null, questions: (r.ownerInput.questions ?? []).map((q) => q.id) } : null
 
 const CATEGORY = {
   'owner-gate': 'you asked to confirm',
@@ -48,7 +51,13 @@ async function send (choice = null) {
   startError.value = ''
   try {
     const body = { actor: actorName(actor.value), note: note.value.trim() || null, ...(split.value ? { split: choice } : { answers: { ...answers } }) }
-    const out = await api.answerOwnerInput(props.project, props.issueId, props.run.runId, body)
+    const send = (t) => api.answerOwnerInput(t.project, t.issueId, t.runId, body)
+    let out
+    if (freshness) {
+      const r = await freshness.guard({ label: 'Answer the questions', runId: props.run.runId, before: askedIdentity(props.run), identity: (_, t) => askedIdentity(freshness.runOf(t.runId)), offered: freshness.offerOn(offers.ownerInput) }, send)
+      if (!r.sent) { error.value = r.notice; return }
+      out = r.value
+    } else out = await send({ project: props.project, issueId: props.issueId, runId: props.run.runId })
     if (out.startError) startError.value = `Answer recorded, but the next run did not start: ${out.startError.message}`
     emit('answered', out)
   } catch (err) {

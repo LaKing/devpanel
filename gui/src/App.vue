@@ -211,9 +211,11 @@ watch(isAuthenticated, (ok) => { if (ok) loadIdentity() }, { immediate: true })
         <strong>{{ unfenced.mode === 'unfenced' ? 'Unfenced:' : 'Seats refused:' }}</strong> {{ unfenced.reason }}.
         <template v-if="unfenced.mode === 'unfenced'">Seats run as namespace 0, local checks and tooling commands unconfined; every run records it.</template>
       </v-alert>
-      <router-view v-slot="{ Component }">
+      <!-- An issue page is bound to the issue it opened on: another issue mounts a new page, so no form,
+           dialog or draft of the old one can be sent to the new one (IssueView currentIssue). -->
+      <router-view v-slot="{ Component, route: shown }">
         <v-fade-transition mode="out-in">
-          <component :is="Component" />
+          <component :is="Component" :key="shown.name === 'issue' ? `issue:${shown.params.project}/${shown.params.id}` : shown.name" />
         </v-fade-transition>
       </router-view>
     </v-main>

@@ -1,6 +1,7 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, inject, ref } from 'vue'
 import { api } from '@/api'
+import { offers } from '@/action-offers'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
 import { wallClockAt, wallClockPrefill } from '@/wall-clock'
 
@@ -17,6 +18,10 @@ const props = defineProps({
   run: { type: Object, required: true }
 })
 const emit = defineEmits(['continued'])
+const freshness = inject('issueFreshness', null)
+/** The run and closure the dialog was opened on: Continue goes to that run only, and is refused once its closure changed. */
+let shownRevision = null
+let shownRunId = null
 
 const open = ref(false)
 const instruction = ref('')
@@ -28,6 +33,8 @@ const busy = ref(false)
 const error = ref('')
 
 function show () {
+  shownRunId = props.run.runId
+  shownRevision = props.run.closure?.revision ?? null
   instruction.value = ''
   wallClockMinutes.value = wallClockPrefill(props.run.wallClock) || (props.run.budgets?.limits?.wallClockMinutes ?? 0)
   acceptShort.value = false
@@ -43,7 +50,18 @@ async function submit () {
   try {
     const limit = props.run.budgets?.limits?.wallClockMinutes
     const budgets = wallClockMinutes.value && wallClockMinutes.value !== limit ? { wallClockMinutes: wallClockMinutes.value } : {}
-    await api.continueRun(props.project, props.issueId, props.run.runId, { instruction: instruction.value, actor: name, budgets, acceptShortWallClock: clock.value?.short === true && acceptShort.value })
+    const body = { instruction: instruction.value, actor: name, budgets, acceptShortWallClock: clock.value?.short === true && acceptShort.value }
+    const send = (t) => api.continueRun(t.project, t.issueId, t.runId, body)
+    if (freshness) {
+      const r = await freshness.guard({
+        label: 'Continue playbook',
+        runId: shownRunId,
+        before: shownRevision,
+        identity: (_, t) => freshness.runOf(t.runId)?.closure?.revision ?? null,
+        offered: freshness.offerOn(offers.continuation('continue'))
+      }, send)
+      if (!r.sent) { error.value = r.notice; return }
+    } else await send({ project: props.project, issueId: props.issueId, runId: shownRunId })
     open.value = false
     emit('continued')
   } catch (e) { error.value = e.message } finally { busy.value = false }

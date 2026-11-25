@@ -1,8 +1,10 @@
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 import { api } from '@/api'
-import { connection } from '@/socket'
+import { connection, socket } from '@/socket'
+import { createTracker, describe, displayedOrInflight, guardPass, judgeAction, pageCurrent, runGuard, runKey, startedEntries } from '@/freshness'
+import FreshnessIndicator from '@/components/FreshnessIndicator.vue'
 import FullVerificationCard from '@/components/FullVerificationCard.vue'
 import RunTimeline from '@/components/RunTimeline.vue'
 import LiveOutput from '@/components/LiveOutput.vue'
@@ -13,15 +15,27 @@ import CycleOutput from '@/components/CycleOutput.vue'
  * either its drive on a stage instance of the cycle's own, with a terminal that follows what the drive prints
  * (CycleOutput.vue), or its Deployment run, read through the run routes from its run home
  * (issues/<project>/.verification-<date>/, which is not an issue).
+ *
+ * How current it is (freshness.js): one refresh reads the record and every run it started, and shows them
+ * together, only for the latest refresh. A verification event, a reconnect, a tab return or an event of a run
+ * shown (or being loaded) invalidates a refresh in flight. The terminals keep their own polling.
  */
 
 const state = ref(null)
-const runs = ref({})
+/** The runs read with the record, tagged with the cycle they belong to. */
+const runSet = ref({ cycleId: null, byProject: {} })
 const selected = ref({})
-const error = ref('')
+
+const freshState = reactive({})
+const tracker = createTracker(freshState)
+const view = computed(() => describe(freshState, connection))
+/** The runs the refresh in flight is loading: their events invalidate it before it shows them. */
+let inflight = null
 
 const cycle = computed(() => state.value?.cycle ?? null)
-const started = computed(() => (cycle.value?.projects ?? []).filter((p) => p.runId))
+const started = computed(() => startedEntries(state.value))
+/** A run shown only under the cycle it was read for. */
+const runs = computed(() => (runSet.value.cycleId === (cycle.value?.id ?? null) ? runSet.value.byProject : {}))
 // Entries the cycle drives itself (instance mode), derives from them (a framework) or holds back for them.
 const driven = computed(() => (cycle.value?.projects ?? []).filter((p) => !p.runId && (p.mode === 'instance' || p.mode === 'derived' || p.state === 'deferred')))
 const minutes = (ms) => typeof ms === 'number' ? `${(ms / 60000).toFixed(1)} min` : null
@@ -35,18 +49,80 @@ function entryLine (p) {
   return parts.join(' · ')
 }
 
+/**
+ * Read the record, then every run it started (from that record, never the one on screen), and show them
+ * together. 'ok' when it published, 'superseded' when something newer took over, 'failed' otherwise.
+ */
 async function load () {
+  const ticket = tracker.begin()
   try {
-    state.value = await api.verificationLatest()
-    const loaded = {}
-    for (const p of started.value) loaded[p.project] = await api.getRun(p.project, p.issueId, p.runId).catch((err) => ({ error: err.message }))
-    runs.value = loaded
-    error.value = ''
-  } catch (err) { error.value = err.message }
+    const latest = await api.verificationLatest()
+    if (!tracker.isLatest(ticket)) return 'superseded'
+    const entries = startedEntries(latest)
+    inflight = { ticket, runs: new Set(entries.map(runKey)) }
+    const read = await Promise.all(entries.map((p) => api.getRun(p.project, p.issueId, p.runId).then((r) => [p.project, r], (err) => { throw new Error(`${p.project}: ${err.message}`) })))
+    if (!tracker.isLatest(ticket)) return 'superseded'
+    if (state.value?.cycle?.id !== latest.cycle?.id) selected.value = {}
+    state.value = latest
+    runSet.value = { cycleId: latest.cycle?.id ?? null, byProject: Object.fromEntries(read) }
+    tracker.succeed(ticket, { epoch: connection.epoch })
+    return 'ok'
+  } catch (err) {
+    return tracker.fail(ticket, err) ? 'failed' : 'superseded'
+  } finally {
+    if (inflight?.ticket === ticket) inflight = null
+  }
+}
+const invalidate = () => { tracker.invalidate(); load() }
+
+/* Run events of a run shown or being loaded: the same rules as the issue page (output ignored, activity throttled). */
+let pending = null
+let activityAt = 0
+function onRunEvent (event) {
+  if (!displayedOrInflight(event, { cycle: cycle.value, inflight })) return
+  if (event.type === 'activity') {
+    if (Date.now() - activityAt < 15_000) return
+    activityAt = Date.now()
+  }
+  tracker.invalidate()
+  clearTimeout(pending)
+  pending = setTimeout(load, 120)
 }
 
-onMounted(load)
-watch(() => connection.verification?.at, load)
+/*
+ * "Full verification now" is checked against this page's own refresh: the pre-send read is a full refresh,
+ * and an event after it means one more check, then a refusal.
+ */
+async function guard (spec, send) {
+  // The pre-send read is a full refresh of the page, every pass; nothing is awaited from it to the send.
+  const result = await runGuard(() => guardPass({
+    refresh: 'always',
+    // Leaving the page ends the check: nothing is published to it and nothing is sent.
+    alive: () => !disposed,
+    current: () => pageCurrent(freshState, connection),
+    load,
+    seq: () => freshState.seq,
+    check () {
+      const verdict = judgeAction({ offered: spec.offered(), before: spec.before, after: spec.identity() })
+      return verdict.send ? null : { reason: verdict.reason }
+    },
+    send: () => send()
+  }))
+  if (result.kind === 'send') return { sent: true, value: await result.value }
+  return {
+    sent: false,
+    notice: result.reason === 'unconfirmed' ? `Could not confirm the current state (${freshState.error ?? 'the refresh did not finish'}); nothing was sent.`
+      : result.reason === 'superseded' ? 'The cycle changed while this was being checked; nothing was sent.'
+        : 'A cycle is already running (or the cycle changed); nothing was sent.'
+  }
+}
+
+onMounted(() => { load(); socket.on('run:event', onRunEvent) })
+let disposed = false
+onUnmounted(() => { disposed = true; socket.off('run:event', onRunEvent); clearTimeout(pending); tracker.reset() })
+watch(() => connection.verification?.seq, invalidate)
+watch(() => connection.epoch, invalidate)
+watch(() => connection.resumes, invalidate)
 
 /** The invocation a selected timeline entry names: a live one, or a recorded turn's. */
 function invocationOf (project) {
@@ -61,9 +137,11 @@ function invocationOf (project) {
 
 <template>
   <v-container fluid class="verify">
-    <h1 class="verify__title">Full verification</h1>
-    <v-card elevation="0" border class="mb-4"><FullVerificationCard /></v-card>
-    <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mb-4">{{ error }}</v-alert>
+    <div class="verify__head">
+      <h1 class="verify__title">Full verification</h1>
+      <FreshnessIndicator :view="view" @retry="load" />
+    </div>
+    <v-card elevation="0" border class="mb-4"><FullVerificationCard :latest="state" :guard="guard" :reload="load" /></v-card>
 
     <v-card v-if="cycle" elevation="0" border class="mb-4">
       <v-card-text class="verify__facts">
@@ -110,7 +188,7 @@ function invocationOf (project) {
       <v-card-text v-if="p.mode === 'instance'">
         <p v-if="p.flaky?.length">Flaky (passed alone on the same instance): {{ p.flaky.map((f) => `${f.command}: ${f.test}`).join('; ') }}</p>
         <p v-else-if="p.rerun?.state === 'skipped'">No rerun of failed tests: {{ p.rerun.message }}</p>
-        <CycleOutput :project="p.project" :active="Boolean(state?.active)" />
+        <CycleOutput :key="`${cycle.id}:${p.project}`" :project="p.project" :active="Boolean(state?.active)" />
       </v-card-text>
     </v-card>
 
@@ -140,7 +218,8 @@ function invocationOf (project) {
 
 <style scoped>
 .verify { padding: 28px 24px 40px; }
-.verify__title { font-size: 1.5rem; font-weight: 650; margin-bottom: 16px; }
+.verify__head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 16px; }
+.verify__title { font-size: 1.5rem; font-weight: 650; margin: 0; }
 .verify__facts { display: grid; gap: 4px; font-size: 0.875rem; }
 .verify__detail { white-space: pre-wrap; }
 </style>

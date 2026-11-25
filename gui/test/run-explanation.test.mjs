@@ -5,6 +5,16 @@ import { explainRun } from '../server/runtime/run-explanation.mjs'
 export default async function (t) {
   t.section('live and waiting runs')
   t.eq('a running run names who is working', explainRun({ status: 'running' }, { active: [{ role: 'auditor-1' }] }).detail, 'Reviewer 1 is working.')
+  {
+    // A check running with no seat at work has a state of its own (the AC7 "checking" headline).
+    const since = Date.parse('2026-11-25T10:20:30Z')
+    const alone = explainRun({ status: 'running' }, { liveCheckSince: since })
+    t.eq('a check running alone: "Running: checking the candidate"', [alone.tone, alone.headline], ['progress', 'Running: checking the candidate'])
+    t.ok('naming since when and that no agent works', /since 10:20:30 UTC.*no agent is working/.test(alone.detail), alone.detail)
+    const beside = explainRun({ status: 'running' }, { active: [{ role: 'auditor-1' }], liveCheckSince: since })
+    t.eq('a check beside a seat keeps the plain headline and says so', [beside.headline, /Reviewer 1 is working\. The checks are running beside them/.test(beside.detail)], ['Running', true])
+    t.eq('no check running: unchanged', explainRun({ status: 'running' }).detail, 'Between turns.')
+  }
   t.eq('a question waits for an answer', explainRun({ status: 'paused', pause: { question: 'Which mailbox?' } }).headline, 'Waiting for your answer')
   t.eq('and quotes the question', explainRun({ status: 'paused', pause: { question: 'Which mailbox?' } }).detail, 'Which mailbox?')
   t.eq('a manual pause is only paused', explainRun({ status: 'paused', pause: { kind: 'manual' } }).tone, 'waiting')

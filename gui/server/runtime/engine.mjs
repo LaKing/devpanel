@@ -74,7 +74,7 @@ import { brokerConfigured, openBrokerTurn } from '../broker/index.mjs'
 import { ensureMountPoint, fenceStubsPresent, removeFenceStubs } from './tooling-mounts.mjs'
 import { childOutputScan, toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
-import { holdGatesTurn, openOwnerHolds, ownerHoldKey, ownerHoldsOf } from './owner-holds.mjs'
+import { holdGatesTurn, openOwnerHolds, openPlanReviewHold, ownerHoldKey, ownerHoldsOf } from './owner-holds.mjs'
 import { interruptedFromEvents, wallClockElapsedMs, wallClockRefusal, wallClockStanding } from './wall-clock.mjs'
 
 export { extractOutput }
@@ -3425,6 +3425,14 @@ export class Engine {
         p.state = 'ready'
         p.pendingInvocation = null
         if (await this.pauseForShutdown({ role, stepId: step.id, invocationId, abandonedMs, ...(lost ? { cleanup: lost.status } : {}) })) return { cancelled: true, byDeadline }
+        if (byDeadline && this.concurrentBatch) {
+          // A sibling of this batch may have stated a hold in plan review: the drive's
+          // ending (settleEnding) decides once every seat has settled, and the run stays
+          // live on disk until then, so a crash here is an ordinary lost owner.
+          (this.deadlineCuts ??= []).push({ role, stepId: step.id, invocationId, abandonedMs, ...(lost ? { cleanup: lost.status } : {}) })
+          await this.persist({ type: 'turn-cut-at-deadline', role, stepId: step.id, invocationId, abandonedMs })
+          return { cancelled: true, byDeadline }
+        }
         this.run.status = byDeadline ? 'blocked' : 'cancelled'
         this.run.blockedReason = byDeadline ? 'budget-exhausted' : null
         this.run.outcome = 'unresolved'
@@ -3586,15 +3594,23 @@ export class Engine {
     const standing = limits.wallClockMinutes ? wallClockStanding(this.run, this.outputs, this.clock.now(), { limitMinutes: limits.wallClockMinutes, stoppedAt: Date.parse(stopped) }) : null
     const refusal = standing ? wallClockRefusal(standing) : null
     const refuse = () => { throw Object.assign(new Error(refusal.message), { status: 422, code: refusal.code, detail: refusal.detail }) }
-    if (refusal?.code === 'WALL_CLOCK_EXHAUSTED') refuse()
-    if ((limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
-        (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens)) {
+    // A hold a seat stated in plan review and nobody has asked yet is not a turn: the
+    // continuation may go on to put it to the panel whatever the budget, and drive()'s
+    // budget check then stops every worker turn after it. Only an exhausted budget is
+    // let through this way; a short clock still needs the operator's consent.
+    const consultOnly = Boolean(openPlanReviewHold(this.snapshot, this.run.steps, this.outputs))
+    const exhaustedClock = refusal?.code === 'WALL_CLOCK_EXHAUSTED'
+    const exhaustedBudget = Boolean((limits.maxSteps && agentSteps(this.run.steps).length >= limits.maxSteps) ||
+        (limits.maxTokens && (this.run.budgets.used.tokens ?? 0) >= limits.maxTokens))
+    if (exhaustedClock && !consultOnly) refuse()
+    if (exhaustedBudget && !consultOnly) {
       // Short of wall clock as well: said here, and the override does not get past this.
       throw Object.assign(new Error(`${refusal ? `${refusal.numbers} ` : ''}Increase the exhausted budget before resuming. Recorded usage is preserved.`), { status: 422, ...(refusal ? { detail: refusal.detail } : {}) })
     }
-    if (refusal && guardShortWallClock && acceptShortWallClock !== true) refuse()
-    const wallClock = standing ? { rule: standing.rule, remainingMs: standing.remainingMs, meanRoundMs: standing.meanRoundMs, rounds: standing.rounds, overridden: Boolean(refusal && guardShortWallClock) } : null
-    return { limits, suspendedMs, wallClock }
+    const short = refusal?.code === 'WALL_CLOCK_SHORT'
+    if (short && guardShortWallClock && acceptShortWallClock !== true) refuse()
+    const wallClock = standing ? { rule: standing.rule, remainingMs: standing.remainingMs, meanRoundMs: standing.meanRoundMs, rounds: standing.rounds, overridden: Boolean(short && guardShortWallClock) } : null
+    return { limits, suspendedMs, wallClock, ...(consultOnly && (exhaustedClock || exhaustedBudget) ? { consultOnly: true } : {}) }
   }
 
   /** Keep the immutable launch snapshot and record explicit continuation allowances separately. */
@@ -3621,7 +3637,7 @@ export class Engine {
       const current = await captureIntegrity(this.run.workspace, { clock: this.clock, trackedPaths: checkpoint.trackedPaths })
       if (current.hash !== checkpoint.hash) throw Object.assign(new Error('The retained workspace changed; resolve integrity before resuming.'), { status: 409 })
     }
-    const { limits, suspendedMs, wallClock } = await this.continuationLimits({ budgets, stoppedAt, acceptShortWallClock, guardShortWallClock })
+    const { limits, suspendedMs, wallClock, consultOnly } = await this.continuationLimits({ budgets, stoppedAt, acceptShortWallClock, guardShortWallClock })
     const previousStatus = this.run.status
     const previousReason = this.run.blockedReason
     const overrides = structuredClone(this.run.controlOverrides ?? {})
@@ -3637,7 +3653,7 @@ export class Engine {
     if (previousReason === 'protocol-repair-exhausted') overrides.repairAttempts = this.snapshot.reviewPolicy.protocolRepair.maxAttempts + 1
     this.run.controlOverrides = overrides
     this.applyControlOverrides()
-    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides, ...(wallClock ? { wallClock } : {}) }
+    const entry = { at: this.clock.iso(), actor, origin, previousStatus, previousReason, previousLimits: this.run.budgets.limits, limits, suspendedMs, overrides, ...(wallClock ? { wallClock } : {}), ...(consultOnly ? { consultOnly } : {}) }
     this.run.resumeHistory ??= []
     this.run.resumeHistory.push(entry)
     this.run.controlSuspendedMs = (this.run.controlSuspendedMs ?? 0) + suspendedMs
@@ -4438,6 +4454,7 @@ export class Engine {
     if (failure) throw failure.reason
     return {
       cancelled: outcomes.some((o) => o.cancelled),
+      byDeadline: outcomes.some((o) => o.byDeadline),
       blocked: outcomes.some((o) => o.blocked),
       withheld: outcomes.some((o) => o.withheld),
       retried: outcomes.some((o) => o.retried)
@@ -4565,6 +4582,12 @@ export class Engine {
       if (await this.pauseAtBoundary()) break
       // A revision whose modules another live run holds: nothing goes on until they are this run's.
       if (!await this.holdRevisionModules()) continue
+      // A hold a seat stated in plan review goes to the consult panel before anything
+      // else: the loop's next turn, an end of rounds or a budget block (owner-holds.mjs).
+      if (openPlanReviewHold(this.snapshot, this.run.steps, this.outputs)) {
+        if (await this.settlePlanReviewHolds() !== 'answered') break
+        continue
+      }
 
       // A finished triage needs no further paid turn, even if the last answer
       // used the remaining turn/token allowance. Publish and finish its result.
@@ -4579,6 +4602,10 @@ export class Engine {
       }
       const exceeded = this.budgetExceeded()
       if (exceeded) {
+        // The hold record as it stands now: a hold answered just before (top of the loop, or the owner) reads answered.
+        await this.recordOwnerHolds()
+        // A Stop signalled meanwhile (that write included) settles as a cancellation, not as the block.
+        if (this.controller.signal.aborted) { await this.settleAbort(); break }
         this.run.status = 'blocked'
         this.run.blockedReason = 'budget-exhausted'
         this.run.endedAt = this.clock.iso()
@@ -4643,7 +4670,8 @@ export class Engine {
       }
 
       // A seat left this to the owner: no brief, implementation or confirmation goes
-      // past it, and nothing the coordinator wrote is read here.
+      // past it, and nothing the coordinator wrote is read here. Holds stated in plan
+      // review were settled at the top of the loop.
       const hold = holdGatesTurn(this.snapshot, next) ? openOwnerHolds(this.run.steps, this.outputs)[0] : null
       if (hold) {
         if (await this.pauseForOwnerHold(hold, next) === 'answered') continue
@@ -4750,6 +4778,9 @@ export class Engine {
     } catch (error) {
       // Background checks belong to this drive: never left running past it.
       await this.settleChecks().catch(() => {})
+      // A batch cut at the deadline ends as the cut turn would have; a crash leaves it live for recovery.
+      if (!error.injected && this.deadlineCuts?.length && this.run.status === 'running') await this.blockAtDeadline(this.deadlineCuts).catch(() => {})
+      this.deadlineCuts = null
       // A failed runtime cannot leave an unaccepted release looking complete.
       // Injected crash tests model process death: recovery must remain explicit.
       if (!error.injected) {
@@ -4763,12 +4794,7 @@ export class Engine {
       throw error
     }
     await this.settleChecks()
-    if (!explicitMax && this.run.status === 'running') {
-      this.run.status = 'blocked'
-      this.run.blockedReason = 'max-turns-reached'
-      this.run.endedAt = this.clock.iso()
-      await this.persist({ type: 'blocked', reason: 'max-turns-reached' })
-    }
+    await this.settleEnding({ explicitMax })
     // However the drive ended: a pause has no time limit, and nothing here waits on staging.
     await this.discardKeptInstance('run-ended')
     if (['blocked','failed','cancelled'].includes(this.run.status) || (this.run.status === 'completed' && this.run.outcome !== 'resolved')) await this.recoverUnacceptedRelease(`Run ended ${this.run.status}/${this.run.outcome}`)
@@ -4930,21 +4956,98 @@ export class Engine {
   }
 
   /** One question at a time, verbatim: the answer closes the hold by that wording. Returns consultFirst's outcome. */
-  async pauseForOwnerHold (hold, next) {
+  async pauseForOwnerHold (hold, next = null) {
     const ask = {
       id: uuid(), at: this.clock.iso(),
       key: ownerHoldKey(hold),
       question: hold.question,
       options: null,
-      // The phase is where the run stands, so the answer's step sits there; the rest is who asked.
-      askedBy: { phase: next.phase.id, stepId: hold.stepId, step: hold.latestStep, role: hold.role },
+      // The phase is where the run stands (a plan-review hold: where it was stated), so the
+      // answer's step sits there; the rest is who asked.
+      askedBy: { phase: next?.phase.id ?? hold.phase, stepId: hold.stepId, step: hold.latestStep, role: hold.role },
       decisionKind: 'owner-hold',
       request: { reason: hold.reason, projectAction: null, category: 'owner-gate', holdCategory: hold.category, recommendation: hold.recommendation }
     }
     // The panel first (consultFirst): its answer closes the hold exactly as the owner's would.
     const outcome = await this.consultFirst(ask, { category: hold.category })
-    if (outcome === 'ask') await this.pauseFor(ask)
+    if (outcome === 'ask') {
+      // A Stop came meanwhile: it settles as a cancellation, never as a question.
+      if (this.controller.signal.aborted) { await this.recordOwnerHolds(); await this.settleAbort(); return 'stopped' }
+      await this.pauseFor(ask)
+    }
     return outcome
+  }
+
+  /**
+   * Every open hold stated in plan review, put to the panel in turn
+   * (execution-contract.md "Owner holds"). 'answered' when none is left open, else
+   * the outcome for the one that was not: 'ask' (paused with the panel's brief),
+   * 'stopped', or a consult recovery block. A Stop wins before each hold and after
+   * the last one.
+   */
+  async settlePlanReviewHolds () {
+    const asked = new Set()
+    const stop = async () => { await this.recordOwnerHolds(); await this.settleAbort(); return 'stopped' }
+    for (let hold; (hold = openPlanReviewHold(this.snapshot, this.run.steps, this.outputs));) {
+      if (this.controller.signal.aborted) return stop()
+      // Cannot happen: the answer carries the hold's key and question. Loud rather than endless.
+      if (asked.has(hold.identity)) throw new Error(`owner hold ${hold.identity} is still open after its answer`)
+      asked.add(hold.identity)
+      await this.recordOwnerHolds()
+      const outcome = await this.pauseForOwnerHold(hold)
+      if (outcome !== 'answered') return outcome
+    }
+    if (this.controller.signal.aborted) return stop()
+    await this.recordOwnerHolds()
+    return 'answered'
+  }
+
+  /** A batch whose seats the wall-clock deadline cut: blocked as each cut turn would have blocked it. */
+  async blockAtDeadline (cuts) {
+    this.run.status = 'blocked'
+    this.run.blockedReason = 'budget-exhausted'
+    this.run.outcome = 'unresolved'
+    this.run.endedAt = this.clock.iso()
+    await this.persist({ type: 'budget-exhausted', budget: 'wallClockMinutes', ...cuts[0], cuts })
+  }
+
+  /**
+   * Where every drive that leaves its loop running ends: at the turn cap, or after a
+   * batch cut at the wall-clock deadline. An operator Stop comes first, then a turn's
+   * unproved cleanup, then a pending pause or freeze (the hold is then asked at the next
+   * drive, before any turn); otherwise
+   * a hold stated in plan review is put to the panel before the run is blocked.
+   */
+  async settleEnding ({ explicitMax }) {
+    const cuts = this.deadlineCuts ?? []
+    this.deadlineCuts = null
+    const stopRequested = () => this.controller.signal.aborted && this.abortReason !== 'deadline'
+    if (this.run.status === 'running' && !stopRequested() && openPlanReviewHold(this.snapshot, this.run.steps, this.outputs)) {
+      await this.recordOwnerHolds()
+      // A Stop signalled meanwhile (that write included) wins over every early ending below, and over the consult.
+      if (stopRequested()) { await this.settleAbort(); return }
+      // A turn's unproved cleanup, then a pending operator pause or full-verification freeze, as at the top of the
+      // loop: the next drive's gate asks. A Stop that arrives while either is written still settles as cancelled.
+      if (this.cleanupHold() || this.run.pauseRequested || this.run.freezeRequested) {
+        if (this.cleanupHold()) await this.blockForCleanup()
+        else await this.pauseAtBoundary()
+        if (stopRequested()) await this.settleAbort()
+        return
+      }
+      // The deadline's abort was for the turns it cut; a Stop since then keeps the controller aborted.
+      if (cuts.length && this.abortReason === 'deadline') this.controller = new AbortController()
+      await this.settlePlanReviewHolds()
+    }
+    // An operator Stop wins over every other ending, a resolved last consult included.
+    if (['running', 'stopping'].includes(this.run.status) && stopRequested()) { await this.recordOwnerHolds(); await this.settleAbort(); return }
+    if (this.run.status !== 'running') return
+    if (cuts.length) { await this.blockAtDeadline(cuts); return }
+    if (!explicitMax) {
+      this.run.status = 'blocked'
+      this.run.blockedReason = 'max-turns-reached'
+      this.run.endedAt = this.clock.iso()
+      await this.persist({ type: 'blocked', reason: 'max-turns-reached' })
+    }
   }
 
   /** Which budget, if any, is spent. Steps are not the only way a run runs away. */

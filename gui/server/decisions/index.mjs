@@ -64,6 +64,9 @@ export function canonical (value) {
 
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex')
 
+/** The key a question is recorded under: one provider and model, one purpose, the same state and questions. */
+export const decisionKey = (config, { purpose, state, questions }) => sha256(canonical({ provider: config.id, model: config.model, purpose, state, questions }))
+
 export const DEFAULT_DECISION_PROVIDER = 'jev'
 const PROVIDER_ID = /^[a-z0-9-]+$/
 
@@ -175,7 +178,7 @@ export function createDecisions ({ oracle, config, ledger = null, admit = null, 
   const pending = new Map()
 
   async function askOnce ({ dir, purpose, subject, state, questions, signal, retryUnavailable = false }) {
-    const key = sha256(canonical({ provider: config.id, model: config.model, purpose, state, questions }))
+    const key = decisionKey(config, { purpose, state, questions })
     const file = path.join(dir, `${purpose}-${key.slice(0, 16)}.json`)
 
     const existing = await readRecord(file)

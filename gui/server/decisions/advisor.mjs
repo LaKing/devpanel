@@ -1,4 +1,4 @@
-import { createDecisions, loadDecisionProvider } from './index.mjs'
+import { createDecisions, loadDecisionProvider, decisionKey } from './index.mjs'
 import { createJevOracle, readCredential } from './jev.mjs'
 import { createOpenAIOracle } from './openai.mjs'
 import { createModelOracle, createRosterModelOracle } from './model-oracle.mjs'
@@ -86,6 +86,16 @@ export function createAdvisor ({
   return {
     /** The provider configuration in force now, or null. */
     config: async () => (await loadProvider()) ?? null,
+    /**
+     * The key ask() would record this question under now, asking nobody and spending nothing:
+     * {configured: false} without a provider, {held: true} while the provider is held.
+     */
+    async currentKey ({ purpose, state, questions }) {
+      const config = await loadProvider()
+      if (!config) return { configured: false }
+      if (await availability()?.check(decisionAvailabilityId(config.id))) return { configured: true, held: true }
+      return { configured: true, key: decisionKey(config, { purpose, state, questions }) }
+    },
     lastOutcome: () => lastOutcome,
 
     /**

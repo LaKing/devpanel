@@ -92,7 +92,7 @@ export const triageNoFindings = {disposition:'no-findings',reasoning:'Nothing re
   size:'minor',sizeReason:'Nothing to change was found.',affectedModules:[],
   autonomy:{verdict:'needs-owner-input',reason:'Nothing was found to work on.',questions:[{id:'Q1',question:'Close this issue as not reproducible?',category:'missing-information',recommendation:'Close it.'}]}}
 
-export function scriptFor ({ planReviews = [[]], implReviews = [[]], malformed = new Set(), fitVerdict = true, confirm = true, planDispositions = {}, needsInput = null, operatorRequest = null } = {}) {
+export function scriptFor ({ planReviews = [[]], implReviews = [[]], malformed = new Set(), fitVerdict = true, confirm = true, planDispositions = {}, needsInput = null, operatorRequest = null, implHolds = null } = {}) {
   // Every substantial plan finding must receive a disposition from the
   // implementation auditor, exactly as the engine will demand of a real one.
   const priorFindings = (round) => {
@@ -157,7 +157,8 @@ export function scriptFor ({ planReviews = [[]], implReviews = [[]], malformed =
         const prior = priorFindings(round)
         const deferred = prior.some((d) => d.disposition === 'deferred')
         const verdict = deferred ? 'changes-needed' : verdictFor(findings)
-        return `Reviewed the code.${NL}${fence({ verdict, artifactRevision: revisionIn(prompt), findings, priorFindings: prior })}`
+        // implHolds: the implementation audit states owner holds, which pause the run before confirmation (after its check).
+        return `Reviewed the code.${NL}${fence({ verdict, artifactRevision: revisionIn(prompt), findings, priorFindings: prior, ...(implHolds ? { ownerHolds: implHolds } : {}) })}`
       }
       case 'confirm': {
         // A revision is named only when the run produced one: a document run has none.

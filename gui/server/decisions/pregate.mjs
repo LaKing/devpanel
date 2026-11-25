@@ -169,8 +169,26 @@ export function createPregate ({ issues, advisor, deadlineMs = 15000, clock = { 
     return out.filter(Boolean)
   }
 
+  /**
+   * The decision a Triage start would meet now, asking nobody: the same key check() would record
+   * under, and whether its record holds. Read before "Start anyway" is sent, so a hold that changed
+   * (a note added, another provider, no record yet) is caught before the request.
+   */
+  async function current ({ project, issueId }) {
+    const issue = await issues.getIssue(project, issueId)
+    const { state, questions } = await triageRequest({ issues, project, issueId })
+    const k = await advisor.currentKey({ purpose: PURPOSE, state, questions })
+    if (!k.configured) return { configured: false, holds: false, reason: 'not-configured' }
+    if (k.held) return { configured: true, holds: false, reason: 'provider-held' }
+    const record = await readJson(recordFile(issue.path, k.key))
+    if (!record) return { configured: true, key: k.key, recorded: false, holds: null, reason: 'not-asked' }
+    const gate = confidentAnswer(record, 'gate')
+    return { configured: true, key: k.key, recorded: true, holds: Boolean(gate && ['close-issue', 'needs-input'].includes(gate.value)), gate: gate?.value ?? null }
+  }
+
   return {
     PURPOSE,
+    current,
     // Asked for by someone on purpose: a failed earlier ask is asked again.
     // The gate before a Triage start (check) never re-asks.
     assess: async (args) => (await assess({ ...args, retryUnavailable: true })).record,

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, provide, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { wallClockAt, wallClockPrefill, wallClockUsedMinutes } from '@/wall-clock'
@@ -21,12 +21,15 @@ import IssueFamily from '@/components/IssueFamily.vue'
 import IssueOccurrences from '@/components/IssueOccurrences.vue'
 import PatchCheck from '@/components/PatchCheck.vue'
 import ContinueRun from '@/components/ContinueRun.vue'
+import FreshnessIndicator from '@/components/FreshnessIndicator.vue'
 import { api } from '@/api'
 import { alertDestination, alertSections } from '@/notifications'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
 import { readFolder, readHidden, revealSectionState, sectionShown, toggleSectionState, writeFolder, writeHidden } from '@/issue-sections'
 import { reportTags } from '@/report-tags'
 import { connection, socket } from '@/socket'
+import { offers, selectionAfterDelete } from '@/action-offers'
+import { checkTarget, createChildRegistry, createSeq, createTracker, describe, guardPass, judgeAction, pageCurrent, pickRun, readOwn, runGuard, stopsForClose } from '@/freshness'
 import { formatBytes, formatDuration, formatHms, formatMTokens, formatMillis } from '@/format'
 
 const route = useRoute()
@@ -38,42 +41,76 @@ const archiving = ref(false)
    to record a reason, and whatever is given lands on the record as an override. */
 const closeDialog = ref(false)
 const closeReason = ref('')
+/* What the Close dialog describes: which variant it offers and what it stops or abandons. */
+const closeIdentity = () => ({
+  variant: liveRun.value ? 'live' : interruptedRuns.value.length ? 'interrupted' : issue.value?.disposition ? 'plain' : 'no-disposition',
+  hasDisposition: Boolean(issue.value?.disposition),
+  liveRunIds: runs.value.filter((r) => LIVE.includes(r.status)).map((r) => r.runId),
+  interruptedRunIds: interruptedRuns.value.map((r) => r.runId)
+})
 async function archiveIssue () {
   if (archiving.value) return
   if ((!issue.value?.disposition || liveRun.value || interruptedRuns.value.length) && !closeDialog.value) { closeDialog.value = true; return }
   archiving.value = true
   actionError.value = ''
-  const confirmedAbandonments = new Set(interruptedRuns.value.map(r => r.runId))
+  // Everything the close sends is fixed at this click; a later page (or issue) changes none of it.
+  const before = closeIdentity()
+  const overrideReason = closeReason.value
+  let op = null
   try {
-    const initialRuns = await api.listRuns(project.value, issueId.value)
-    for (const item of initialRuns.filter(r => LIVE.includes(r.status))) {
-      await api.stopRun(project.value, issueId.value, item.runId, { wait: true })
+    const guarded = await guard({ label: 'Close issue', runId: null, before, identity: closeIdentity, offered: () => !issue.value?.archived },
+      (t) => ({ project: t.project, id: t.issueId, ...before, overrideReason }))
+    if (!guarded.sent) return
+    op = guarded.value
+    const confirmedAbandonments = new Set(op.interruptedRunIds)
+    const initialRuns = await api.listRuns(op.project, op.id)
+    // Only the runs the confirmation named are stopped; a run that started since means the close changed.
+    const { stop, unexpected } = stopsForClose(op.liveRunIds, initialRuns.filter(r => LIVE.includes(r.status)).map((r) => r.runId))
+    if (unexpected.length) {
+      if (stillOnIssue(op)) await load()
+      throw new Error(`A run started after you confirmed (${unexpected.join(', ')}); nothing was stopped. Review it and press Close issue again.`)
+    }
+    // Every later write passes the guard again: the terms the operator confirmed must still hold at that moment,
+    // and each is sent to the captured location. A refusal stops the close and says what changed.
+    const termsHold = () => !issue.value?.archived && Boolean(issue.value?.disposition) === op.hasDisposition
+    // Each step names the issue (and run) it writes to: if the page now shows another issue, it refuses.
+    const step = (label, runId, offered, send) => guard({
+      label, issue: { project: op.project, issueId: op.id }, runId, retires: runId != null, offered,
+      verify: () => termsHold() || 'The issue changed while it was being closed (an outcome was recorded, or it was archived). Nothing more was sent; review it and close again.'
+    }, () => send())
+    for (const id of stop) {
+      if (!(await step('Stop run', id, offerOn(offers.closeStop), () => api.stopRun(op.project, op.id, id, { wait: true }))).sent) return
     }
     const deadline = Date.now() + 30000
-    let currentRuns = await api.listRuns(project.value, issueId.value)
+    let currentRuns = await api.listRuns(op.project, op.id)
     while (currentRuns.some(r => LIVE.includes(r.status))) {
       if (Date.now() >= deadline) throw new Error('The run is still stopping. Wait for it to finish, then try closing again.')
       await new Promise(resolve => setTimeout(resolve, 500))
-      currentRuns = await api.listRuns(project.value, issueId.value)
+      currentRuns = await api.listRuns(op.project, op.id)
     }
     const pending = currentRuns.filter(r => (r.supportedActions ?? []).includes('abandon'))
     if (pending.some(r => !confirmedAbandonments.has(r.runId))) {
-      await load()
+      if (stillOnIssue(op)) await load()
       throw new Error('The run needs recovery. Review the abandonment confirmation and press Close issue again.')
     }
-    for (const item of pending) await api.abandonRun(project.value, issueId.value, item.runId)
-    await api.archiveIssue(project.value, issueId.value, issue.value?.disposition ? {} : { overrideReason: closeReason.value })
+    for (const item of pending) {
+      if (!(await step('Abandon run', item.runId, offerOn(offers.abandon), () => api.abandonRun(op.project, op.id, item.runId))).sent) return
+    }
+    if (!(await step('Close issue', null, offerOn(offers.archive),
+      () => api.archiveIssue(op.project, op.id, op.hasDisposition ? {} : { overrideReason: op.overrideReason }))).sent) return
+    if (!stillOnIssue(op)) return
     closeDialog.value = false
-    await router.push(`/projects/${project.value}`)
-  } catch (error) { actionError.value = error.message } finally { archiving.value = false }
+    await router.push(`/projects/${op.project}`)
+  } catch (error) { if (!op || stillOnIssue(op)) actionError.value = error.message } finally { archiving.value = false }
 }
 
 async function restoreIssue () {
   archiving.value = true
   actionError.value = ''
   try {
-    await api.restoreIssue(project.value, issueId.value)
-    await load()
+    const r = await guard({ label: 'Restore issue', runId: null, offered: () => Boolean(issue.value?.archived) },
+      (t) => api.restoreIssue(t.project, t.issueId))
+    if (r.sent) await load()
   } catch (error) { actionError.value = error.message } finally { archiving.value = false }
 }
 
@@ -95,6 +132,8 @@ const answerText = ref('')
 const answerActor = ref(rememberedActor())
 const answerSending = ref(false)
 const actionError = ref('')
+/* Why an action was not sent: what changed, or that the current state could not be confirmed. */
+const actionNotice = ref('')
 
 const project = computed(() => route.params.project)
 const issueId = computed(() => route.params.id)
@@ -179,15 +218,20 @@ const interruptedRuns = computed(() => runs.value.filter(r => (r.supportedAction
 const closeTitle = computed(() => liveRun.value ? 'Stop and close this issue?' : interruptedRuns.value.length ? 'Close and abandon interrupted work?' : 'Close without a disposition?')
 const runStatus = r => r.blockedReason === 'recovery-required' || (r.status !== 'paused' && (r.supportedActions ?? []).includes('abandon')) ? 'Interrupted — needs recovery' : r.status
 // The trash icon deletes on the click, without asking: the operator asked for exactly that.
-const canDeleteRun = computed(() => ['completed', 'blocked', 'failed', 'cancelled'].includes(run.value?.status))
+// The same rule the guard applies before sending (action-offers.js): offered only where the server would delete.
+const canDeleteRun = computed(() => offers.delete(offerState({ runId: run.value?.runId })))
 const deletingRun = ref(false)
 async function deleteRun () {
   if (!run.value) return
+  const deleted = run.value.runId
   deletingRun.value = true
   actionError.value = ''
   try {
-    await api.deleteRun(project.value, issueId.value, run.value.runId)
-    selectedRunId.value = null
+    const r = await guard({ label: 'Delete run', runId: deleted, retires: true, offered: offerOn(offers.delete) },
+      (t) => api.deleteRun(t.project, t.issueId, t.runId))
+    if (!r.sent) return
+    // Only if the deleted run is still the one shown: a run chosen meanwhile stays chosen.
+    selectedRunId.value = selectionAfterDelete(selectedRunId.value, deleted)
     await load()
   } catch (error) { actionError.value = error.message } finally { deletingRun.value = false }
 }
@@ -197,8 +241,9 @@ async function abandonRun () {
   abandoning.value = true
   actionError.value = ''
   try {
-    await api.abandonRun(project.value, issueId.value, run.value.runId)
-    await load()
+    const r = await guard({ label: 'Abandon run', retires: true, offered: offerOn(offers.abandon) },
+      (t) => api.abandonRun(t.project, t.issueId, t.runId))
+    if (r.sent) await load()
   } catch (error) { actionError.value = error.message } finally { abandoning.value = false }
 }
 
@@ -264,7 +309,6 @@ const BUDGET_NAME = { maxSteps: 'turns', maxTokens: 'tokens', wallClockMinutes: 
 /* Decision forms stay folded until asked for, except the one a finished run is waiting on. */
 const showDisposition = ref(false)
 const showPriority = ref(false)
-watch(() => issueId.value, () => { showDisposition.value = false; showPriority.value = false })
 
 /* The issue folder, in the issue card: open by itself only when there is no
    run to look at, since then it is all there is. Opening or closing it by hand
@@ -310,7 +354,12 @@ const followUpFor = (risk) => (run.value?.closure?.followUps ?? []).find((f) => 
 const creatingFollowUps = ref(false)
 async function createFollowUps () {
   creatingFollowUps.value = true
-  try { await api.createFollowUps(project.value, issueId.value, run.value.runId, actorName(answerActor.value) || undefined); await load() } catch (e) { actionError.value = e.message } finally { creatingFollowUps.value = false }
+  const missing = () => openRisks.value.filter((r) => !followUpFor(r)).map((r) => r.index)
+  try {
+    const r = await guard({ label: 'Create follow-up issues', identity: missing, offered: (fresh, t) => offers.followUps(offerState(t), missing().length) },
+      (t) => api.createFollowUps(t.project, t.issueId, t.runId, actorName(answerActor.value) || undefined))
+    if (r.sent) await load()
+  } catch (e) { actionError.value = e.message } finally { creatingFollowUps.value = false }
 }
 const canFinalize = computed(() => (run.value?.supportedActions ?? []).includes('finalize'))
 const finalizing = ref(false)
@@ -319,7 +368,9 @@ async function finalizeRun () {
   finalizing.value = true
   actionError.value = ''
   try {
-    const result = await api.finalizeRun(project.value, issueId.value, run.value.runId)
+    const r = await guard({ label: 'Finalize run', offered: offerOn(offers.finalize('finalize')) }, (t) => api.finalizeRun(t.project, t.issueId, t.runId))
+    if (!r.sent) return
+    const result = r.value
     if (result.status !== 'completed') actionError.value = `Closure was evaluated again and is still blocked: ${result.blockedReason}`
     await load()
   } catch (error) { actionError.value = error.message } finally { finalizing.value = false }
@@ -333,7 +384,9 @@ async function reconcileDelivery () {
   reconciling.value = true
   actionError.value = ''
   try {
-    const result = await api.reconcileDelivery(project.value, issueId.value, run.value.runId)
+    const r = await guard({ label: 'Reconcile with source', offered: offerOn(offers.finalize('reconcile-delivery')) }, (t) => api.reconcileDelivery(t.project, t.issueId, t.runId))
+    if (!r.sent) return
+    const result = r.value
     const attempt = result.reconciliation
     if (result.status !== 'completed') actionError.value = attempt && attempt.state !== 'accepted'
       ? `Not reconciled (${attempt.state}): ${attempt.error ?? ''}${attempt.conflicts?.length ? ` Paths: ${attempt.conflicts.join(', ')}` : ''}`
@@ -350,7 +403,10 @@ async function refreshChecks () {
   if (!run.value) return
   refreshingChecks.value = true
   actionError.value = ''
-  try { await api.refreshChecks(project.value, issueId.value, run.value.runId); await load() }
+  try {
+    const r = await guard({ label: 'Refresh checks', offered: offerOn(offers.continuation('refresh-checks')) }, (t) => api.refreshChecks(t.project, t.issueId, t.runId))
+    if (r.sent) await load()
+  }
   catch (error) { actionError.value = error.message } finally { refreshingChecks.value = false }
 }
 /* Named failures of an approved revision's check do not stop its delivery
@@ -360,18 +416,25 @@ const canAcceptCheck = computed(() => !issue.value?.archived && (run.value?.supp
 const acceptCheckDialog = ref(false)
 const acceptCheckReason = ref('')
 const acceptingCheck = ref(false)
+const acceptCheckIdentity = () => run.value?.acceptCheck ? { revision: run.value.acceptCheck.revision, failures: run.value.acceptCheck.failures.map((f) => f.key).sort() } : null
+let acceptCheckShown = null
 function openAcceptCheck () {
+  acceptCheckShown = { runId: run.value?.runId ?? null, ...acceptCheckIdentity(), keys: (run.value?.acceptCheck?.failures ?? []).map((f) => f.key) }
   acceptCheckReason.value = ''
   actionError.value = ''
   acceptCheckDialog.value = true
 }
 async function acceptCheckResult () {
-  if (!run.value?.acceptCheck || !acceptCheckReason.value.trim()) return
+  // A withdrawn offer is the guard's to refuse, and the dialog says why (acceptCheckGone, the guard's notice).
+  if (!acceptCheckReason.value.trim()) return
   acceptingCheck.value = true
   actionError.value = ''
   try {
-    const { revision, failures } = run.value.acceptCheck
-    await api.acceptCheckResult(project.value, issueId.value, run.value.runId, { revision, failures: failures.map((f) => f.key), reason: acceptCheckReason.value.trim(), actor: actorName(answerActor.value) || undefined })
+    const shown = acceptCheckShown
+    const reason = acceptCheckReason.value.trim()
+    const r = await guard({ label: 'Accept check result', runId: shown.runId, before: { revision: shown.revision, failures: shown.failures }, identity: acceptCheckIdentity, offered: (fresh, t) => offerOn(offers.continuation('accept-check-result'))(fresh, t) && Boolean(runOf(t.runId)?.acceptCheck) },
+      (t) => api.acceptCheckResult(t.project, t.issueId, t.runId, { revision: shown.revision, failures: shown.keys, reason, actor: actorName(answerActor.value) || undefined }))
+    if (!r.sent) { actionError.value = r.notice; return }
     acceptCheckDialog.value = false
     await load()
   } catch (error) { actionError.value = error.message } finally { acceptingCheck.value = false }
@@ -386,7 +449,9 @@ async function recoverRun () {
   recovering.value = true
   actionError.value = ''
   try {
-    const result = await api.recoverRun(project.value, issueId.value, run.value.runId, actorName(answerActor.value) || undefined)
+    const r = await guard({ label: 'Recover run', offered: offerOn(offers.continuation('recover')) }, (t) => api.recoverRun(t.project, t.issueId, t.runId, actorName(answerActor.value) || undefined))
+    if (!r.sent) return
+    const result = r.value
     if (result.recovered === false) actionError.value = `Recovery could not continue the run: ${result.reason}`
     await load()
   } catch (error) { actionError.value = error.message } finally { recovering.value = false }
@@ -399,7 +464,13 @@ const cleanupDialog = ref(false)
 const cleanupReason = ref('')
 const cleanupBusy = ref(false)
 const cleanupError = ref('')
+let cleanupRunId = null
+/** The unproved cleanup entries the operator is acknowledging: a different set means a different acknowledgement. */
+let cleanupShown = null
+const openCleanupOf = (r) => [...(r?.openCleanup ?? [])].sort()
 function openCleanupDialog () {
+  cleanupRunId = run.value?.runId ?? null
+  cleanupShown = openCleanupOf(run.value)
   cleanupReason.value = ''
   cleanupError.value = ''
   cleanupDialog.value = true
@@ -408,7 +479,15 @@ async function acknowledgeCleanup () {
   cleanupBusy.value = true
   cleanupError.value = ''
   try {
-    await api.acknowledgeCleanup(project.value, issueId.value, run.value.runId, cleanupReason.value)
+    const reason = cleanupReason.value
+    const r = await guard({
+      label: 'Acknowledge cleanup',
+      runId: cleanupRunId,
+      before: cleanupShown,
+      identity: (_, t) => openCleanupOf(runOf(t?.runId ?? cleanupRunId)),
+      offered: offerOn(offers.acknowledgeCleanup)
+    }, (t) => api.acknowledgeCleanup(t.project, t.issueId, t.runId, reason))
+    if (!r.sent) { cleanupError.value = r.notice; return }
     cleanupDialog.value = false
     await load()
   } catch (error) { cleanupError.value = error.message } finally { cleanupBusy.value = false }
@@ -423,20 +502,44 @@ const integrityState = ref(null)
 const integrityReason = ref('')
 const integrityBusy = ref(false)
 const integrityError = ref('')
+/* Reads scoped to an issue and run: a reply is shown only if it is the newest for the run still selected. */
+const runKey = (runId) => `${project.value}/${issueId.value}/${runId}`
+const integritySeq = createSeq()
+let integrityRunId = null
 async function openIntegrity () {
+  integrityRunId = run.value?.runId ?? null
   integrityDialog.value = true
   integrityState.value = null
   integrityReason.value = ''
   integrityError.value = ''
   integrityBusy.value = true
-  try { integrityState.value = await api.inspectIntegrity(project.value, issueId.value, run.value.runId) }
-  catch (error) { integrityError.value = error.message } finally { integrityBusy.value = false }
+  const key = runKey(integrityRunId)
+  const ticket = integritySeq.next(key)
+  const shown = () => integritySeq.isLatest(ticket, key) && runKey(selectedRunId.value) === key
+  try {
+    const state = await api.inspectIntegrity(project.value, issueId.value, integrityRunId)
+    if (shown()) integrityState.value = state
+  } catch (error) { if (shown()) integrityError.value = error.message } finally { if (shown()) integrityBusy.value = false }
 }
 async function resolveIntegrity (disposition) {
   integrityBusy.value = true
   integrityError.value = ''
   try {
-    await api.resolveIntegrity(project.value, issueId.value, run.value.runId, { disposition, expectedStateHash: integrityState.value.stateHash, reason: integrityReason.value })
+    const stateHash = integrityState.value.stateHash
+    const reason = integrityReason.value
+    const r = await guard({
+      label: 'Resolve integrity',
+      runId: integrityRunId,
+      offered: offerOn(offers.continuation('resolve-integrity')),
+      // The inspected changes are read again from their source: the state hash must still be the one shown.
+      source: () => ownRead(integritySeq, runKey(integrityRunId), () => api.inspectIntegrity(project.value, issueId.value, integrityRunId)),
+      verify: (fresh) => {
+        if (fresh.stateHash === stateHash && (fresh.dispositions ?? []).includes(disposition)) return true
+        integrityState.value = fresh
+        return 'The changes moved since you inspected them; review them again. Nothing was sent.'
+      }
+    }, (t) => api.resolveIntegrity(t.project, t.issueId, t.runId, { disposition, expectedStateHash: stateHash, reason }))
+    if (!r.sent) { integrityError.value = r.notice; return }
     integrityDialog.value = false
     await load()
   } catch (error) { integrityError.value = error.message } finally { integrityBusy.value = false }
@@ -452,8 +555,14 @@ async function applyArtifact () {
   applyingArtifact.value = true
   actionError.value = ''
   try {
-    await api.applyArtifact(project.value, issueId.value, run.value.runId, run.value.delivery.revision)
-    await load()
+    const revision = run.value.delivery.revision
+    const r = await guard({
+      label: 'Apply patch to project',
+      before: { revision },
+      identity: () => ({ revision: run.value?.delivery?.revision }),
+      offered: offerOn(offers.applyArtifact)
+    }, (t) => api.applyArtifact(t.project, t.issueId, t.runId, revision))
+    if (r.sent) await load()
   } catch (error) { actionError.value = error.message } finally { applyingArtifact.value = false }
 }
 async function downloadPatch () {
@@ -469,23 +578,62 @@ const integrationTargetInfo = ref(null)
 const loadingTarget = ref(false)
 const integrating = ref(false)
 const integrationError = ref('')
+const integrationSeq = createSeq()
 async function loadIntegrationTarget () {
+  const runId = run.value.runId
+  const key = runKey(runId)
+  const ticket = integrationSeq.next(key)
+  const shown = () => integrationSeq.isLatest(ticket, key) && runKey(selectedRunId.value) === key
   loadingTarget.value = true
   integrationError.value = ''
-  try { integrationTargetInfo.value = await api.integrationTarget(project.value, issueId.value, run.value.runId) } catch (e) { integrationError.value = e.message } finally { loadingTarget.value = false }
+  try {
+    const info = await api.integrationTarget(project.value, issueId.value, runId)
+    if (shown()) integrationTargetInfo.value = info
+  } catch (e) { if (shown()) integrationError.value = e.message } finally { if (shown()) loadingTarget.value = false }
 }
-watch(() => run.value?.runId, () => { integrationTargetInfo.value = null })
+// Leaving the run (or the issue) invalidates every inspection read in flight, so none lands after a return to it.
+watch([() => run.value?.runId, project, issueId], () => {
+  integrationSeq.next(null)
+  integritySeq.next(null)
+  integrationTargetInfo.value = null
+  loadingTarget.value = false
+})
+const integrationPhase = (_, t) => runOf(t?.runId ?? run.value?.runId)?.integration?.phase ?? null
 async function reconcileIntegration () {
-  try { await api.reconcileIntegration(project.value, issueId.value, run.value.runId); await load() } catch (e) { integrationError.value = e.message }
+  try {
+    const r = await guard({ label: 'Finish it now', identity: integrationPhase, offered: offerOn(offers.reconcileIntegration) },
+      (t) => api.reconcileIntegration(t.project, t.issueId, t.runId))
+    if (r.sent) await load()
+  } catch (e) { integrationError.value = e.message }
 }
 async function integrate () {
   const target = integrationTargetInfo.value
   if (!target?.branch || !target.head) return
-  if (!window.confirm(`Integrate revision ${run.value.closure?.revision?.slice(0, 23)}… into ${target.branch} at ${target.head.slice(0, 12)}? This merges the candidate's commit.`)) return
+  const revision = run.value.closure?.revision
+  const runId = run.value.runId
+  if (!window.confirm(`Integrate revision ${revision?.slice(0, 23)}… into ${target.branch} at ${target.head.slice(0, 12)}? This merges the candidate's commit.`)) return
   integrating.value = true
   integrationError.value = ''
   try {
-    const result = await api.integrateRun(project.value, issueId.value, run.value.runId, { expectedRevision: run.value.closure?.revision, targetBranch: target.branch, expectedTargetHead: target.head })
+    const r = await guard({
+      label: 'Merge the change',
+      runId,
+      before: { revision },
+      identity: () => ({ revision: run.value?.closure?.revision }),
+      offered: offerOn(offers.integrate),
+      // The target branch is read again: the merge goes only onto the head that was shown.
+      source: () => ownRead(integrationSeq, runKey(runId), () => api.integrationTarget(project.value, issueId.value, runId)),
+      verify: (fresh) => {
+        const sameTarget = offers.mergeTarget(fresh) &&
+          fresh.repository === target.repository && fresh.branch === target.branch && fresh.head === target.head
+        if (sameTarget) return true
+        integrationTargetInfo.value = fresh
+        if (!offers.mergeTarget(fresh) || fresh.repository !== target.repository) return 'The merge target is no longer confirmed as the candidate\'s repository (it changed, or could not be read). Review it again; nothing was sent.'
+        return `The target branch moved (${short(target.head)} → ${short(fresh.head)}) since you prepared the merge. Review it again; nothing was sent.`
+      }
+    }, (t) => api.integrateRun(t.project, t.issueId, t.runId, { expectedRevision: revision, targetBranch: target.branch, expectedTargetHead: target.head }))
+    if (!r.sent) { integrationError.value = r.notice; return }
+    const result = r.value
     if (result.error) integrationError.value = result.error
     integrationTargetInfo.value = null
     await load()
@@ -501,12 +649,17 @@ async function savePriority () {
   savingPriority.value = true
   priorityError.value = ''
   try {
-    await api.setPriority(project.value, issueId.value, { value: priorityValue.value, reason: priorityReason.value })
+    const body = { value: priorityValue.value, reason: priorityReason.value }
+    const r = await guard({ label: 'Set priority', runId: null, before: priorityShown, identity: () => issue.value?.priority?.value ?? null, offered: () => !issue.value?.archived },
+      (t) => api.setPriority(t.project, t.issueId, body))
+    if (!r.sent) { priorityError.value = r.notice; return }
     priorityReason.value = ''
     showPriority.value = false
     await load()
   } catch (e) { priorityError.value = e.message } finally { savingPriority.value = false }
 }
+let priorityShown = null
+watch(showPriority, (open) => { if (open) priorityShown = issue.value?.priority?.value ?? null })
 const priorityColour = (value) => ({ urgent: 'error', high: 'warning', normal: 'primary', low: 'surface-variant' })[value] ?? undefined
 
 const DISPOSITION_OPTIONS = [
@@ -525,6 +678,8 @@ const dispositionRelated = ref('')
 const dispositionNeedsRelated = computed(() => ['split', 'duplicate'].includes(dispositionValue.value))
 const dispositionColour = (value) => value === 'resolved' ? 'success' : ['not-resolved', 'declined'].includes(value) ? 'error' : ['split', 'duplicate'].includes(value) ? 'info' : 'warning'
 const reportFindings = computed(() => run.value?.findings ?? [])
+let dispositionShown = { runId: null, disposition: null }
+watch(showDisposition, (open) => { if (open) dispositionShown = { runId: run.value?.runId ?? null, disposition: issue.value?.disposition?.value ?? null } })
 const dispositionError = ref('')
 const savingDisposition = ref(false)
 async function saveDisposition () {
@@ -532,7 +687,12 @@ async function saveDisposition () {
   dispositionError.value = ''
   try {
     const related = dispositionNeedsRelated.value ? dispositionRelated.value.split(/[\s,]+/).filter(Boolean) : null
-    await api.setDisposition(project.value, issueId.value, { value: dispositionValue.value, evidence: dispositionEvidence.value, runId: run.value?.runId ?? null, related })
+    const shown = dispositionShown
+    const body = { value: dispositionValue.value, evidence: dispositionEvidence.value, related }
+    // The decision cites the run whose findings the form showed: it must still be the one on screen.
+    const r = await guard({ label: 'Record the outcome', runId: shown.runId, before: shown.disposition, identity: () => issue.value?.disposition?.value ?? null, offered: () => !issue.value?.archived },
+      (t) => api.setDisposition(t.project, t.issueId, { ...body, runId: t.runId }))
+    if (!r.sent) { dispositionError.value = shown.runId && !runs.value.some((x) => x.runId === shown.runId) ? `The run this decision cites (${shown.runId}) no longer exists; review it again. Nothing was sent.` : r.notice; return }
     dispositionEvidence.value = ''
     dispositionRelated.value = ''
     showDisposition.value = false
@@ -557,7 +717,10 @@ const resumeClock = computed(() => wallClockAt(run.value?.wallClock, resumeBudge
 async function requestPause () {
   pausing.value = true
   actionError.value = ''
-  try { await api.pauseRun(project.value, issueId.value, run.value.runId); await load() }
+  try {
+    const r = await guard({ label: 'Pause run', offered: offerOn(offers.pause) }, (t) => api.pauseRun(t.project, t.issueId, t.runId))
+    if (r.sent) await load()
+  }
   catch (error) { actionError.value = error.message }
   finally { pausing.value = false }
 }
@@ -572,13 +735,19 @@ function openResume () {
   if (limits.maxSteps && used.steps >= limits.maxSteps) resumeBudgets.value.maxSteps = used.steps + limits.maxSteps
   if (limits.maxTokens && used.tokens >= limits.maxTokens) resumeBudgets.value.maxTokens = used.tokens + limits.maxTokens
   actionError.value = ''
+  resumeRunId = run.value.runId
   resumeDialog.value = true
 }
+let resumeRunId = null
 async function resumeRun () {
   resuming.value = true
   actionError.value = ''
   try {
-    await api.resumeRun(project.value, issueId.value, run.value.runId, resumeBudgets.value, actorName(answerActor.value) || undefined, resumeClock.value?.short === true && acceptShortWallClock.value)
+    const budgets = { ...resumeBudgets.value }
+    const acceptShort = resumeClock.value?.short === true && acceptShortWallClock.value
+    const r = await guard({ label: 'Resume run', runId: resumeRunId, offered: offerOn(offers.continuation('resume')) },
+      (t) => api.resumeRun(t.project, t.issueId, t.runId, budgets, actorName(answerActor.value) || undefined, acceptShort))
+    if (!r.sent) { actionError.value = r.notice; return }
     resumeDialog.value = false
     await load()
   } catch (error) { actionError.value = error.message }
@@ -628,9 +797,6 @@ const metrics = computed(() => {
   }
 })
 
-/* While the socket is down no events arrive, so anything shown about a live run
-   is a snapshot. Say so rather than letting a frozen timeline look finished. */
-const stale = computed(() => connection.status !== 'online' && Boolean(liveRun.value))
 
 const runDate = new Intl.DateTimeFormat(undefined, {
   month: 'short', day: 'numeric', year: 'numeric',
@@ -645,10 +811,27 @@ function runTitle (item) {
 const short = (f) => (f ? `${f.slice(0, 19)}…` : '—')
 
 let disposed = false
-let issueLoadVersion = 0
-let runLoadVersion = 0
+/*
+ * How current this page is (freshness.js). One refresh at a time: the issue, its
+ * runs, the supervisor's questions and the selected run are read together and
+ * shown together, only by the latest refresh and only on the issue still open.
+ * Panels that read their own endpoints report into `children`.
+ */
+const freshState = reactive({})
+const tracker = createTracker(freshState)
+const children = createChildRegistry(reactive({}))
+const freshRetry = ref(0)
+const freshSynced = ref(0)
+const view = computed(() => describe(freshState, connection, children.summary()))
+/** A run chosen in the picker (or the URL) whose read has not landed yet. */
+const pendingRunId = ref(null)
+const runNotice = ref('')
+/* The issue this page was mounted for (App.vue keys the page by issue): once the route names another,
+   this page reads nothing more and every guard refuses, whatever form or dialog it still holds. */
+const mountedOn = { project: route.params.project, id: route.params.id }
 function currentIssue () {
   if (disposed || route.name !== 'issue' || !project.value || !issueId.value) return null
+  if (project.value !== mountedOn.project || issueId.value !== mountedOn.id) return null
   return { project: project.value, id: issueId.value }
 }
 function stillOnIssue (location) {
@@ -658,14 +841,8 @@ function stillOnIssue (location) {
 
 /** Counts issue reloads, so panels that read their own endpoints follow the page. */
 const issueVersion = ref(0)
-// Open questions the top-level supervisor asked about this issue (ask_operator).
+// Open questions the top-level supervisor asked about this issue (ask_operator), read with the issue.
 const supervisorQuestions = ref([])
-async function loadSupervisorQuestions (location) {
-  try {
-    const all = await api.supervisorQuestions()
-    supervisorQuestions.value = all.filter((q) => q.project === location.project && q.issueId === location.id)
-  } catch { supervisorQuestions.value = [] /* the supervisor service may be unavailable; nothing to show */ }
-}
 
 /*
  * The Sections bar: any card or section can be hidden so the rest get the
@@ -735,62 +912,145 @@ watch(() => alertTarget.value ? `${run.value?.runId}:${alertTarget.value.state}:
   document.querySelector(action ? `[data-alert-action="${action}"]` : '[data-testid="alert-target"]')?.scrollIntoView({ block: 'center' })
 }, { immediate: true })
 
-async function load ({ keepSelection = true } = {}) {
+/**
+ * Read the issue, its runs, the supervisor's questions and the run to show, and
+ * show them all at once. Nothing is replaced unless every read succeeded for the
+ * latest refresh of the issue still open; a failure keeps the last complete view
+ * and the indicator offers Retry. Resolves 'ok' when it published, 'superseded' when a newer
+ * refresh (or the issue left) took over, 'failed' when a read failed.
+ */
+async function load ({ runId = null } = {}) {
   const location = currentIssue()
-  if (!location) return
-  const version = ++issueLoadVersion
-  const current = () => version === issueLoadVersion && stillOnIssue(location)
-  loadError.value = ''
+  if (!location) return 'superseded'
+  const ticket = tracker.begin()
+  const current = () => tracker.isLatest(ticket) && stillOnIssue(location)
   try {
-    const [nextIssue, nextRuns] = await Promise.all([
+    const [nextIssue, nextRuns, questions] = await Promise.all([
       api.getIssue(location.project, location.id),
-      api.listRuns(location.project, location.id)
+      api.listRuns(location.project, location.id),
+      api.supervisorQuestions()
     ])
-    if (!current()) return
+    if (!current()) return 'superseded'
+    const pick = pickRun({ list: nextRuns, explicit: runId ?? pendingRunId.value, query: route.query.run ?? null, current: selectedRunId.value })
+    const nextRun = pick.runId ? await api.getRun(location.project, location.id, pick.runId) : null
+    if (!current()) return 'superseded'
     issue.value = nextIssue
-    loadSupervisorQuestions(location)
-    issueVersion.value++
     runs.value = nextRuns
-
-    const prevRunId = selectedRunId.value
-    const requested = route.query.run
-    if (requested && nextRuns.some((r) => r.runId === requested)) {
-      selectedRunId.value = requested
-    } else if (!keepSelection || !nextRuns.some((r) => r.runId === selectedRunId.value)) {
-      selectedRunId.value = nextRuns[0]?.runId ?? null
-    }
-    if (selectedRunId.value === prevRunId) await loadRun()
+    supervisorQuestions.value = questions.filter((q) => q.project === location.project && q.issueId === location.id)
+    if (selectedRunId.value !== pick.runId) selectedTurn.value = null
+    selectedRunId.value = pick.runId
+    run.value = nextRun
+    if (nextRun) selectedTurn.value = pickTurn(nextRun, selectedTurn.value)
+    pendingRunId.value = null
+    runNotice.value = pick.missing ? `The run you chose (${pick.missing}) no longer exists; showing ${nextRun ? runTitle(nextRun) : 'no run'}.` : ''
+    loadError.value = ''
+    issueVersion.value++
+    tracker.succeed(ticket, { epoch: connection.epoch })
+    freshSynced.value++
+    return 'ok'
   } catch (err) {
-    if (current()) loadError.value = err.message
+    if (!current()) return 'superseded'
+    tracker.fail(ticket, err)
+    loadError.value = err.message
+    return 'failed'
   } finally {
-    if (current()) loading.value = false
+    if (stillOnIssue(location)) loading.value = false
   }
 }
 
-async function loadRun () {
-  const location = currentIssue()
-  const runId = selectedRunId.value
-  const version = ++runLoadVersion
-  if (!location) return
-  if (!runId) { run.value = null; return }
-  const current = () => version === runLoadVersion && stillOnIssue(location) && selectedRunId.value === runId
-  try {
-    const nextRun = await api.getRun(location.project, location.id, runId)
-    if (!current()) return
-    run.value = nextRun
-    selectedTurn.value = pickTurn(nextRun, selectedTurn.value)
-  } catch (err) {
-    // Keep the last successful read for this issue when its connection drops.
-    if (current()) loadError.value = err.message
-  }
+/** Retry: the page and every panel that reports into it read again. */
+function retry () {
+  freshRetry.value++
+  return load()
+}
+
+/** Pick another run: the old one stays on screen until the new one has been read. */
+function chooseRun (runId) {
+  if (!runId || (runId === selectedRunId.value && pendingRunId.value == null)) return
+  pendingRunId.value = runId
+  load({ runId })
 }
 
 /** Adopt the new run immediately: it has an id before it has any turns. */
 function onStarted (started) {
   actionError.value = ''
-  selectedRunId.value = started.runId
-  load()
+  pendingRunId.value = started.runId
+  load({ runId: started.runId })
 }
+
+/*
+ * Before anything is sent: is what the person acted on still true? (AC5.)
+ * When the page's own refresh is not current it refreshes first; the action's own
+ * source (a pre-gate, a merge target, the chat) is read again; then, with nothing
+ * awaited before the send, the refresh must not have been overtaken, the issue and
+ * run must still be the ones acted on, and the action still offered and unchanged.
+ * An overtaken check runs once more; anything else refuses and says why.
+ */
+const REFUSAL = {
+  gone: (label) => `"${label}" is no longer offered${explanation.value?.headline ? `: ${explanation.value.headline}` : ''}. Nothing was sent.`,
+  changed: (label) => `${label}: what you were shown changed. Review it again; nothing was sent.`,
+  unconfirmed: () => `Could not confirm the current state (${freshState.error ?? 'the refresh did not finish'}); nothing was sent. Retry when the view is up to date.`,
+  superseded: () => 'The view changed while this was being checked; review it again. Nothing was sent.',
+  disposed: () => 'The page was left before this could be checked; nothing was sent.'
+}
+async function guard (spec, send) {
+  // The issue an action names (a later Close step names the one it was confirmed on); the current one otherwise.
+  const target = { project: spec.issue?.project ?? project.value, issueId: spec.issue?.issueId ?? issueId.value, runId: 'runId' in spec ? spec.runId : (run.value?.runId ?? null) }
+  const before = 'before' in spec ? spec.before : (spec.identity ? spec.identity() : null)
+  actionNotice.value = ''
+  const result = await runGuard(() => guardPass({
+    alive: () => !disposed,
+    current: () => pageCurrent(freshState, connection),
+    load: () => load(),
+    seq: () => freshState.seq,
+    source: spec.source ?? null,
+    check (fresh) {
+      const where = checkTarget({ target, retires: spec.retires, current: currentIssue() && { project: project.value, issueId: issueId.value, selectedRunId: selectedRunId.value, listedRunIds: runs.value.map((r) => r.runId) } })
+      if (!where.ok) return { reason: where.reason }
+      // Offered is judged on the run the action was taken on, never on whichever run is selected now.
+      const verdict = judgeAction({ offered: spec.offered(fresh, target), before, after: spec.identity ? spec.identity(fresh, target) : before })
+      if (!verdict.send) return { reason: verdict.reason }
+      const verified = spec.verify ? spec.verify(fresh) : true
+      return verified === true ? null : { reason: 'changed', message: verified }
+    },
+    send: (fresh) => send(target, fresh)
+  }))
+  if (result.kind === 'send') return { sent: true, value: await result.value }
+  const notice = result.message ?? REFUSAL[result.reason](spec.label)
+  if (stillOnIssue({ project: target.project, id: target.issueId })) actionNotice.value = notice
+  return { sent: false, notice }
+}
+/**
+ * A read of an action's own source under its panel's latest-only sequence. A panel passes its
+ * reporter: this read supersedes the panel's display read, so it settles the panel's state too.
+ */
+const ownRead = readOwn
+/** A run as the page knows it: the selected one in full, any other from the run list. */
+const runOf = (runId) => (run.value?.runId === runId ? run.value : runs.value.find((r) => r.runId === runId)) ?? null
+/** The page's fresh state for an action's rule (action-offers.js): the issue, its runs, and the run acted on. */
+const offerState = (t) => ({ issue: issue.value, runs: runs.value, run: runOf(t?.runId) })
+const offerOn = (rule) => (_, t) => rule(offerState(t))
+/*
+ * An open confirmation whose offer a refresh withdrew says so inside the dialog and cannot be submitted
+ * (AC5): judged by the same rule as its guard, on the run the dialog was opened for.
+ */
+const goneIn = (open, runIdOf, rule, label) => computed(() => (open.value && !rule(offerState({ runId: runIdOf() })) ? REFUSAL.gone(label) : ''))
+const acceptCheckGone = goneIn(acceptCheckDialog, () => acceptCheckShown?.runId, (s) => offers.continuation('accept-check-result')(s) && Boolean(s.run?.acceptCheck), 'Accept check result')
+const resumeGone = goneIn(resumeDialog, () => resumeRunId, offers.continuation('resume'), 'Resume run')
+const cleanupGone = goneIn(cleanupDialog, () => cleanupRunId, offers.acknowledgeCleanup, 'Acknowledge cleanup')
+const integrityGone = goneIn(integrityDialog, () => integrityRunId, offers.continuation('resolve-integrity'), 'Resolve integrity')
+const closeGone = goneIn(closeDialog, () => null, (s) => Boolean(s.issue) && !s.issue.archived, 'Close issue')
+provide('issueFreshness', {
+  guard, ownRead, registry: children, retry: freshRetry, synced: freshSynced,
+  // What starting a run depends on, for the start dialog's guard.
+  startable: () => canStart.value,
+  // The run as the page last published it: props reach children only at the next render.
+  run: () => run.value,
+  runOf,
+  offerOn,
+  issue: () => issue.value,
+  startIdentity: () => ({ latestRunId: latestRun.value?.runId ?? null, live: Boolean(liveRun.value) })
+})
 
 /**
  * Ask the run to stop. The answer is `stopping`, not `stopped`: the run settles
@@ -810,9 +1070,16 @@ async function sendAnswer (choice = null) {
   if (!answer || !actorName(answerActor.value)) { actionError.value = 'An answer and your name are both required.'; return }
   answerSending.value = true
   actionError.value = ''
+  const shown = { pauseId: run.value.pause.id, question: run.value.pause.question ?? null }
+  const actor = actorName(answerActor.value)
   try {
-    await api.answerRun(project.value, issueId.value, run.value.runId, answer, actorName(answerActor.value), run.value.pause.id)
-    answerText.value = ''
+    const r = await guard({
+      label: 'Answer',
+      before: shown,
+      identity: () => ({ pauseId: run.value?.pause?.id ?? null, question: run.value?.pause?.question ?? null }),
+      offered: (fresh, t) => { const r = runOf(t.runId); return offerOn(offers.continuation('answer'))(fresh, t) && Boolean(r?.pause) && !['manual', 'full-verification'].includes(r.pause.kind) }
+    }, (t) => api.answerRun(t.project, t.issueId, t.runId, answer, actor, shown.pauseId))
+    if (r.sent) answerText.value = ''
   } catch (err) {
     actionError.value = err.message
   } finally {
@@ -826,7 +1093,7 @@ async function requestStop () {
   stopRequested.value = true
   actionError.value = ''
   try {
-    await api.stopRun(project.value, issueId.value, run.value.runId)
+    await guard({ label: 'Stop run', offered: offerOn(offers.stop) }, (t) => api.stopRun(t.project, t.issueId, t.runId))
   } catch (err) {
     actionError.value = err.message
   } finally {
@@ -838,12 +1105,11 @@ async function requestStop () {
 const selectedTurnData = computed(() =>
   run.value?.timeline.find((t) => t.number === selectedTurn.value) ?? null)
 
-watch(selectedRunId, () => { selectedTurn.value = null; loadRun() })
 
 /* Socket events refresh the display, but the display is always rebuilt from
    persisted state — a refresh or a lost connection reconstructs the same view. */
 function onChanged (payload) {
-  if (!payload?.id || (payload.id === issueId.value && payload.project === project.value)) load()
+  if (!payload?.id || (payload.id === issueId.value && payload.project === project.value)) { tracker.invalidate(); load() }
 }
 /* A run event can be about a run this browser has never seen — a start from
    another tab, or one that outlived a reload — so the list is refreshed too. */
@@ -859,48 +1125,40 @@ function onRunEvent (payload) {
     if (Date.now() - activityLoadAt < 15_000) return
     activityLoadAt = Date.now()
   }
+  // The server moved on: a refresh already in flight may no longer settle as current.
+  tracker.invalidate()
   clearTimeout(pending)
   pending = setTimeout(() => load(), 120)
 }
 let activityLoadAt = 0
 
-/* Reconnecting re-reads persisted state. Nothing is replayed from a buffer: the
-   view a reconnecting browser builds is the same one a fresh browser builds. */
-const onReconnect = () => load()
+/* Reconnecting, or coming back to a hidden or sleeping tab, re-reads persisted
+   state. Nothing is replayed from a buffer: the view a reconnecting browser builds
+   is the same one a fresh browser builds. */
+watch(() => connection.epoch, () => { tracker.invalidate(); load() })
+watch(() => connection.resumes, () => { tracker.invalidate(); load() })
+// A full verification freezes and thaws admission (the issue read's admissionFrozen) with no event of this issue.
+watch(() => connection.verification?.seq, () => { tracker.invalidate(); load() })
 
 onMounted(() => {
-  load({ keepSelection: false })
+  children.setKey(`${project.value}/${issueId.value}`)
+  load()
   clock = setInterval(() => { now.value = Date.now() }, 1000)
   socket.on('issues:changed', onChanged)
   socket.on('run:event', onRunEvent)
-  socket.on('connect', onReconnect)
 })
 
 onUnmounted(() => {
   disposed = true
-  issueLoadVersion++
-  runLoadVersion++
+  tracker.reset()
   clearInterval(clock)
   clearTimeout(pending)
   socket.off('issues:changed', onChanged)
   socket.off('run:event', onRunEvent)
-  socket.off('connect', onReconnect)
 })
 
-watch([project, issueId], () => {
-  issueLoadVersion++
-  runLoadVersion++
-  issue.value = null
-  runs.value = []
-  run.value = null
-  selectedRunId.value = null
-  selectedTurn.value = null
-  if (!currentIssue()) return
-  loading.value = true
-  load({ keepSelection: false })
-})
 watch(() => route.query.run, (runId) => {
-  if (runId && runs.value.some((r) => r.runId === runId)) selectedRunId.value = runId
+  if (runId && runId !== selectedRunId.value && currentIssue()) chooseRun(runId)
 })
 </script>
 
@@ -922,6 +1180,7 @@ watch(() => route.query.run, (runId) => {
       <button v-for="s in pageSections" :key="s.id" type="button" class="section-toggle" :aria-pressed="shown(s.id)"
               :disabled="(s.parents ?? []).some((p) => !shown(p))" :title="`${shown(s.id) ? 'Hide' : 'Show'} ${s.label.toLowerCase()}`"
               @click="toggleSection(s.id)">{{ s.label }}</button>
+      <FreshnessIndicator :view="view" class="issue__fresh" @retry="retry" />
     </div>
 
     <!-- ============================================== card 1: the issue -->
@@ -1095,15 +1354,20 @@ watch(() => route.query.run, (runId) => {
     </div>
 
     <div class="issue__alerts">
-      <v-alert v-if="loadError" type="error" variant="tonal" density="compact">
+      <!-- Before the first successful read there is no page to mark stale: say what failed. -->
+      <v-alert v-if="loadError && !issue" type="error" variant="tonal" density="compact">
         {{ loadError }}
-        <v-btn v-if="!issue" variant="text" size="small" :loading="loading" @click="load()">Reload issue</v-btn>
+        <v-btn variant="text" size="small" :loading="loading" @click="retry()">Reload issue</v-btn>
       </v-alert>
+      <v-alert v-if="actionNotice" type="info" variant="tonal" density="compact" closable data-test="action-notice" @click:close="actionNotice = ''">
+        {{ actionNotice }}
+      </v-alert>
+      <v-alert v-if="runNotice" type="info" variant="tonal" density="compact" closable @click:close="runNotice = ''">{{ runNotice }}</v-alert>
       <v-alert v-if="actionError" type="error" variant="tonal" density="compact" closable @click:close="actionError = ''">
         {{ actionError }}
       </v-alert>
       <!-- The run keeps going without this browser; only the view goes stale. -->
-      <v-alert v-if="stale" type="warning" variant="tonal" density="compact">
+      <v-alert v-if="connection.status !== 'online' && liveRun" type="warning" variant="tonal" density="compact">
         Connection lost. The run continues on the server; this page shows the last state it read and refreshes when the connection returns.
       </v-alert>
       <v-alert v-if="issue?.archived" type="info" variant="tonal" density="compact">
@@ -1122,10 +1386,12 @@ watch(() => route.query.run, (runId) => {
           <p v-else-if="interruptedRuns.length" class="muted">Close this issue and abandon its interrupted or paused runs? Existing work and logs will be kept. Their outcomes remain unverified.</p>
           <p v-if="!issue.disposition" class="muted">No outcome is recorded for this issue. You can record one under "Your decision", or close it now. A reason is optional and is kept on the issue.</p>
           <v-text-field v-model="closeReason" label="Reason for closing without a disposition (optional)" aria-label="Reason for closing without a disposition" autofocus />
+          <v-alert v-if="closeGone" type="warning" variant="tonal" class="mb-3">{{ closeGone }}</v-alert>
           <v-alert v-if="actionError" type="error" variant="tonal" class="mb-3">{{ actionError }}</v-alert>
+          <v-alert v-if="actionNotice" type="info" variant="tonal" class="mb-3">{{ actionNotice }}</v-alert>
           <div class="issue__dialog-actions">
             <v-btn variant="text" size="small" @click="closeDialog = false">Cancel</v-btn>
-            <v-btn color="warning" variant="tonal" size="small" :disabled="archiving" :loading="archiving" @click="archiveIssue">Close issue</v-btn>
+            <v-btn color="warning" variant="tonal" size="small" :disabled="archiving || Boolean(closeGone)" :loading="archiving" @click="archiveIssue">Close issue</v-btn>
           </div>
         </v-card>
       </v-dialog>
@@ -1135,6 +1401,7 @@ watch(() => route.query.run, (runId) => {
           <v-card-title>Changes the integrity check held back</v-card-title>
           <v-card-text>
             <div v-if="integrityBusy && !integrityState" class="muted">Comparing the workspace with the state the turn received…</div>
+            <v-alert v-if="integrityGone" type="warning" variant="tonal" density="compact" class="mb-3">{{ integrityGone }}</v-alert>
             <v-alert v-if="integrityError" type="error" variant="tonal" density="compact" class="mb-3">{{ integrityError }}</v-alert>
             <template v-if="integrityState">
               <p><strong>{{ integrityState.role }}</strong> — {{ integrityState.reason }}<template v-if="integrityState.cause"> ({{ integrityState.cause.class }}: {{ integrityState.cause.message }})</template></p>
@@ -1151,7 +1418,7 @@ watch(() => route.query.run, (runId) => {
             <v-btn :disabled="integrityBusy" @click="integrityDialog = false">Cancel</v-btn>
             <v-spacer />
             <template v-if="integrityState">
-              <v-btn v-for="d in integrityState.dispositions" :key="d" :color="INTEGRITY_ACTIONS[d].color" :loading="integrityBusy" :disabled="!integrityReason.trim()" @click="resolveIntegrity(d)">{{ INTEGRITY_ACTIONS[d].label }}</v-btn>
+              <v-btn v-for="d in integrityState.dispositions" :key="d" :color="INTEGRITY_ACTIONS[d].color" :loading="integrityBusy" :disabled="!integrityReason.trim() || Boolean(integrityGone)" @click="resolveIntegrity(d)">{{ INTEGRITY_ACTIONS[d].label }}</v-btn>
             </template>
           </v-card-actions>
         </v-card>
@@ -1165,9 +1432,10 @@ watch(() => route.query.run, (runId) => {
             <p v-if="run?.acceptCheck?.notRun?.length" class="mb-2">Required commands that did not run because of them: <code>{{ run.acceptCheck.notRun.join(', ') }}</code></p>
             <p class="mb-4">If the coordinator has not confirmed this version, it is asked first, and nothing is accepted or delivered unless it confirms. The run page then says which happened.</p>
             <v-textarea v-model="acceptCheckReason" label="Why these failures are unrelated to this change" rows="3" density="compact" variant="outlined" />
+            <v-alert v-if="acceptCheckGone" type="warning" variant="tonal" class="mb-2">{{ acceptCheckGone }}</v-alert>
             <v-alert v-if="actionError" type="error" variant="tonal">{{ actionError }}</v-alert>
           </v-card-text>
-          <v-card-actions><v-spacer /><v-btn :disabled="acceptingCheck" @click="acceptCheckDialog = false">Cancel</v-btn><v-btn color="primary" :loading="acceptingCheck" :disabled="!acceptCheckReason.trim()" @click="acceptCheckResult">Accept and deliver</v-btn></v-card-actions>
+          <v-card-actions><v-spacer /><v-btn :disabled="acceptingCheck" @click="acceptCheckDialog = false">Cancel</v-btn><v-btn color="primary" :loading="acceptingCheck" :disabled="!acceptCheckReason.trim() || Boolean(acceptCheckGone)" @click="acceptCheckResult">Accept and deliver</v-btn></v-card-actions>
         </v-card>
       </v-dialog>
 
@@ -1183,9 +1451,10 @@ watch(() => route.query.run, (runId) => {
             <p v-if="resumeClock" class="mb-2">{{ resumeClock.text }}</p>
             <v-alert v-if="resumeClock?.exhausted" type="warning" variant="tonal" class="mb-2">No time is left under this limit: raise it to resume.</v-alert>
             <v-checkbox v-if="resumeClock?.short" v-model="acceptShortWallClock" density="compact" hide-details label="Less than a mean round is left: resume anyway. A turn may be cut at the deadline." />
+            <v-alert v-if="resumeGone" type="warning" variant="tonal" class="mb-2">{{ resumeGone }}</v-alert>
             <v-alert v-if="actionError" type="error" variant="tonal">{{ actionError }}</v-alert>
           </v-card-text>
-          <v-card-actions><v-spacer /><v-btn :disabled="resuming" @click="resumeDialog = false">Cancel</v-btn><v-btn color="primary" :loading="resuming" @click="resumeRun">Resume saved run</v-btn></v-card-actions>
+          <v-card-actions><v-spacer /><v-btn :disabled="resuming" @click="resumeDialog = false">Cancel</v-btn><v-btn color="primary" :loading="resuming" :disabled="Boolean(resumeGone)" @click="resumeRun">Resume saved run</v-btn></v-card-actions>
         </v-card>
       </v-dialog>
 
@@ -1196,9 +1465,10 @@ watch(() => route.query.run, (runId) => {
             <p v-if="run?.explanation?.cause" class="muted mb-2"><code>{{ run.explanation.cause }}</code></p>
             <p class="mb-4">You are recording that no process a turn started is still running. Your name and reason are kept on the run and on the project.</p>
             <v-textarea v-model="cleanupReason" label="What you checked (required)" rows="3" auto-grow counter="2000" density="compact" variant="outlined" />
+            <v-alert v-if="cleanupGone" type="warning" variant="tonal" class="mb-2">{{ cleanupGone }}</v-alert>
             <v-alert v-if="cleanupError" type="error" variant="tonal">{{ cleanupError }}</v-alert>
           </v-card-text>
-          <v-card-actions><v-spacer /><v-btn :disabled="cleanupBusy" @click="cleanupDialog = false">Cancel</v-btn><v-btn color="primary" :loading="cleanupBusy" :disabled="!cleanupReason.trim()" @click="acknowledgeCleanup">Acknowledge</v-btn></v-card-actions>
+          <v-card-actions><v-spacer /><v-btn :disabled="cleanupBusy" @click="cleanupDialog = false">Cancel</v-btn><v-btn color="primary" :loading="cleanupBusy" :disabled="!cleanupReason.trim() || Boolean(cleanupGone)" @click="acknowledgeCleanup">Acknowledge</v-btn></v-card-actions>
         </v-card>
       </v-dialog>
 
@@ -1252,7 +1522,8 @@ watch(() => route.query.run, (runId) => {
           </v-alert>
           <div v-show="shown('runbar')" class="runbar">
             <v-select
-              v-model="selectedRunId"
+              :model-value="pendingRunId ?? selectedRunId"
+              :loading="pendingRunId != null"
               :items="runs"
               :item-title="runTitle"
               item-value="runId"
@@ -1261,6 +1532,7 @@ watch(() => route.query.run, (runId) => {
               density="compact"
               variant="outlined"
               hide-details
+              @update:model-value="chooseRun"
             >
               <template #item="{ props: itemProps, item }">
                 <v-list-item v-bind="itemProps" role="option" :title="runTitle(item)">
@@ -1357,7 +1629,7 @@ watch(() => route.query.run, (runId) => {
           </div>
 
           <!-- Triage asked the owner before starting; the run has ended and holds nothing. -->
-          <OwnerInput v-if="run.ownerInput && !run.ownerInput.answer" :project="project" :issue-id="issueId" :run="run" data-alert-action="owner-input" :class="{ 'alert-focus': alertTarget?.target === 'owner-input' && alertTarget.state === 'waiting' }" @answered="load" />
+          <OwnerInput v-if="run.ownerInput && !run.ownerInput.answer" :project="project" :issue-id="issueId" :run="run" data-alert-action="owner-input" :class="{ 'alert-focus': alertTarget?.target === 'owner-input' && alertTarget.state === 'waiting' }" @answered="load()" />
 
           <p v-if="explanation.next || explanation.kept" class="status__next">
             {{ [explanation.kept, explanation.next].filter(Boolean).join(' ') }}
@@ -1693,6 +1965,7 @@ watch(() => route.query.run, (runId) => {
 .section-toggle[aria-pressed="false"] { color: inherit; opacity: 0.55; text-decoration: line-through; }
 .section-toggle:disabled { cursor: default; opacity: 0.35; }
 .issue__questions { display: flex; flex-direction: column; gap: 6px; }
+.issue__fresh { margin-left: auto; }
 .issue__alerts { display: flex; flex-direction: column; gap: 6px; }
 .issue__alerts:empty { display: none; }
 .issue__dialog-title { font-size: 1rem; font-weight: 650; margin-bottom: 6px; }

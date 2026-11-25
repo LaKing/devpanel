@@ -88,7 +88,9 @@ phases:
       maxRounds: 10
       consensus: true
       until: review.verdict == approved && !review.substantial
-      # Nobody is asked when the rounds run out: a loop whose last round left
+      # Nobody is asked whether to go on when the rounds run out (an open owner
+      # hold is still put to the consult panel first, execution-contract.md
+      # "Owner holds"): a loop whose last round left
       # fewer substantial findings than the one before gets one more round,
       # otherwise the run ends unresolved with drafts and findings preserved.
       onExhausted: extend-if-converging

@@ -251,7 +251,10 @@ app.post('/api/projects/:project/issues', route(async (req, res) => {
 }))
 
 app.get('/api/projects/:project/issues/:id', route(async (req, res) => {
-  res.json(await getIssue(req.params.project, req.params.id))
+  // admissionFrozen: the full verification's freeze in effect ({cycleId, at}) or null, read with the issue so the
+  // page refuses before sending what supervisor.mjs refuses while frozen (start :368, answer :770, finalize :1589).
+  const frozen = supervisor.frozen?.() ?? null
+  res.json({ ...(await getIssue(req.params.project, req.params.id)), admissionFrozen: frozen ? { cycleId: frozen.cycleId ?? null, at: frozen.at ?? null } : null })
 }))
 
 // Where the issue came from, what came out of it, and what it waits for or holds up (issue-family.mjs).
@@ -625,15 +628,20 @@ async function assessors () {
   const { roster } = await loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT })
   const models = []
   for (const m of roster.values()) {
-    const hold = await supervisor.availability.check(m.id).catch(() => null)
+    // A lookup that failed is not "no hold": availabilityError says so, and the panel treats the model as unconfirmed.
+    let hold = null
+    let availabilityError = null
+    try { hold = await supervisor.availability.check(m.id) } catch (error) { availabilityError = String(error?.message ?? error) }
     models.push({ id: m.id, title: m.title ?? m.id, harness: m.harness, efforts: Array.isArray(m.efforts) ? m.efforts : [], defaultEffort: m.defaultEffort ?? null,
-      verified: m.verification?.status === 'verified', heldUntil: hold?.exhaustedUntil ?? null })
+      verified: m.verification?.status === 'verified', heldUntil: hold?.exhaustedUntil ?? null, ...(availabilityError ? { availabilityError } : {}) })
   }
   return { provider: config ? { id: config.id, title: config.title ?? config.id, model: config.model } : null, models: models.sort((a, b) => a.title.localeCompare(b.title)) }
 }
 const pregateView = async (project, issueId) => {
   const config = await loadProvider()
-  return { configured: Boolean(config), threshold: config?.threshold ?? null, assessors: await assessors(), ...await pregate.latest({ project, issueId }) }
+  // What a start would meet now (pregate.current): the panel checks it before Start anyway. Its failure fails nothing else.
+  const current = await pregate.current({ project, issueId }).catch((error) => ({ error: error.message }))
+  return { configured: Boolean(config), threshold: config?.threshold ?? null, assessors: await assessors(), ...await pregate.latest({ project, issueId }), current }
 }
 
 // The pre-gate on one issue: the newest assessment and what an operator could confirm.
@@ -712,7 +720,7 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
 
 app.get('/api/projects/:project/issues/:id/runs', route(async (req, res) => {
   const issue = await issues.getRunHolder(req.params.project, req.params.id)
-  res.json(issue.packed ? [] : await listRuns(issue.path))
+  res.json(issue.packed ? [] : await listRuns(issue.path, { strict: true }))
 }))
 
 app.get('/api/projects/:project/issues/:id/runs/:runId', route(async (req, res) => {
@@ -722,7 +730,8 @@ app.get('/api/projects/:project/issues/:id/runs/:runId', route(async (req, res) 
     project: req.params.project,
     issueId: req.params.id,
     isActive: supervisor.isActive(req.params.project, req.params.id),
-    liveCheckSince: supervisor.liveCheckSince(req.params.project, req.params.id, req.params.runId)
+    liveCheckSince: supervisor.liveCheckSince(req.params.project, req.params.id, req.params.runId),
+    strict: true
   }))
 }))
 
@@ -769,7 +778,8 @@ app.post('/api/projects/:project/issues/:id/runs', route(async (req, res) => {
     runOptions,
     configRoot: process.env.DEVPANEL_CONFIG_ROOT,
     // The panel is the operator: this is the one place a pre-gate hold is overridden.
-    pregateOverride: pregateBody?.override ? { by: 'operator', reason: pregateBody.reason } : null
+    // expectKey names the hold the operator was shown; the start refuses when another one (or none) applies.
+    pregateOverride: pregateBody?.override ? { by: 'operator', reason: pregateBody.reason, expectKey: typeof pregateBody.expectKey === 'string' ? pregateBody.expectKey : null } : null
   })
   res.status(201).json(started)
 }))

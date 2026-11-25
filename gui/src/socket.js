@@ -22,6 +22,10 @@ const state = reactive({
   /* The last `verification:changed` event of the full verification: the
      dashboard card and the verification page reload when it moves. */
   verification: null,
+  /* Counts connections: a page synchronized on an earlier one is not current on this one. */
+  epoch: 0,
+  /* Counts returns of the tab from hidden or from the back-forward cache: pages refresh on each. */
+  resumes: 0,
   error: null
 })
 
@@ -49,6 +53,7 @@ function connectWithToken () {
 watch([authToken, hasProxyLogin], connectWithToken, { immediate: true })
 
 socket.on('connect', () => {
+  state.epoch++
   state.status = 'online'
   state.attempts = 0
   state.error = null
@@ -84,7 +89,9 @@ socket.on('hello', (payload) => {
 })
 
 socket.on('metrics', applyMetrics)
-socket.on('verification:changed', (event) => { state.verification = { ...event, at: Date.now() } })
+// `seq` counts events: two in the same millisecond are still two changes (a timestamp would merge them).
+let verificationSeq = 0
+socket.on('verification:changed', (event) => { state.verification = { ...event, at: Date.now(), seq: ++verificationSeq } })
 
 function applyMetrics (metrics) {
   if (!metrics) return
@@ -105,5 +112,13 @@ function measureLatency () {
 setInterval(() => {
   if (state.status === 'online') measureLatency()
 }, 10_000)
+
+// A sleeping or hidden tab gets no events it can trust; coming back is a reason to read again.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') state.resumes++ })
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('pageshow', (event) => { if (event.persisted) state.resumes++ })
+}
 
 export const connection = readonly(state)

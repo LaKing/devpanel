@@ -530,10 +530,22 @@ export function createFullVerification ({
     return kept + 1
   }
 
-  async function latestRecord () {
-    const dates = (await fs.readdir(verificationDir).catch(() => [])).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort().reverse()
+  /**
+   * The newest cycle record. With `strict` (latest(), what the pages show) a listing or a newest record that exists
+   * but cannot be read throws (503) instead of falling back to an older cycle; only a missing one is passed over.
+   */
+  async function latestRecord ({ strict = false } = {}) {
+    const unreadable = (what, error) => Object.assign(new Error(`${what} cannot be read: ${error.message}`), { status: 503 })
+    const listed = await fs.readdir(verificationDir).catch((error) => {
+      if (strict && error.code !== 'ENOENT') throw unreadable('the verification directory', error)
+      return []
+    })
+    const dates = listed.filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort().reverse()
     for (const date of dates) {
-      const record = await fs.readFile(path.join(verificationDir, date, 'cycle.json'), 'utf8').then(JSON.parse, () => null)
+      const record = await fs.readFile(path.join(verificationDir, date, 'cycle.json'), 'utf8').then(JSON.parse, (error) => {
+        if (strict && error.code !== 'ENOENT') throw unreadable(`the cycle record of ${date}`, error)
+        return null
+      })
       if (record) return record
     }
     return null
@@ -665,12 +677,16 @@ export function createFullVerification ({
       running = null
       current = null
       supervisor.thaw(record.id)
+      // Not active any more: a page that read it active must hear so.
+      if (record.id) changed(record)
       throw error
     }
     // The record as it stood when admission closed; the cycle goes on changing its own copy.
     const frozen = structuredClone(record)
     activeInputs = inputs
-    running = cycle(record, inputs).catch((error) => log.warn?.(`[devpanel] full verification ${record.id} failed: ${error.message}`)).finally(() => { running = null })
+    // Clearing `running` changes what latest() reports (active), so it is announced like any write,
+    // whatever became of the cycle's own last write or its announcement.
+    running = cycle(record, inputs).catch((error) => log.warn?.(`[devpanel] full verification ${record.id} failed: ${error.message}`)).finally(() => { running = null; changed(record) })
     return frozen
   }
 
@@ -1494,7 +1510,7 @@ export function createFullVerification ({
         active: Boolean(running),
         frozen: supervisor.frozen?.() ?? null,
         deliveries: lastDeliveryCheck,
-        cycle: running ? current : await latestRecord()
+        cycle: running ? current : await latestRecord({ strict: true })
       }
     },
     /** For tests: the cycle in progress settles. */

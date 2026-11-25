@@ -222,6 +222,53 @@ export default async function (t) {
       t.eq('a hand start without a schedule records none and uses UTC dates', [ended.schedule, ended.timeZone], [null, 'UTC'])
     }
 
+    t.section('5b. the end of a cycle is announced once it is no longer active, whatever its announcement did')
+    {
+      const issuesDir = await temp('devpanel-fv-settle-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const w = world({ issuesDir })
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const order = []
+      let lastEmit = null
+      const emit = (event) => { order.push({ at: 'emit' }); lastEmit = event }
+      const onEnded = async () => { order.push({ at: 'announce-rejected' }); throw new Error('the supervisor is away') }
+      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, pollMs: 1000, emit, onEnded, log: { warn () {} } })
+      const started = await fv.startNow({ by: 'tester' })
+      await fv.settle()
+      const rejectedAt = order.findIndex((o) => o.at === 'announce-rejected')
+      const lastAt = order.map((o) => o.at).lastIndexOf('emit')
+      t.ok('the announcement was attempted and rejected', rejectedAt >= 0)
+      t.ok('an event follows the rejected announcement', lastAt > rejectedAt, JSON.stringify(order))
+      t.eq('it is the existing verification:changed, for that cycle', [lastEmit.type, lastEmit.id], ['verification:changed', started.id])
+      t.eq('and a refresh it triggers reads the cycle inactive', (await fv.latest()).active, false)
+    }
+    {
+      const issuesDir = await temp('devpanel-fv-failstart-')
+      const w = world({ issuesDir })
+      const events = []
+      const fv = createFullVerification({ supervisor: { ...w.supervisor, freeze: async () => { throw new Error('freeze refused') } }, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(issuesDir, '.verification'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, emit: (e) => events.push(e), log: { warn () {} } })
+      let failed = null
+      try { await fv.startNow({ by: 'tester' }) } catch (error) { failed = error.message }
+      t.eq('a start that failed after taking an id says so with an event, and is not active', [failed, events.length, events[0]?.type, (await fv.latest()).active], ['freeze refused', 1, 'verification:changed', false])
+    }
+    {
+      // AC2: the newest cycle record exists but cannot be read; latest() fails rather than publish an older cycle.
+      const issuesDir = await temp('devpanel-fv-unreadable-')
+      const w = world({ issuesDir })
+      const verificationDir = path.join(issuesDir, '.verification')
+      await fs.mkdir(path.join(verificationDir, '2026-11-06'), { recursive: true })
+      await fs.writeFile(path.join(verificationDir, '2026-11-06', 'cycle.json'), JSON.stringify({ id: '2026-11-06.1', state: 'ended' }))
+      await fs.mkdir(path.join(verificationDir, '2026-11-07', 'cycle.json'), { recursive: true })   // reading it fails (EISDIR)
+      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      const unreadable = await fv.latest().then(() => null, (error) => error)
+      t.eq('an unreadable newest cycle is a 503 naming its date, never the older cycle', [unreadable?.status, /2026-11-07/.test(unreadable?.message ?? '')], [503, true])
+      await fs.rm(path.join(verificationDir, '2026-11-07'), { recursive: true })
+      await fs.mkdir(path.join(verificationDir, '2026-11-07'))
+      t.eq('a date with no cycle record yet is passed over (nothing unreadable)', (await fv.latest()).cycle?.id, '2026-11-06.1')
+      const listing = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir: path.join(verificationDir, '2026-11-06', 'cycle.json'), resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, log: { warn () {} } })
+      t.eq('an unlistable verification directory is a 503 too', (await listing.latest().then(() => null, (error) => error))?.status, 503)
+    }
+
     t.section('6. off without the block; no catch-up after the time has passed')
     {
       const issuesDir = await temp('devpanel-fv-off-')

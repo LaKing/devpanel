@@ -794,8 +794,9 @@ engine releases the worktree on that report. The fake harness in `gui/test/fakes
   `operatorRequest` needs a `category` (`live-checkout` | `owner-gate` | `authorization` |
   `requirement-conflict`) and a `recommendation`; technical choices go to handoff `assumptions`, listed in
   `result.md`. A seat's `ownerHolds` (`access` | `security` | `documented-promise`, with a reason) pause the run before
-  implementation and before confirmation until the owner answers, whatever the coordinator wrote (`runtime/owner-holds.mjs`,
-  `run.ownerHolds`, execution-contract.md "Owner holds").
+  implementation and before confirmation until the owner answers, whatever the coordinator wrote; one stated in plan review
+  goes to the consult panel before the plan loop's next turn, end of rounds or budget block (`runtime/owner-holds.mjs`,
+  `engine.settlePlanReviewHolds`, `run.ownerHolds`, execution-contract.md "Owner holds").
 - Operator decisions are steps. A phase transition `to: await-input` (with a `question`), a loop
   `onExhausted: await-input`, or the coordinator's own `operatorRequest` on its `handoff` pauses the run
   (`status: paused`, `run.pause`); `engine.answer()` records the

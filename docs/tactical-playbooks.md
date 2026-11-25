@@ -169,7 +169,7 @@ live-checkout work, a stop the issue itself asked for or a question a plan or an
 audit addresses to the owner on access, security or a documented promise
 (`owner-gate`), authorization and verified requirement conflicts, one question
 with a recommendation. A seat states such a question in `ownerHolds`, and the
-engine asks it before implementation, whatever the coordinator wrote
+engine asks it before plan review goes on, or before implementation, whatever the coordinator wrote
 (execution-contract.md "Owner holds").
 
 ## Proportional scope

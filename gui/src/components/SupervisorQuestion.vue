@@ -1,7 +1,8 @@
 <script setup>
-import { ref } from 'vue'
+import { inject, ref } from 'vue'
 
 import { api } from '@/api'
+import { createSeq } from '@/freshness'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
 import QuestionBrief from '@/components/QuestionBrief.vue'
 
@@ -16,13 +17,44 @@ const text = ref('')
 const actor = ref(rememberedActor())
 const sending = ref(false)
 const error = ref('')
+/* On the issue page the answer goes through the page's guard, and a refusal is said on the page:
+   this component is gone once the page refreshes without the question. */
+const freshness = inject('issueFreshness', null)
+const seq = createSeq()
 
 async function send (choice = null) {
   const answer = (choice ?? text.value).trim()
   if (!answer || !actorName(actor.value)) { error.value = 'An answer and your name are both required.'; return }
   sending.value = true
+  const id = props.question.id ?? props.question.questionId
+  const shown = props.question.question
+  const name = actorName(actor.value)
+  const stillOpen = (open) => open.find((q) => (q.id ?? q.questionId) === id) ?? null
   try {
-    await api.answerSupervisorQuestion(props.question.id ?? props.question.questionId, answer, actorName(actor.value))
+    if (freshness) {
+      // Read the open questions again under the page's guard: answer only the one shown, still open, still asking the same.
+      const r = await freshness.guard({
+        label: 'Answer the supervisor',
+        runId: null,
+        source: () => freshness.ownRead(seq, 'supervisor-questions', () => api.supervisorQuestions()),
+        offered: () => true,
+        verify: (open) => {
+          const still = stillOpen(open)
+          if (!still) return 'This question was answered or withdrawn meanwhile. Nothing was sent.'
+          return still.question === shown || 'The question changed since it was shown; read it again. Nothing was sent.'
+        }
+      }, () => api.answerSupervisorQuestion(id, answer, name))
+      if (r.sent) { text.value = ''; error.value = '' }
+      emit('answered')
+      return
+    }
+    const still = stillOpen(await api.supervisorQuestions())
+    if (!still || still.question !== shown) {
+      error.value = still ? 'The question changed since it was shown; read it again. Nothing was sent.' : 'This question was answered or withdrawn meanwhile. Nothing was sent.'
+      emit('answered')
+      return
+    }
+    await api.answerSupervisorQuestion(id, answer, name)
     text.value = ''; error.value = ''
     emit('answered')
   } catch (e) { error.value = e.message } finally { sending.value = false }

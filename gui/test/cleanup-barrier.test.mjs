@@ -6,6 +6,7 @@ import path from 'node:path'
 import { startRun, resumeRun, releaseOwnership, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { resolvePlaybook } from '../server/config/load.mjs'
 import { readBarrier } from '../server/runtime/cleanup-barrier.mjs'
+import { getRun, listRuns } from '../server/runs-api.mjs'
 import { alive } from '../server/runtime/process.mjs'
 import { hostPlatform, platformFor, REAP_TAG } from '../server/runtime/platform.mjs'
 import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
@@ -58,6 +59,17 @@ export default async function (t) {
     t.eq('the run blocked cleanup-unproved', `${first.run.status}/${first.run.blockedReason}`, 'blocked/cleanup-unproved')
     const barrier = await readBarrier(projectDir)
     t.eq('the barrier names the run and its tag', barrier.entries.map((e) => [e.runId, e.tag]), [[first.runId, first.run.cleanup.entries[0].tag]])
+    // What the page mirrors before Delete or Close (supervisor.mjs deleteRun, issues.js requireCleanupRecorded).
+    const readFlags = async () => [(await listRuns(a.path, { strict: true })).find((r) => r.runId === first.runId)?.cleanupUnrecorded,
+      (await getRun(a.path, first.runId, { issues: f.issues, project: P, issueId: a.id })).cleanupUnrecorded]
+    t.eq('recorded in the barrier: the run list and the run detail say cleanupUnrecorded false', await readFlags(), [false, false])
+    const barrierFile = path.join(projectDir, '.cleanup-barrier.json')
+    const saved = await fs.readFile(barrierFile)
+    await fs.writeFile(barrierFile, JSON.stringify({ entries: [], history: [] }))
+    t.eq('missing from the barrier: both say true', await readFlags(), [true, true])
+    await fs.writeFile(barrierFile, '{')
+    t.eq('an unreadable barrier counts as unrecorded', await readFlags(), [true, true])
+    await fs.writeFile(barrierFile, saved)
     const refused = await refusal(start(b, IN_PLACE))
     t.eq('another issue\'s in-place start is refused', [refused?.status, refused?.code], [409, 'CLEANUP_BARRIER'])
     t.ok('naming the run that holds it', refused?.message.includes(first.runId), refused?.message)

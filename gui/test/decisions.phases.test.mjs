@@ -127,13 +127,34 @@ export default async function (t) {
     const notOperator = await refusal(() => supervisor.start({ project: P, issueId: f.issue.id, playbookId: 'triage', configRoot: f.configRoot, pregateOverride: { by: 'supervisor', reason: 'because' } }))
     t.eq('and an operator', notOperator?.status, 403)
 
-    const started = await supervisor.start({ project: P, issueId: f.issue.id, playbookId: 'triage', configRoot: f.configRoot, pregateOverride: { by: 'operator', reason: 'the other issue is a different page' } })
+    // What Start anyway is checked against before it is sent (pregate.current), and the server's own check of the key.
+    const now = await pregate.current({ project: P, issueId: f.issue.id })
+    t.eq('current: the hold a start would meet now, asking nobody', [now.configured, now.recorded, now.holds, now.gate, now.key === held?.pregate.key, oracle.calls.length], [true, true, true, 'close-issue', true, 1])
+    const recorded = (await fs.readdir(path.join(f.issue.path, 'decisions'))).filter((n) => /^triage-pregate-[^.]+\.json$/.test(n))
+    t.eq('its key is the one the ask recorded under', recorded, [`triage-pregate-${now.key.slice(0, 16)}.json`])
+    const wrongKey = await refusal(() => supervisor.start({ project: P, issueId: f.issue.id, playbookId: 'triage', configRoot: f.configRoot, pregateOverride: { by: 'operator', reason: 'because', expectKey: 'another-hold' } }))
+    t.eq('an override naming another hold is refused, with the hold in force', [wrongKey?.status, wrongKey?.code, wrongKey?.pregate?.key === now.key], [409, 'PREGATE_CHANGED', true])
+    t.eq('and nothing was reserved', await runsOf(f.issue.path), [])
+    const unconfigured = createPregate({ issues: f.issues, advisor: createAdvisor({ spending: () => null, loadProvider: async () => null, createOracle: () => oracle }) })
+    t.eq('without a provider nothing holds', await unconfigured.current({ project: P, issueId: f.issue.id }), { configured: false, holds: false, reason: 'not-configured' })
+
+    const started = await supervisor.start({ project: P, issueId: f.issue.id, playbookId: 'triage', configRoot: f.configRoot, pregateOverride: { by: 'operator', reason: 'the other issue is a different page', expectKey: now.key } })
     await supervisor.settle()
     const dir = path.join(f.issue.path, 'runs', started.runId, 'decisions')
     const override = JSON.parse(await fs.readFile(path.join(dir, 'pregate-override.json'), 'utf8'))
     t.eq('an operator override starts the run and is kept with it', [override.by, override.reason, override.held.gate], ['operator', 'the other issue is a different page', 'close-issue'])
     t.ok('beside the record it overrode', (await fs.readdir(dir)).some((n) => n.startsWith('triage-pregate-')))
     t.eq('still one call', oracle.calls.length, 1)
+    t.ok('an override naming the hold in force starts', Boolean(started.runId))
+
+    // A note changes what the pre-gate would be asked: the shown hold no longer applies.
+    await f.issues.createStep(P, f.issue.id, { name: 'note', text: 'It is a different page after all.', format: 'md' })
+    const afterNote = await pregate.current({ project: P, issueId: f.issue.id })
+    t.eq('after a note the key moves and nothing is recorded under it', [afterNote.key !== now.key, afterNote.recorded, afterNote.holds, afterNote.reason], [true, false, null, 'not-asked'])
+    t.eq('current asked nobody', oracle.calls.length, 1)
+    const runsBefore = (await runsOf(f.issue.path)).length
+    const noHold = await refusal(() => supervisor.start({ project: P, issueId: f.issue.id, playbookId: 'triage', configRoot: f.configRoot, pregateOverride: { by: 'operator', reason: 'because', expectKey: now.key } }))
+    t.eq('Start anyway when no hold applies any more is refused, nothing reserved', [noHold?.status, noHold?.code, (await runsOf(f.issue.path)).length], [409, 'PREGATE_CHANGED', runsBefore])
 
     const report = await triageAgreement({ issues: f.issues, threshold: 0.9 })
     const row = report.rows.find((r) => r.runId === started.runId)

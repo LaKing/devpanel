@@ -2935,13 +2935,37 @@ coordinator writes change nothing; there is no withdrawal, so a moot hold is res
 as moot and asked. It closes when an operator step answers its key
 (`owner-hold:<role>:<id>`) with the same question as the latest statement: restating
 it, or omitting it, never asks again, and a different question under that id does.
+A repeat under the same id keeps its answer only when the question text is exactly
+equal; any rewording is a new question and goes to the consult panel again.
 
 In a strategy with a `recordsRevision` step, the engine pauses before a coordinator
 turn in that step's loop, before that step, and before a `closureConfirmation`
 while a hold is open, with `pause.kind: 'owner-hold'` and `pause.request.category:
-'owner-gate'`, one hold at a time. Plan review goes on meanwhile, so the owner is
-asked about a plan the audits approved. The answer reaches later turns through
-`decisions`; one that changes the approved plan is what `restartPlan` is for. What
+'owner-gate'`, one hold at a time. The answer reaches later turns through
+`decisions`; one that changes the approved plan is what `restartPlan` is for.
+
+A hold stated in plan review (a loop before any revision whose every seat reads
+`decisions`: plan-and-implement's `plan-review`; `owner-holds.mjs`
+`planReviewPhases`) is not left for implementation. Whichever seat stated it, the
+engine puts it to the consult panel (`engine.consultFirst`) before anything else the
+run does: the loop's next turn, an end of rounds (the extended or `rounds-exhausted`
+ending, or an `await-input` question), a budget block, or the drive's turn cap
+(`engine.settlePlanReviewHolds`, called at the top of the drive loop and from
+`settleEnding`). When a seat beside the one that stated it is cut at the wall-clock
+deadline, the cut is recorded first, the panel is asked once every seat of the round
+has settled, and the budget block is written after that. Resolved, the answer is a
+decision step with `decision.consult`, recorded in plan review, and the next brief,
+plan and audits read it in `decisions`. Not resolved, the run pauses exactly as before
+implementation and goes on from the owner's answer: escalated, with `pause.consult`
+and the panel's `pause.brief`; when the panel answers unavailable, with `pause.consult`
+and no brief; when no panel is configured or it is switched off, with neither. Each hold is asked once: an answered one is
+never asked again, after a plan restart, an evidence refresh or an exact repeat, and
+a crash between the hold and its consult replays to one consult (the recorded result,
+`run.consulting`, and a run left live on disk for recovery; a recovery or Resume at
+an exhausted budget is let through to consult only, `consultOnly` on the resume entry,
+and then blocks on the budget with no further turn). An operator Stop, a turn's
+unproved cleanup, and a pending operator pause or full-verification freeze come first:
+the hold is then asked at the next drive, before any turn. The gates before implementation and before confirmation are unchanged. What
 a seat writes only in prose the engine cannot see: the coordinator raises it as an
 `owner-gate` `operatorRequest`.
 

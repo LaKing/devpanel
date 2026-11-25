@@ -1,8 +1,10 @@
 <script setup>
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 
 import DialogHeader from './DialogHeader.vue'
 import { api } from '@/api'
+import { createSeq } from '@/freshness'
+import { startAdmitted } from '@/action-offers'
 
 /*
  * Two steps: pick a playbook with one click, then settle the settings for this
@@ -22,6 +24,11 @@ const props = defineProps({
   initialPlaybook: { type: String, default: null }
 })
 const emit = defineEmits(['update:modelValue', 'started'])
+/* On the issue page: revalidate before starting (AC5). Elsewhere a start goes as before. */
+const freshness = inject('issueFreshness', null)
+const pregateSeq = createSeq()
+/** What starting depended on when the dialog opened: the latest run and whether one was live. */
+let startShown = null
 
 const playbooks = ref([])
 const chosen = ref(null)
@@ -60,8 +67,10 @@ const selected = computed(() => playbooks.value.find((p) => p.id === chosen.valu
 const previewMatches = computed(() =>
   Boolean(previewData.value?.ok) && previewedId.value === chosen.value && previewedOptions.value === optionsKey.value)
 
+/* A full verification closed admission and this playbook writes the checkout (supervisor.mjs:368): no start. */
+const frozenOut = computed(() => Boolean(freshness) && previewMatches.value && !startAdmitted(freshness.issue(), previewData.value))
 const startable = computed(() =>
-  Boolean(selected.value?.ok) && previewMatches.value && previewData.value.configurationReady === true && !previewing.value && !starting.value)
+  Boolean(selected.value?.ok) && previewMatches.value && previewData.value.configurationReady === true && !frozenOut.value && !previewing.value && !starting.value)
 
 const blockers = computed(() => (previewData.value?.prerequisites ?? []).filter((p) => p.category === 'blocking'))
 // Catalogue resolution has no project or run settings. Only the matching
@@ -129,6 +138,7 @@ watch(open, async (isOpen) => {
   // Every opening starts at the choice, with nothing previewed: the first step
   // is the operator's, not a default the page made for them.
   step.value = 'pick'
+  startShown = freshness?.startIdentity() ?? null
   chosen.value = null
   hold.value = null
   overrideReason.value = ''
@@ -278,23 +288,57 @@ function setParticipant (role, values) {
   } }
 }
 
+/** Whether the hold shown is still the one a start would meet now (pregate.current). */
+function holdStillApplies (fresh, shown) {
+  const current = fresh?.current
+  if (current?.holds === true && current.key === shown?.key) return true
+  hold.value = null
+  if (current?.configured === false || current?.holds === false) return 'The pre-gate no longer holds this issue; start Triage normally. Nothing was sent.'
+  return 'The issue changed since the pre-gate decided; start again to see its decision now. Nothing was sent.'
+}
+
 async function start (override = false) {
   if (!startable.value) return
   if (override && !overrideReason.value.trim()) return
   starting.value = true
   error.value = ''
+  const shownHold = override ? hold.value : null
+  // Everything the start sends is fixed at this click, from the preview the operator read:
+  // a setting changed (and previewed again) while it is being revalidated changes nothing sent.
+  // The hash binds the start to that configuration: if the playbook changed on disk in between,
+  // the server refuses rather than running something the operator never saw. Start anyway names
+  // the hold it overrides; the server refuses when another one (or none) applies by then.
+  const payload = {
+    playbook: chosen.value,
+    configHash: previewData.value.configHash,
+    // A plain copy: a reactive proxy cannot be cloned, and a later edit must not reach it.
+    runOptions: JSON.parse(JSON.stringify(previewData.value.runOptions ?? {})),
+    pregate: override ? { override: true, reason: overrideReason.value.trim(), expectKey: shownHold?.key ?? null } : null
+  }
+  const payloadPreview = previewData.value
+  const send = (t) => api.startRun(t.project, t.issueId, payload.playbook, payload.configHash, payload.runOptions, payload.pregate)
   try {
-    // The hash binds the start to the configuration this page described. If the
-    // playbook changed on disk in between, the server refuses rather than
-    // running something the operator never saw.
-    const run = await api.startRun(props.project, props.issueId, chosen.value, previewData.value.configHash, previewData.value.runOptions,
-      override ? { override: true, reason: overrideReason.value.trim() } : null)
+    let run
+    if (freshness) {
+      const r = await freshness.guard({
+        label: override ? 'Start anyway' : 'Start run',
+        runId: null,
+        before: startShown,
+        identity: freshness.startIdentity,
+        offered: () => freshness.startable() && startAdmitted(freshness.issue(), payloadPreview),
+        // Start anyway re-reads the hold the server's own check would apply now.
+        ...(override ? { source: () => freshness.ownRead(pregateSeq, `${props.project}/${props.issueId}`, () => api.pregate(props.project, props.issueId)), verify: (fresh) => holdStillApplies(fresh, shownHold) } : {})
+      }, send)
+      if (!r.sent) { error.value = r.notice; return }
+      run = r.value
+    } else run = await send({ project: props.project, issueId: props.issueId })
     hold.value = null
     overrideReason.value = ''
     open.value = false
     emit('started', run)
   } catch (e) {
     if (e.body?.code === 'PREGATE_HOLD') hold.value = { message: e.message, ...e.body.pregate }
+    else if (e.body?.code === 'PREGATE_CHANGED') { hold.value = e.body.pregate ? { message: e.message, ...e.body.pregate } : null; error.value = `${e.message}. Nothing was started.` }
     else error.value = e.message
   } finally {
     starting.value = false
@@ -579,6 +623,9 @@ async function start (override = false) {
         </div>
         </template>
 
+        <v-alert v-if="frozenOut" type="warning" variant="tonal" density="compact" class="mt-4" data-test="start-frozen">
+          A full verification has closed admission to runs that write the checkout (cycle {{ freshness.issue()?.admissionFrozen?.cycleId ?? 'unknown' }}); this playbook writes it, so it cannot start until the cycle ends.
+        </v-alert>
         <v-alert v-if="error" type="error" variant="tonal" density="compact" class="mt-4">{{ error }}</v-alert>
         <v-alert v-if="hold" type="warning" variant="tonal" density="compact" class="mt-4" title="Held by the pre-gate">
           <p>{{ hold.message }}</p>

@@ -1,8 +1,10 @@
 <script setup>
 import { formatHms, formatMTokens, usageTokens } from '@/format'
-import { computed, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { childReporter, createSeq } from '@/freshness'
+import { assessable, availabilityProblem } from '@/action-offers'
 
 /*
  * Assess: what should happen to this issue next, asked of the decision
@@ -25,6 +27,12 @@ const props = defineProps({
   version: { type: Number, default: 0 }
 })
 const emit = defineEmits(['changed'])
+/* On the issue page its reads report into the page indicator and only the newest applies. */
+const freshness = inject('issueFreshness', null)
+const seq = createSeq()
+const reporter = childReporter(freshness?.registry, 'Assessment')
+onUnmounted(() => reporter.dispose())
+const issueKey = () => `${props.project}/${props.issueId}`
 
 const data = ref(null)
 const asking = ref(false)
@@ -34,9 +42,35 @@ const assessor = ref('provider')
 const effort = ref(null)
 
 async function load () {
-  try { data.value = await api.pregate(props.project, props.issueId); error.value = '' } catch (e) { error.value = e.message }
+  const key = issueKey()
+  const ticket = seq.next(key)
+  const settle = reporter.start()
+  try {
+    const next = await api.pregate(props.project, props.issueId)
+    if (!seq.isLatest(ticket, key)) return
+    data.value = next
+    // An availability read that failed inside the response is a failed read for the indicator, with its reason.
+    const problem = availabilityProblem(next)
+    error.value = problem ?? ''
+    settle(problem ? 'failed' : 'ok', problem)
+  } catch (e) {
+    if (!seq.isLatest(ticket, key)) return
+    error.value = e.message
+    settle('failed', e)
+  }
 }
-watch(() => [props.project, props.issueId, props.version], load, { immediate: true })
+watch(() => [props.project, props.issueId, props.version, freshness?.retry.value], load, { immediate: true })
+/** The pre-gate read again before sending, under the same sequence; it shows what it read. */
+async function reread () {
+  // It supersedes any display read in flight, so it settles the panel's state itself (ownRead with the reporter).
+  const read = await freshness.ownRead(seq, issueKey(), () => api.pregate(props.project, props.issueId), reporter, availabilityProblem)
+  if (read.latest()) {
+    data.value = read.value
+    const problem = availabilityProblem(read.value)
+    error.value = problem ?? ''
+  }
+  return read
+}
 
 const provider = computed(() => data.value?.assessors?.provider ?? null)
 const models = computed(() => data.value?.assessors?.models ?? [])
@@ -49,22 +83,76 @@ watch([provider, models], ([p, list]) => {
   if (assessor.value === 'provider' && !p) assessor.value = list.find((m) => m.verified && !m.heldUntil)?.id ?? 'provider'
 }, { immediate: true })
 
-const canAsk = computed(() => !props.archived && (assessor.value === 'provider' ? Boolean(provider.value) : Boolean(chosenModel.value?.verified && !chosenModel.value?.heldUntil)))
+/** Who would actually answer: the configured provider and its model, or a roster model at an effort. */
+function assessorOf (view, choice, chosenEffort = null) {
+  if (choice === 'provider') {
+    const p = view?.assessors?.provider
+    return p ? { provider: p.id, model: p.model ?? null } : null
+  }
+  return { model: choice, effort: chosenEffort }
+}
+// The same rule as the guard: the button is offered only when the server would take the assessment.
+const canAsk = computed(() => !props.archived && assessable(data.value, assessor.value, effort.value))
 
 async function assess () {
   asking.value = true
   error.value = ''
+  // Fixed at this click: who is asked, at which effort, and the body that asks them.
+  const choice = assessor.value
+  const chosenEffort = choice === 'provider' ? null : effort.value
+  const shown = assessorOf(data.value, choice, chosenEffort)
+  const using = choice === 'provider' ? {} : { model: choice, effort: chosenEffort }
+  const key = issueKey()
+  let ticket = null
+  let settle = () => false
+  // The answer is a read of the panel too: it is shown only if no newer read took over meanwhile.
+  const send = (t) => { ticket = seq.next(key); settle = reporter.start(); return api.assessPregate(t.project, t.issueId, using) }
   try {
-    data.value = await api.assessPregate(props.project, props.issueId, assessor.value === 'provider' ? {} : { model: assessor.value, effort: effort.value })
-  } catch (e) { error.value = e.message } finally { asking.value = false }
+    let next
+    if (freshness) {
+      const r = await freshness.guard({
+        label: 'Assess',
+        runId: null,
+        source: reread,
+        before: shown,
+        // A provider or model changed meanwhile would answer instead of the one shown: refused, not sent.
+        identity: (fresh) => assessorOf(fresh, choice, chosenEffort),
+        offered: (fresh) => !freshness.issue()?.archived && assessable(fresh, choice, chosenEffort)
+      }, send)
+      if (!r.sent) { error.value = r.notice; return }
+      next = r.value
+    } else next = await send({ project: props.project, issueId: props.issueId })
+    if (seq.isLatest(ticket, key)) {
+      data.value = next
+      const problem = availabilityProblem(next)
+      error.value = problem ?? ''
+      settle(problem ? 'failed' : 'ok', problem ?? undefined)
+    }
+  } catch (e) {
+    error.value = e.message
+    // The response that was to refresh the panel failed: the panel stays marked failed (with Retry), never current.
+    if (ticket && seq.isLatest(ticket, key)) settle('failed', e)
+  } finally { asking.value = false }
+}
+
+/** Confirm is offered on exactly the terms the list draws it: listed, present, confirmable, unconfirmed, open issue. */
+function proposalOffered (view, key, proposalId) {
+  const a = (view?.assessments ?? []).find((x) => x.record?.key === key)
+  const p = a?.proposals?.find((x) => x.id === proposalId)
+  const confirmed = (a?.confirmations ?? []).some((c) => c.proposalId === proposalId)
+  return Boolean(p?.confirmable && !confirmed && !props.archived && !freshness?.issue()?.archived)
 }
 
 async function confirm (key, proposal) {
   if (!window.confirm(`${proposal.title}?\n\nThis is applied as your decision, citing the assessment.`)) return
   confirming.value = `${key}:${proposal.id}`
   error.value = ''
+  const send = (t) => api.confirmPregate(t.project, t.issueId, key, proposal.id)
   try {
-    await api.confirmPregate(props.project, props.issueId, key, proposal.id)
+    if (freshness) {
+      const r = await freshness.guard({ label: `Confirm "${proposal.title}"`, runId: null, source: reread, offered: (fresh) => proposalOffered(fresh, key, proposal.id) }, send)
+      if (!r.sent) { error.value = r.notice; return }
+    } else await send({ project: props.project, issueId: props.issueId })
     emit('changed')
     await load()
   } catch (e) { error.value = e.message } finally { confirming.value = '' }
@@ -106,8 +194,8 @@ const shown = computed(() => (showAll.value ? list.value : list.value.slice(0, 5
       <select v-model="assessor" class="assess__select" aria-label="Assessor" :disabled="archived">
         <option v-if="provider" value="provider">{{ provider.title }} · {{ provider.model }}</option>
         <option v-else value="provider" disabled>Decision provider (not configured)</option>
-        <option v-for="m in models" :key="m.id" :value="m.id" :disabled="!m.verified || Boolean(m.heldUntil)">
-          {{ m.title }}{{ !m.verified ? ' (unverified)' : m.heldUntil ? ` (on hold until ${m.heldUntil.slice(0, 16).replace('T', ' ')})` : '' }}
+        <option v-for="m in models" :key="m.id" :value="m.id" :disabled="!m.verified || Boolean(m.heldUntil) || Boolean(m.availabilityError)">
+          {{ m.title }}{{ !m.verified ? ' (unverified)' : m.heldUntil ? ` (on hold until ${m.heldUntil.slice(0, 16).replace('T', ' ')})` : m.availabilityError ? ' (availability unknown — could not read)' : '' }}
         </option>
       </select>
       <select v-if="efforts.length" v-model="effort" class="assess__select assess__select--effort" aria-label="Effort" :disabled="archived">

@@ -1,7 +1,8 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { childReporter, createSeq } from '@/freshness'
 import { actorName, proxyUser, rememberedActor } from '@/identity'
 import { formatHms, formatStep } from '@/format'
 import { socket } from '@/socket'
@@ -38,14 +39,39 @@ const actor = ref(rememberedActor())
 const askInvocation = ref(null)
 const openReasoning = ref(new Set())
 
+/* On the issue page: only the newest read for the run still shown applies, and it reports into the page indicator. */
+const freshness = inject('issueFreshness', null)
+const seq = createSeq()
+const reporter = childReporter(freshness?.registry, 'Coordinator chat')
+function apply (next) {
+  chat.value = next
+  // A question still being answered names its fork's invocation (after a reload too).
+  const asking = next?.entries?.find((e) => e.kind === 'question' && e.state === 'asking' && e.invocationId)
+  if (asking && !askInvocation.value) askInvocation.value = asking.invocationId
+  error.value = ''
+}
 async function load () {
+  const runId = props.run.runId
+  const ticket = seq.next(runId)
+  const settle = reporter.start()
   try {
-    chat.value = await api.coordinatorChat(props.project, props.issueId, props.run.runId)
-    // A question still being answered names its fork's invocation (after a reload too).
-    const asking = chat.value?.entries?.find((e) => e.kind === 'question' && e.state === 'asking' && e.invocationId)
-    if (asking && !askInvocation.value) askInvocation.value = asking.invocationId
-    error.value = ''
-  } catch (e) { error.value = e.message }
+    const next = await api.coordinatorChat(props.project, props.issueId, runId)
+    if (!seq.isLatest(ticket, props.run.runId)) return
+    apply(next)
+    settle('ok')
+  } catch (e) {
+    if (!seq.isLatest(ticket, props.run.runId)) return
+    error.value = e.message
+    settle('failed', e)
+  }
+}
+/** The chat read again before sending, under the same sequence; it shows what it read. */
+async function reread () {
+  const runId = props.run.runId
+  // It supersedes any display read in flight, so it settles the panel's state itself (ownRead with the reporter).
+  const read = await freshness.ownRead(seq, runId, () => api.coordinatorChat(props.project, props.issueId, runId), reporter)
+  if (read.latest() && runId === props.run.runId) apply(read.value)
+  return read
 }
 
 /* Output chunks reach only subscribed viewers, so the fork's invocation comes with the question itself. */
@@ -57,7 +83,9 @@ function onRunEvent (event) {
 }
 
 onMounted(() => { load(); socket.on('run:event', onRunEvent) })
-onUnmounted(() => socket.off('run:event', onRunEvent))
+onUnmounted(() => { socket.off('run:event', onRunEvent); reporter.dispose() })
+// A chat-only change missed while away is read again after the page synchronizes, and on Retry.
+watch(() => [freshness?.synced.value, freshness?.retry.value], () => { if (freshness) load() })
 watch(() => props.run.runId, () => { chat.value = null; askInvocation.value = null; load() })
 // A turn that carried an instruction changes its delivery state.
 watch(() => props.run.timeline?.length, () => load())
@@ -101,8 +129,16 @@ async function send (kind) {
   if (!text.value.trim()) { error.value = 'Write a message first.'; return }
   if (!actorName(actor.value)) { error.value = 'Your name is required.'; return }
   sending.value = true
+  const runId = props.run.runId
+  const body = { kind, text: text.value, actor: actorName(actor.value) }
+  const send = (t) => api.sendCoordinatorChat(t.project, t.issueId, t.runId, body)
   try {
-    await api.sendCoordinatorChat(props.project, props.issueId, props.run.runId, { kind, text: text.value, actor: actorName(actor.value) })
+    if (freshness) {
+      // Ask needs a session and no question outstanding; Instruct needs the run to take instructions.
+      const offered = (fresh) => kind === 'question' ? Boolean(fresh?.canAsk) && !(fresh?.asking?.length > 0) : !fresh?.instructionRefusal
+      const r = await freshness.guard({ label: kind === 'question' ? 'Ask' : 'Instruct', runId, source: reread, offered }, send)
+      if (!r.sent) { error.value = r.notice; return }
+    } else await send({ project: props.project, issueId: props.issueId, runId })
     text.value = ''
     error.value = ''
     await load()

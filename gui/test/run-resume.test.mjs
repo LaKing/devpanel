@@ -138,6 +138,12 @@ export default async t => {
       Object.assign(step, { phase: 'implement-review', round: 0, startedAt: new Date(Date.parse(step.endedAt) - hour).toISOString() })
       engine.outputs[step.number] = { valid: true, contract: 'reviewResult', output: { findings: [] } }
     }
+    // A plan step that stated a hold in a plan-review loop (owner-holds.mjs planReviewPhases), not asked yet.
+    const planHold = (engine) => {
+      engine.snapshot.phases.unshift({ id: 'plan-review', loop: { steps: [{ id: 'plan', role: 'planner', context: ['decisions'] }] } })
+      engine.run.steps.push({ number: '900', role: 'planner', stepId: 'plan', phase: 'plan-review' })
+      engine.outputs['900'] = { valid: true, contract: 'authorArtifact', output: { summary: 'a plan', ownerHolds: [{ id: 'H1', question: 'Q?', category: 'security', reason: 'r', recommendation: 'x' }] } }
+    }
     {
       const { f, engine } = await stopped()
       aRound(engine)
@@ -166,6 +172,30 @@ export default async t => {
       engine.run.budgets.limits.wallClockMinutes = 30
       const entry = await engine.resumeExecution({ guardShortWallClock: false })
       t.eq('owner-loss recovery skips the short check and says it did not override', entry.wallClock.overridden, false)
+      await releaseOwnership(engine)
+    }
+    {
+      // (l) A hold stated in plan review and not asked yet lets a Resume past an EXHAUSTED budget only to consult
+      // it (continuationLimits consultOnly); a short clock still needs the operator's consent, and only that
+      // consent reads as an override.
+      const { engine } = await stopped()
+      aRound(engine)
+      planHold(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      const short = await refuses(() => engine.resumeExecution({}))
+      t.eq('(l) a pending plan-review hold does not get a short clock past the refusal', short?.code, 'WALL_CLOCK_SHORT')
+      const consented = await engine.resumeExecution({ acceptShortWallClock: true })
+      t.eq('(l) with consent it passes as an override, not as consult-only', [consented.wallClock.overridden, consented.consultOnly ?? null], [true, null])
+      await releaseOwnership(engine)
+    }
+    {
+      const { engine } = await stopped()
+      aRound(engine)
+      planHold(engine)
+      engine.run.budgets.limits.wallClockMinutes = 30
+      engine.run.startedAt = new Date(Date.parse(engine.run.pause.at) - 40 * 60_000).toISOString()
+      const entry = await engine.resumeExecution({})
+      t.eq('(l) an exhausted clock with the hold pending: let through only to consult, no override recorded', [entry.consultOnly, entry.wallClock.overridden], [true, false])
       await releaseOwnership(engine)
     }
     {

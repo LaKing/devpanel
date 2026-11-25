@@ -1,7 +1,8 @@
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, inject, onUnmounted, ref, watch } from 'vue'
 
 import { api } from '@/api'
+import { childReporter, createSeq } from '@/freshness'
 import { formatHms, formatMTokens } from '@/format'
 
 /*
@@ -14,10 +15,31 @@ const props = defineProps({ project: { type: String, required: true }, issueId: 
 const stats = ref(null)
 const error = ref('')
 
+/* On the issue page its reads report into the page indicator; only the newest applies. */
+const freshness = inject('issueFreshness', null)
+const seq = createSeq()
+const reporter = childReporter(freshness?.registry, 'Time spent')
+onUnmounted(() => reporter.dispose())
 async function load () {
-  try { stats.value = await api.issueStats(props.project, props.issueId); error.value = '' } catch (e) { error.value = e.message }
+  const key = `${props.project}/${props.issueId}`
+  const ticket = seq.next(key)
+  const settle = reporter.start()
+  try {
+    const next = await api.issueStats(props.project, props.issueId)
+    if (!seq.isLatest(ticket, key)) return
+    stats.value = next
+    error.value = ''
+    settle('ok')
+  } catch (e) {
+    if (!seq.isLatest(ticket, key)) return
+    // The last statistics stay on screen beside the error.
+    error.value = e.message
+    settle('failed', e)
+  }
 }
-watch(() => [props.project, props.issueId, props.version], load, { immediate: true })
+watch(() => [props.project, props.issueId, props.version, freshness?.retry.value], load, { immediate: true })
+// Another issue's statistics never stand under this one's heading.
+watch(() => [props.project, props.issueId], () => { stats.value = null; error.value = '' })
 
 const hms = (x) => (x == null ? '—' : formatHms(x))
 const money = (usd, unpriced) => (usd ? `$${usd.toFixed(usd < 1 ? 3 : 2)}${unpriced ? ' +' : ''}` : unpriced ? 'unpriced' : '—')
@@ -27,9 +49,9 @@ const t = computed(() => stats.value?.time ?? null)
 <template>
   <section class="istats" aria-label="Time spent on this issue">
     <h3 class="istats__title">Time spent</h3>
-    <p v-if="error" class="istats__error">{{ error }}</p>
-    <p v-else-if="stats && !stats.runs" class="muted">No run worked on this issue.</p>
-    <template v-else-if="stats">
+    <p v-if="error" class="istats__error">{{ error }} <v-btn size="x-small" variant="text" @click="load">Retry</v-btn></p>
+    <p v-if="stats && !stats.runs" class="muted">No run worked on this issue.</p>
+    <template v-if="stats && stats.runs">
       <div class="istats__tiles">
         <div class="istats__tile"><span>Agents working</span><strong>{{ hms(t.agentMs) }}</strong><small>{{ stats.runs }} run{{ stats.runs === 1 ? '' : 's' }}</small></div>
         <div class="istats__tile"><span>Coordinator</span><strong>{{ hms(stats.coordinator.agentMs) }}</strong><small>{{ stats.coordinator.turns }} turn{{ stats.coordinator.turns === 1 ? '' : 's' }}</small></div>

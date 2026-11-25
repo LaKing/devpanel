@@ -36,10 +36,37 @@ export const openOwnerHolds = (steps, outputs) => ownerHoldsOf(steps, outputs).f
 const stepsOf = (phase) => (phase.loop ? phase.loop.steps : [phase.step])
 const recordsRevision = (phase) => stepsOf(phase).some((step) => step?.recordsRevision === true)
 
+const readsDecisions = (phase) => stepsOf(phase).every((step) => (step?.context ?? []).includes('decisions'))
+
+/**
+ * Plan review: the review loops before any revision whose every seat reads
+ * `decisions`, in a run that implements something (plan-and-implement's
+ * `plan-review`). A loop whose seats would not see the answer is not one.
+ */
+export function planReviewPhases (snapshot) {
+  const phases = snapshot?.phases ?? []
+  if (!phases.some(recordsRevision)) return new Set()
+  return new Set(phases.filter((p) => p.loop && !recordsRevision(p) && readsDecisions(p)).map((p) => p.id))
+}
+
+/**
+ * The first open hold whose latest statement was made in plan review, with that
+ * phase: the engine puts it to the consult panel before anything else happens
+ * in the run (engine.settlePlanReviewHolds). Null when there is none.
+ */
+export function openPlanReviewHold (snapshot, steps, outputs) {
+  const phases = planReviewPhases(snapshot)
+  if (!phases.size) return null
+  const phaseOf = new Map(steps.map((s) => [s.number, s.phase]))
+  const hold = openOwnerHolds(steps, outputs).find((h) => phases.has(phaseOf.get(h.latestStep)))
+  return hold ? { ...hold, phase: phaseOf.get(hold.latestStep) } : null
+}
+
 /**
  * Does an open hold stop this turn? Only in a run that implements something, and
- * only at what would start or continue that work or carry it to delivery. Plan
- * review goes on, so the owner is asked about a plan the audits approved.
+ * only at what would start or continue that work or carry it to delivery. A hold
+ * stated in plan review never gets this far: the engine settles it before the
+ * loop's next turn, ending or budget block (openPlanReviewHold).
  */
 export function holdGatesTurn (snapshot, next) {
   if (!(snapshot.phases ?? []).some(recordsRevision)) return false

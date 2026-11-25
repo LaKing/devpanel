@@ -457,9 +457,9 @@ function splitSuggestion (run, outputs) {
 }
 
 /** Where a run stands, for a person. See the header for the fields. */
-export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [] } = {}) {
+export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [], liveCheckSince = null } = {}) {
   if (!run) return null
-  const standing = withReleaseCoverage(run, withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership }), outputs, ownership))
+  const standing = withReleaseCoverage(run, withSplitSuggestion(run, explainStanding(run, { outputs, active, ownership, liveCheckSince }), outputs, ownership))
   const unaccepted = riskStatement(run, acceptedRisks)
   if (!unaccepted) return standing
   const n = unaccepted.risks.length
@@ -559,7 +559,7 @@ function answeredWords (run) {
   return `Answered earlier in this run: ${answers.slice(-3).map(say).join('; ')}.`
 }
 
-function standingOf (run, { outputs, active, ownership }) {
+function standingOf (run, { outputs, active, ownership, liveCheckSince = null }) {
   if (run.landed) return landed(run, standingOf({ ...run, landed: undefined }, { outputs, active }))
   const kept = run.workspace?.state === 'retained' ? 'Its workspace and logs are kept.' : 'Its logs are kept.'
 
@@ -616,6 +616,13 @@ function standingOf (run, { outputs, active, ownership }) {
       if (back) {
         return { tone: 'progress', headline: 'Running: returned to the author after closure',
           detail: `The coordinator found ${back.criteria.map((c) => `${c.id} (${c.unmet})`).join(', ')} not yet met on an approved, checked version, so the engine gave the author another round (return ${run.closureReturns.length} of 2). ${doing}` }
+      }
+      // A check running with no seat at work is its own state: the page says so rather than "Between turns".
+      if (liveCheckSince != null) {
+        const since = new Date(liveCheckSince).toISOString().slice(11, 19)
+        return working.length
+          ? { tone: 'progress', headline: 'Running', detail: `${doing} The checks are running beside them (since ${since} UTC).` }
+          : { tone: 'progress', headline: 'Running: checking the candidate', detail: `The project's checks are running on the latest revision (since ${since} UTC); no agent is working.` }
       }
       return { tone: 'progress', headline: 'Running', detail: doing }
     }
