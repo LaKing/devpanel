@@ -115,6 +115,15 @@ rebuilt front end can be served by a back end from hours earlier — a page call
 routes the running process has never heard of. The panel detects that and says so
 (see *Staleness*, below), but restarting is the fix.
 
+**A build keeps the earlier builds' chunks.** `npm run build` never empties
+`dist/assets` (`emptyOutDir: false` in vite.config.js): a tab opened before a
+rebuild fetches a page's code only when that page is first opened, and must still
+find it there, or its menu stops opening pages. Unchanged chunks keep their names,
+so each build adds only what changed (a whole build is about 1.9 MB). To reclaim
+the space, first close every panel tab on every machine, then run
+`npx vite build --emptyOutDir` from `gui/`. With a tab still open this deletes
+files that tab needs, which is the failure the setting exists to prevent.
+
 Two details in the unit are load-bearing:
 
 - **`TimeoutStopSec=45` against `DEVPANEL_SHUTDOWN_GRACE_MS=20000`.** SIGTERM runs

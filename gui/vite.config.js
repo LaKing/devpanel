@@ -50,7 +50,13 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    emptyOutDir: true,
+    // Earlier builds' chunks stay in dist/assets. An open panel tab keeps the module
+    // graph of the build it loaded and fetches a page's chunk only when that page is
+    // first opened; were the chunk deleted, the SPA fallback would answer with
+    // index.html and the menu click would do nothing. Names carry content hashes, so
+    // a kept file is only extra, never served in place of a newer one. Clearing them
+    // is maintenance, done only while no panel tab is open anywhere (gui/README.md).
+    emptyOutDir: false,
     chunkSizeWarningLimit: 900
   }
 })
