@@ -2018,6 +2018,10 @@ Locks carry owner identity — pid, boot id, process start time, host.
   another; `run-exclusivity.mjs`): a live in-place run holds the checkout, so nothing
   starts, answers or finalizes beside it, and two release-tactic runs of a project,
   because a run's verifiers and its restore come after the release lock is gone.
+  Integration approval and its reconciliation (`integrateRun`, `reconcileIntegration`)
+  take the issue's run lock fail-fast before reading or writing anything: a lock
+  held by a live or unknown owner (or, at the integrate route, a run of the issue
+  active here) refuses `RUN_LOCKED` (409, retryable); a dead owner is taken over.
 - **Delivery lock** — `devpanel-source-delivery.lock` in a repository's Git common
   directory, taken in sorted order (`runtime/source-lock.mjs`). A delivery holds it
   while writing. A base snapshot that reads the live tree (`working-tree`, or
@@ -3135,10 +3139,13 @@ any journal length; an append whose check misses reads and validates the whole j
 once, as before.
 
 The writer contract: a concurrent foreign writer is not detected reliably; the journal has one writer under the run lock.
-Integration and its reconcile (`integrateRun`, `reconcileIntegration`) currently
-append from the panel process without `.run.lock`; their appends take turns with the
-engine's inside the process, per journal, as above. A second process writing the
-journal is the foreign writer this sentence excludes.
+Integration and its reconcile (`integrateRun`, `reconcileIntegration`) append
+under `.run.lock` like the engine. The supervisor's sweeps (startup reconcile, live
+agents) settle an unfinished publication through `sweepPendingIntegration`: when
+another owner holds the issue's lock they read only that run's `run.json`, inspect
+no journal and write nothing for it until a later sweep (at startup, the next start).
+Journal damage on such a run is therefore first observed by a reader under the lock;
+once observed it is recorded, and trimming the tail does not clear it.
 
 Availability updates hold a process-safe lock for the full read/modify/write,
 including operator clears. A missing store starts empty; an invalid store refuses

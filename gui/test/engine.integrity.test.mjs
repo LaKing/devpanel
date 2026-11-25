@@ -102,6 +102,7 @@ export default async function (t) {
       t.eq('delivery never attempted', f.delivery.calls.length, 0)
       t.eq('no normal actions offered: only an integrity disposition or abandonment', supportedActions(run), ['resolve-integrity', 'abandon'])
       t.eq('even apparently unchanged quarantine is retained', workspaceDisposition(run, { unchanged: true, proven: true }).discard, false)
+      await engine.runLock.release()   // integration takes the run lock itself
       const denied = await rejected(() => integrateRun({ issuePath: f.issuePath, runId: engine.runId }))
       t.ok('integration refuses quarantine', /integrity/.test(denied?.message))
       await releaseWorkspace(engine)

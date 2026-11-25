@@ -52,7 +52,7 @@ import { createPregate } from './decisions/pregate.mjs'
 import { triageAgreement } from './decisions/triage-shadow.mjs'
 import { installLogging } from './logging.mjs'
 import { LockHeld } from './runtime/lock.mjs'
-import { integrateRun, integrationTarget, reconcileIntegration } from './runtime/integrate.mjs'
+import { integrateRun, integrationTarget, reconcileIntegration, runLocked } from './runtime/integrate.mjs'
 import { applyRunArtifact, approvedCheckPatch, retainedPatch } from './runtime/apply-artifact.mjs'
 import { checkPatch } from './runtime/patch-check.mjs'
 import { availabilityReport } from './availability-api.mjs'
@@ -379,7 +379,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/integrate', route(async 
   const { project, id, runId } = req.params
   const { expectedRevision, targetBranch = null, expectedTargetHead = null } = req.body ?? {}
   if (!expectedRevision) throw Object.assign(new Error('expectedRevision is required: approve the revision you reviewed'), { status: 400 })
-  if (supervisor.isActive(project, id)) throw Object.assign(new Error('a run is active on this issue; wait for it to settle'), { status: 409 })
+  if (supervisor.isActive(project, id)) throw runLocked('a run is active on this issue; wait for it to settle', { liveness: 'alive' })
   const issue = await unpackedIssue(project, id)
   const result = await integrateRun({
     issuePath: issue.path, runId, project, projectPath: projectPath(project),

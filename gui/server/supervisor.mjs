@@ -36,7 +36,7 @@ import { hostPlatform } from './runtime/platform.mjs'
 import { terminatePids } from './runtime/process.mjs'
 import { openCleanup, noteLostTags, proveEntries, cleanupRefusal, readBarrier, liftBarrierEntries, syncBarrier, unrecordedCleanup, unrecordedRefusal } from './runtime/cleanup-barrier.mjs'
 import { createProbeExecutor } from './runtime/probe-budget.mjs'
-import { reconcileIntegration } from './runtime/integrate.mjs'
+import { sweepPendingIntegration } from './runtime/integrate.mjs'
 import * as store from './runtime/store.mjs'
 import { readChat, coordinatorRole, instructionRefusal, chatView, recordInstruction, askCoordinator } from './runtime/coordinator-chat.mjs'
 import { captureIntegrity, integrityChanges, readIntegrity } from './runtime/integrity.mjs'
@@ -1814,6 +1814,31 @@ export function createSupervisor ({
    * run it names. Reading it as evidence about a different run would leave a
    * stale run un-reconciled, and deleting it would strip a live owner of its lock.
    */
+  /*
+   * What a sweep's settling of an unfinished publication says. Only a record
+   * that changed is announced: a refusal (the lock held, a journal needing
+   * recovery) leaves the record as it was, and announcing it would wake every
+   * dashboard into polling again into the same refusal. It is warned once.
+   * True when another owner holds the issue's lock: the caller skips the run.
+   */
+  const integrationRefusals = new Set()
+  function noteIntegrationSweep (swept, project, issue, runId) {
+    const settled = swept?.settled
+    if (!settled) return false
+    const key = `${issue.path}\0${runId}`
+    if (settled.reconciled === true) {
+      for (const k of integrationRefusals) if (k.startsWith(`${key}\0`)) integrationRefusals.delete(k)
+      emit?.({ type: 'integration-reconciled', project, issueId: issue.id, runId, phase: settled.phase ?? null, error: settled.integration?.error ?? null })
+    } else if (settled.refused) {
+      const once = `${key}\0${settled.refused.code ?? 'error'}`
+      if (!integrationRefusals.has(once)) {
+        integrationRefusals.add(once)
+        console.warn(`[devpanel] the unfinished publication of ${project}/${issue.id} run ${runId} was not reconciled: ${settled.refused.message}`)
+      }
+    }
+    return swept.held === true
+  }
+
   /** An owner proved alive, or one whose liveness cannot be established: never taken over. */
   const held = (owner) => owner.liveness === 'alive' || owner.liveness === 'unknown'
 
@@ -1957,17 +1982,18 @@ export function createSupervisor ({
         }
 
         for (const runId of names) {
-          const run = await store.readRun(issue.path, runId).catch((error) => {
+          // A publication the previous process did not finish is settled from
+          // its record, under the run lock, before anything else is offered on
+          // the run (sweepPendingIntegration).
+          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform }).catch((error) => {
             if (error.code !== 'ENOENT') unread.push({ project: projectId, issue, runId })
             return null
           })
+          // Another owner holds the issue: nothing more for this run until a
+          // later sweep (the next start), so nothing is written without the lock.
+          if (noteIntegrationSweep(swept, projectId, issue, runId)) continue
+          const run = swept?.run
           if (!run) continue
-          // A publication the previous process did not finish: settle it from
-          // its record before anything else is offered on the run.
-          if (['publishing', 'published'].includes(run.integration?.phase)) {
-            const settled = await reconcileIntegration({ issuePath: issue.path, runId }).catch((error) => ({ error: error.message }))
-            emit?.({ type: 'integration-reconciled', project: projectId, issueId: issue.id, runId, phase: settled.phase ?? null, error: settled.error ?? null })
-          }
           // The barrier as the run records say: open entries a failed write
           // left off it are put back (or held here), settled ones lifted.
           await keepOnBarrier(path.dirname(issue.path), run)
@@ -2098,14 +2124,12 @@ export function createSupervisor ({
         } catch { continue }
 
         for (const runId of names) {
-          const run = await store.readRun(issue.path, runId).catch(() => null)
+          // A publication the previous process did not finish: settled under
+          // the run lock first; a held lock leaves the run to a later poll.
+          const swept = await sweepPendingIntegration({ issuePath: issue.path, runId, platform }).catch(() => null)
+          if (noteIntegrationSweep(swept, projectId, issue, runId)) continue
+          const run = swept?.run
           if (!run) continue
-          // A publication the previous process did not finish: settle it from
-          // its record before anything else is offered on the run.
-          if (['publishing', 'published'].includes(run.integration?.phase)) {
-            const settled = await reconcileIntegration({ issuePath: issue.path, runId }).catch((error) => ({ error: error.message }))
-            emit?.({ type: 'integration-reconciled', project: projectId, issueId: issue.id, runId, phase: settled.phase ?? null, error: settled.error ?? null })
-          }
           if (!LIVE_STATUSES.includes(run.status)) continue
 
           const owner = await lockOwner(issue.path, runId)

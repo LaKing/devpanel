@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process'
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -6,7 +7,8 @@ import { promisify } from 'node:util'
 
 import { gitWorktreeProvider, worktreeDiffDelivery, startRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { baselineOf, fingerprint } from '../server/runtime/fingerprint.mjs'
-import { integrateRun } from '../server/runtime/integrate.mjs'
+import { integrateRun, reconcileIntegration, runLocked, sweepPendingIntegration } from '../server/runtime/integrate.mjs'
+import { acquire, currentOwner } from '../server/runtime/lock.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
 import * as store from '../server/runtime/store.mjs'
 import { engineFixture, scriptFor, cleanupFixtures } from './fakes/fixture.mjs'
@@ -311,6 +313,156 @@ export default async function (t) {
     t.ok('with a commit and branch', Boolean(run_.delivery.commit) && run_.delivery.branch.startsWith('devpanel/'))
     t.eq('verified', run_.delivery.reconstruction.verified, true)
     await releaseWorkspace(engine)
+  }
+
+  // A declaration naming main as the integration branch of the candidate's repository.
+  const declared = (c) => sandbox(async (dir) => {
+    await fs.mkdir(path.join(dir, 'projects'), { recursive: true })
+    await fs.writeFile(path.join(dir, 'projects', 'p.yaml'), `id: p${NL}sourceRepository: ${c.projectPath}${NL}integrationBranch: main${NL}`)
+  })
+  // Every file under a run directory with its content hash: "nothing was written".
+  const snapshot = async (dir) => {
+    const out = {}
+    for (const e of await fs.readdir(dir, { recursive: true, withFileTypes: true })) {
+      if (!e.isFile()) continue
+      const file = path.join(e.parentPath ?? e.path, e.name)
+      out[path.relative(dir, file)] = crypto.createHash('sha256').update(await fs.readFile(file)).digest('hex')
+    }
+    return out
+  }
+  const runDirOf = (c) => store.runDir(c.issuePath, c.runId)
+  const lockFile = (c) => path.join(c.issuePath, '.run.lock')
+  const mainHead = async (c) => (await run('git', ['-C', c.projectPath, 'rev-parse', 'main'])).stdout.trim()
+  // A publication interrupted before the branch moved (as in 4b4).
+  const publishing = async (c) => {
+    const record = await store.readRun(c.issuePath, c.runId)
+    record.integration = { approvedBy: 'operator', revision: c.fp.fingerprint, repository: c.receipt.repository, targetBranch: 'main', targetHeadBefore: c.ws.baseCommit, mergeCommit: 'deadbeef', method: 'x', at: 't', error: null, phase: 'publishing', worktrees: { pending: [], updated: [], stale: [] } }
+    delete record.journal
+    await store.writeRun(c.issuePath, c.runId, record)
+  }
+  // A lock another owner holds: alive (this process, another run), unknown (another host), dead (pid reused).
+  const foreignLock = async (c, kind) => {
+    const owner = { ...await currentOwner('other-run'), ...(kind === 'unknown' ? { host: 'elsewhere' } : {}), ...(kind === 'dead' ? { processStartedAt: '1' } : {}) }
+    await fs.writeFile(lockFile(c), JSON.stringify({ purpose: 'run', token: `held-${kind}`, owner }))
+  }
+  const tornTail = (c) => fs.appendFile(path.join(runDirOf(c), 'events.jsonl'), '{"type":')
+  const trimTail = async (c) => {
+    const file = path.join(runDirOf(c), 'events.jsonl')
+    const text = await fs.readFile(file, 'utf8')
+    await fs.writeFile(file, text.slice(0, text.lastIndexOf(NL) + 1))
+  }
+
+  t.section('6. both operations take the run lock first: a held lock refuses, retryable, before anything is read or written')
+  {
+    for (const kind of ['alive', 'unknown']) {
+      const c = await committedCandidate()
+      const cfg = await declared(c)
+      if (kind === 'alive') c.held = await acquire(lockFile(c), { purpose: 'run', runId: 'other-run' })
+      else await foreignLock(c, 'unknown')
+      const before = await snapshot(runDirOf(c))
+      const lockBefore = await fs.readFile(lockFile(c), 'utf8')
+      const refused = await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfg, expectedRevision: c.fp.fingerprint, targetBranch: 'main', expectedTargetHead: c.ws.baseCommit }).catch((e) => e)
+      t.eq(`${kind} owner: integrateRun refuses RUN_LOCKED`, [refused?.code, refused?.retryable, refused?.status, refused?.liveness], ['RUN_LOCKED', true, 409, kind])
+      t.eq(`${kind} owner: run.json and events.jsonl unchanged`, await snapshot(runDirOf(c)), before)
+      t.eq(`${kind} owner: the integration branch unchanged`, await mainHead(c), c.ws.baseCommit)
+      t.eq(`${kind} owner: the lock is left as it was`, await fs.readFile(lockFile(c), 'utf8'), lockBefore)
+
+      await publishing(c)
+      const beforeReconcile = await snapshot(runDirOf(c))
+      const refusedReconcile = await reconcileIntegration({ issuePath: c.issuePath, runId: c.runId }).catch((e) => e)
+      t.eq(`${kind} owner: reconcileIntegration refuses RUN_LOCKED`, [refusedReconcile?.code, refusedReconcile?.retryable, refusedReconcile?.status], ['RUN_LOCKED', true, 409])
+      t.eq(`${kind} owner: nothing under the run changed`, await snapshot(runDirOf(c)), beforeReconcile)
+      t.eq(`${kind} owner: the lock is still there`, await fs.readFile(lockFile(c), 'utf8'), lockBefore)
+      if (c.held) await c.held.release(); else await fs.rm(lockFile(c))
+    }
+
+    // A dead owner's lock is taken over: both operations complete, and leave no lock.
+    {
+      const c = await committedCandidate()
+      const cfg = await declared(c)
+      await foreignLock(c, 'dead')
+      const done = await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfg, expectedRevision: c.fp.fingerprint, targetBranch: 'main', expectedTargetHead: c.ws.baseCommit })
+      t.eq('dead owner: integrateRun takes the lock over and completes', [done.error, done.integration.phase], [null, 'complete'])
+      t.eq('and leaves no lock', await fs.access(lockFile(c)).then(() => true, () => false), false)
+      const d = await committedCandidate()
+      await publishing(d)
+      await foreignLock(d, 'dead')
+      const settled = await reconcileIntegration({ issuePath: d.issuePath, runId: d.runId })
+      t.eq('dead owner: reconcileIntegration takes the lock over and settles', [settled.reconciled, settled.phase], [true, 'aborted'])
+      t.eq('and leaves no lock', await fs.access(lockFile(d)).then(() => true, () => false), false)
+    }
+
+    // The normal path holds the run lock while it works.
+    {
+      const c = await committedCandidate()
+      const cfg = await declared(c)
+      let seen = null
+      const result = await integrateRun({ issuePath: c.issuePath, runId: c.runId, project: 'p', projectPath: c.projectPath, configRoot: cfg, expectedRevision: c.fp.fingerprint, targetBranch: 'main', expectedTargetHead: c.ws.baseCommit,
+        hooks: { beforePublish: async () => { seen = JSON.parse(await fs.readFile(lockFile(c), 'utf8')) } } })
+      t.eq('integrated', [result.error, result.integration.phase], [null, 'complete'])
+      t.eq('the run lock was held for this run while publishing', [seen?.purpose, seen?.owner?.runId], ['integrate', c.runId])
+      t.eq('and released afterwards', await fs.access(lockFile(c)).then(() => true, () => false), false)
+      await publishing(c)
+      t.eq('reconcileIntegration with the lock free settles', (await reconcileIntegration({ issuePath: c.issuePath, runId: c.runId })).reconciled, true)
+      t.eq('and leaves no lock', await fs.access(lockFile(c)).then(() => true, () => false), false)
+    }
+
+    const refusal = runLocked('busy', { liveness: 'alive' })
+    t.eq('runLocked is the retryable refusal', [refusal.status, refusal.code, refusal.retryable], [409, 'RUN_LOCKED', true])
+    // The route's own guard: still first, before the issue is read and outside the serialiser, and classified.
+    const index = await fs.readFile(path.join(path.dirname(new URL(import.meta.url).pathname), '../server/index.js'), 'utf8')
+    const start = index.indexOf("app.post('/api/projects/:project/issues/:id/runs/:runId/integrate'")
+    const route = index.slice(start, index.indexOf('app.', start + 10))
+    const guard = route.indexOf('if (supervisor.isActive(project, id)) throw runLocked(')
+    t.ok('the integrate route refuses an active run with runLocked', guard > 0)
+    t.ok('before it reads the issue or queues the integration', guard < route.indexOf('unpackedIssue(') && guard < route.indexOf('integrateRun('))
+  }
+
+  t.section('7. journal damage observed under the lock is kept; a sweep that finds the lock held observes none')
+  {
+    // (a) A publication with a torn tail while another owner holds the lock.
+    const c = await committedCandidate()
+    await publishing(c)
+    await tornTail(c)
+    await foreignLock(c, 'unknown')
+    const before = await snapshot(runDirOf(c))
+    const swept = await sweepPendingIntegration({ issuePath: c.issuePath, runId: c.runId })
+    t.eq('(a) the sweep leaves the run alone', [swept.held, swept.settled?.refused?.code], [true, 'RUN_LOCKED'])
+    t.eq('(a) the journal was not inspected: no recovery finding', await fs.access(path.join(runDirOf(c), 'journal-recovery.json')).then(() => true, () => false), false)
+    t.eq('(a) nothing under the run changed', await snapshot(runDirOf(c)), before)
+    t.eq('(a) the branch is unchanged', await mainHead(c), c.ws.baseCommit)
+    await trimTail(c)
+    await fs.rm(lockFile(c))
+    // Damage is first observed later, under the lock; this tail was never observed, so nothing records it.
+    t.eq('(a) a tail trimmed before anyone observed it is not seen later either', (await reconcileIntegration({ issuePath: c.issuePath, runId: c.runId })).phase, 'aborted')
+
+    // (b) The same with the lock free: damage observed under the lock is kept.
+    const d = await committedCandidate()
+    const cfg = await declared(d)
+    await publishing(d)
+    await tornTail(d)
+    const sweptFree = await sweepPendingIntegration({ issuePath: d.issuePath, runId: d.runId }).catch((e) => e)
+    t.eq('(b) reconciliation under the lock meets the damage', sweptFree?.code ?? sweptFree?.settled?.refused?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    t.ok('(b) and records it', await fs.access(path.join(runDirOf(d), 'journal-recovery.json')).then(() => true, () => false))
+    await trimTail(d)
+    t.eq('(b) after the trim reconciliation is still refused', (await reconcileIntegration({ issuePath: d.issuePath, runId: d.runId }).catch((e) => e))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    const raw = JSON.parse(await fs.readFile(path.join(runDirOf(d), 'run.json'), 'utf8'))
+    t.eq('(b) the publication is still pending', raw.integration.phase, 'publishing')
+    const again = await integrateRun({ issuePath: d.issuePath, runId: d.runId, project: 'p', projectPath: d.projectPath, configRoot: cfg, expectedRevision: d.fp.fingerprint, targetBranch: 'main', expectedTargetHead: d.ws.baseCommit }).catch((e) => e)
+    t.eq('(b) integration is refused', again?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    t.eq('(b) the branch is unchanged', await mainHead(d), d.ws.baseCommit)
+    t.ok('(b) integrate is not offered', !supportedActions(await store.readRun(d.issuePath, d.runId)).includes('integrate'))
+
+    // (c) A delivered run with nothing pending: the sweep records damage as before.
+    const e = await committedCandidate()
+    const cfgE = await declared(e)
+    await tornTail(e)
+    const plain = await sweepPendingIntegration({ issuePath: e.issuePath, runId: e.runId })
+    t.eq('(c) no publication pending: read as every reader reads it', [plain.held, plain.settled, plain.run.recovery.required], [false, null, true])
+    t.ok('(c) the finding is recorded', await fs.access(path.join(runDirOf(e), 'journal-recovery.json')).then(() => true, () => false))
+    await trimTail(e)
+    t.eq('(c) after the trim integration stays refused', (await integrateRun({ issuePath: e.issuePath, runId: e.runId, project: 'p', projectPath: e.projectPath, configRoot: cfgE, expectedRevision: e.fp.fingerprint, targetBranch: 'main', expectedTargetHead: e.ws.baseCommit }).catch((x) => x))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    t.eq('(c) and recovery is still required', (await store.readRun(e.issuePath, e.runId)).recovery.required, true)
   }
 
   await cleanupFixtures()

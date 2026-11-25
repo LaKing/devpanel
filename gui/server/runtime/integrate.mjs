@@ -8,6 +8,8 @@ import { promisify } from 'node:util'
 import { projectConfig } from '../config/load.mjs'
 import * as store from './store.mjs'
 import { fetchFromStore, isStoreOf } from './git-store.mjs'
+import { acquire, LockHeld } from './lock.mjs'
+import { hostPlatform } from './platform.mjs'
 
 /*
  * Integration: an operator's approval, bound to a revision and a target,
@@ -76,9 +78,41 @@ function serialised (key, fn) {
   return next
 }
 
+/**
+ * The refusal when the issue's run lock is held by someone else (or a run of
+ * the issue is active here): nothing was read or written, so trying again once
+ * it is free is safe.
+ */
+export function runLocked (message, { liveness = null, holder = null } = {}) {
+  return Object.assign(refuse(message), { code: 'RUN_LOCKED', retryable: true, liveness, holder })
+}
+
+/*
+ * Integration writes run.json and the run's journal, whose single writer holds
+ * the issue's run lock (execution-contract.md "Locking"). Taken first, fail-fast:
+ * a dead owner is taken over, a live or unknown one refuses before anything is
+ * read. Nobody calling this holds the lock already, so it cannot wait on itself.
+ */
+async function underRunLock (issuePath, runId, purpose, platform, fn) {
+  let lock
+  try {
+    lock = await acquire(path.join(issuePath, '.run.lock'), { purpose, runId, mkdir: false, platform })
+  } catch (error) {
+    if (!(error instanceof LockHeld)) throw error
+    const holder = { pid: error.owner?.pid ?? null, runId: error.owner?.runId ?? null }
+    throw runLocked(`the issue's run lock is held (${error.liveness}, pid ${holder.pid ?? 'unknown'}${holder.runId ? `, run ${holder.runId}` : ''}); nothing was read or written, try again when it is free`, { liveness: error.liveness, holder })
+  }
+  try {
+    return await fn()
+  } finally {
+    await lock.release()
+  }
+}
+
 export async function integrateRun (options) {
   const key = await fs.realpath(options.projectPath).catch(() => options.projectPath)
-  return serialised(key, () => integrateRunUnserialised(options))
+  const platform = options.platform ?? hostPlatform()
+  return serialised(key, () => underRunLock(options.issuePath, options.runId, 'integrate', platform, () => integrateRunUnserialised(options)))
 }
 
 async function integrateRunUnserialised ({ issuePath, runId, project, projectPath, configRoot, expectedRevision, targetBranch = null, expectedTargetHead = null, approvedBy = 'operator', clock = { iso: () => new Date().toISOString() }, hooks = {} }) {
@@ -251,7 +285,11 @@ async function followCheckouts (record, source) {
  * a `published` phase still owes the checkouts their update. Safe to call
  * repeatedly; a complete or aborted record is left alone.
  */
-export async function reconcileIntegration ({ issuePath, runId, clock = { iso: () => new Date().toISOString() } }) {
+export async function reconcileIntegration ({ issuePath, runId, clock = { iso: () => new Date().toISOString() }, platform = hostPlatform() }) {
+  return underRunLock(issuePath, runId, 'integration-reconcile', platform, () => reconcileIntegrationLocked({ issuePath, runId, clock }))
+}
+
+async function reconcileIntegrationLocked ({ issuePath, runId, clock }) {
   await store.requireCompleteEvents(issuePath, runId)
   const runRecord = await store.readRun(issuePath, runId).catch(() => null)
   const record = runRecord?.integration
@@ -279,4 +317,23 @@ export async function reconcileIntegration ({ issuePath, runId, clock = { iso: (
   await store.writeRun(issuePath, runId, runRecord)
   await store.appendEvent(issuePath, runId, { type: 'integration-reconciled', phase: record.phase, error: record.error ?? null })
   return { reconciled: true, phase: record.phase, integration: record }
+}
+
+/**
+ * What the supervisor's sweeps (startup reconcile, live agents) do first for a
+ * run: settle a publication the previous process left unfinished, under the
+ * run lock. The record is read raw, without the journal, to decide that. When
+ * another owner holds the issue's lock the run is left alone: `held` is true,
+ * the raw record is all that was read, the journal was not inspected and
+ * nothing was written, so damage is first observed, and recorded, by a reader
+ * under the lock. Otherwise the run is read as every other reader reads it.
+ */
+export async function sweepPendingIntegration ({ issuePath, runId, platform = hostPlatform() }) {
+  const raw = await fs.readFile(path.join(store.runDir(issuePath, runId), 'run.json'), 'utf8').then(JSON.parse).catch(() => null)
+  let settled = null
+  if (['publishing', 'published'].includes(raw?.integration?.phase)) {
+    settled = await reconcileIntegration({ issuePath, runId, platform }).catch((refused) => ({ refused }))
+    if (settled.refused?.code === 'RUN_LOCKED') return { run: raw, settled, held: true }
+  }
+  return { run: await store.readRun(issuePath, runId), settled, held: false }
 }

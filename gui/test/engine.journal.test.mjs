@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { integrateRun, reconcileIntegration } from '../server/runtime/integrate.mjs'
+import { acquire } from '../server/runtime/lock.mjs'
 import { readEvents, readRun } from '../server/runtime/store.mjs'
 import { supportedActions, workspaceDisposition } from '../server/supervisor.mjs'
 import { getRun } from '../server/runs-api.mjs'
@@ -37,8 +38,12 @@ export default async function (t) {
     t.eq('operator resume cannot bypass journal recovery', (await rejected(() => resumed.resumeExecution()))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
     t.eq('direct turn invocation is refused', (await rejected(() => resumed.runTurn({})))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
     t.eq('delivery evaluation is refused', (await rejected(() => resumed.evaluateClosure()))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    t.eq('integration is refused while the resumed engine holds the run lock', (await rejected(() => integrateRun({ issuePath: f.issuePath, runId: engine.runId })))?.code, 'RUN_LOCKED')
+    t.eq('so is its reconciliation', (await rejected(() => reconcileIntegration({ issuePath: f.issuePath, runId: engine.runId })))?.code, 'RUN_LOCKED')
+    await resumed.runLock.release()
     t.eq('integration is refused before publishing', (await rejected(() => integrateRun({ issuePath: f.issuePath, runId: engine.runId })))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
     t.eq('integration reconciliation is refused', (await rejected(() => reconcileIntegration({ issuePath: f.issuePath, runId: engine.runId })))?.code, 'EVENT_JOURNAL_RECOVERY_REQUIRED')
+    resumed.runLock = await acquire(path.join(f.issuePath, '.run.lock'), { purpose: 'run', runId: engine.runId, mkdir: false })
     t.eq('unsafe UI actions are absent', supportedActions(resumed.run), ['abandon'])
     t.eq('workspace is retained even if unchanged', workspaceDisposition(resumed.run, { unchanged: true, proven: true }).discard, false)
     t.eq('all refusals preserve journal bytes', await fs.readFile(file), damaged)
