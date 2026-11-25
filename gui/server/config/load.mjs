@@ -17,6 +17,7 @@ import { DEFAULT_CONFIG_ROOT, hostConfigDir, discover } from './host-config.mjs'
 import { hostSettings } from './host-settings.mjs'
 import { harnessRefusal } from '../runtime/confinement-policy.mjs'
 import { hostPlatform } from '../runtime/platform.mjs'
+import { ENGINE_PROGRAMS, engineProgramOf } from './engine-operations.mjs'
 
 /*
  * Configuration loading. Filesystem and validation only — nothing here invokes a
@@ -92,9 +93,9 @@ function projectOnlyTooling (data, file, errors) {
 // strategy: what a seat playbook declares is refused with a sentence rather than the schema's "must NOT be valid".
 export const ENGINE_ONLY = 'engine-only'
 const SEAT_KEYS = ['strategy', 'strategyVersion', 'participants', 'fallbackModels', 'overrides', 'intent', 'checks', 'autoClose', 'workspace', 'delivery', 'budgets']
-/** The refusal of a start of an engine-only playbook, before anything is reserved or probed; null for any other. */
+/** The refusal of a start of an engine-only playbook that names no engine program, before anything is reserved or probed; null for any other. */
 export function engineOnlyRefusal (resolved) {
-  if (resolved?.kind !== ENGINE_ONLY) return null
+  if (resolved?.kind !== ENGINE_ONLY || resolved.engineProgram) return null
   const error = new Error(resolved.liveExecution.blockers[0]?.reason ?? 'an engine-only playbook cannot be started')
   return Object.assign(error, { status: 422, code: 'ENGINE_ONLY_NOT_RUNNABLE', started: false, retryable: false })
 }
@@ -818,10 +819,11 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
 }
 
 /**
- * An engine-only playbook: no seats, no strategy, no prompts. Its phases are engine steps, which the
- * engine does not execute yet, so it resolves for config:check, preview and the panel's lists and
- * carries one blocker: a start is refused before anything is reserved (supervisor.mjs start,
- * launch.mjs reserveRun), and preflight returns before probing any harness.
+ * An engine-only playbook: no seats, no strategy, no prompts. Its phases are engine steps. When they name
+ * exactly an engine program (config/engine-operations.mjs: the full verification) it resolves runnable,
+ * `engineProgram` naming it, and the supervisor starts it as one run (full-verification-run.mjs). Any other
+ * sequence resolves for config:check, preview and the panel's lists with one blocker: a start is refused
+ * before anything is reserved (supervisor.mjs start, launch.mjs reserveRun). Preflight never probes a harness.
  */
 function resolveEngineOnly (playbook, { errors, runOptions, project, infrastructure }) {
   const options = Object.keys(runOptions ?? {})
@@ -833,6 +835,7 @@ function resolveEngineOnly (playbook, { errors, runOptions, project, infrastruct
   }
   if (errors.length) return { ok: false, errors }
   const operations = [...new Set(playbook.phases.map((p) => p.engine))]
+  const engineProgram = engineProgramOf(playbook.phases)
   const contributing = [playbook.hash, ...(project ? [project.hash] : []), sha256(`fence:${JSON.stringify(FENCE_POLICY)}`)].sort()
   const resolved = {
     kind: ENGINE_ONLY,
@@ -851,12 +854,13 @@ function resolveEngineOnly (playbook, { errors, runOptions, project, infrastruct
     contracts: null,
     budgets: {},
     checks: { requirement: 'none', target: null, boundToRevision: true },
-    liveExecution: {
+    engineProgram,
+    liveExecution: engineProgram ? { eligible: true, blockers: [] } : {
       eligible: false,
       blockers: [{
         kind: 'engine-only-unsupported',
-        reason: `the engine does not execute engine steps yet (operations: ${operations.join(', ')}); this playbook can be resolved and previewed, not started`,
-        remedy: 'none until the engine implements these operations; no harness is probed and nothing is spent',
+        reason: `the engine does not execute engine steps other than its programs (operations: ${operations.join(', ')}; programs: ${Object.entries(ENGINE_PROGRAMS).map(([id, ops]) => `${id} = ${ops.join(', ')}`).join('; ')}); this playbook can be resolved and previewed, not started`,
+        remedy: 'name exactly the operations of an engine program in its phases; no harness is probed and nothing is spent',
         file: playbook.file
       }]
     },

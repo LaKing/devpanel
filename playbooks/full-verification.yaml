@@ -1,0 +1,21 @@
+id: full-verification
+version: 1
+kind: engine-only
+title: Full verification
+description: Runs the full verification cycle as one run. It closes admission to the writing runs of the projects it verifies and waits for writes and drives in flight. It verifies every stage against the previous green cycle of its mode and records what changed since the last verification. Then it checkpoints when every stage is green, or opens an issue for each red project, and finally opens admission and resumes what it paused. Stop ends it as interrupted. It has no seats and spends nothing on models.
+phases:
+  - id: freeze
+    title: Close admission for the projects it verifies
+    engine: full-verification-freeze
+  - id: wait
+    title: Wait for writes and drives in flight
+    engine: full-verification-wait
+  - id: stages
+    title: Verify every stage
+    engine: full-verification-stages
+  - id: outcome
+    title: Record changes and handle the outcome
+    engine: full-verification-outcome
+  - id: thaw
+    title: Open admission and resume
+    engine: full-verification-thaw

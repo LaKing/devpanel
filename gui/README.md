@@ -849,9 +849,14 @@ uncommitted), `by-hand` (commits `{sha, author, authoredAt, subject, handPaths}`
 `runs` when it also carries deliveries) and `uncommitted` (`{paths, total}`). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
 while one runs). The socket event `verification:changed` names the cycle and its state; the
 top-level supervisor is told `verification-ended` once it ended.
+`GET /api/projects/:project/verification-runs` lists the Full verification runs whose cycle verifies the project (its
+scope), newest ten, `{cycleId, date, state, verdict, run: {project, issueId, runId}}` (`server/full-verification-run.mjs`).
+A Full verification run's detail and list entries carry `engineProgram` and `cycleRun` (status, `phases` with state,
+times and detail, `scope`, `preview`); Stop on it interrupts its cycle.
 
-`GET /api/verification/output?project=<id>[&command=<key>&after=<bytes>]` is the **Full verification** page's terminal
-(`/verification`, in the drawer; `CycleOutput.vue`): the commands of one entry's drive in the latest cycle, oldest first
+`GET /api/verification/output?project=<id>[&cycle=<id>][&command=<key>&after=<bytes>]` is the **Full verification** page's terminal
+(`/verification`, in the drawer; `CycleOutput.vue`): the commands of one entry's drive in the latest cycle (or the cycle `cycle`
+names, as a Full verification run's page asks; 404 when there is none), oldest first
 (`key` is `<check directory>/<command id>`, with `running`, `bytes`, `changedAt`; a rerun of failed tests has a check
 directory of its own), and with `command` that command's text from byte `after` on (`text`, `next`, `running`,
 `truncated`, `restarted`), at most 256 kB a reading, cut at a character boundary. A running command is read from its

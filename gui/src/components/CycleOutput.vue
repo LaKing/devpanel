@@ -11,7 +11,8 @@ import { api } from '@/api'
  * Decision: the text kept in the page is bounded (the tail): a whole-suite log is megabytes, and the file on the
  * host is the full record.
  */
-const props = defineProps({ project: { type: String, required: true }, active: { type: Boolean, default: false } })
+// `cycleId`: the cycle whose drive is shown (a Full verification run's own); none, the latest cycle's.
+const props = defineProps({ project: { type: String, required: true }, active: { type: Boolean, default: false }, cycleId: { type: String, default: null } })
 
 const KEEP = 400000
 const commands = ref([])
@@ -41,12 +42,12 @@ async function poll () {
   if (busy) return
   busy = true
   try {
-    const listing = await api.verificationOutput(props.project)
+    const listing = await api.verificationOutput(props.project, null, 0, props.cycleId)
     commands.value = listing.commands
     if (follow.value || !chosen.value) choose((running.value ?? commands.value.at(-1))?.key ?? null)
     // Several readings in one poll while a long log is being caught up with, a bounded number of them.
     for (let reads = 0; chosen.value && reads < 8; reads++) {
-      const { output } = await api.verificationOutput(props.project, chosen.value, next)
+      const { output } = await api.verificationOutput(props.project, chosen.value, next, props.cycleId)
       if (!output || output.key !== chosen.value) break
       if (output.restarted) text.value = ''
       const stick = !pane.value || pane.value.scrollHeight - pane.value.scrollTop - pane.value.clientHeight < 40

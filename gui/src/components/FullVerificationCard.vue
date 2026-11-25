@@ -128,7 +128,9 @@ const outcome = computed(() => {
       <div class="fv__summary">
         <template v-if="cycle">
           <strong>{{ cycle.id }}</strong>
-          <span>· {{ cycle.trigger === 'hand' ? 'started by hand' : 'scheduled' }}</span>
+          <span>· {{ { hand: 'started by hand', schedule: 'scheduled', deliveries: 'after deliveries', playbook: 'started as a playbook run' }[cycle.trigger] ?? cycle.trigger }}</span>
+          <!-- A cycle a Full verification playbook run wraps (server/full-verification-run.mjs): its run. -->
+          <router-link v-if="cycle.run" data-test="cycle-run-link" :to="`/projects/${encodeURIComponent(cycle.run.project)}/${encodeURIComponent(cycle.run.issueId)}?run=${encodeURIComponent(cycle.run.runId)}`">· its run</router-link>
           <span>· {{ cycle.state }}</span>
           <v-chip v-if="cycle.verdict" size="x-small" :color="verdictColor(cycle.verdict)" variant="tonal" class="ml-1">{{ cycle.verdict }}</v-chip>
         </template>

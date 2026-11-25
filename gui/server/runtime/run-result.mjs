@@ -56,6 +56,14 @@ export function runResult (run, outputs) {
 
 function judgedResult (run, outputs) {
   if (run.journal?.recoveryRequired) return { result: null, resultReason: 'event-journal-recovery-required' }
+  // A Full verification run (full-verification-run.mjs): what the cycle achieved, never a delivery.
+  if (run.engineProgram === 'full-verification') {
+    const c = run.cycleRun ?? {}
+    if (run.status !== 'completed') return { result: run.status === 'failed' || run.status === 'cancelled' ? 'incomplete' : null, resultReason: run.status === 'cancelled' ? 'full-verification-interrupted' : run.status === 'failed' ? 'full-verification-failed' : null }
+    if (c.verdict === 'green') return { result: 'completed', resultReason: 'full-verification-green', resultLabel: 'Full verification green' }
+    if (c.verdict === 'no-stages') return { result: 'completed', resultReason: 'full-verification-no-stages', resultLabel: 'Full verification: nothing to verify' }
+    return { result: 'incomplete', resultReason: 'full-verification-red', resultLabel: `Full verification red${c.red?.length ? `: ${c.red.join(', ')}` : ''}` }
+  }
   // A person's explicit claim (supervisor.markLanded), never inferred from the
   // source repository; outcome, closure and approvals stay as the engine left them.
   if (run.landed) return { result: 'delivered', resultReason: 'manual-landing', resultLabel: `Landed by hand by ${run.landed.by}` }

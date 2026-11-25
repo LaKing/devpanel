@@ -717,6 +717,8 @@ export function createFullVerification ({
   // the cycle ends interrupted, not run, and admission opens. `graceMs`: how long the stops it asks for are waited for.
   maxWaitMs = null,
   graceMs = 60_000,
+  // How long the resumes after the thaw may take before the cycle records its end anyway (a resume that stalls never holds it).
+  resumeMs = 60_000,
   // The change list (cycleChanges): what a cycle records of what changed since the last verification, and how long it may take.
   changesOf = null,
   changesMs = CHANGES_MS
@@ -756,10 +758,18 @@ export function createFullVerification ({
   const orInterrupted = (record, promise) => Promise.race([promise, controlOf(record).interrupted])
   const maxWait = () => maxWaitMs ?? (hostSettings().verificationTrigger?.maxWaitMinutes ?? 240) * 60_000
   class CycleInterrupted extends Error {}
-  /** A bound reached (note 001): the whole cycle is interrupted; its stage runs are asked to stop and nothing starts after. */
-  function interrupt (record, label) {
+  /** An error that is the cycle's own interruption (its bound, or a start the supervisor refused for it): the stage reads interrupted. */
+  const cutByInterruption = (error) => error instanceof CycleInterrupted || error?.code === 'CYCLE_INTERRUPTED'
+  const RERUN_INTERRUPTED = 'the cycle was interrupted; no further rerun drive was started'
+  /**
+   * A bound reached (note 001), or a Stop of the run that wraps the cycle (full-verification-run.mjs, reason `stopped`):
+   * the whole cycle is interrupted; its stage runs are asked to stop and nothing starts after.
+   */
+  function interrupt (record, label, { reason = 'wait-bound', by = null } = {}) {
     if (record.interruption) return
-    record.interruption = { reason: 'wait-bound', label, at: clock.iso(), boundMinutes: Math.round(maxWait() / 60_000) }
+    record.interruption = reason === 'wait-bound'
+      ? { reason: 'wait-bound', label, at: clock.iso(), boundMinutes: Math.round(maxWait() / 60_000) }
+      : { reason, label, at: clock.iso(), by }
     controlOf(record).abort?.abort()
     for (const e of record.projects ?? []) {
       if (e.runId && ['running', 'starting'].includes(e.state)) Promise.resolve(supervisor.stop?.({ project: e.project, issueId: e.issueId, runId: e.runId })).catch(() => {})
@@ -986,7 +996,7 @@ export function createFullVerification ({
   // --------------------------------------------------------------- the cycle
 
   /** Start a cycle and return a copy of its record as frozen; the cycle goes on in the background. */
-  async function startCycle ({ trigger, by = null, scheduledFor = null, deliveries = null }) {
+  async function startCycle ({ trigger, by = null, scheduledFor = null, deliveries = null, run = null, signal = null }) {
     if (running) throw Object.assign(new Error(`a full verification cycle is already running (${current.id})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: current.id })
     // The scope, decided before anything is frozen or recorded: inputs that cannot be read refuse the cycle.
     let inputs
@@ -998,6 +1008,8 @@ export function createFullVerification ({
     const date = localDate(clock.now(), timeZone)
     const record = {
       id: null, date, trigger, by, scheduledFor, ...(deliveries ? { deliveries } : {}), schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
+      // The run that wraps this cycle (a Full verification playbook start, full-verification-run.mjs), when there is one.
+      ...(run ? { run: { project: run.project, issueId: run.issueId, runId: run.runId } } : {}),
       state: 'frozen', verdict: null, frozenAt: clock.iso(), seatsIdleAt: null, startedAt: null, endedAt: null,
       scope: { projects: cycleScope(inputs), decidedAt: clock.iso() },
       asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], leftPaused: [], refused: [], outcome: null, error: null
@@ -1005,9 +1017,16 @@ export function createFullVerification ({
     running = true
     current = record
     const control = { abort: new AbortController(), interrupted: null, notify: null, tasks: new Map(), pinned: null }
-    control.interrupted = new Promise((resolve, reject) => { control.notify = () => reject(new CycleInterrupted('the full verification reached its wait bound')) })
+    control.interrupted = new Promise((resolve, reject) => { control.notify = () => reject(new CycleInterrupted(record.interruption?.reason === 'stopped' ? 'the full verification was stopped' : 'the full verification reached its wait bound')) })
     control.interrupted.catch(() => {})
     controls.set(record, control)
+    // A Stop of the wrapping run: the cycle ends as an interrupted cycle ends (settleInterruption, thaw, resume).
+    if (signal) {
+      // Only while the cycle can still be interrupted: once it handles its outcome or thaws, a Stop changes nothing of it.
+      const stop = () => { if (['frozen', 'running'].includes(record.state)) interrupt(record, 'stop', { reason: 'stopped', by: signal.reason?.by ?? by }) }
+      if (signal.aborted) stop()
+      else signal.addEventListener('abort', stop, { once: true })
+    }
     try {
       // Never an id this process already gave a cycle: one whose cycle.json never landed would otherwise be reused, and a
       // late write of the older cycle would match the newer one's file (late-cycle-record-write).
@@ -1224,7 +1243,17 @@ export function createFullVerification ({
       // After the thaw no write is awaited unbounded: a write stalled since before the bound holds the record's chain, and
       // the later writes (this one, the end below) still land after it, in order, whenever it settles (late-cycle-record-write).
       await settleWrite(record)
-      await resumeFrozen(record, { scope: record.scope?.projects ?? null }).catch((error) => { record.error ??= `resuming: ${error.message}` })
+      // Bounded (late-cycle-record-write): a resume that stalls never holds back the end's record or its announcement. One
+      // that settles later is written then, into this cycle's own file.
+      const resuming = resumeFrozen(record, { scope: record.scope?.projects ?? null }).catch((error) => { record.error ??= `resuming: ${error.message}` })
+      let disarmResume = null
+      const resumeBound = new Promise((resolve) => { disarmResume = clock.after(resumeMs, () => resolve(TIMED_OUT)) })
+      const resumed = await Promise.race([resuming, resumeBound])
+      disarmResume?.()
+      if (resumed === TIMED_OUT) {
+        record.resume = { timedOut: true, boundSeconds: Math.round(resumeMs / 1000), pending: resumingNow.get(record) ?? null }
+        resuming.then(() => settleWrite(record))
+      }
       activeInputs = null
       pinnedHosts = new Map()
       record.state = record.interruption ? 'interrupted' : record.error ? 'failed' : 'ended'
@@ -1428,6 +1457,9 @@ export function createFullVerification ({
       entry.coverage = pick(await Promise.resolve().then(() => coverageOf({ project: entry.project, projectPath: projectDir, snapshotPath: workspace.path, snapshotAt: entry.snapshotAt, candidates: counting?.map((r) => r.runId) ?? null }))
         .catch((error) => ({ error: error.message })))
       await write(record)
+      // Interrupted while it read what the snapshot covers (late-cycle-work): no drive is begun after the bound. Nothing
+      // is awaited between this check and the drive's start.
+      if (record.interruption || signalOf(record)?.aborted) throw new CycleInterrupted('interrupted before the drive')
       const check = await fullVerificationDrive({ target, workspace, runDir: home, runId: driveId, project: entry.project, stage: entry.stage, verificationDir, clock, mode: 'instance', ...(drive ? { drive } : {}),
         signal: signalOf(record), resolved: pinOf(record, infra.staging?.ssh?.hostRef),
         onDriveWait: async (w) => {
@@ -1453,12 +1485,14 @@ export function createFullVerification ({
         verdict: incomplete ? 'incomplete' : check.gating === 'passed' ? 'green' : 'red'
       })
       // Before the finally below destroys the instance: each failed test alone on it (full-verification-rerun.mjs).
-      if (entry.verdict !== 'green') {
+      if (entry.verdict !== 'green' && (record.interruption || signalOf(record)?.aborted)) entry.rerun = { state: 'interrupted', reason: RERUN_INTERRUPTED }
+      else if (entry.verdict !== 'green') {
         await rerunFailed(record, { entry, infra, check, target, home, driveId, workspace })
         if (entry.rerun?.state === 'ran') await writeJson(path.join(home, 'drive.json'), { driveId, cycleId: record.id, project: entry.project, fullVerification: { check, rerun: entry.rerun } })
       }
     } catch (error) {
-      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
+      if (cutByInterruption(error)) Object.assign(entry, { state: 'interrupted', verdict: null, interrupted: { at: clock.iso(), reason: error.message } })
+      else Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message } })
     } finally {
       // Only a drive whose whole suite ran proves the deliveries its snapshot holds (verification-trigger.mjs).
       entry.coverageEstablished = Boolean(entry.suiteRan) && entry.verdict !== 'incomplete' && entry.state === 'settled'
@@ -1494,6 +1528,8 @@ export function createFullVerification ({
       entry.rerun = { state: 'running', bound, reported: plan.reported, tests: [], drives: [] }
       await write(record).catch(() => {})
       for (const [i, group] of rerunCommands(plan.tests, settings).entries()) {
+        // Interrupted meanwhile (late-cycle-work): no further rerun drive is begun; the entry stays as the suite left it.
+        if (record.interruption || signalOf(record)?.aborted) { Object.assign(entry.rerun, { state: 'interrupted', reason: RERUN_INTERRUPTED }); return }
         const rerunTarget = { ...target, commands: [fill(group.command, target.stageInstance)] }
         const result = await (drive ?? runChecks)({ target: rerunTarget, revision: null, base: true, dirName: `${RERUN_DIR}-${i + 1}`, baseCommit: workspace.baseCommit, workspacePath: workspace.path, gitDir: workspace.gitDir ?? null, runDir: home, clock, runId: driveId,
           signal: signalOf(record), resolved: pinOf(record, infra.staging?.ssh?.hostRef) })
@@ -1557,6 +1593,11 @@ export function createFullVerification ({
       }
       const started = await supervisor.start({ project: entry.project, issueId: home.id, playbookId: 'deployment', expectConfigHash: resolution.resolved.configHash, runOptions, configRoot, cycle: record.id, signal: signalOf(record) })
       Object.assign(entry, { runId: started.runId, runDir: path.join(home.path, 'runs', started.runId), state: 'running', startedAt: clock.iso() })
+      // Registered just after the bound (interrupt() stopped only the entries that already had a run): asked to stop now.
+      if (record.interruption || signalOf(record)?.aborted) {
+        Promise.resolve(supervisor.stop?.({ project: entry.project, issueId: home.id, runId: started.runId })).catch(() => {})
+        throw new CycleInterrupted('interrupted as the stage run registered; it was asked to stop')
+      }
       await write(record)
       let run = null
       let readFailures = 0
@@ -1599,7 +1640,8 @@ export function createFullVerification ({
       if (entry.verdict === 'red') entry.rerun = { state: 'skipped', reason: 'release-mode', message: 'a release-mode stage has no instance of the cycle\'s own to rerun a failed test on' }
       entry.coverageEstablished = Boolean(run.release?.status === 'completed' && entry.suiteRan)
     } catch (error) {
-      Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message }, coverageEstablished: false })
+      if (cutByInterruption(error)) Object.assign(entry, { state: 'interrupted', verdict: null, interrupted: { at: clock.iso(), reason: error.message }, coverageEstablished: false })
+      else Object.assign(entry, { state: 'refused', verdict: 'red', refusal: { code: error.code ?? null, status: error.status ?? null, message: error.message }, coverageEstablished: false })
     }
     entry.durationMs = entry.startedAt ? Math.max(0, Date.parse(entry.endedAt ?? clock.iso()) - Date.parse(entry.startedAt)) : null
     await write(record)
@@ -1926,6 +1968,8 @@ export function createFullVerification ({
     }
   }
 
+  // The run each cycle is resuming now, named on its record when the resumes outlive their bound.
+  const resumingNow = new WeakMap()
   /**
    * Resume every run of an issue or a run home the freeze paused; one where an operator's pause was
    * pending as well stays paused for that operator. Refusals are recorded, never retried.
@@ -1933,7 +1977,8 @@ export function createFullVerification ({
   /**
    * Resume the runs paused as full-verification. At a cycle's end (`scope`) only those of its scope: a pause of a
    * project outside it, left by an earlier cycle, is named in `leftPaused` and left to recover() at the next start or
-   * to an operator's resume. Without a scope (recover()), every such pause, as before.
+   * to an operator's resume. Without a scope (recover()), every such pause, as before. Once a newer cycle of this
+   * process started, none is begun any more (its resumes outlived their bound).
    */
   async function resumeFrozen (record, { scope = null } = {}) {
     for (const p of await issues.listProjects()) {
@@ -1948,11 +1993,16 @@ export function createFullVerification ({
         const named = { project, issueId: issue.id, runId: latest.runId }
         if (scope && !scope.includes(project)) { (record.leftPaused ??= []).push({ ...named, cycleId: run.pause.cycleId ?? null, reason: 'outside this cycle\'s scope' }); continue }
         if (run.pause.manualPending) { record.heldForOperator.push(named); continue }
+        // A newer cycle started while this one was still resuming (its resumes outlived their bound): never resumed under it.
+        if (controls.has(record) && current !== record) { (record.leftPaused ??= []).push({ ...named, cycleId: run.pause.cycleId ?? null, reason: 'a newer cycle started before this one finished resuming' }); continue }
+        resumingNow.set(record, named)
         try {
           await supervisor.resume({ ...named, actor: 'service', origin: 'full-verification' })
           record.resumed.push(named)
         } catch (error) {
           record.refused.push({ ...named, reason: error.message })
+        } finally {
+          resumingNow.delete(record)
         }
       }
     }
@@ -1964,6 +2014,25 @@ export function createFullVerification ({
     stop () { stopped = true; cancel?.(); cancel = null; cancelDeliveries?.(); cancelDeliveries = null },
     /** "Full verification now": the same freeze, stages and record as the other triggers. */
     startNow: ({ by = 'operator' } = {}) => startCycle({ trigger: 'hand', by }),
+    /**
+     * A Full verification playbook run (full-verification-run.mjs): the same cycle, its record naming the run, and
+     * interrupted as a stopped cycle when `signal` aborts. `done` settles with the cycle's record once it ended.
+     */
+    async startForRun ({ by = 'operator', run, signal = null }) {
+      const cycle = await startCycle({ trigger: 'playbook', by, run, signal })
+      const record = current?.id === cycle.id ? current : null
+      return { cycle, done: Promise.resolve(running).then(() => record ?? cycle) }
+    },
+    /** The projects a cycle started now would verify, from the same reading a start decides from (cycleInputs, cycleScope). */
+    async scope () {
+      const inputs = await cycleInputs()
+      return { projects: cycleScope(inputs), unreadable: inputs.unreadable ?? [] }
+    },
+    /** One cycle's record by id: the one running now, else the record on disk; null when none has it. */
+    async recordOf (cycleId) {
+      if (running && current?.id === cycleId) return current
+      return (await cycleRecords(verificationDir)).find((r) => r.id === cycleId) ?? null
+    },
     /**
      * Deliver every end still owed to the top-level supervisor (a cycle recover() marked interrupted, or one whose
      * announcement failed), once each; called when the supervisor exists. Returns the cycle ids told.

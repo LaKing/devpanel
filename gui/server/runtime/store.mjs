@@ -108,8 +108,9 @@ export async function initRun (issuePath, { runId, issue, resolved, clock = syst
     playbook: {
       id: resolved.playbook.id,
       version: resolved.playbook.version,
-      strategy: resolved.strategy.id,
-      strategyVersion: resolved.strategy.version,
+      // An engine-only playbook (config/load.mjs) binds no strategy.
+      strategy: resolved.strategy?.id ?? null,
+      strategyVersion: resolved.strategy?.version ?? null,
       intent: resolved.intent?.id ?? null,
       // The EXACT configuration this run was cut from, not just its name and a
       // version number a person has to remember to raise. Editing a playbook's

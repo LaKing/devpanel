@@ -20,7 +20,7 @@ Everything is plain files: human-authored config is YAML, machine-written state 
 
 ## Tactical playbooks
 
-Read `docs/tactical-playbooks.md` before changing playbooks, coordinator effects, evidence windows or release operations. The normal catalogue now has Analysis, Triage, Implementation, Plan and implement and Deployment; a staging release is a Deployment run in its `staging` environment (the default). Refactoring and Prompt remain; the legacy pingpong and one-time migration playbooks were removed (2026-09-25), the Staging playbook (2026-11-07). Default seats: Opus 5.5 at medium coordinates and writes; coding playbooks occupy `auditor-1` with GPT-6.2 Sol at medium. Optional seats are omitted unless occupied; consensus requires every occupied auditor on the same artifact. Only the engine executes configured release mutations.
+Read `docs/tactical-playbooks.md` before changing playbooks, coordinator effects, evidence windows or release operations. The normal catalogue now has Analysis, Triage, Implementation, Plan and implement and Deployment, plus the engine-only Full verification (the cycle as one run, `full-verification-run.mjs`); a staging release is a Deployment run in its `staging` environment (the default). Refactoring and Prompt remain; the legacy pingpong and one-time migration playbooks were removed (2026-09-25), the Staging playbook (2026-11-07). Default seats: Opus 5.5 at medium coordinates and writes; coding playbooks occupy `auditor-1` with GPT-6.2 Sol at medium. Optional seats are omitted unless occupied; consensus requires every occupied auditor on the same artifact. Only the engine executes configured release mutations.
 
 ## Project infrastructure
 
@@ -133,7 +133,7 @@ Diagnostics go to `logs/devpanel.jsonl` (tail it), with the journal as a seconda
 | `harness/*.mjs` | runtime adapters (`claude`, `codex`, `gemini`, `antigravity`); the contract is `harness/README.md` | developers |
 | `roster/*.yaml` | concrete models bound to a harness, with `efforts` and `verification.status` | operators |
 | `strategy-templates/<id>/` | `strategy.yaml` (roles, phases, loops, review policy, completion) + `prompts/*.md` + `intents/*.yaml` (prompt overlays per kind of work, keyed by step id) | operators |
-| `playbooks/*.yaml` | a strategy bound to participants (or, `kind: engine-only`, no seats and its own engine `phases`: resolved, checked and previewed, never started yet; docs/tactical-playbooks.md "Engine-only playbooks"), budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
+| `playbooks/*.yaml` | a strategy bound to participants (or, `kind: engine-only`, no seats and its own engine `phases`: resolved, checked and previewed; started only when the phases name an engine program, `config/engine-operations.mjs`, which today is the full verification's, `full-verification.yaml`; docs/tactical-playbooks.md "Engine-only playbooks"), budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
 | `consult/panel.yaml` | the consult panel (`gui/server/consult/`, `schemas/consult-panel.schema.json`), *Consultation* on the Playbooks page: its seats (`consultant-1..3`, each optional, at least one occupied; roster models with efforts), rounds, bounds per run, `alwaysHuman` categories, further `readOnly` paths and `deny` masks; a `host-config/consult/panel.yaml` replaces it whole; read at every consult, never part of a run's snapshot; see `docs/consult.md` | operators |
 | `decisions/<id>.yaml` | advisory decision provider (`jev`: TypeSafe Jev, the default; `openai`: the OpenAI Decisions API, beta; `model`: a verified roster model through its CLI, `decisions/model-oracle.mjs`), its client `kind`, endpoint, `credentialRef`, `threshold`, pricing (`decision-provider.schema.json`); `decisions/active.yaml` (`provider: <id>`) selects the one active provider, Jev when absent; see `docs/decisions.md` | operators |
 | `projects/<id>.yaml` | optional per-project source repository and integration branch, workspace policy (`base`, `symlinks`, `excludes`, seat `tooling` mounts and commands), infrastructure, local `checks` (a project without SSH staging; docs/project-infrastructure.md "Local checks") and `actions` (`project.schema.json`) | operators |
@@ -358,6 +358,14 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   operation per project at a time, recorded under `issues/<project>/.actions/<id>/` with output appended before
   its `project:action` socket event. Operators run these from the project page or with
   `project-action-cli.mjs`; the top-level supervisor has no action for them. See `docs/project-infrastructure.md`.
+- `full-verification-run.mjs` — the Full verification playbook: the cycle as one run, held on the issue it was started from
+  (supervisor.mjs `launchEngineProgram`, `setEngineRunner`). The cycle record names the run (`record.run`,
+  `trigger: 'playbook'`), and the run mirrors it into `run.cycleRun` (status and a timeline of the five phases), which the
+  run list, run detail, explanation and the issue page read. The preview and the first phase carry the change list read now
+  and what the freeze would pause (`supervisor.freezeCandidates`). Live output is the verification output feed with
+  `cycle=<id>`. Stop interrupts the cycle (`interruption.reason: stopped`); a shutdown does not. Reconcile settles a run left
+  live as cancelled, and `recover()` here mirrors what the cycle's `recover()` left. `GET /api/projects/:project/verification-runs`
+  links each scope project to it. docs/tactical-playbooks.md "Full verification cycles".
 - `verification-output.mjs` — what a full verification's drives print, for the Full verification page (`/verification`, in the drawer; `VerificationView.vue`,
   `CycleOutput.vue`): `GET /api/verification/output` lists the commands of one entry's drive and returns one command's text from a byte offset, so the page
   follows a running command like a terminal. A running command has `<id>.live` in its check directory: `runtime/checks.mjs` `runOne` appends every command's

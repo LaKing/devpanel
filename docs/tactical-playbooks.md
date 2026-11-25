@@ -428,13 +428,19 @@ preview`, the start dialog and the Playbooks page show its engine phases and no
 seat, model or model cost; the Playbooks page has no seat to edit and the
 seat-edit API refuses one.
 
-The engine does not execute engine steps yet, so such a playbook cannot be
-started: it resolves with one `engine-only-unsupported` blocker. Preflight
-returns before probing any harness, and a start is refused with
-`ENGINE_ONLY_NOT_RUNNABLE` before anything is locked, reserved or probed
-(`supervisor.start`, and again in `reserveRun`). The top-level supervisor's
+The engine executes engine programs whole (`config/engine-operations.mjs`). An
+engine-only playbook whose phases name exactly a program's operations, in order,
+resolves runnable (`engineProgram`, no blocker). The only program is the full
+verification (`full-verification-freeze`, `-wait`, `-stages`, `-outcome`, `-thaw`), and the
+catalogue's `full-verification` playbook names it ("Full verification cycles"
+below). Any other sequence resolves with one `engine-only-unsupported` blocker, and
+a start is refused with `ENGINE_ONLY_NOT_RUNNABLE` before anything is locked,
+reserved or probed (`supervisor.start`, and again in `reserveRun`). Preflight
+never probes a harness for an engine-only playbook. The top-level supervisor's
 preview of one carries no previewId, so `start_run` never reaches the start gate
-or the spending ledger. No engine-only playbook is in the catalogue.
+or the spending ledger. The supervisor does not start engine-only playbooks; an
+operator starts the Full verification playbook from the panel (start dialog or
+start API).
 
 ## Configuring releases
 
@@ -605,6 +611,34 @@ changes delivered since the last cycle, together. It starts in three ways:
   them (the host settings' `fullVerification.afterDeliveries`, default 10; 0 turns this off).
 - **On request**: "Full verification now", `POST /api/verification/start`.
 - **At a configured time**, once a day, when the host settings name one (`fullVerification.at` and `timeZone`); optional.
+- **As a run**: starting the **Full verification** playbook (`playbooks/full-verification.yaml`) from an issue's start
+  dialog or its start API (below).
+
+**The Full verification playbook** (`server/full-verification-run.mjs`) runs the same cycle as one run, held on the
+issue it was started from. The cycle's code is unchanged; its record names the run (`run`) and its `trigger` is
+`playbook`. While the cycle runs, that issue holds a live run like any other. The three triggers above start cycles
+exactly as before, with no run.
+
+- The run mirrors the record into `run.cycleRun`: the cycle's status, and a timeline of the playbook's five phases
+  (close admission, wait for writes and drives, verify every stage, record changes and handle the outcome, open admission
+  and resume), each with its state, times and what it holds. The run list, the run detail, the issue page (its phases
+  instead of turns) and the run explanation read it. There are no seats and no steps.
+- The **preview** (start dialog, `GET /api/playbooks/full-verification/preview`) and the **first timeline entry** carry
+  what the cycle would verify (its scope), what changed since the last verification (the change list, read now, before any
+  snapshot) and which live runs its freeze would pause (`wouldPause`: whole without any reading, i.e. in place, release,
+  unreadable or unconfined; `mayContinue`: decided at the freeze). The command-line preview (`npm run preview`) carries
+  neither the change list nor the would-pause list: only the panel process reads live runs.
+- **Live output** is the verification output feed for the run's own cycle (`GET /api/verification/output?cycle=<id>`),
+  the same terminal as on the Full verification page. Each stage entry says where its output is; an entry with nothing
+  driven (refused, derived, not run, verified through its instances) shows no terminal and says why.
+- **Stop** interrupts the cycle (`interruption.reason: stopped`, `by`), exactly as its wait bound does: stage runs asked to
+  stop, admission thawed, the runs it paused resumed, the instances destroyed by their drives. The run ends `cancelled`.
+  A cycle that ended green completes the run (verdict through the run's result); red is `incomplete`; a failed cycle fails it.
+- **A service shutdown** does not interrupt the cycle, as before. At the next start, reconcile settles the run as
+  `cancelled` (never recovery-required, never auto-resumed), the cycle's own `recover()` marks it interrupted, and the run
+  then carries that record.
+- **Each project in the cycle's scope links to the run**: `GET /api/projects/:project/verification-runs`, shown on the
+  project page; the run page links back to each project, and the Full verification page links to the run.
 
 **Configure it** in the host settings (docs/host-config.md "Host settings"); every key is optional:
 

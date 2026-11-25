@@ -318,6 +318,30 @@ export default async function (t) {
       t.ok('a rerun.test whose drive declares no selftest report is refused', reportless({ id: 'rerun', run: '/opt/stage-tools/rerun.sh {{instance}} {{test}}' }).some((e) => e.includes('report: selftest')))
       t.eq('the same with report: selftest on the rerun command passes', reportless({ id: 'rerun', run: '/opt/stage-tools/rerun.sh {{instance}} {{test}}', report: 'selftest' }), [])
     }
+
+    t.section('11. a bound reached during a rerun drive: no further rerun drive is begun, the entry stays as the suite left it, the cycle interrupted')
+    {
+      const issuesDir = await temp('devpanel-fvr-bound-')
+      const at = clock()
+      const answers = rerunAnswers({ 'b: breaks': 'pass', 'c: wobbles': 'pass' })
+      // The first rerun drive outlives the stage's bound: the clock passes it while that drive runs.
+      const s = seams({ issuesDir, infra: { 'app-project': instanceInfra({ rerun: named }) }, suite: () => suiteFails(['b: breaks', 'c: wobbles']), rerun: (target) => { at.advance(5_001); return answers(target) } })
+      const verificationDir = path.join(issuesDir, '.verification')
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, clock: at, verificationDir, maxWaitMs: 5_000, graceMs: 30_000 })
+      const started = await fv.startNow({ by: 'tester' })
+      const file = path.join(verificationDir, started.date, 'cycle.json')
+      let record = null
+      // Nothing on the clock moves until the first rerun drive passes the bound itself; then the grace runs out on the clock.
+      for (let i = 0; i < 400 && !s.calls.reruns.length; i++) await new Promise((resolve) => setTimeout(resolve, 5))
+      for (let i = 0; i < 400 && record?.state !== 'interrupted'; i++) { at.advance(1_000); record = await readJson(file).catch(() => null); await new Promise((resolve) => setTimeout(resolve, 5)) }
+      await fv.settle()
+      record = await readJson(file)
+      const app = record.projects[0]
+      t.eq('the cycle is interrupted by the stage\'s bound', [record.state, record.interruption?.label], ['interrupted', 'stage app-project'])
+      t.eq('one rerun drive ran; the second was never begun', s.calls.reruns.length, 1)
+      t.eq('the rerun reads interrupted and the entry stays red, as the suite left it', [app.rerun?.state, app.rerun?.reason, app.verdict, app.flaky ?? null], ['interrupted', 'the cycle was interrupted; no further rerun drive was started', 'red', null])
+      t.eq('the instance is destroyed all the same; nothing checkpointed', [s.calls.destroys.length, s.calls.actions.length], [1, 0])
+    }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
   }

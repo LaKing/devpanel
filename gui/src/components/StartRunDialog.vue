@@ -608,6 +608,31 @@ async function start (override = false) {
             <span>{{ ph.engine }}</span>
             <span v-if="ph.title" class="dim">{{ ph.title }}</span>
           </div>
+          <!-- The full verification's program (server/full-verification-run.mjs preview): what it would verify, what changed
+               since the last verification, and which live runs its freeze would pause. Read now; the cycle reads again. -->
+          <template v-if="previewData.cycle">
+          <h3 class="section">What the cycle would do</h3>
+          <div v-if="previewData.cycle.error || previewData.cycle.unread" class="dim" data-test="cycle-preview-unread">{{ previewData.cycle.error ?? previewData.cycle.unread }}</div>
+          <template v-else>
+          <div class="row" data-test="cycle-preview-scope"><span class="row__role">verifies</span><span>{{ (previewData.cycle.scope ?? []).join(', ') || 'no project' }}</span></div>
+          <div class="row" data-test="cycle-preview-pause"><span class="row__role">would pause</span>
+            <span>{{ (previewData.cycle.wouldPause ?? []).map((r) => `${r.project}/${r.issueId} (${r.reason})`).join(', ') || 'no live run' }}</span></div>
+          <div v-if="previewData.cycle.mayContinue?.length" class="row"><span class="row__role">decided at the freeze</span>
+            <span>{{ previewData.cycle.mayContinue.map((r) => `${r.project}/${r.issueId}`).join(', ') }}</span></div>
+          <div class="dim">What changed since the last verification ({{ previewData.cycle.basis }}):</div>
+          <div v-if="previewData.cycle.changes?.state !== 'computed'" class="dim">{{ previewData.cycle.changes?.error ?? previewData.cycle.changes?.state }}</div>
+          <template v-else>
+          <div v-for="repo in previewData.cycle.changes?.repositories ?? []" :key="repo.checkout" class="row" data-test="cycle-preview-changes">
+            <span class="row__role">{{ repo.project ?? repo.checkout }}</span>
+            <span v-if="repo.error" class="dim">{{ repo.error }}</span>
+            <span v-for="sec in repo.sections ?? []" :key="sec.kind" class="dim">
+              {{ { delivered: 'issues delivered', 'by-hand': 'commits by hand', uncommitted: 'uncommitted' }[sec.kind] }}
+              {{ sec.kind === 'uncommitted' ? sec.total : sec.items.length }}{{ sec.kind === 'delivered' && sec.items.length ? `: ${sec.items.slice(0, 5).map((d) => d.issueId ?? d.runId).join(', ')}` : '' }}
+            </span>
+          </div>
+          </template>
+          </template>
+          </template>
           </template>
           <template v-else>
           <h3 class="section">Participants</h3>

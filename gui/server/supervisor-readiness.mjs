@@ -144,10 +144,13 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
     }
   }
   const resolved = resolution.resolved
-  // An engine-only playbook (config/load.mjs) has no workspace, delivery or seats to read: it cannot start.
+  // An engine-only playbook (config/load.mjs) has no workspace, delivery or seats to read. One naming an engine program
+  // (the full verification) is started by an operator from the panel, never by the supervisor; any other cannot start.
   if (resolved.kind === 'engine-only') {
     return { playbook, kind: resolved.kind, configHash: resolved.configHash, ready: false, observedAt,
-      prerequisites: resolved.liveExecution.blockers.map((b) => ({ condition: 'configuration', state: b.reason, needs: b.remedy })) }
+      prerequisites: resolved.engineProgram
+        ? [{ condition: 'entrance', state: `engine program ${resolved.engineProgram}: started by an operator from the panel`, needs: 'an operator starts it; the supervisor does not start engine-only playbooks' }]
+        : resolved.liveExecution.blockers.map((b) => ({ condition: 'configuration', state: b.reason, needs: b.remedy })) }
   }
   const action = resolved.workspace?.isolation === 'in-place' ? 'in-place' : resolved.completion?.delivery?.action
   const writesSource = ['apply-to-source', 'in-place'].includes(action)

@@ -82,6 +82,8 @@ export async function listRuns (issuePath, { strict = false } = {}) {
         steps: run.steps.length,
         budgets: run.budgets,
         timing: run.timing ?? null,
+        // A Full verification run (full-verification-run.mjs): its cycle, phases and scope.
+        ...(run.cycleRun ? { engineProgram: run.engineProgram ?? null, cycleRun: run.cycleRun } : {}),
         preflight: run.preflight ? { state: run.preflight.state, attempts: run.preflight.attempts } : null,
         workspaceState: run.workspace?.state ?? null,
         // Only a blocked run can offer refresh-checks, which needs its snapshot.
@@ -219,6 +221,9 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     status: run.status,
     outcome: run.outcome,
     ...runResult(run, outputs),
+    // A Full verification run (full-verification-run.mjs): the cycle it wraps, a timeline of its phases and its scope.
+    engineProgram: run.engineProgram ?? null,
+    cycleRun: run.cycleRun ?? null,
     blockedReason: run.blockedReason,
     reconcilePending: reconcilePending(run),
     recoveryPending: recoveryPending(run),

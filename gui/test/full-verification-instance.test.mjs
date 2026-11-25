@@ -792,6 +792,67 @@ export default async function (t) {
       t.eq('the derived and the deferred entries read interrupted, red, establishing nothing', after.projects.map((p) => [p.project, p.state, p.verdict, p.coverageEstablished, p.instance ?? null]), [
         ['framework-project', 'interrupted', 'red', false, null], ['other-framework-project', 'interrupted', 'red', false, null], ['site-project', 'interrupted', 'red', false, { name: instanceName('fv-x-site-project'), destroyed: { passed: true, at: '2026-11-14T10:00:00.000Z' } }]])
     }
+
+    t.section('24. a bound reached while the snapshot\'s coverage is read: no drive is begun, the instance is destroyed, the snapshot released, the entry interrupted (not refused)')
+    {
+      const issuesDir = await temp('devpanel-fvi-bound-coverage-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const s = seams({ issuesDir, infra: { 'app-project': instanceInfra() }, outcome: passing() })
+      let release = null
+      let asked = null
+      const askedFor = new Promise((resolve) => { asked = resolve })
+      const stalled = new Promise((resolve) => { release = resolve })
+      const covered = s.options.coverageOf
+      const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, coverageOf: async (args) => { asked(); await stalled; return covered(args) }, clock, verificationDir, maxWaitMs: 5_000, graceMs: 30_000 })
+      const started = await fv.startNow({ by: 'tester' })
+      await askedFor
+      clock.advance(5_001)
+      release()
+      const day = path.join(verificationDir, started.date, 'cycle.json')
+      const record = await (async () => { for (let i = 0; i < 400; i++) { clock.advance(1_000); const r = await readJson(day).catch(() => null); if (r?.state === 'interrupted') return r; await new Promise((resolve) => setTimeout(resolve, 5)) } return readJson(day) })()
+      const app = record.projects[0]
+      t.eq('the cycle is interrupted by the stage\'s bound', [record.state, record.interruption?.reason, record.interruption?.label], ['interrupted', 'wait-bound', 'stage app-project'])
+      t.eq('no drive was begun after the bound', s.calls.targets.length, 0)
+      t.eq('the instance is destroyed and the snapshot released all the same', [s.calls.destroys, s.calls.releases.length], [[driveIdOf(record.id, 'app-project')], 1])
+      t.eq('the entry reads interrupted, as the stage recorded it, not refused', [app.state, app.verdict, app.refusal ?? null, app.interrupted?.reason, app.coverageEstablished], ['interrupted', null, null, 'interrupted before the drive', false])
+      t.eq('nothing checkpointed, admission thawed', [s.calls.actions.length, s.options.supervisor.frozen()], [0, null])
+      await fv.settle()
+    }
+
+    t.section('26. a stage that returns long after its bound: the interrupted end is recorded and announced without it, and its late write never replaces the newer cycle\'s record')
+    {
+      const issuesDir = await temp('devpanel-fvi-bound-late-write-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const s = seams({ issuesDir, infra: { 'app-project': instanceInfra() }, outcome: passing() })
+      let release = null
+      let asked = null
+      const askedFor = new Promise((resolve) => { asked = resolve })
+      const stalled = new Promise((resolve) => { release = resolve })
+      let drives = 0
+      // A's drive ignores its signal and returns only when released; B's drives pass at once.
+      const drive = async (args) => { if (++drives === 1) { asked(); await stalled } return s.options.drive(args) }
+      const clock = manualClock(Date.parse('2026-11-14T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, ...s.options, drive, clock, verificationDir, maxWaitMs: 5_000, graceMs: 0 })
+      const a = await fv.startNow({ by: 'tester' })
+      await askedFor
+      clock.advance(5_001)
+      await fv.settle()
+      const day = path.join(verificationDir, a.date)
+      const ofA = await readJson(path.join(day, 'cycle.json'))
+      t.eq('while A\'s drive is still stalled, A is recorded interrupted and told once', [ofA.id, ofA.state, ofA.projects[0].state, s.calls.ended.length, s.calls.ended[0]?.state], [a.id, 'interrupted', 'interrupted', 1, 'interrupted'])
+      const b = await fv.startNow({ by: 'tester' })
+      await fv.settle()
+      const bBytes = await fs.readFile(path.join(day, 'cycle.json'), 'utf8')
+      t.eq('B ran and ended green in cycle.json', [JSON.parse(bBytes).id, JSON.parse(bBytes).verdict], [b.id, 'green'])
+      release()
+      const late = await (async () => { for (let i = 0; i < 400; i++) { const r = await readJson(path.join(day, 'cycle.1.json')).catch(() => null); if (s.calls.destroys.filter((d) => d === driveIdOf(a.id, 'app-project')).length >= 1 && r?.projects?.[0]?.instance?.destroyed && s.calls.targets.length >= 2) return r; await new Promise((resolve) => setTimeout(resolve, 5)) } return readJson(path.join(day, 'cycle.1.json')) })()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      t.eq('A\'s late write never replaced B\'s record: cycle.json is byte for byte B\'s', await fs.readFile(path.join(day, 'cycle.json'), 'utf8'), bBytes)
+      const afterA = await readJson(path.join(day, 'cycle.1.json'))
+      t.eq('A\'s own file still reads interrupted, its entry as sealed (not settled or green), told once', [afterA.id, afterA.state, afterA.projects[0].state, afterA.projects[0].verdict ?? null, s.calls.ended.filter((n) => n.cycleId === a.id).length], [a.id, 'interrupted', 'interrupted', null, 1])
+      t.eq('the late stage did finish meanwhile: its drive returned and its instance was destroyed', [s.calls.targets.length >= 2, s.calls.destroys.includes(driveIdOf(a.id, 'app-project')), Boolean(late)], [true, true, true])
+    }
   } finally {
     await Promise.all(temps.map((d) => fs.rm(d, { recursive: true, force: true })))
   }

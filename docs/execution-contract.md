@@ -3743,6 +3743,14 @@ runs, and only for the projects it verifies. A run writes when what it can do to
 be read is taken to write. Analysis, Triage and inquiries only read: the freeze neither asks,
 refuses nor waits for them, and they may start.
 
+A cycle started by the Full verification playbook (`server/full-verification-run.mjs`, tactical-playbooks.md "Full
+verification cycles") is the same cycle: its record carries `run: {project, issueId, runId}` and `trigger: 'playbook'`.
+The wrapping run writes no checkout (`writes: false`), so the freeze neither asks it nor waits for it. Its Stop interrupts
+the cycle with `interruption: {reason: 'stopped', label, at, by}`; the bound's interruption keeps `{reason: 'wait-bound',
+label, at, boundMinutes}`. Both then end the same way (settleInterruption, thaw, resume of the scope's pauses). A service
+shutdown is no Stop. A run left live by a dead owner is settled by reconcile as `cancelled`, without `stoppedBy`, so
+`resumeInterrupted` never resumes it. After the cycle's `recover()` the run mirrors the record `recover()` left.
+
 **Whole and contained runs** (`run-exclusivity.mjs wholeFreeze`, `server/cycle-gates.mjs`). Inside
 the scope, a writing run is frozen *whole* (everything below: refused, asked to pause, waited
 for) only when it works in place, releases (staging, deployment), cannot be read, or *reaches
@@ -3859,7 +3867,18 @@ awaited between the check and its spawn), the cycle's own pending work is follow
 `not-run` and running ones `interrupted`, the outcome is skipped (`outcome.skipped:
 interrupted`), and after a grace of 60 s admission thaws, naming what was still in flight
 (`interruption.inFlight`, `admission-thawed {interrupted: true}`): the freeze is never lifted
-silently while a write is in progress. A thaw clears the cycle's freeze requests wherever they
+silently while a write is in progress. After the bound nothing new of the cycle begins: an
+instance stage begins no drive (checked with nothing awaited before the drive's start) and no
+further rerun drive (`rerun.state: interrupted`), and a stage run that registers after it is
+asked to stop at once (that stop is its trace; it is named in `inFlight` only when it registered
+within the grace). A stage the interruption cut reads `interrupted` (`entry.interrupted {at,
+reason}`), never `refused`. The resumes after the thaw are bounded too (60 s): past that the end
+is recorded and announced anyway (`resume {timedOut, boundSeconds, pending}`), a resume that
+settles later is written into the cycle's own record, and once a newer cycle has started none
+is begun (`leftPaused`, "a newer cycle started before this one finished resuming"). A write of
+the cycle that lands late goes only to the file holding that cycle (`cycle.<n>.json` once a
+later cycle of its date rotated it), never over a newer cycle's record, and keeps its entries
+as sealed when it settled. A thaw clears the cycle's freeze requests wherever they
 sit (engine, reservation, persisted record); a request whose cycle is not active is dropped
 where it is used (`freeze-request-dropped`), and after a restart none is.
 

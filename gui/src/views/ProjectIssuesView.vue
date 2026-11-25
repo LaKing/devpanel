@@ -97,6 +97,8 @@ let loadSeq = 0
 const checkoutOverlap = ref(null)
 // The project's module pool and the locks live runs hold in it (module-locks.mjs); null without a pool.
 const moduleLocks = ref(null)
+// The Full verification runs whose cycle verifies this project (server/full-verification-run.mjs forProject).
+const verificationRuns = ref([])
 // One line on the page however many modules are held: the modules are grouped by the run that holds them and
 // shown only when the line is opened (a run of nine modules used to take half the screen).
 const lockRuns = computed(() => {
@@ -127,6 +129,7 @@ async function load () {
     // Only a warning: a failed reading shows nothing and blocks nothing.
     api.checkoutOverlap(project.value).then((reading) => { if (seq === loadSeq) checkoutOverlap.value = reading }, () => { if (seq === loadSeq) checkoutOverlap.value = null })
     api.moduleLocks(project.value).then((reading) => { if (seq === loadSeq) moduleLocks.value = reading }, () => { if (seq === loadSeq) moduleLocks.value = null })
+    api.verificationRuns(project.value).then((list) => { if (seq === loadSeq) verificationRuns.value = list }, () => { if (seq === loadSeq) verificationRuns.value = [] })
   } catch (err) {
     if (seq !== loadSeq) return
     loadError.value = err.message
@@ -293,6 +296,15 @@ watch([project, archived], () => {
           New issue
         </v-btn>
       </div>
+    </div>
+
+    <!-- The Full verification runs that verified (or verify) this project, each linked to its run. -->
+    <div v-if="verificationRuns.length" class="mb-3 text-body-2" data-test="verification-runs">
+      <span class="text-medium-emphasis">Full verification runs:</span>
+      <router-link v-for="v in verificationRuns" :key="v.cycleId" class="ml-2"
+                   :to="`/projects/${encodeURIComponent(v.run.project)}/${encodeURIComponent(v.run.issueId)}?run=${encodeURIComponent(v.run.runId)}`">
+        {{ v.cycleId }} · {{ v.verdict ?? v.state }}
+      </router-link>
     </div>
 
     <!-- A reading that blocks nothing, so it is information: one line per run, its files only when opened. -->

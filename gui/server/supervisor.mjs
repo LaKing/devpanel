@@ -47,7 +47,7 @@ import { readChat, coordinatorRole, instructionRefusal, chatView, recordInstruct
 import { captureIntegrity, integrityChanges, readIntegrity } from './runtime/integrity.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
 import { inspectSourceRepository, repositoryFaultError, usesSourceRepository } from './runtime/source-repository.mjs'
-import { resolvePlaybook, loadConfig, engineOnlyRefusal } from './config/load.mjs'
+import { resolvePlaybook, loadConfig, engineOnlyRefusal, ENGINE_ONLY } from './config/load.mjs'
 import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
@@ -414,6 +414,25 @@ export function createSupervisor ({
       .map((t) => ({ project: t.project, issueId: t.issueId, runId: t.runId, phase: t.kind, kind: t.kind, since: t.since, ...(t.host ? { host: t.host } : {}), ...(t.action ? { action: t.action } : {}) }))
   ]
   /**
+   * What a freeze of these projects would ask now, read-only (the Full verification preview): the live writing runs of
+   * the scope whole without any reading (in place, release, unreadable, unconfined) would pause; the others are
+   * classified at the freeze (paused only if they reach what the cycle snapshots); pending writing starts are waited for.
+   */
+  function freezeCandidates (projects) {
+    const scope = new Set(projects ?? [])
+    const named = (r) => ({ project: r.project, issueId: r.issueId, runId: r.runId })
+    const wouldPause = []
+    const mayContinue = []
+    for (const record of active.values()) {
+      if (!writes(record) || !scope.has(record.project) || ofCycle(record)) continue
+      const quick = wholeFreezeQuick({ snapshot: snapshotOf(record), frozen: null, fence: seatFencePolicy(platform), platform, env: process.env })
+      if (quick) wouldPause.push({ ...named(record), reason: quick.reason })
+      else mayContinue.push({ ...named(record), reason: 'decided at the freeze: paused only if it reaches what the cycle snapshots' })
+    }
+    const pending = [...pendingWrites.values()].filter((p) => scope.has(p.project)).map((p) => ({ project: p.project, issueId: p.issueId, runId: p.runId, phase: p.phase }))
+    return { wouldPause, mayContinue, pending }
+  }
+  /**
    * Committing project actions of the scope still holding their action lock (project-actions.mjs records the
    * effect in the lock itself, so one is visible from the moment it holds it, from the panel or the CLI).
    */
@@ -674,6 +693,7 @@ export function createSupervisor ({
     let modulePool = null
     let moduleExpected = []
     let startContained = false
+    let engineProgram = null
     try { await admission(project, async () => {
       const issue = await holderOf(project, issueId)
       home = Boolean(issue.home)
@@ -710,6 +730,22 @@ export function createSupervisor ({
       if (resolution.ok && (!writesCheckout(resolution.resolved) || startContained)) pendingWrites.delete(k)
       // A cycle interrupted while its own start was being admitted creates no run.
       if (signal?.aborted) throw Object.assign(err(409, 'the full verification cycle was interrupted before this start registered'), { code: 'CYCLE_INTERRUPTED', started: false })
+      // An engine program (config/engine-operations.mjs: the full verification): no seats, nothing to probe, lock or
+      // deliver. Its runner admits it before anything is reserved; the run is reserved as running and driven by it.
+      if (resolution.ok && resolution.resolved.kind === ENGINE_ONLY) {
+        const runner = engineRunners.get(resolution.resolved.engineProgram)
+        if (!runner) throw Object.assign(err(503, `the engine program ${resolution.resolved.engineProgram} is not available in this process`), { started: false, retryable: true })
+        await runner.admit?.()
+        // It never writes the checkout: no pending write of it may hold a cycle's wait (busy) once it starts one.
+        pendingWrites.delete(k)
+        engineProgram = { id: resolution.resolved.engineProgram, runner }
+        reservation = await reserveRun({
+          playbookId, supervisorLaunchId,
+          issue: { project, id: issueId, name: issue.name ?? null, openedOn: issue.openedOn ?? null, path: issue.path },
+          issuePath: issue.path, configRoot: root, expectConfigHash, runOptions, status: 'running'
+        })
+        return
+      }
       const noGreen = resolution.ok ? resolution.resolved.liveExecution.blockers.find((b) => b.kind === 'no-green-staging') : null
       if (noGreen) throw Object.assign(err(422, noGreen.reason, { code: 'NO_GREEN_STAGING', latestGreen: noGreen.latestGreen ?? null, unverifiable: noGreen.unverifiable ?? [] }), { started: false, retryable: false })
       if (resolution.ok) {
@@ -829,6 +865,8 @@ export function createSupervisor ({
       throw translate(error)
     }
 
+    if (engineProgram) return launchEngineProgram({ k, project, issueId, reservation, program: engineProgram })
+
     const record = {
       runId: reservation.runId,
       issuePath: reservation.issuePath,
@@ -880,6 +918,61 @@ export function createSupervisor ({
     })
 
     return { runId: record.runId, status: 'preflighting', ...(startOverlap ? { startOverlap } : {}) }
+  }
+
+  /*
+   * Engine programs (config/engine-operations.mjs), each driven by its runner: the full verification's
+   * (full-verification-run.mjs), registered by the server. A runner has `admit()` (refuses before anything is
+   * reserved) and `drive(context)`, which settles the run record itself; nothing here is a seat or an engine.
+   */
+  const engineRunners = new Map()
+  function setEngineRunner (program, runner) { engineRunners.set(program, runner) }
+
+  /**
+   * A reserved engine-program run: registered as live and driven by its runner. It writes no checkout (`writes: false`):
+   * no freeze asks it, no cycle waits for it (busy). Stop aborts its controller; the runner decides what that means
+   * (a service shutdown leaves the cycle to the next start's recovery). The run lock is held until the runner settled.
+   */
+  function launchEngineProgram ({ k, project, issueId, reservation, program }) {
+    reservation.run.preflight = null
+    reservation.run.workspace = { ...reservation.run.workspace, state: 'none' }
+    reservation.run.engineProgram = program.id
+    const record = {
+      runId: reservation.runId, issuePath: reservation.issuePath, project, issueId, phase: 'engine',
+      engine: null, reservation, controller: new AbortController(), stopping: false, finished: null,
+      home: false, cycleId: null, writes: false, engineProgram: program.id
+    }
+    active.set(k, record)
+    starting.delete(k)
+    pendingWrites.delete(k)
+    emit?.({ type: 'run-reserved', project, issueId, runId: record.runId, status: 'running' })
+    const notify = (event) => emit?.({ ...event, project, issueId, runId: record.runId })
+    record.finished = (async () => {
+      try {
+        await writeReservation(record)
+        await program.runner.drive({
+          project, issueId, runId: record.runId, issuePath: record.issuePath, run: reservation.run,
+          signal: record.controller.signal,
+          stoppedBy: () => record.stoppedBy ?? null,
+          stopActor: () => record.stopActor ?? null,
+          stopping: () => record.stopping,
+          write: () => writeReservation(record),
+          emit: notify
+        })
+      } catch (error) {
+        console.warn(`[devpanel] engine program ${program.id} of ${k} run ${record.runId} failed: ${error.message}`)
+        if (LIVE_STATUSES.includes(reservation.run.status) && record.stoppedBy !== SERVICE_SHUTDOWN) {
+          Object.assign(reservation.run, { status: 'failed', endedAt: new Date().toISOString(), failure: { class: 'runtime', message: error.message } })
+          await writeReservation(record).catch(() => {})
+        }
+      } finally {
+        await record.reservationWrites?.catch(() => {})
+        await reservation.runLock.release().catch(() => {})
+        active.delete(k)
+        notify({ type: 'engine-run-ended', status: reservation.run.status })
+      }
+    })()
+    return { runId: record.runId, status: 'running' }
   }
 
   /**
@@ -1936,11 +2029,13 @@ export function createSupervisor ({
    * what they are asking for. A run that is preflighting stops too: the probes
    * are abandoned rather than paid for.
    */
-  async function stop ({ project, issueId, runId, wait = false }) {
+  async function stop ({ project, issueId, runId, wait = false, actor = null }) {
     const record = active.get(key(project, issueId))
 
     if (!record || record.runId !== runId) return stopUnowned({ project, issueId, runId })
 
+    // Who stopped it, for a record that names it (an engine program's: the full verification's interruption).
+    if (actor && !record.stopping) record.stopActor = actor
     await beginStop(record)
 
     if (wait) {
@@ -2421,6 +2516,16 @@ export function createSupervisor ({
     const detail = owner.liveness === 'absent'
       ? 'no lock was held for it when this server took over'
       : `the process that owned it (pid ${owner.record?.owner?.pid}) is gone`
+    // An engine-program run (the full verification's) has no turn whose result is unknown: it is settled, never
+    // recovery-required. The cycle's own recover() and the runner's recover() then record how the cycle ended. No
+    // stoppedBy: a service shutdown's mark would make resumeInterrupted resume it as a seat run.
+    if (run.engineProgram) {
+      const at = new Date().toISOString()
+      Object.assign(run, { status: 'cancelled', endedAt: run.endedAt ?? at, stoppedBy: null })
+      run.cycleRun = { ...(run.cycleRun ?? {}), ownerLost: { detail: `the run was ${wasStopping ? 'stopping' : 'live'} when its owner disappeared — ${detail}`, at } }
+      await store.writeRun(issuePath, run.runId, run)
+      return run
+    }
 
     run.outcome = 'unresolved'
     // When the owner was last seen doing something: the time from then until a
@@ -2562,6 +2667,8 @@ export function createSupervisor ({
             if (held(now)) console.warn(`[devpanel] reconcile skipped ${projectId}/${issue.id} run ${runId}: the issue's run lock is held (${now.liveness}, pid ${now.record?.owner?.pid ?? 'unknown'})`)
             continue
           }
+          // An engine-program run is settled, not recovery work (markUnownedHeld).
+          if (run.engineProgram) { emit?.({ type: 'engine-run-settled', project: projectId, issueId: issue.id, runId }); continue }
           recovered.push({ project: projectId, issueId: issue.id, runId })
           emit?.({ type: 'run-recovery-required', project: projectId, issueId: issue.id, runId })
         }
@@ -2843,7 +2950,7 @@ export function createSupervisor ({
     return { questionId: first, state: 'asking' }
   }
 
-  return { setAutoStartGate, setAfterEnd, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, frozenFor, wholeOf, startsConfined: () => startsConfined(), busy, busyActions, releaseIdle, gates, cycleGateFor: (record) => gates.gateFor(record), writeGateFor, moduleLockReading, modulesCoverage }
+  return { setAutoStartGate, setAfterEnd, setEngineRunner, freezeCandidates, liveCheckSince, pathOverlap, chatHistory, acknowledgeCleanup, proveCleanup, instructCoordinator, askCoordinator: askCoordinatorQuestion, inquiryStatus, closeInquiry, reopenInquiry, packInquiry, start, answer, pause: pauseRun, resume: args => answer({ ...args, resume: true }), recover: args => answer({ ...args, recover: true }), resolveIntegrity: ({ disposition, expectedStateHash, reason, ...args }) => answer({ ...args, integrity: { disposition, expectedStateHash, reason } }), inspectIntegrity, retryInput: args => answer({ ...args, retryInput: true }), refreshChecks: args => answer({ ...args, refreshChecks: true }), continueRun: args => answer({ ...args, continueRun: true }), acceptCheckResult: ({ failures, reason, revision, authority = 'operator', ...args }) => answer({ ...args, acceptCheck: { failures, reason, revision, authority } }), finalize, reconcileDelivery: args => finalize({ ...args, reconcile: true }), stop, abandon, deleteRun, markLanded, isActive, checkoutHolder, settle, reconcile, resumeInterrupted, shutdown, liveAgents, active, availability, deliveryActions: worktreeDiffDelivery.actions, freeze: freezeAdmission, thaw: thawAdmission, frozen: () => freeze, frozenFor, wholeOf, startsConfined: () => startsConfined(), busy, busyActions, releaseIdle, gates, cycleGateFor: (record) => gates.gateFor(record), writeGateFor, moduleLockReading, modulesCoverage }
 }
 
 /**
@@ -2926,6 +3033,8 @@ export function supportedActions (run, { active = false, refresh } = {}) {
 }
 
 function baseActions (run, { active = false, refresh } = {}) {
+  // An engine-program run (the full verification's) is stopped while live, and offers nothing once it ended.
+  if (run.engineProgram) return ['pending', 'preflighting', 'running'].includes(run.status) ? ['stop'] : []
   if (run.abandonment && run.status === 'cancelled') return ['start-new']
   // A restart, not a fault of the run: reconcile and continue, or give it up.
   if (!active && ownerLossRecoverable(run)) return ['recover', 'abandon']

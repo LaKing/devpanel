@@ -435,9 +435,10 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         if (a.runOptions?.inquiry !== undefined) throw fail('An inquiry is opened with inquire, not by a preview option')
         const result = await tools.preview(a)
         if (!result.ok) return result
-        // An engine-only playbook cannot be started: no preview is stored and no previewId given, so start_run
-        // is refused at its first check, before admission, the start gate, the ledger and every counter.
-        if (result.kind === 'engine-only') return { ...result, startable: false, notStartable: 'engine-only: the engine does not execute engine steps yet; this playbook can be previewed, not started' }
+        // An engine-only playbook is not started by the supervisor: no preview is stored and no previewId given, so
+        // start_run is refused at its first check, before admission, the start gate, the ledger and every counter.
+        // The Full verification playbook is started by an operator from the panel (its engine program runs there).
+        if (result.kind === 'engine-only') return { ...result, startable: false, notStartable: result.liveEligible ? 'engine-only: an operator starts this playbook from the panel; the supervisor does not start engine-only playbooks' : 'engine-only: the engine does not execute these engine steps; this playbook can be previewed, not started' }
         const previewId = crypto.randomUUID()
         // A triage starts the playbook its sizing recommends when it closes
         // autonomous, unless the preview asked otherwise (autoStart: false). It is

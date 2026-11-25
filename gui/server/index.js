@@ -34,6 +34,7 @@ import { readGrants, writeGrant, revokeGrant } from './broker/broker.mjs'
 import { listProjectActions, readOperation, startProjectAction, stopAllProjectActions, stopProjectAction } from './project-actions.mjs'
 import { createSupervisor } from './supervisor.mjs'
 import { createFullVerification } from './full-verification.mjs'
+import { createCycleRuns } from './full-verification-run.mjs'
 import { createOwnerInput } from './owner-input.mjs'
 import { clientHost } from './opened-by.mjs'
 import { identify, proxyActor } from './proxy-user.mjs'
@@ -208,6 +209,12 @@ app.get('/api/projects/:project/module-locks', route(async (req, res) => {
 }))
 
 // Delivered runs no successful staging release has covered (staging-coverage.mjs). Reads; starts nothing.
+// The Full verification runs whose cycle verifies this project (full-verification-run.mjs forProject).
+app.get('/api/projects/:project/verification-runs', route(async (req, res) => {
+  await issues.requireProject?.(req.params.project)
+  res.json(await cycleRuns.forProject(req.params.project))
+}))
+
 app.get('/api/projects/:project/staging-pending', route(async (req, res) => {
   await knownInfrastructureProject(req.params.project)
   res.json(await stagingPendingReport({ project: req.params.project, projectPath: projectPath(req.params.project), root: process.env.DEVPANEL_CONFIG_ROOT, listIssues: (p, o) => issues.listIssues(p, o) }))
@@ -498,6 +505,8 @@ app.delete('/api/projects/:project/issues/:id', route(async (req, res) => {
 let supervisor = null
 let topSupervisor = null
 let fullVerification = null
+// The Full verification playbook's runner (full-verification-run.mjs), created with the cycle.
+let cycleRuns = null
 let modelPerformance = null
 const emitProjectAction = (event) => { io?.emit('project:action', event) }
 
@@ -562,7 +571,10 @@ app.get('/api/verification/output', route(async (req, res) => {
   if (typeof project !== 'string' || !project) throw Object.assign(new Error('project is required'), { status: 400 })
   const after = req.query.after === undefined ? 0 : Number(req.query.after)
   if (!Number.isInteger(after) || after < 0) throw Object.assign(new Error('after is a byte offset'), { status: 400 })
-  const { cycle } = await fullVerification.latest()
+  // `cycle` names one cycle (a Full verification run's view); without it, the latest as before.
+  const wanted = typeof req.query.cycle === 'string' && req.query.cycle ? req.query.cycle : null
+  const cycle = wanted ? await fullVerification.recordOf(wanted) : (await fullVerification.latest()).cycle
+  if (wanted && !cycle) throw Object.assign(new Error(`no full verification cycle ${wanted}`), { status: 404 })
   res.json(await cycleOutput({ cycle, project, command: typeof command === 'string' && command ? command : null, after }))
 }))
 
@@ -761,7 +773,9 @@ app.get('/api/playbooks/:id/preview', route(async (req, res) => {
     selectRelease: projectRef ? () => selectStagedRelease({ project, projectPath: projectRef.path, listIssues: (p, o) => listIssues(p, o) }) : null,
     pathOverlap: projectRef ? (args) => supervisor.pathOverlap({ project, projectPath: projectRef.path, issuePath: issue.path, ...args }) : null,
     moduleLocks: projectRef ? () => supervisor.moduleLockReading({ project, issueId }) : null,
-    modulesCoverage: projectRef ? (target) => supervisor.modulesCoverage({ project, projectPath: projectRef.path, issueId, issuePath: issue.path, target }) : null })
+    modulesCoverage: projectRef ? (target) => supervisor.modulesCoverage({ project, projectPath: projectRef.path, issueId, issuePath: issue.path, target }) : null,
+    // The Full verification playbook: what the cycle would verify, what changed, what its freeze would pause.
+    cyclePreview: () => cycleRuns.preview() })
   res.status(result.ok ? 200 : 422).json(result)
 }))
 
@@ -975,7 +989,8 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/stop', route(async (req,
     project: req.params.project,
     issueId: req.params.id,
     runId: req.params.runId,
-    wait: req.body?.wait === true
+    wait: req.body?.wait === true,
+    actor: req.actor ?? null
   })
   res.json(result)
 }))
@@ -1183,10 +1198,15 @@ loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT })
 // A cycle the last process left unfinished is marked interrupted, and the runs its
 // freeze paused are resumed, before anything else can start.
 // A cycle's end is the top-level supervisor's news (verification-ended), created further down.
-fullVerification = createFullVerification({ supervisor, issues, projectsDir: issues.PROJECTS_DIR, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction,
+fullVerification = createFullVerification({ supervisor, issues, projectsDir: issues.PROJECTS_DIR, emit: (event) => { io?.emit('verification:changed', event); cycleRuns?.noteChanged(event) }, emitAction: emitProjectAction,
   // Not ready yet: the notice stays owed (cycle.json `announce: pending`) and announcePending delivers it below.
   onEnded: (notice) => { if (!topSupervisor) throw new Error('the top-level supervisor is not ready yet'); return topSupervisor.noteVerification(notice) } })
 await fullVerification.recover().catch((error) => console.warn(`[devpanel] full verification recovery: ${error.message}`))
+// The Full verification playbook runs the cycle as a run (full-verification-run.mjs). A run left live by the last process
+// was settled by reconcile above; it now carries how recover() left its cycle.
+cycleRuns = createCycleRuns({ fullVerification, supervisor, issues })
+supervisor.setEngineRunner('full-verification', cycleRuns)
+await cycleRuns.recover().catch((error) => console.warn(`[devpanel] full verification run recovery: ${error.message}`))
 // What the last shutdown cancelled comes back, before the top-level supervisor or
 // anyone else could take its project's slot. Recovery above is untouched: a run
 // that missed the shutdown's grace is recovery-required, and carries no mark.

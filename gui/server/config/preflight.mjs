@@ -89,6 +89,8 @@ export async function preflight (resolved, { probe, depth = 'model', root = CONF
     }
     return summarise(findings, { depth, probed: false })
   }
+  // A runnable engine-only playbook (an engine program, config/engine-operations.mjs) has no seat to probe.
+  if (resolved.kind === 'engine-only') return summarise([finding('config', 'pass', `engine program ${resolved.engineProgram}: no seat, nothing to probe`)], { depth, probed: false })
   findings.push(finding('config', 'pass', 'every participant model is verified'))
 
   // What this host may run (confinement-policy.mjs), before anything is

@@ -89,14 +89,23 @@ function indexSteps (phases) {
  * @param refusedSeat  optional () => the issue's latest recorded refusal (runtime/refused-seat.mjs); read from issue.path by default
  * @param retainedWork optional ({ resolved, coverage }) => what a follow-up start would build on (runtime/retained-work.mjs); read from issue.path by default
  */
-export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null, refusedSeat = issue?.path ? () => latestRefusal(issue.path) : null, retainedWork = issue?.path ? (args) => readRetainedWork({ issuePath: issue.path, ...args }) : null } = {}) {
+export async function previewRun ({ playbookId, configRoot, issue = null, project = null, deliveryActions = null, runOptions = {}, platform = undefined, pathOverlap = null, selectRelease = null, moduleLocks = null, modulesCoverage = null, cyclePreview = null, refusedSeat = issue?.path ? () => latestRefusal(issue.path) : null, retainedWork = issue?.path ? (args) => readRetainedWork({ issuePath: issue.path, ...args }) : null } = {}) {
   // A production release with no named releaseId is filled from the issues
   // (release-selection.mjs selectStagedRelease), the same way the start fills it.
   const resolution = await resolveWithRelease(playbookId, { root: configRoot, runOptions, projectId: project?.id ?? issue?.project, platform }, selectRelease)
   if (!resolution.ok) return { ok: false, errors: resolution.errors }
 
   const r = resolution.resolved
-  if (r.kind === 'engine-only') return previewEngineOnly(r)
+  if (r.kind === 'engine-only') {
+    const engine = previewEngineOnly(r)
+    // The full verification's program (full-verification-run.mjs preview): the projects it would verify, what changed in
+    // them since the last verification and the live runs its freeze would pause. Only the panel process reads those.
+    if (r.engineProgram !== 'full-verification') return engine
+    const cycle = cyclePreview
+      ? await Promise.resolve().then(() => cyclePreview()).catch((error) => ({ error: error.message }))
+      : { unread: 'read by the panel process only: the command-line preview carries neither the change list nor the runs the freeze would pause' }
+    return { ...engine, cycle }
+  }
   const stepsById = indexSteps(r.phases)
   const ctx = knownContext(issue, project, r.playbook)
 
@@ -295,6 +304,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
  * No seats, models, prompts or paid preflight to describe, and nothing about a workspace or checks is read.
  */
 function previewEngineOnly (r) {
+  // A runnable engine program has no blocker: nothing is spent and no harness is probed.
   const prerequisites = r.liveExecution.blockers.map((b) => ({ category: 'blocking', kind: b.kind, detail: `${b.reason}. ${b.remedy ?? ''}`.trim(), file: b.file }))
   return {
     ok: true,

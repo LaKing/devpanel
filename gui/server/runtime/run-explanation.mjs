@@ -468,6 +468,8 @@ function cycleWaitStanding (cycleWait) {
 /** Where a run stands, for a person. See the header for the fields. */
 export function explainRun (run, { outputs = {}, active = [], ownership = null, acceptedRisks = [], liveCheckSince = null } = {}) {
   if (!run) return null
+  // A Full verification run (full-verification-run.mjs): the cycle's standing, from what the run mirrored of its record.
+  if (run.engineProgram === 'full-verification') return cycleRunStanding(run)
   // An operator's write on a run that is not running (finalize or reconcile of a blocked run, integrate, apply-artifact)
   // waiting for a full verification: the wait is what the run is doing now, whatever its status says.
   if (run.cycleWait && run.status !== 'running') return { ...cycleWaitStanding(run.cycleWait), status: run.status }
@@ -477,6 +479,67 @@ export function explainRun (run, { outputs = {}, active = [], ownership = null, 
   const n = unaccepted.risks.length
   const choice = `${plural(n, 'residual risk')} ${n === 1 ? 'is' : 'are'} unaccepted: to record resolved, accept ${n === 1 ? 'it' : 'each'} with a reason; otherwise record partially-resolved.`
   return { ...standing, next: [standing.next, choice].filter(Boolean).join(' '), unacceptedRisks: unaccepted }
+}
+
+const count = (list, one, many = `${one}s`) => `${(list ?? []).length} ${(list ?? []).length === 1 ? one : many}`
+
+/** How the full verification's interruption reads: a Stop, its wait bound, or a restart (its own recover()). */
+function interruptionWords (c) {
+  const i = c.interruption
+  if (i?.reason === 'stopped') return `Stopped${i.by ? ` by ${i.by}` : ''} at ${i.at ?? 'an unknown time'}`
+  if (i?.reason === 'wait-bound') return `It reached its wait bound of ${i.boundMinutes ?? '?'} minutes while waiting for ${i.label ?? 'work in flight'}`
+  if (c.ownerLost || c.error) return 'The panel stopped before the cycle ended'
+  return 'It was interrupted'
+}
+
+/**
+ * A Full verification run (full-verification-run.mjs mirrors the cycle's record into `run.cycleRun`): what the cycle is
+ * doing or how it ended, in words. It translates the record and decides nothing.
+ */
+function cycleRunStanding (run) {
+  const c = run.cycleRun ?? {}
+  const cycle = c.cycleId ? `Cycle ${c.cycleId}` : 'The cycle'
+  const phase = (c.phases ?? []).find((p) => p.id === run.phase?.id) ?? null
+  const thaw = (c.phases ?? []).find((p) => p.id === 'thaw')?.detail ?? null
+  const resumedWords = thaw ? `${count(thaw.resumed, 'run')} it paused resumed, ${count(thaw.heldForOperator, 'run')} held for an operator, ${count(thaw.leftPaused, 'run')} of earlier cycles left paused.` : null
+  const kept = 'Its record is in issues/.verification/; the Full verification page (/verification) shows its drives.'
+  switch (run.status) {
+    case 'pending':
+    case 'preflighting':
+    case 'running': {
+      if (!c.cycleId) return { tone: 'progress', headline: 'Full verification: starting', detail: 'Reading what the cycle would verify, what changed and which runs its freeze would pause, before it closes admission.', status: run.status }
+      const waiting = (c.phases ?? []).find((p) => p.id === 'wait')?.detail?.waitingOn ?? []
+      const progress = run.phase?.id === 'wait' ? (waiting.length ? ` Waiting for ${count(waiting, 'write or drive', 'writes and drives')} in flight.` : '')
+        : run.phase?.id === 'stages' && c.stages ? ` ${c.stages.settled} of ${c.stages.total} stages settled.` : ''
+      return { tone: 'progress', headline: `Full verification: ${phase?.title ?? run.phase?.id ?? 'running'}`, status: run.status,
+        detail: `${cycle} verifies ${count(c.scope, 'project')} (${(c.scope ?? []).join(', ') || 'none'}); admission is closed to their writing runs.${progress}`,
+        next: 'Stop ends the cycle as interrupted: admission opens, its instances are destroyed and the runs it paused resume.' }
+    }
+    case 'stopping':
+      return { tone: 'progress', headline: 'Stopping: the cycle is ending as interrupted', status: run.status,
+        detail: `${cycle} was asked to stop. Its stage runs are asked to stop, then admission opens and what it paused resumes.` }
+    case 'completed': {
+      const outcome = (c.phases ?? []).find((p) => p.id === 'outcome')?.detail ?? {}
+      if (c.verdict === 'green') {
+        return { tone: 'success', headline: 'Full verification green', status: run.status, kept,
+          detail: [`${cycle}: every stage of ${(c.scope ?? []).join(', ') || 'its scope'} is green.`, outcome.committed ? 'The checkpoint committed what it tested.' : outcome.withheld?.length ? `The checkpoint was withheld for ${outcome.withheld.join(', ')}: their checkouts moved.` : 'No checkpoint committed.', resumedWords].filter(Boolean).join(' ') }
+      }
+      if (c.verdict === 'no-stages') return { tone: 'neutral', headline: 'Full verification: nothing to verify', status: run.status, kept, detail: [`${cycle} found no stage to drive.`, resumedWords].filter(Boolean).join(' ') }
+      return { tone: 'warning', headline: `Full verification red${c.red?.length ? `: ${c.red.join(', ')}` : ''}`, status: run.status, kept,
+        detail: [`${cycle} ended red.`, outcome.issues?.length ? `Issues opened: ${outcome.issues.map((i) => `${i.project}/${i.issueId}`).join(', ')}.` : null, resumedWords].filter(Boolean).join(' '),
+        next: 'The red issues carry the failing tests and what changed since the last verification.' }
+    }
+    case 'cancelled':
+      if (!c.cycleId) return { tone: 'neutral', headline: 'Stopped before the cycle started', status: run.status, detail: c.ownerLost ? `${c.ownerLost.detail}. Nothing was frozen.` : 'Nothing was frozen.' }
+      return { tone: c.interruption?.reason === 'stopped' ? 'neutral' : 'warning', headline: 'Full verification interrupted', status: run.status, kept,
+        detail: [`${cycle}: ${interruptionWords(c)}.`, 'No outcome ran: nothing was checkpointed and no issue was opened.', resumedWords, c.ownerLost ? `${c.ownerLost.detail}.` : null].filter(Boolean).join(' '),
+        next: 'Start the playbook again for a new cycle.' }
+    case 'failed':
+      return { tone: 'error', headline: c.refused ? 'The full verification did not start' : 'The full verification failed', status: run.status,
+        cause: run.failure?.message ?? c.error ?? null, detail: c.refused ? 'Nothing was frozen.' : resumedWords, next: 'Start the playbook again once the cause is fixed.' }
+    default:
+      return { tone: 'neutral', headline: `Full verification: ${run.status}`, status: run.status }
+  }
 }
 
 /*

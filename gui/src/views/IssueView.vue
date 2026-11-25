@@ -8,6 +8,7 @@ import AddToIssue from '@/components/AddToIssue.vue'
 import IssueMaterial from '@/components/IssueMaterial.vue'
 import MarkdownText from '@/components/MarkdownText.vue'
 import RunTimeline from '@/components/RunTimeline.vue'
+import CycleRunPanel from '@/components/CycleRunPanel.vue'
 import StartRunDialog from '@/components/StartRunDialog.vue'
 import AssessBar from '@/components/AssessBar.vue'
 import OwnerInput from '@/components/OwnerInput.vue'
@@ -1666,7 +1667,10 @@ watch(() => route.query.run, (runId) => {
                 <span>Coordinator chat</span>
                 <span class="summary-entry__hint">reasoning · ask · instruct</span>
               </button>
+              <!-- A Full verification run has no turns: the cycle's phases instead (server/full-verification-run.mjs). -->
+              <CycleRunPanel v-if="run.cycleRun" :run="run" />
               <RunTimeline
+                v-else
                 :timeline="run.timeline"
                 :active="run.active"
                 :selected="selectedTurn"

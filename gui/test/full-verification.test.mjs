@@ -984,6 +984,67 @@ export default async function (t) {
       t.eq('interrupted inside the freeze, nothing driven, admission thawed', [ended.interruption?.label, w.calls.starts.length, w.calls.thaws.length, w.supervisor.frozen()], ['freeze', 0, 1, null])
     }
 
+    t.section('38. a stage run that registers after the bound, inside the grace: asked to stop, its entry interrupted (not refused); the cycle interrupted with its reason, thawed, its scope\'s pause resumed, nothing checkpointed')
+    {
+      const issuesDir = await temp('devpanel-fv-bound-late-start-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const w = world({ issuesDir, paused: [{ project: 'app-project', issueId: '2026-11-01-frozen', runId: 'r-frozen' }] })
+      let release = null
+      const pending = new Promise((resolve) => { release = resolve })
+      const stops = []
+      w.supervisor.start = async (args) => { w.calls.starts.push(args); await pending; return { runId: 'r-late', status: 'preflighting' } }
+      w.supervisor.stop = async (args) => { stops.push(args) }
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 5_000, graceMs: 30_000, log: { warn () {} } })
+      await fv.startNow({ by: 'tester' })
+      await until(() => w.calls.starts.length === 1, 'the stage start to be asked')
+      clock.advance(5_001)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      t.eq('in the grace: still frozen, nobody asked to stop yet (the run has no id)', [w.calls.thaws.length, stops.length], [0, 0])
+      release()
+      await until(() => stops.length === 1, 'the late run to be asked to stop')
+      t.eq('the run registered after the bound is asked to stop', stops, [{ project: 'app-project', issueId: 'verification-2026-11-07', runId: 'r-late' }])
+      const ended = await until(async () => { clock.advance(1_000); const r = await cycleFile(verificationDir); return r?.state === 'interrupted' ? r : null }, 'the cycle to be interrupted')
+      const app = ended.projects.find((e) => e.project === 'app-project')
+      t.eq('interrupted by the bound on that stage, with its reason, no verdict', [ended.interruption?.reason, ended.interruption?.label, ended.verdict], ['wait-bound', 'stage app-project', null])
+      t.eq('its entry reads interrupted, as the stage recorded it, not refused', [app.state, app.verdict, app.refusal ?? null, /registered/.test(app.interrupted?.reason ?? '')], ['interrupted', null, null, true])
+      t.eq('the next stage on that host never started', [w.calls.starts.length, ended.projects.find((e) => e.project === 'shop-project').state], [1, 'not-run'])
+      t.eq('thawed once; its scope\'s pause resumed; nothing checkpointed', [w.calls.thaws, w.calls.resumes.map((r) => r.runId), w.calls.actions.length], [[ended.id], ['r-frozen'], 0])
+    }
+
+    t.section('39. resumes that stall after the thaw hold nothing: the end is recorded and announced at their bound, a new cycle starts, and the old one never resumes a run under the new freeze')
+    {
+      const issuesDir = await temp('devpanel-fv-bound-resume-')
+      const verificationDir = path.join(issuesDir, '.verification')
+      const stuck = { project: 'app-project', issueId: 'stuck', runId: 'r-stuck', phase: 'run', kind: 'run' }
+      const w = world({ issuesDir, busy: [stuck], paused: [{ project: 'app-project', issueId: 'p1', runId: 'r-p1' }, { project: 'app-project', issueId: 'p2', runId: 'r-p2' }] })
+      let release = null
+      const stalled = new Promise((resolve) => { release = resolve })
+      w.supervisor.resume = async function (args) { w.calls.resumes.push(args); if (w.calls.resumes.length === 1) await stalled; return { status: 'pending' } }
+      const told = []
+      const clock = manualClock(Date.parse('2026-11-07T09:00:00.000Z'))
+      const fv = createFullVerification({ resolveHost: fakeResolve, supervisor: w.supervisor, issues: w.issues, clock, settings: () => null, verificationDir, resolve: w.resolve, infrastructureOf: w.infrastructureOf, readRun: w.readRun, ...w.seams, resolveHost: pinned, pollMs: 1000, maxWaitMs: 10_000, graceMs: 0, resumeMs: 3_000, onEnded: (n) => { told.push(n) }, log: { warn () {} } })
+      const a = await fv.startNow({ by: 'tester' })
+      await until(async () => (await cycleFile(verificationDir))?.waitingOn?.length, 'the wait to be recorded')
+      clock.advance(10_500)
+      await until(() => w.calls.resumes.length === 1, 'the first resume to be asked')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      t.eq('while that resume stalls, the end is neither recorded nor announced', [(await cycleFile(verificationDir)).state, told.length], ['resuming', 0])
+      clock.advance(3_001)
+      const ended = await until(async () => { const r = await cycleFile(verificationDir); return r?.state === 'interrupted' && told.length ? r : null }, 'the end to be recorded and announced')
+      t.eq('the end names the resume still pending at the bound', [ended.resume?.timedOut, ended.resume?.boundSeconds, ended.resume?.pending?.runId], [true, 3, 'r-p1'])
+      t.eq('and is announced as interrupted', [told.length, told[0].cycleId, told[0].state], [1, a.id, 'interrupted'])
+      w.supervisor.busyList = []
+      const b = await fv.startNow({ by: 'tester' })
+      t.ok('a new cycle starts, not refused as running', b.id && b.id !== a.id, JSON.stringify(b.id))
+      release()
+      const older = path.join(verificationDir, a.date, 'cycle.1.json')
+      const late = await until(async () => { const r = await readJson(older).catch(() => null); return r?.leftPaused?.some((x) => x.runId === 'r-p2') ? r : null }, 'the late resume to be recorded in the older cycle\'s own file')
+      t.eq('the older cycle resumed only what it began before the new one started; the rest is left paused, named', [late.id, late.resumed.map((x) => x.runId), late.leftPaused.find((x) => x.runId === 'r-p2').reason], [a.id, ['r-p1'], 'a newer cycle started before this one finished resuming'])
+      t.eq('the late write landed in the older cycle\'s file, never over the new cycle\'s', (await cycleFile(verificationDir)).id, b.id)
+      await fv.settle()
+    }
+
     t.section('35. G15 the cycle starts sooner: a contained run in seat turns is not waited for; another run\'s drive in flight on its host is, and the record says so')
     {
       const dir = await temp('devpanel-fv-sooner-')
