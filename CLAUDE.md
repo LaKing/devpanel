@@ -65,6 +65,12 @@ npm run --silent retire-refs [-- --project <id>] [--apply]   # per repository, t
                              # enumeration error or Git warning (tools/retire-refs.mjs; execution-contract.md "Retiring refs/devpanel/*")
 npm run --silent overview [-- --project <id>]   # run outcome metrics as JSON (generatedAt, scope, rates with
                              # of/total/means), archived history included; read-only, no session (tools/overview.mjs)
+npm run --silent runs -- --project <id> [--from <utc>] [--to <utc>]   # one JSON line per run of the project whose startedAt is in the UTC window
+                             # (YYYY-MM-DD, days inclusive, or an ISO UTC time ending in Z with optional seconds and at most 3 fractional digits;
+                             # none: every run), open and packed issues, ordered by run id:
+                             # issue, runId, playbook, configHash, status, outcome, agentMs, operatorWaitMs, checksMs with its coverage, turns, cost with
+                             # unpriced steps, tokens, cause, the next run on the issue; each input it cannot read is one {"unreadable","error"} line;
+                             # a last totals line counted as overview counts; read-only, no session (tools/runs.mjs; exit 1 only when the project has no directory)
 npm run --silent supervisor-calls -- --from <YYYY-MM-DD> --to <YYYY-MM-DD>   # the top-level supervisor's calls per started run
                              # for a stated period (inclusive UTC days) as JSON, from the ledger and run records, with what the
                              # ledger covers; read-only, no session (tools/supervisor-calls.mjs)

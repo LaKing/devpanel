@@ -57,7 +57,7 @@ const asksAQuestion = (pause) => Boolean(pause) && !['manual', 'full-verificatio
  * drive reused from the cache keeps the times of the run that drove it, which
  * are not this run's.
  */
-function checkIntervals (run) {
+export function checkIntervals (run) {
   const span = (c) => { const a = ms(c?.at); return a != null && typeof c.durationMs === 'number' ? interval(a, a + c.durationMs) : null }
   const results = [...(run.checkResults ?? []), ...(run.priorCheckResults ?? [])]
   return [
