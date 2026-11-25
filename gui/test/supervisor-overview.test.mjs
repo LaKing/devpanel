@@ -75,6 +75,26 @@ export default async function (t) {
     t.eq('only priced runs contribute to the total', cost.usd, 1.5)
     t.eq('and the unpriced ones are counted as unpriced', [cost.priced, cost.unpriced], [1, 4])
     t.eq('duration is measured only where both ends are known', overview.totals.runs.durationMs.counted, 5)
+    t.eq('nothing estimated in old records, no partial run among them', [cost.estimatedUsd, cost.estimatedSteps, cost.partial], [0, 0, 0])
+  }
+
+  t.section('2b. reported, estimated and unknown cost apart; a partially priced run is not priced')
+  {
+    const priced = await buildOverview({
+      projects: ['alpha-project'],
+      listIssues: async (project, { archived = false } = {}) => archived ? [] : [issue({ id: 'costs' })],
+      readRuns: async () => [
+        run({ runId: 'reported', status: 'completed', outcome: 'resolved', used: { costUsd: 2 } }),
+        run({ runId: 'partial', status: 'completed', outcome: 'resolved', used: { costUsd: 1, estimatedCostUsd: 0.25, costEstimatedSteps: 1, costUnknownSteps: 2 } }),
+        run({ runId: 'estimated', status: 'completed', outcome: 'resolved', used: { estimatedCostUsd: 0.5, costEstimatedSteps: 4 } }),
+        run({ runId: 'probe-only', status: 'failed', outcome: 'unresolved', used: { costUsd: 0, costUnknownSteps: 1 } })
+      ],
+      now: NOW
+    })
+    const cost = priced.totals.runs.cost
+    t.eq('reported and estimated money are summed apart', [cost.usd, cost.estimatedUsd], [3, 0.75])
+    t.eq('unknown and estimated steps are counted apart', [cost.unpricedSteps, cost.estimatedSteps], [3, 5])
+    t.eq('priced, partial and unpriced runs', [cost.priced, cost.partial, cost.unpriced], [2, 1, 1])
   }
 
   t.section('3. a run\'s outcome is not the issue\'s state')

@@ -100,6 +100,10 @@ export default async function (t) {
     t.eq('OpenAI counts cached input inside input', estimateCallCost(codex, PRICE).usd, (600 * 2 + 400 * 1 + 100 * 10) / 1e6)
     const additive = { provider: 'unpriced-provider', inputTokens: 100, outputTokens: 10, cacheReadTokens: 1000, cacheCreationTokens: 200 }
     t.eq('other providers report each category apart, and a cache write falls back to the input rate', estimateCallCost(additive, PRICE).usd, (100 * 2 + 1000 * 1 + 200 * 2 + 10 * 10) / 1e6)
+    const geminiCli = { provider: 'google', inputTokens: 100, outputTokens: 10, cacheReadTokens: 40, inputIncludesCached: true }
+    t.eq('the Gemini CLI says its input includes the cache, so the cached share is not charged twice', estimateCallCost(geminiCli, PRICE).usd, (60 * 2 + 40 * 1 + 10 * 10) / 1e6)
+    const antigravity = { provider: 'google', inputTokens: 100, outputTokens: 10, cacheReadTokens: 40 }
+    t.eq('antigravity reports input without it, so the same provider stays additive', estimateCallCost(antigravity, PRICE).usd, (100 * 2 + 40 * 1 + 10 * 10) / 1e6)
     t.eq('a cache-write rate is used when given', estimateCallCost(additive, { ...PRICE, cacheWriteUsdPerMillionTokens: 5 }).usd, (100 * 2 + 1000 * 1 + 200 * 5 + 10 * 10) / 1e6)
     t.ok('counts without a thread total are the invocation\'s own, in a fork as well', estimateCallCost(additive, PRICE, { resumed: true, fork: true }) !== null)
     t.eq('an estimate says how it was reached', [estimateCallCost(codex, PRICE).source, estimateCallCost(codex, PRICE).asOf, estimateCallCost(codex, PRICE).tokensBasis, estimateCallCost(codex, PRICE).tokens.cacheRead], ['test fixture', '2026-01-01', 'first', 400])

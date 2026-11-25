@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process'
 
 import { isIssueId } from './issues.js'
 import { runMetrics, checkIntervals } from './runtime/run-metrics.mjs'
+import { runCost } from './runtime/run-cost.mjs'
 
 /*
  * One row per run of a project, for cohort analysis (tools/runs.mjs).
@@ -99,7 +100,7 @@ export function recordProblem (record, now = Date.now()) {
   for (const [obj, k] of [['playbook', 'id'], ['playbook', 'configHash'], ['failure', 'class'], ['failure', 'message'], ['preflight', 'state'], ['preflight', 'detail']]) {
     if (!absentOr(record[obj]?.[k], isString)) return `${obj}.${k} is not a string`
   }
-  for (const k of ['costUsd', 'tokens', 'costUnknownSteps']) if (!absentOr(record.budgets?.used?.[k], isNumber)) return `budgets.used.${k} is not a number`
+  for (const k of ['costUsd', 'tokens', 'costUnknownSteps', 'estimatedCostUsd', 'costEstimatedSteps']) if (!absentOr(record.budgets?.used?.[k], isNumber)) return `budgets.used.${k} is not a number`
   if (!absentOr(record.steps, Array.isArray)) return 'steps is not an array'
   if ((record.steps ?? []).some((s) => !plain(s))) return 'a member of steps is not an object'
   const evidence = checkEvidenceProblem(record)
@@ -337,7 +338,8 @@ function row (loc, { runId, record, configHash }, next, now) {
     checksMs: m.time.checksMs,
     checks: { coverage: intervals > 0 ? 'recorded' : 'none', intervals },
     turns: m.turns,
-    cost: { usd: used.costUsd ?? null, unpricedSteps: used.costUnknownSteps ?? 0 },
+    // usd is reported money only; estimatedUsd is roster-priced; pricing is runtime/run-cost.mjs's.
+    cost: (({ reportedUsd, estimatedUsd, unknownSteps, estimatedSteps, pricing }) => ({ usd: reportedUsd, estimatedUsd, unpricedSteps: unknownSteps, estimatedSteps, pricing }))(runCost(used)),
     tokens: used.tokens ?? null,
     cause: causeOf(record),
     next
@@ -346,7 +348,7 @@ function row (loc, { runId, record, configHash }, next, now) {
 
 /** Counted as the overview's absorb counts: every row by status, time and cost over terminal rows. */
 function totalsOf (rows, { unreadable, skipped, now, project, from, to, issuesDir }) {
-  const t = { rows: rows.length, byStatus: {}, terminal: 0, agentMs: 0, operatorWaitMs: 0, checksMs: 0, cost: { usd: 0, priced: 0, unpriced: 0, tokens: 0 } }
+  const t = { rows: rows.length, byStatus: {}, terminal: 0, agentMs: 0, operatorWaitMs: 0, checksMs: 0, cost: { usd: 0, estimatedUsd: 0, tokens: 0, priced: 0, partial: 0, unpriced: 0, unpricedSteps: 0, estimatedSteps: 0 } }
   for (const r of rows) {
     if (r.status != null) t.byStatus[r.status] = (t.byStatus[r.status] ?? 0) + 1
     if (!TERMINAL.includes(r.status)) continue
@@ -354,10 +356,15 @@ function totalsOf (rows, { unreadable, skipped, now, project, from, to, issuesDi
     t.agentMs += r.agentMs
     t.operatorWaitMs += r.operatorWaitMs
     t.checksMs += r.checksMs
-    if (r.cost.usd != null) { t.cost.usd += r.cost.usd; t.cost.priced++ } else t.cost.unpriced++
+    t.cost.usd += r.cost.usd ?? 0
+    t.cost.estimatedUsd += r.cost.estimatedUsd
+    t.cost.unpricedSteps += r.cost.unpricedSteps
+    t.cost.estimatedSteps += r.cost.estimatedSteps
+    t.cost[r.cost.pricing]++
     if (r.tokens != null) t.cost.tokens += r.tokens
   }
   t.cost.usd = Math.round(t.cost.usd * 10000) / 10000
+  t.cost.estimatedUsd = Math.round(t.cost.estimatedUsd * 10000) / 10000
   return {
     ...t,
     unreadable,
@@ -367,6 +374,6 @@ function totalsOf (rows, { unreadable, skipped, now, project, from, to, issuesDi
     from: from == null ? null : new Date(from).toISOString(),
     to: to == null ? null : new Date(to).toISOString(),
     issuesDir,
-    means: 'rows are runs whose startedAt is in [from, to] (every run without a window), open and packed issues, ordered by run id; next is the following run id of the same issue folder or bundle, computed before the window; agentMs, operatorWaitMs and checksMs are run-metrics.mjs\'s, totalled here over terminal rows as the overview totals them; checks.coverage "none" means the record holds no check interval, which cannot tell "no check ran" from "an older record kept none"; cause is failure.class, else blockedReason, else a preflight detail, and "unknown" means nothing was recorded; an unreadable line is an input that did not read, a skipped line a packed copy of a run whose folder copy was counted'
+    means: 'rows are runs whose startedAt is in [from, to] (every run without a window), open and packed issues, ordered by run id; next is the following run id of the same issue folder or bundle, computed before the window; agentMs, operatorWaitMs and checksMs are run-metrics.mjs\'s, totalled here over terminal rows as the overview totals them; checks.coverage "none" means the record holds no check interval, which cannot tell "no check ran" from "an older record kept none"; cost.usd is reported money, cost.estimatedUsd roster-priced money and cost.unpricedSteps the steps neither priced; cost.pricing is priced (known money, no unknown step), partial (known money and unknown steps) or unpriced, and the totals count each over terminal rows; cause is failure.class, else blockedReason, else a preflight detail, and "unknown" means nothing was recorded; an unreadable line is an input that did not read, a skipped line a packed copy of a run whose folder copy was counted'
   }
 }

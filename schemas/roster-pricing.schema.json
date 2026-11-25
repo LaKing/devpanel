@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://devpanel/schemas/roster-pricing.schema.json",
   "title": "Roster model pricing",
-  "description": "What one roster model's tokens cost, for estimating supervisor calls whose runtime reports no cost. Kept beside the roster entry, not in it: an entry is hashed by its bytes, so a price there would start a new configuration group.",
+  "description": "What one roster model's tokens cost, for estimating supervisor calls, consult seats and run steps whose runtime reports no cost. Kept beside the roster entry, not in it: an entry is hashed by its bytes, so a price there would start a new configuration group.",
   "type": "object",
   "required": ["id", "inputUsdPerMillionTokens", "outputUsdPerMillionTokens", "cachedInputUsdPerMillionTokens", "source", "asOf"],
   "additionalProperties": false,

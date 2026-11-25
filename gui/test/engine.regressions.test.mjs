@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import { fingerprint } from '../server/runtime/fingerprint.mjs'
+import { LockHeld } from '../server/runtime/lock.mjs'
 import { engineFixture, scriptFor, cleanupFixtures, simulateProcessDeath } from './fakes/fixture.mjs'
 
 export const name = 'engine — regressions for the milestone-3 boundary findings'
@@ -249,7 +250,8 @@ export default async function (t) {
     let second = null
     try { await start(f) } catch (error) { second = error }
     t.ok('a second run on the same issue is refused', Boolean(second), second?.message)
-    t.eq('the refusal names the lock', second?.constructor?.name, 'LockHeld')
+    // IssueBusy (issue-locks.mjs) is the LockHeld an issue's run lock refuses with.
+    t.ok('the refusal names the lock', second instanceof LockHeld, second?.constructor?.name)
     await releaseWorkspace(engine)
     const third = await start(f)
     t.ok('and the lock is available again once released', Boolean(third))

@@ -1134,6 +1134,8 @@ async function invokeOnce ({
       outputTokens: stats.output_tokens ?? null,
       cacheCreationTokens: null,
       cacheReadTokens: stats.cached ?? null,
+      // Read by call-cost.mjs: the cached share is inside inputTokens.
+      inputIncludesCached: true,
       tokens: stats.total_tokens ?? ((stats.input_tokens ?? 0) + (stats.output_tokens ?? 0)),
       // The CLI reports no money at all, for any auth method.
       costUsd: null

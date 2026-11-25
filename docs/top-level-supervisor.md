@@ -840,7 +840,7 @@ time only when one is known, and null otherwise; nothing is estimated.
 | --- | --- | --- | --- |
 | `dependency` | the open prerequisites | each gets a disposition or is archived | null |
 | `checkout-held` | the issue and run of the live in-place run holding the checkout | that run settles (a wall-clock budget is a limit, and pauses suspend it) | null |
-| `module-lock` | `modules` the issue's triage named that another live run of the same module pool holds, and `holders` (module, run, project, issue) | `module-lock`: the holding run ends and its locks are released | null |
+| `module-lock` | `modules` the issue's triage named that another live run of the same module pool holds, or that a waiting run's recorded decision reserves, and `holders` (module, run, project, issue; a waiter with `reserved: true`, `since`, `behind` (who holds the module now) and `state`) | `module-lock`: the holding run ends and its locks are released, or the waiter takes its modules | null |
 | `own-run` | the run, its status | it settles, or its question is answered | null |
 | `owner-input` | the run | the owner answers on the issue page | null |
 | `report-trust` | | an operator starts it from the panel (a report the supervisor may only assess stays `ready`, with `allowedPlaybooks`) | null |
@@ -859,7 +859,16 @@ that issue is refused as occupied (retryable, `MODULE_LOCKED`, the holder named)
 waits and never fails the issue. Issues whose modules are disjoint stay `ready` and start
 side by side without anyone being asked. A `running` row whose run waits for a module its
 revision now needs carries `module-lock` with `waiting: true`; that run takes the module
-itself when it frees.
+itself when it frees. Resuming, continuing, refreshing the checks of or finalizing a
+blocked run is never refused for a module lock: the decision is recorded and the run waits
+for its modules like a paused run's answer, its row `waiting: true` with `since` and the
+`decision`. That recorded decision **reserves** its modules: from then on `start_run` of
+another issue needing one of them is refused `MODULE_LOCKED` naming the waiting run
+(`reserved: true`, `since`, `behind`) even while the module is free or still held by the
+run it waits behind, so nothing started later overtakes it (docs/execution-contract.md
+"Module locks", Reservations). A waiter a service shutdown interrupted shows as
+`module-lock` with `waiting: true, interrupted: true` on its not-live row until the next
+start carries it on.
 
 What stops every start is said once, as `canStartNow` and `because[]`: `finishing`,
 `session-starts`, `concurrency` (a live run settles) and, only where allowances are
@@ -1093,7 +1102,10 @@ A reading of a project in a module pool, and a preview, also carry `moduleLocks`
 the holding `runId`, `project` and `issueId`, `since`, `state` held | dead | stale |
 unknown, `waiting` when that run waits for another module) and, for an issue,
 `expected` (its triage modules, `source: sizing | none`) and `conflicts`: the expected
-modules another live run holds. Two issues with disjoint modules read with empty
+modules another live run holds or a waiting run reserves (reserved ones first, with
+`reserved: true`, `since`, `behind`), and `reservations` (every standing reservation of the
+pool: the waiting `runId`, `project`, `issueId`, `modules`, `since`, `decision`, `state`
+waiting | unknown | interrupted, and `behind` per module). Two issues with disjoint modules read with empty
 `conflicts`; two sharing a module read with the holder named. With a coding playbook
 named, a conflict is a `module-lock` prerequisite of `configuration` (`ready: false`):
 `start_run` would be refused as occupied, and the ready queue shows it as

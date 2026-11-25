@@ -36,7 +36,7 @@ import { selectTargeted, missingNamedTests, namedFailuresOf } from './targeted-t
 import { affectedModules, affectedModulesNotice, baseFiles, changedModules, countsForClosure, failedFilters, failedInTests, isModulesTarget, lintFiles, moduleChecksums, modulesDrive, modulesSelftestFailures, modulesTiming, revisionFiles, undeclaredModulesReason } from './modules-tier.mjs'
 import { compareFailures, compareSelftestReports, failureFingerprints, failureIdentities, gateReason, gatingResult, inconclusiveBase, testedNothing, unfinishedSuites } from './baseline-failures.mjs'
 import { carryForwardBrief } from './carry-forward.mjs'
-import { clearWait, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
+import { clearWait, dropReservation, releaseModules, takeModules, writeWait, yieldsIn } from './module-locks.mjs'
 import { instanceName, SYNC_ID } from './instance-drive.mjs'
 import { syncFailedForGood } from './dependency-sync.mjs'
 import { changedHooks, combinedSets, composeTree, parseReading, subscribersOf } from './module-hooks.mjs'
@@ -77,6 +77,7 @@ import { childOutputScan, toolingBrief } from './tooling-commands.mjs'
 import { hostGuidanceBrief } from './host-guidance.mjs'
 import { holdGatesTurn, openOwnerHolds, openPlanReviewHold, ownerHoldKey, ownerHoldsOf } from './owner-holds.mjs'
 import { interruptedFromEvents, wallClockElapsedMs, wallClockRefusal, wallClockStanding } from './wall-clock.mjs'
+import { estimateCallCost, leavesCleanBaseline } from './call-cost.mjs'
 
 export { extractOutput }
 
@@ -1667,6 +1668,14 @@ export class Engine {
       const entries = await readChat(this.issuePath, this.runId)
       const sel = selectInstructions({ entries, steps: this.run.steps, role, scope, freshSession: !(readAccess ? p.readSession?.id : p.session?.id), record: p.turnInstructions ?? null, key })
       for (const s of sel.reset) { if (s === 'read') p.readSession = null; else p.session = null }
+      // What this attempt resumes and the clean baseline it may price a running
+      // total against (commitTurn), taken off the seat until the turn commits: an
+      // attempt that fails after starting leaves the session's totals stale, so no
+      // baseline survives it. One that provably never started gives it back
+      // (unreachedAttempt).
+      pending.priorSessionId = (readAccess ? p.readSession : p.session)?.id ?? null
+      pending.usageBaseline = p.usageBaseline?.[scope] ?? null
+      if (p.usageBaseline?.[scope]) { p.usageBaseline = { ...p.usageBaseline }; delete p.usageBaseline[scope] }
       p.turnInstructions = sel.replay
         ? { ...p.turnInstructions, reached: [...p.turnInstructions.reached, { invocationId: pending.invocationId, scope }] }
         : { key, snapshot: sel.snapshot, reached: [{ invocationId: pending.invocationId, scope }] }
@@ -1688,8 +1697,31 @@ export class Engine {
     }
   }
 
+  /**
+   * What one committed turn cost: reported by the runtime, estimated from the
+   * snapshot's roster price (call-cost.mjs), or unknown with the reason. A running
+   * total is priced only on a fresh session or against a clean baseline the
+   * previous turn on the same session recorded; a pending from before this
+   * (no `priorSessionId`) counts as resumed without one.
+   */
+  stepCost (role, pending, session, usage) {
+    if (typeof usage.costUsd === 'number') return { basis: 'reported', usd: usage.costUsd }
+    const model = this.participantSpec(role)?.model ?? {}
+    if (!model.pricing) return { basis: 'unknown', reason: 'no-pricing' }
+    const prior = pending.priorSessionId
+    const ownUsage = prior != null && pending.usageBaseline?.session === prior && session?.id === prior
+    const est = estimateCallCost(usage, model.pricing, { resumed: prior !== null, ownUsage })
+    if (est) return { basis: 'estimated', usd: est.usd, model: model.id, source: est.source, asOf: est.asOf, rates: est.rates, tokens: est.tokens, tokensBasis: est.tokensBasis }
+    const counted = (v) => Number.isInteger(v) && v >= 0
+    const any = [usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheCreationTokens].some((v) => counted(v) && v > 0)
+    return { basis: 'unknown', reason: !counted(usage.inputTokens) || !counted(usage.outputTokens) || !any ? 'no-token-counts' : 'unproved-baseline' }
+  }
+
   /** An attempt the runtime positively never started reached no session: it no longer fixes its turn's snapshot. */
-  unreachedAttempt (p, invocationId) {
+  unreachedAttempt (p, invocationId, pending = null) {
+    // Its session's totals are as the last committed turn left them.
+    const scope = pending?.sessionScope === 'read' ? 'read' : 'main'
+    if (pending?.usageBaseline && !p.usageBaseline?.[scope]) p.usageBaseline = { ...p.usageBaseline, [scope]: pending.usageBaseline }
     const record = p.turnInstructions
     if (!record?.reached?.some((r) => r.invocationId === invocationId)) return
     p.turnInstructions = { ...record, reached: record.reached.filter((r) => r.invocationId !== invocationId) }
@@ -1960,7 +1992,7 @@ export class Engine {
 
       if (evidence?.phase === 'not-started') {
         // Positively established that nothing ran. Only now is retry safe.
-        this.unreachedAttempt(p, p.pendingInvocation.invocationId)
+        this.unreachedAttempt(p, p.pendingInvocation.invocationId, p.pendingInvocation)
         p.pendingInvocation = null
         p.state = p.session ? 'ready' : 'uninitialised'
         await this.persist({ type: 'recovery', role, resolution: 'no-work-done' })
@@ -2209,6 +2241,7 @@ export class Engine {
         : null
 
       const basedOn = this.outputs[created.number]?.output?.basedOnRevision
+      const cost = usage ? this.stepCost(role, pending, session, usage) : null
       this.run.steps.push({
         number: created.number,
         slug: created.slug,
@@ -2237,6 +2270,8 @@ export class Engine {
         // idempotent push, so a retry cannot count it twice and an adopted turn
         // is not counted as free.
         usage: usage ?? null,
+        // Reported, estimated from the snapshot's roster price, or unknown and why.
+        ...(cost ? { cost } : {}),
         // Whether the seat fence held this turn, and if not, why (decision 8:
         // a turn that could not be fenced runs, visibly, as namespace 0).
         ...(pending.fence ? { fence: pending.fence } : {}),
@@ -2258,8 +2293,19 @@ export class Engine {
 
       this.run.budgets.used.steps = agentSteps(this.run.steps).length
       this.run.budgets.used.tokens = (this.run.budgets.used.tokens ?? 0) + (usage?.tokens ?? 0)
-      if (typeof usage?.costUsd === 'number') this.run.budgets.used.costUsd = (this.run.budgets.used.costUsd ?? 0) + usage.costUsd
-      else if (usage) this.run.budgets.used.costUnknownSteps = (this.run.budgets.used.costUnknownSteps ?? 0) + 1
+      // Reported and estimated money are kept apart; only a step that is neither is unknown.
+      const used = this.run.budgets.used
+      if (cost?.basis === 'reported') used.costUsd = (used.costUsd ?? 0) + cost.usd
+      else if (cost?.basis === 'estimated') {
+        used.estimatedCostUsd = (used.estimatedCostUsd ?? 0) + cost.usd
+        used.costEstimatedSteps = (used.costEstimatedSteps ?? 0) + 1
+      } else if (cost) used.costUnknownSteps = (used.costUnknownSteps ?? 0) + 1
+      // This turn left its session's running totals current: the next turn on it
+      // may price its delta. A legacy pending (no priorSessionId) never does.
+      const scope = pending.sessionScope === 'read' ? 'read' : 'main'
+      if (pending.priorSessionId !== undefined && session?.id && leavesCleanBaseline(usage, { priorSessionId: pending.priorSessionId, sessionId: session.id })) {
+        p.usageBaseline = { ...p.usageBaseline, [scope]: { session: session.id } }
+      }
       await this.saveRun()
     }
 
@@ -3055,6 +3101,8 @@ export class Engine {
         endWait()
         locks.waiting = null
         await clearWait(locks.pool, this.runId).catch(() => {})
+        // A stopped waiter frees what it reserved; one a service shutdown stopped keeps it for the next start's continuation.
+        if (this.abortReason !== SERVICE_SHUTDOWN) await dropReservation(locks.pool, this.runId).catch(() => {})
         await this.persist({ type: 'module-lock-wait-stopped' })
         return false
       }
@@ -3073,13 +3121,18 @@ export class Engine {
         }
         if (ofRevision().length) record.moduleLocks = { added: ofRevision(), ...(from ? { waitedFrom: from } : {}), ...(yielded.length ? { yielded } : {}) }
         await this.persist({ type: 'module-locks-taken', modules: pending, revision: record?.fingerprint ?? null })
+        // Held now: the reservation a recorded decision made (supervisor.answer, finalize) is no longer needed.
+        await dropReservation(locks.pool, this.runId).catch(() => {})
         return true
       }
+      const first = !from
       if (!from) {
         from = this.clock.iso()
         this.openDriveWaits.set(waitId, { from: Date.parse(from) })
       }
       locks.waiting = { modules: pending, holders: got.conflicts, since: from }
+      // A finalize answers its caller as soon as it waits (supervisor.finalize: 202, waitingFor modules).
+      if (first) this.onModuleWait?.({ modules: pending, holders: got.conflicts, since: from })
       // The wait file is rewritten at every poll (other runs read it for the waits-for graph);
       // the event, and with it the run.json write and the log line, only when what the run
       // waits for changed: at the wait's beginning, and on a change of modules or holders.
@@ -3690,7 +3743,7 @@ export class Engine {
       // When the seat stopped working, before any scan or advice that follows.
       pending.stoppedAt = this.clock.iso()
       // Refused before the runtime was called: this attempt reached no session.
-      if (error?.started === false) this.unreachedAttempt(p, invocationId)
+      if (error?.started === false) this.unreachedAttempt(p, invocationId, pending)
       // The seat touched the operator's CLI configuration (config-guard.mjs):
       // on the run first, so a crash before the failure is recorded still blocks
       // a retry of this invocation (recover).
@@ -3875,7 +3928,7 @@ export class Engine {
 
   /** A turn prepared but not started because the freeze arrived: no step, nothing in flight. */
   async withholdTurn ({ role, step, invocationId, pending, p }) {
-    this.unreachedAttempt(p, invocationId)
+    this.unreachedAttempt(p, invocationId, pending)
     if (!await this.endIntegrity(role, pending, 'withheld', 'the full verification closed admission before the turn started')) {
       p.state = 'ready'
       p.pendingInvocation = null
@@ -4982,6 +5035,12 @@ export class Engine {
     }
     this.run.status = 'running'
     await this.persist({ type: 'running' })
+    // What the run owes (a pause, or an ended run's continuation: module-locks.mjs) is taken before anything
+    // else, the refresh of checks included: a refresh stopped while it waits keeps its request.
+    if (!await this.holdRevisionModules()) {
+      await this.settleAbort()
+      return this.run
+    }
     if (this.run.checkRefresh?.pending) {
       await this.maybeRunChecks({ force: true, target: this.run.checkRefresh.target })
       this.run.checkRefresh.pending = false
@@ -5621,7 +5680,11 @@ export class Engine {
     this.run.status = 'running'
     this.run.blockedReason = null
     this.run.endedAt = null
+    delete this.run.finalizeInterrupted
     await this.persist({ type: 'finalizing', previousBlock: previous })
+    // Its modules before delivery (module-locks.mjs): owed since the run ended, reserved by supervisor.finalize,
+    // waited for while another run holds one. Stopped meanwhile, it delivers nothing and stands blocked as before.
+    if (!await this.holdRevisionModules() || this.controller.signal.aborted) return this.finalizeStopped({ previous, previousLimits })
     if (await this.evaluateClosure({ mayReturnDelivery }) === 'returned') {
       this.run.finalizations.at(-1).returned = { deliveryReturn: this.run.deliveryReturns?.length ?? null }
       await this.persist({ type: 'finalize-returned', suspendedMs })
@@ -5629,6 +5692,24 @@ export class Engine {
     }
     this.run.endedAt = this.clock.iso()
     await this.persist({ type: 'finished', reason: 'finalize', outcome: this.run.outcome, blockedReason: this.run.blockedReason })
+    return this.run
+  }
+
+  /**
+   * A finalize stopped before closure (while it waited for its modules): blocked again where it was, nothing
+   * delivered. A service shutdown marks it `finalizeInterrupted`, so the next start finalizes it again
+   * (supervisor.resumeInterrupted) and its module reservation stands until then.
+   */
+  async finalizeStopped ({ previous, previousLimits }) {
+    const shutdown = this.abortReason === SERVICE_SHUTDOWN
+    this.run.status = 'blocked'
+    this.run.blockedReason = previous
+    this.run.endedAt = this.clock.iso()
+    this.run.budgets.limits = previousLimits
+    this.run.finalizations.at(-1).stopped = { at: this.clock.iso(), by: shutdown ? SERVICE_SHUTDOWN : 'operator' }
+    if (shutdown) this.run.finalizeInterrupted = { at: this.clock.iso() }
+    else await dropReservation(this.run.moduleLocks?.pool, this.runId).catch(() => {})
+    await this.persist({ type: 'finalize-stopped', previousBlock: previous, stoppedBy: shutdown ? SERVICE_SHUTDOWN : 'operator' })
     return this.run
   }
 

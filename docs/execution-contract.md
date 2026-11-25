@@ -155,8 +155,19 @@ Every step records `usage` as the adapter reported it, with the provider's
 categories kept apart — `inputTokens`, `outputTokens`, `cacheCreationTokens`,
 `cacheReadTokens` — and `tokens` derived by that provider's semantics (Anthropic:
 all four summed, since cached input is still input the model read; OpenAI:
-input already includes the cached share). `costUsd` is kept when reported;
-steps without a cost are counted in `budgets.used.costUnknownSteps`. Two
+input already includes the cached share). `costUsd` is kept when reported.
+A step without one is estimated from its model's roster price, frozen into the
+snapshot's participants (`runtime/call-cost.mjs`), and `step.cost` says which:
+`{basis: 'reported', usd}`, `{basis: 'estimated', usd, model, source, asOf,
+rates, tokens, tokensBasis}` or `{basis: 'unknown', reason}` (`no-pricing`,
+`no-token-counts`, `unproved-baseline`). Estimates sum into
+`budgets.used.estimatedCostUsd` and `costEstimatedSteps`, never into `costUsd`;
+only steps that are neither are counted in `budgets.used.costUnknownSteps`. A
+running total (below) is priced only on a fresh session, or on a resumed one
+whose previous committed turn left a clean baseline (complete counters, same
+session, no reset): the seat's baseline is taken off at each launch and given
+back only when the attempt provably never started. Historical steps are not
+repriced. Two
 runtimes report **running totals** on a resumed session rather than the
 invocation's own usage, and the adapters turn those back into per-invocation
 numbers by subtracting the totals recorded on the session descriptor after the
@@ -2167,20 +2178,62 @@ section's owner identity, plus the module, project and issue.
   carrying it, and a lock whose marker matches the record's stays held while the
   status still reads ended. The marker goes when the continuation proceeds or gives
   its locks back, so a run that has really ended leaves stale locks; no clock is
-  compared. Every continuation of
-  an ended run — resume, recover, continue, refresh checks, accept a check result, and an
-  integrity `restored` or `accept-partial` (only `abandon` ends it) — takes its
-  recorded set again under the current process (a restart made the earlier owner
-  dead) before the run goes on. A module another run took meanwhile refuses it,
-  naming the holder, and the set stays required on the record
-  (`run.moduleLocks.released`, `reason: reclaim-refused`), so the next attempt must
-  take it again; a continuation refused after the set was taken gives an ended
-  run's locks back.
+  compared.
+- **Continuing an ended run waits, never refused.** Resume, Continue playbook, Refresh
+  checks, Accept check result and Retry input of an ended (blocked, cancelled…) run, and
+  Finalize, are never refused for a module lock: like a paused run's answer, the run
+  owes the set its end gave back (`oweEnded`: `released` and any locks an older record
+  still names go to `run.moduleLocks.owed`), the decision is recorded (the resume, the
+  `<phase>:continue` step, the refresh request, the finalization…), and the engine takes
+  the set before anything else happens — the refresh of checks and Finalize's closure
+  included — waiting for a holder exactly as growth does (`moduleLocks.waiting`, the
+  explanation "Waiting for modules another run is working on", the wait excused from
+  the wall clock). A waiting Finalize answers 202 `{status: 'waiting', waitingFor:
+  'modules', modules, holders}` and delivers by itself once the set is free; stopped
+  while it waits, it stands blocked as before with nothing delivered. A recovery and an
+  integrity `restored` or `accept-partial` still take their recorded set again under
+  the current process (a restart made the earlier owner dead) before the run goes on: a
+  module another run took meanwhile refuses them, naming the holder, the set stays
+  required on the record (`run.moduleLocks.released`, `reason: reclaim-refused`), and a
+  continuation refused after the set was taken gives the locks back. An `abandon` takes
+  none.
+- **Reservations: a recorded decision is not overtaken.** Such a waiter holds nothing
+  while it waits (a set is taken all or nothing), so its recorded decision reserves the
+  set: `<pool>/reservations/<runId>.json` names the run, its issue, the modules (what it
+  owes plus what its latest revision still needs), `since` and the decision. The file is
+  written before the decision is recorded, by the process holding the run's issue lock
+  (`.run.lock`): inside the project's admission for an answer, after it for Finalize; the
+  rule that counts is "file first, decision second". A start reads the pool's
+  reservations before it takes anything and again right after its take; a reservation
+  standing against a module the reserving run does not itself hold refuses it 409,
+  retryable, `MODULE_LOCKED`, the waiter named first (`holders[]` with `reserved: true`,
+  `since`, `decision`, `behind`: the runs holding that module now) and what the start had
+  taken given back. Whether a reservation stands is read, never written, by everyone
+  but its owner: while the issue's run lock names the run and that owner is alive
+  (`waiting`) or `unknown` (never dropped, as an unknown owner's lock is never taken over),
+  or while the run awaits the next start's automatic continuation after a service
+  shutdown (`interrupted`, only with `resumeAfterShutdown` on). A dead owner, a lock
+  naming another run, a deleted run or a refused automatic continuation: it does not
+  stand. A reservation refuses starts only and makes no live run wait, so it is not part
+  of the waits-for graph: wait cycles keep the youngest-yields rule above. Its owner
+  removes it when the set is taken, when the wait is stopped (Stop: the module is free
+  again), when the run settles otherwise, when the decision is refused, at a delete and
+  at an abandon. A service shutdown during the wait keeps it: the run ends `cancelled`
+  by `service-shutdown` (a Finalize stands blocked with `finalizeInterrupted`), the next
+  start carries the decision on before it serves (`resumeInterrupted`: resume, or
+  finalize again) and the reservation keeps its `since`. That replay takes runs newest
+  end first, so a waiter may take a module before the run that held it before the
+  shutdown; neither is refused and neither can deadlock, since both take their sets all
+  or nothing.
 - **Visible** as `moduleLocks` on readiness and preview (the pool, every lock with
-  its state, the issue's expected modules and conflicts; a conflict is a
-  `module-lock` prerequisite of a coding configuration in readiness and an
-  information prerequisite in preview) and on the project page
-  (`GET /api/projects/:project/module-locks`).
+  its state, `reservations` (each standing waiter with its modules, `since`, decision,
+  state and `behind`), the issue's expected modules and conflicts, reserved ones first; a
+  conflict is a `module-lock` prerequisite of a coding configuration in readiness and an
+  information prerequisite in preview, a reserved one worded "reserved by run R …
+  waiting since T behind run H"), on the project page
+  (`GET /api/projects/:project/module-locks`: the alert names each waiter, since when and
+  behind whom) and in the supervisor's ready queue (docs/top-level-supervisor.md "The
+  ready queue").
 
 ## Retiring refs/devpanel/*
 
@@ -3207,7 +3260,10 @@ operator (`DELETE /api/availability/:model`).
 ## Cost reporting, and a quota that runs out
 
 `budgets.maxCostUsd` is advisory metadata. Reported costs and estimates never stop
-an individual run. Unknown prices remain explicit in `budgets.used.costUnknownSteps`.
+an individual run. Estimates stay apart in `budgets.used.estimatedCostUsd` and do not count
+toward `maxCostUsd`. Unknown prices remain explicit in `budgets.used.costUnknownSteps`. The
+export, its totals and the overview show reported, estimated and unknown cost apart and count a
+run with known money beside unknown steps as partial (`runtime/run-cost.mjs`).
 
 No model is ever put in a seat's place automatically. A confirmed provider quota
 failure records the model in the availability store (held until its reset, or an

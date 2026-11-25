@@ -37,6 +37,12 @@ export const SERVICE_SHUTDOWN = 'service-shutdown'
 /** A cancellation the service caused and the next start has not yet tried to undo (supervisor.resumeInterrupted). */
 export const awaitsAutoResume = (run) => run?.status === 'cancelled' && run.stoppedBy === SERVICE_SHUTDOWN && !run.abandonment && !run.autoResumeRefused
 
+/** A finalize a service shutdown stopped while it waited for its modules (engine.finalize): the next start finalizes it again. */
+export const awaitsAutoFinalize = (run) => run?.status === 'blocked' && Boolean(run.finalizeInterrupted) && !run.abandonment && !run.autoResumeRefused
+
+/** Either: a decision the next start carries on by itself, so its module reservation stands meanwhile (module-locks.mjs). */
+export const awaitsRestart = (run) => awaitsAutoResume(run) || awaitsAutoFinalize(run)
+
 /**
  * A shutdown stopped this run before it had a workspace (preflight): there is no
  * work to keep and nothing to verify, so resuming it is doing its setup, from its

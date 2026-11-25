@@ -521,7 +521,10 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
         id: model.id, wire: model.model, harness: model.harness, profile: model.profile ?? 'default',
         credentialRef: model.credentialRef ?? null, endpointRef: model.endpointRef ?? null,
         account: model.account ?? null,
-        verification: model.verification, file: model.file, hash: model.hash
+        verification: model.verification, file: model.file, hash: model.hash,
+        // Its roster price (unhashed, beside the entry): frozen with the run, so a
+        // step without a reported cost is estimated at the rate it ran under.
+        pricing: model.pricing ?? null
       },
       effort,
       instructions: p.instructions ?? null

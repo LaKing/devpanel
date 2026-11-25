@@ -93,13 +93,13 @@ export default async function (t) {
       blockedReason: 'preflight-refused', preflight: { state: 'refused', detail: 'no harness answers' }
     }))
     await putRun('alpha-project', alphaOpen, run('a4', 'cancelled', at(T0, 9_000_000), { preflight: { state: 'pending', detail: null } }))
-    await putRun('alpha-project', alphaOpen, run('a5', 'blocked', at(T0, 10_000_000), { blockedReason: 'rounds-exhausted', budgets: { used: { costUsd: 1.25, tokens: 300 } } }))
+    await putRun('alpha-project', alphaOpen, run('a5', 'blocked', at(T0, 10_000_000), { blockedReason: 'rounds-exhausted', budgets: { used: { costUsd: 1.25, estimatedCostUsd: 0.5, costEstimatedSteps: 2, costUnknownSteps: 1, tokens: 300 } } }))
     const alphaLive = await issue('alpha-project', 'In flight')
     await putRun('alpha-project', alphaLive, run('a6', 'running', at(T0, 20_000_000)))
     await putRun('alpha-project', alphaLive, run('a7', 'paused', at(T0, 21_000_000)))
     const alphaPacked = await issue('alpha-project', 'Put away')
     await putRun('alpha-project', alphaPacked, run('b1', 'completed', '2026-11-01T08:00:00.000Z', {
-      steps: [turn('implementer', '2026-11-01T08:01:00.000Z', 30_000)], budgets: { used: { costUsd: 0.25, tokens: 500 } }
+      steps: [turn('implementer', '2026-11-01T08:01:00.000Z', 30_000)], budgets: { used: { estimatedCostUsd: 0.25, costEstimatedSteps: 3, tokens: 500 } }
     }))
     await issues.setIssueArchived('alpha-project', alphaPacked, true)
 
@@ -209,6 +209,8 @@ export default async function (t) {
     const rp = await issue('repeat-project', 'Readable folder')
     await putRun('repeat-project', rp, run('rp-1', 'completed', '2026-11-15T00:00:00.000Z'))
     await fs.mkdir(path.join(issuesDir, '.archive'), { recursive: true })
+    // Creating an issue may leave the id-lock directory there (issue-locks.mjs); the fixture replaces it.
+    await fs.rm(path.join(issuesDir, '.archive', 'repeat-project'), { recursive: true, force: true })
     await fs.writeFile(path.join(issuesDir, '.archive', 'repeat-project'), 'not a directory')
 
     // ---- moved: a restore caught between publishing the folder and removing the sidecar
@@ -325,7 +327,9 @@ export default async function (t) {
     const nost = JSON.parse(JSON.stringify(broken.rows.find((r) => r.runId === 'nost')))
     t.eq('a record without status and outcome reads null for both, after serialization', [nost.status, nost.outcome, 'status' in nost, 'outcome' in nost], [null, null, true, true])
     const a = Object.fromEntries(alpha.rows.map((r) => [r.runId, r]))
-    t.eq('cost, unpriced steps and tokens', [a.a1.cost, a.a1.tokens, a.a2.cost, a.a2.tokens], [{ usd: 0.5, unpricedSteps: 0 }, 1000, { usd: null, unpricedSteps: 1 }, 20])
+    t.eq('cost, unpriced steps and tokens', [a.a1.cost, a.a1.tokens, a.a2.cost, a.a2.tokens], [{ usd: 0.5, estimatedUsd: 0, unpricedSteps: 0, estimatedSteps: 0, pricing: 'priced' }, 1000, { usd: null, estimatedUsd: 0, unpricedSteps: 1, estimatedSteps: 0, pricing: 'unpriced' }, 20])
+    t.eq('reported, estimated and unknown apart; reported money beside an unknown step is partial', a.a5.cost, { usd: 1.25, estimatedUsd: 0.5, unpricedSteps: 1, estimatedSteps: 2, pricing: 'partial' })
+    t.eq('estimated money alone is priced, with no reported usd', a.b1.cost, { usd: null, estimatedUsd: 0.25, unpricedSteps: 0, estimatedSteps: 3, pricing: 'priced' })
     t.eq('checks coverage', [a.a1.checks, a.a3.checks], [{ coverage: 'recorded', intervals: 1 }, { coverage: 'none', intervals: 0 }])
     t.ok('agent and wait time are measured', a.a1.agentMs > 0 && a.a1.operatorWaitMs === 60_000 && a.a1.checksMs === 45_000, JSON.stringify([a.a1.agentMs, a.a1.operatorWaitMs, a.a1.checksMs]))
     t.eq('cause: failure.class', a.a2.cause, { value: 'runtime', source: 'failure.class', detail: 'boom' })
@@ -342,7 +346,8 @@ export default async function (t) {
     t.eq('byStatus', x.byStatus, o.byStatus)
     t.eq('terminal', x.terminal, o.terminal)
     t.eq('agentMs, operatorWaitMs, checksMs', [x.agentMs, x.operatorWaitMs, x.checksMs], [o.metrics.agentMs, o.metrics.operatorWaitMs, o.metrics.checksMs])
-    t.eq('cost: usd, priced, unpriced, tokens', x.cost, { usd: o.cost.usd, priced: o.cost.priced, unpriced: o.cost.unpriced, tokens: o.cost.tokens })
+    t.eq('cost: reported, estimated, tokens, priced, partial, unpriced and steps, as the overview counts them', x.cost, o.cost)
+    t.eq('the totals count partially priced runs apart', [x.cost.priced, x.cost.partial, x.cost.unpriced, x.cost.usd, x.cost.estimatedUsd, x.cost.unpricedSteps, x.cost.estimatedSteps], [2, 1, 3, 1.75, 0.75, 2, 5])
     t.ok('the parity is not vacuous', x.rows === 8 && x.agentMs > 0 && x.cost.usd > 0, JSON.stringify(x))
 
     t.section('5. AC1: the command writes nothing, starts nothing, and exits 0 unless the project has no directory')

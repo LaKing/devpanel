@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { currentOwner } from '../server/runtime/lock.mjs'
-import { conflictsWith, endContinuation, lockedMessage, poolDirectory, readPoolLocks, readWaits, reclaimRunLocks, releaseModules, releaseRunLocks, takeModules, writeWait, yieldsIn } from '../server/runtime/module-locks.mjs'
+import { conflictsWith, dropReservation, endContinuation, lockedMessage, oweEnded, poolDirectory, readPoolLocks, readReservations, readWaits, reclaimRunLocks, releaseModules, releaseRunLocks, reservedAgainst, reserveModules, takeModules, writeWait, yieldsIn } from '../server/runtime/module-locks.mjs'
 import { buildReadyQueue, freedSince, queueObservation } from '../server/ready-queue.mjs'
 import { launchReadiness } from '../server/supervisor-readiness.mjs'
 import { createTopSupervisor } from '../server/top-supervisor.mjs'
@@ -166,6 +166,64 @@ export default async function (t) {
       await releaseModules({ pool: POOL, held: [...older.held, ...got.held], dir })
     }
 
+    t.section('reservations: a recorded decision waiting for its set reserves it; it stands by the run lock\'s identity rules and is no wait')
+    {
+      const me = await currentOwner('ghost')
+      // A waiter: an ended run's issue folder, its run.json, and the issue's run lock with the owner given.
+      const waiter = async (id, runId, { status = 'blocked', owner, extra = {} } = {}) => {
+        const issuePath = path.join(root, 'issues', id)
+        await fs.mkdir(path.join(issuePath, 'runs', runId), { recursive: true })
+        await fs.writeFile(path.join(issuePath, 'runs', runId, 'run.json'), JSON.stringify({ runId, status, ...extra }))
+        if (owner !== null) await fs.writeFile(path.join(issuePath, '.run.lock'), JSON.stringify({ purpose: 'run', token: runId, owner: owner ?? await currentOwner(runId) }))
+        const run = { runId, revisions: [], moduleLocks: { pool: POOL, project: 'instance-a-project', issueId: id, held: [], released: { modules: ['@c/r'], at: 'x' } } }
+        t.ok(`${id}: the ended run owes what its end gave back`, await oweEnded(run) && run.moduleLocks.owed?.join() === '@c/r' && !run.moduleLocks.released)
+        await reserveModules(run, { issuePath, decision: 'resume', dir })
+        return { issuePath, run }
+      }
+      const standing = async (opts) => (await readReservations(POOL, { dir, ...opts })).map((r) => [r.runId, r.state])
+      const alive = await waiter('res-alive', 'run-res-alive')
+      t.eq('owner alive for this run: it stands, waiting', await standing(), [['run-res-alive', 'waiting']])
+      const before = (await readReservations(POOL, { dir }))[0]
+      await reserveModules(alive.run, { issuePath: alive.issuePath, decision: 'continue', dir })
+      const after = (await readReservations(POOL, { dir }))[0]
+      t.eq('written again it keeps its date and decision', [after.since, after.decision, after.modules], [before.since, 'resume', ['@c/r']])
+      await dropReservation(POOL, 'run-res-alive', { dir })
+      await waiter('res-unknown', 'run-res-unknown', { owner: { ...me, runId: 'run-res-unknown', host: 'another-host.invalid' } })
+      t.eq('owner unknown: it stands, never dropped', await standing(), [['run-res-unknown', 'unknown']])
+      await dropReservation(POOL, 'run-res-unknown', { dir })
+      await waiter('res-dead', 'run-res-dead', { owner: { ...me, runId: 'run-res-dead', pid: 999999, processStartedAt: '1' } })
+      t.eq('owner dead: dropped (ignored)', await standing(), [])
+      await waiter('res-other', 'run-res-other', { owner: await currentOwner('a-newer-run') })
+      t.eq('the run lock names another run: it does not stand', await standing(), [])
+      const deleted = await waiter('res-deleted', 'run-res-deleted')
+      await fs.rm(path.join(deleted.issuePath, 'runs'), { recursive: true, force: true })
+      t.eq('the run is deleted: it does not stand', await standing(), [])
+      for (const id of ['res-dead', 'res-other', 'res-deleted']) await dropReservation(POOL, `run-${id}`, { dir })
+      await waiter('res-shutdown', 'run-res-shutdown', { status: 'cancelled', owner: null, extra: { stoppedBy: 'service-shutdown' } })
+      t.eq('interrupted by a service shutdown: it stands until the next start carries it on', await standing(), [['run-res-shutdown', 'interrupted']])
+      t.eq('not when automatic continuation is off', await standing({ resumeAfterShutdown: false }), [])
+      const refusedPath = path.join(root, 'issues', 'res-shutdown', 'runs', 'run-res-shutdown', 'run.json')
+      await fs.writeFile(refusedPath, JSON.stringify({ runId: 'run-res-shutdown', status: 'cancelled', stoppedBy: 'service-shutdown', autoResumeRefused: { reason: 'x' } }))
+      t.eq('nor once that continuation was refused', await standing(), [])
+      await fs.writeFile(refusedPath, JSON.stringify({ runId: 'run-res-shutdown', status: 'cancelled', stoppedBy: 'service-shutdown' }))
+      const reservations = await readReservations(POOL, { dir })
+      const holder = await take('run-holding', 'instance-b-project', 'issue-holding', ['@c/r'])
+      const locks = await readPoolLocks(POOL, { dir })
+      const reserved = reservedAgainst(reservations, locks, ['@c/r', 'b-modules/free'])
+      t.eq('against a start: the waiter, behind the run holding the module now', reserved.map((r) => [r.module, r.runId, r.reserved, r.behind]), [['@c/r', 'run-res-shutdown', true, ['run-holding']]])
+      t.ok('the refusal names the waiter in words', /@c\/r is reserved by run run-res-shutdown/.test(lockedMessage(reserved)), lockedMessage(reserved))
+      t.eq('a module the reserver holds itself is a lock, not a reservation', reservedAgainst([{ ...reservations[0], runId: 'run-holding' }], locks, ['@c/r']), [])
+      await writeWait(POOL, { runId: 'run-w1', project: 'p', issueId: 'w1', startedAt: '2026-01-01T00:00:00Z', wants: ['@c/r'], holders: [] }, { dir })
+      t.eq('a reservation is no wait record: the waits-for graph never reads it', (await readWaits(POOL, { dir })).filter((w) => w.runId.startsWith('run-res') || w.runId === 'run-w1').map((w) => w.runId), ['run-w1'])
+      t.eq('and closes no cycle', await yieldsIn(POOL, { runId: 'run-w1', startedAt: '2026-01-01T00:00:00Z', wants: ['@c/r'] }, { dir }), false)
+      await fs.rm(path.join(poolDirectory(POOL, dir), 'waits', 'run-w1.json'), { force: true })
+      await releaseModules({ pool: POOL, held: holder.held, dir })
+      await dropReservation(POOL, 'run-res-shutdown', { dir })
+      t.eq('dropped by its owner, nothing stands', await standing(), [])
+      const stopped = { runId: 'run-stopped', moduleLocks: { pool: POOL, held: [], waiting: { modules: ['@c/r'] }, owed: ['@c/r'], released: { modules: ['@c/q'], at: 'x' } } }
+      t.eq('a run stopped while it waited, holding nothing, keeps what it owes and what it released', [await releaseRunLocks(stopped, { dir }), stopped.moduleLocks.owed, stopped.moduleLocks.released.modules], [true, ['@c/r'], ['@c/q']])
+    }
+
     t.section('the ready queue: a start sharing a module waits (blockedBy module-lock), a disjoint one is ready; the release wakes the supervisor')
     {
       const issueRow = (id, modules) => ({ id, name: id, status: 'open', openedAt: '2026-01-01T00:00:00Z', sizing: { affectedModules: modules } })
@@ -182,6 +240,21 @@ export default async function (t) {
       const live = { ...issueRow('waiting', ['@c/x']), latestRun: { runId: 'run-w', status: 'running', live: true } }
       const waiting = await buildReadyQueue({ issuesByProject: { 'instance-b-project': [live] }, state: state(), moduleWaits: { 'instance-b-project/waiting': { runId: 'run-w', wants: ['@c/x'], holders: [holder] } } })
       t.eq('a started run waiting for a module shows it on its running row', [row(waiting, 'waiting').state, row(waiting, 'waiting').blockedBy.map((b) => [b.kind, b.waiting ?? false])], ['running', [['own-run', false], ['module-lock', true]]])
+    }
+
+    t.section('the ready queue names a waiter: a reserved holder with since and behind, the waiter\'s own row, an interrupted waiter')
+    {
+      const issueRow = (id, modules, latestRun = null) => ({ id, name: id, status: 'open', openedAt: '2026-01-01T00:00:00Z', sizing: { affectedModules: modules }, ...(latestRun ? { latestRun } : {}) })
+      const row = (q, id) => q.rows.find((r) => r.id === id)
+      const waiterHolder = { module: '@c/x', runId: 'run-w', project: 'instance-a-project', issueId: 'waiter', reserved: true, since: '2026-01-02T00:00:00Z', behind: ['run-a'], state: 'waiting' }
+      const q = await buildReadyQueue({ issuesByProject: { 'instance-b-project': [issueRow('later', ['@c/x'])] }, state: state(), moduleConflicts: { 'instance-b-project/later': [waiterHolder] } })
+      const block = row(q, 'later').blockedBy?.[0]
+      t.eq('a later issue sharing the waiter\'s module is blocked, naming the waiter, since when, behind whom', [row(q, 'later').state, block?.kind, block?.holders?.[0]], ['blocked', 'module-lock', waiterHolder])
+      const own = await buildReadyQueue({ issuesByProject: { 'instance-a-project': [issueRow('waiter', ['@c/x'], { runId: 'run-w', status: 'running', live: true })] }, state: state(), moduleWaits: { 'instance-a-project/waiter': { runId: 'run-w', wants: ['@c/x'], holders: [{ module: '@c/x', runId: 'run-a' }], since: '2026-01-02T00:00:00Z', decision: 'resume', state: 'waiting' } } })
+      const ownBlock = row(own, 'waiter').blockedBy.find((b) => b.kind === 'module-lock')
+      t.eq('the waiter\'s own row carries since and its decision', [ownBlock?.waiting, ownBlock?.since, ownBlock?.decision, ownBlock?.holders?.[0]?.runId], [true, '2026-01-02T00:00:00Z', 'resume', 'run-a'])
+      const interrupted = await buildReadyQueue({ issuesByProject: { 'instance-a-project': [issueRow('waiter', ['@c/x'], { runId: 'run-w', status: 'cancelled', live: false })] }, state: state(), moduleWaits: { 'instance-a-project/waiter': { runId: 'run-w', wants: ['@c/x'], reserved: ['@c/x'], holders: [], since: '2026-01-02T00:00:00Z', state: 'interrupted' } } })
+      t.eq('a waiter a shutdown interrupted shows on its not-live row', [row(interrupted, 'waiter').state, row(interrupted, 'waiter').blockedBy?.map((b) => [b.kind, b.interrupted ?? false, b.since])], ['decide', [['module-lock', true, '2026-01-02T00:00:00Z']]])
     }
 
     t.section('readiness (and so a preview) shows the difference between a disjoint and a shared issue (AC11 on fixtures)')

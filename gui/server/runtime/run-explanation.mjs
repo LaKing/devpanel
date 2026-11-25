@@ -613,7 +613,7 @@ function standingOf (run, { outputs, active, ownership, liveCheckSince = null })
       if (lockWait?.modules?.length && !active.length) {
         const holders = [...new Set((lockWait.holders ?? []).map((h) => h.runId).filter(Boolean))]
         return { tone: 'waiting', headline: 'Waiting for modules another run is working on',
-          detail: `${run.moduleLocks.owed?.length ? 'The answer is recorded. ' : ''}Before it goes on this run needs ${lockWait.modules.join(', ')}, and ${holders.length ? `run ${holders.join(', ')}` : 'another run'} holds ${lockWait.modules.length === 1 ? 'it' : 'part of them'} now.`,
+          detail: `${run.moduleLocks.owed?.length ? 'The decision is recorded. ' : ''}Before it goes on this run needs ${lockWait.modules.join(', ')}, and ${holders.length ? `run ${holders.join(', ')}` : 'another run'} holds ${lockWait.modules.length === 1 ? 'it' : 'part of them'} now.`,
           next: 'It continues by itself once the modules are free; the wait does not count against its time limit.' }
       }
       // A wait for a full verification (cycle-gates.mjs): a wait, not a pause; nothing to answer, it ends at the thaw.

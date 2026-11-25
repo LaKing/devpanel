@@ -236,7 +236,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   const locks = moduleLocks && locksModules(r) ? await Promise.resolve().then(moduleLocks).catch((error) => ({ unavailable: error.message })) : null
   if (locks?.conflicts?.length) {
     // Information, like path-overlap: occupancy is not a configuration fault, and the start's own refusal is retryable.
-    prerequisites.push({ kind: 'module-lock', category: 'information', status: 'occupied', detail: `${locks.conflicts.map((c) => `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; ')}: the start waits until that run ends (retryable; the supervisor's ready queue shows blockedBy module-lock)`, holders: locks.conflicts })
+    prerequisites.push({ kind: 'module-lock', category: 'information', status: 'occupied', detail: `${locks.conflicts.map((c) => c.reserved ? `${c.module} is reserved by run ${c.runId} of ${c.project}/${c.issueId}, ${c.state === 'interrupted' ? 'interrupted by a service shutdown' : `waiting since ${c.since}`}${c.behind?.length ? ` behind run ${c.behind.join(', ')}` : ''}` : `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; ')}: the start waits until that run ends (retryable; the supervisor's ready queue shows blockedBy module-lock)`, holders: locks.conflicts })
   }
   // The issue's latest run recorded a provider refusal on a seat this start fills with the same
   // model (refused-seat.mjs): information only, it never makes the configuration unready.

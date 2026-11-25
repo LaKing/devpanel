@@ -5,6 +5,8 @@ import { startRun, resumeRun } from '../server/runtime/launch.mjs'
 import { readRun, readEvents, runDir } from '../server/runtime/store.mjs'
 import { fingerprint, LEGACY_FINGERPRINT_RULE, FINGERPRINT_RULE } from '../server/runtime/fingerprint.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
+import { oweEnded, poolDirectory, releaseModules, releaseRunLocks, reserveModules, takeModules } from '../server/runtime/module-locks.mjs'
+import { awaitsRestart, SERVICE_SHUTDOWN } from '../server/runtime/run-control.mjs'
 import { engineFixture, simulateProcessDeath, cleanupFixtures } from './fakes/fixture.mjs'
 
 export const name = 'engine — a run that stopped at delivery can be finalized from its retained worktree'
@@ -27,6 +29,7 @@ function unverifiableDelivery () {
 
 const start = (f, deliveryProvider) => startRun({ ...f, issue: { project: 'devpanel-project', id: f.issue.id }, deliveryProvider })
 const resume = (f, runId, deliveryProvider) => resumeRun({ issuePath: f.issuePath, runId, harnesses: f.harnesses, stepStore: f.stepStore, clock: f.clock, configRoot: f.configRoot, projectPath: f.projectPath, deliveryProvider })
+const until = async (test) => { const end = Date.now() + 10000; while (!test()) { if (Date.now() > end) throw Error('Timed out'); await new Promise((r) => setTimeout(r, 10)) } }
 const rejected = async (fn) => { try { await fn(); return null } catch (e) { return e } }
 
 /** Rewrite the recorded revision (and everything that names it) as if it had been taken under an older rule. */
@@ -135,6 +138,57 @@ export default async function (t) {
     await resumed.finalize()
     t.eq('blocked as drift', resumed.run.blockedReason, 'candidate-changed-since-approval')
     t.ok('no migration recorded', !resumed.run.revisions.some((r) => r.migratedFrom))
+
+    t.section('5b. finalize waits for the modules its end gave back, never refused; a stop or a shutdown meanwhile delivers nothing')
+    f = await engineFixture()
+    engine = await start(f, unverifiableDelivery())
+    await engine.drive()
+    {
+      const POOL = 'finalize-locks-pool'
+      const reservation = path.join(poolDirectory(POOL), 'reservations', `${engine.runId}.json`)
+      const prepare = async () => {
+        await simulateProcessDeath(f.issuePath)
+        const r = await resume(f, engine.runId, f.delivery)
+        r.moduleLockPollMs = 20
+        // As supervisor.finalize leaves it: the set the end gave back is owed, and reserved before the decision.
+        r.run.moduleLocks ??= { pool: POOL, project: 'devpanel-project', issueId: f.issue.id, held: [], waiting: null, released: { modules: ['@c/f'], at: 'x' } }
+        await oweEnded(r.run)
+        await reserveModules(r.run, { issuePath: f.issuePath, decision: 'finalize' })
+        return r
+      }
+      const other = await takeModules({ pool: POOL, modules: ['@c/f'], runId: 'run-other', project: 'instance-project', issueId: 'other-issue', issuePath: null, startedAt: '2026-01-01T00:00:00Z' })
+      const exists = (file) => fs.access(file).then(() => true, () => false)
+
+      let r = await prepare()
+      let waited = null
+      r.onModuleWait = (w) => { waited = w }
+      let finalizing = r.finalize()
+      await until(() => waited)
+      t.eq('it waits for the module, naming the holder, delivering nothing', [r.run.status, r.run.moduleLocks.waiting?.modules, waited.holders.map((h) => h.runId), f.delivery.calls.length], ['running', ['@c/f'], ['run-other'], 0])
+      t.eq('the finalization is recorded, and the modules are reserved', [r.run.finalizations.length, await exists(reservation)], [1, true])
+      r.cancel('requested')
+      await finalizing
+      t.eq('a stop puts it back where it was, nothing delivered', [r.run.status, r.run.blockedReason, r.run.finalizations.at(-1).stopped?.by, f.delivery.calls.length], ['blocked', 'delivery-unverifiable', 'operator', 0])
+      t.eq('and gives its reservation back', await exists(reservation), false)
+
+      r = await prepare()
+      waited = null
+      r.onModuleWait = (w) => { waited = w }
+      finalizing = r.finalize()
+      await until(() => waited)
+      r.cancel(SERVICE_SHUTDOWN)
+      await finalizing
+      t.eq('a shutdown leaves it blocked, marked for the next start, still reserved', [r.run.status, r.run.blockedReason, Boolean(r.run.finalizeInterrupted), awaitsRestart(r.run), await exists(reservation)], ['blocked', 'delivery-unverifiable', true, true, true])
+
+      r = await prepare()
+      finalizing = r.finalize()
+      await until(() => r.run.moduleLocks.waiting)
+      await releaseModules({ pool: POOL, held: other.held })
+      await finalizing
+      t.eq('once the module is free it takes it and delivers', [r.run.status, r.run.moduleLocks.retaken?.at(-1)?.modules, f.delivery.calls.length > 0, r.run.finalizeInterrupted], ['completed', ['@c/f'], true, undefined])
+      t.eq('the reservation is gone once the set is held', await exists(reservation), false)
+      await releaseRunLocks(r.run)
+    }
 
     t.section('6. what the panel offers')
     const blocked = (blockedReason, extra = {}) => ({ status: 'blocked', blockedReason, participants: {}, workspace: { path: '/w', state: 'retained' }, integrity: { status: 'clear' }, ...extra })

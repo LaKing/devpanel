@@ -51,7 +51,7 @@ export default async function (t) {
   t.eq('holding nothing while it waits', [engine.run.moduleLocks.held, (await readPoolLocks(POOL)).map((l) => [l.module, l.runId])], [[], [['@c/x', 'run-other']]])
   t.eq('no implementation turn ran without the modules', ran(engine.run, 'implement') + ran(engine.run, 'brief-implement'), 0)
   const told = explainRun(engine.run, { active: [] })
-  t.ok('a person reads that the answer is in and what the run waits for', told.tone === 'waiting' && /answer is recorded/.test(told.detail) && told.detail.includes('@c/x') && told.detail.includes('run-other'), JSON.stringify(told))
+  t.ok('a person reads that the answer is in and what the run waits for', told.tone === 'waiting' && /decision is recorded/.test(told.detail) && told.detail.includes('@c/x') && told.detail.includes('run-other'), JSON.stringify(told))
 
   t.section('once the module is free the run takes its set and goes on to the end')
   await releaseModules({ pool: POOL, held: other.held })

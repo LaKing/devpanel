@@ -73,8 +73,9 @@ A model's price is therefore not in its entry: `roster-pricing/<id>.yaml` (schem
 `roster-pricing.schema.json`: `id`, `inputUsdPerMillionTokens`,
 `outputUsdPerMillionTokens`, `cachedInputUsdPerMillionTokens`, `source`, `asOf`, optional
 `cacheWriteUsdPerMillionTokens`) moves no hash and no configHash. It prices supervisor
-calls whose runtime reports no cost (docs/top-level-supervisor.md), and takes effect at the
-next Start or model substitution. The tracked tree ships none: enter a price you can
+calls, consult seats and run steps whose runtime reports no cost (docs/top-level-supervisor.md,
+docs/execution-contract.md), and takes effect at the next Start, run start or model
+substitution: a run freezes it into its snapshot. The tracked tree ships none: enter a price you can
 source, with where you read it. A price naming no roster id, or a file that does not
 validate, is a `config:check` warning and blocks nothing: that model stays unpriced, so
 its calls stay unknown.

@@ -7,6 +7,7 @@ import { issuesRoot } from '../project-path.mjs'
 import { systemClock } from './clock.mjs'
 import { acquire, LockHeld, ownerLiveness } from './lock.mjs'
 import { hostPlatform } from './platform.mjs'
+import { awaitsRestart } from './run-control.mjs'
 
 /*
  * Module locks (execution-contract.md "Module locks"): one lock file per module of a
@@ -29,6 +30,7 @@ export const locksRoot = (dir = null) => dir ?? process.env.DEVPANEL_MODULE_LOCK
 export const poolDirectory = (pool, dir = null) => path.join(locksRoot(dir), sha(pool))
 const lockFile = (pool, module, dir) => path.join(poolDirectory(pool, dir), `${sha(module)}.lock`)
 const waitFile = (pool, runId, dir) => path.join(poolDirectory(pool, dir), 'waits', `${runId}.json`)
+const reservationFile = (pool, runId, dir) => path.join(poolDirectory(pool, dir), 'reservations', `${runId}.json`)
 
 const normalize = (modules) => [...new Set((modules ?? []).filter((m) => typeof m === 'string' && m.length).map((m) => m.replace(/\/+$/, '')))].sort()
 
@@ -172,8 +174,10 @@ const stepsOf = (phase) => (phase.loop ? phase.loop.steps : [phase.step])
 /** Whether runs of this resolved playbook lock modules: those that record revisions (coding playbooks). */
 export const locksModules = (resolved) => (resolved?.phases ?? []).some((phase) => stepsOf(phase).some((step) => step?.recordsRevision === true))
 
-/** In words, who holds what a start or resume wanted. */
-export const lockedMessage = (conflicts) => conflicts.map((c) => `module ${c.module} is locked by run ${c.runId ?? '(unknown)'}${c.project ? ` of ${c.project}/${c.issueId}` : ''}${c.liveness === 'unknown' || c.state === 'unknown' ? ' (its owner is unknown, so it is not taken over)' : ''}`).join('; ') + ': this start shares a module with that run, so it waits until the run ends'
+/** In words, who holds (or, recorded decision waiting for it, reserves) what a start wanted. */
+export const lockedMessage = (conflicts) => conflicts.map((c) => c.reserved
+  ? `module ${c.module} is reserved by run ${c.runId}${c.project ? ` of ${c.project}/${c.issueId}` : ''}, ${c.state === 'interrupted' ? 'whose recorded decision was interrupted by a service shutdown and is carried on at the next start' : `which has waited for it since ${c.since}${c.behind?.length ? ` (behind run ${c.behind.join(', ')})` : ''}`}${c.state === 'unknown' ? ' (its owner is unknown, so the reservation is not dropped)' : ''}`
+  : `module ${c.module} is locked by run ${c.runId ?? '(unknown)'}${c.project ? ` of ${c.project}/${c.issueId}` : ''}${c.liveness === 'unknown' || c.state === 'unknown' ? ' (its owner is unknown, so it is not taken over)' : ''}`).join('; ') + ': this start shares a module with that run, so it waits until the run ends'
 
 /** Give up every lock of an ended run and its wait record; true when anything was held. */
 export async function releaseRunLocks (run, { dir = null, clock = systemClock } = {}) {
@@ -183,7 +187,8 @@ export async function releaseRunLocks (run, { dir = null, clock = systemClock } 
   await releaseModules({ pool: locks.pool, held: locks.held, dir })
   await clearWait(locks.pool, run.runId, { dir }).catch(() => {})
   if (!modules.length && !locks.waiting) return false
-  locks.released = { modules, at: clock.iso() }
+  // A run stopped while it waited holds nothing: what it gave up before (released, owed) stays on the record.
+  if (modules.length) locks.released = { modules, at: clock.iso() }
   locks.held = []
   locks.waiting = null
   delete locks.continuation
@@ -229,6 +234,102 @@ export async function yieldForPause (run, { dir = null, clock = systemClock } = 
     locks.released = { modules: owed, at: clock.iso(), reason: 'paused' }
   }
   return true
+}
+
+/**
+ * A continuation of an ended run (resume, continue, refresh checks, accept a check result, retry input,
+ * finalize) owes the set its end gave back, as a paused run's answer does: nothing is taken here, the
+ * engine takes it before anything goes on and waits for a holder (engine.takePendingModules). Locks an
+ * older record still names as held are given back by token first. True when something became owed;
+ * the caller writes the record.
+ */
+export async function oweEnded (run, { dir = null } = {}) {
+  const locks = run?.moduleLocks
+  if (!locks?.pool) return false
+  const held = (locks.held ?? []).map((h) => h.module)
+  if (held.length) await releaseModules({ pool: locks.pool, held: locks.held, dir })
+  const owed = normalize([...held, ...(locks.released?.modules ?? []), ...(locks.owed ?? [])])
+  locks.held = []
+  delete locks.continuation
+  if (!owed.length) return false
+  locks.owed = owed
+  delete locks.released
+  return true
+}
+
+/*
+ * Reservations (execution-contract.md "Module locks", Reservations): a recorded decision of a run that
+ * owes its set reserves it against later starts, so no start overtakes the waiter. One file per run,
+ * <pool>/reservations/<runId>.json, beside the locks and apart from the wait records (the waits-for graph
+ * never reads it: a reservation makes no live run wait). It is written before the decision is recorded,
+ * by the process holding the run's issue lock, and only that owner removes it: when the set is taken,
+ * when the wait is stopped (a service shutdown excepted), when the run settles without awaiting the next
+ * start, at a rejected decision, a delete or an abandon. Whether it stands is read, never written, by
+ * everyone else (readReservations).
+ */
+
+/** Write the run's reservation of what it owes and its latest revision still needs; a file already there keeps its date and decision. */
+export async function reserveModules (run, { issuePath, decision, dir = null, clock = systemClock } = {}) {
+  const locks = run?.moduleLocks
+  if (!locks?.pool) return false
+  const modules = normalize([...(locks.owed ?? []), ...(run.revisions?.at(-1)?.moduleLocks?.pending ?? [])])
+  if (!modules.length) return false
+  const file = reservationFile(locks.pool, run.runId, dir)
+  const before = await readJson(file)
+  await fs.mkdir(path.dirname(file), { recursive: true })
+  const temp = `${file}.${process.pid}.tmp`
+  await fs.writeFile(temp, JSON.stringify({ runId: run.runId, project: locks.project ?? null, issueId: locks.issueId ?? null, issuePath, modules,
+    since: before?.runId === run.runId && before.since ? before.since : clock.iso(), decision: before?.runId === run.runId && before.decision ? before.decision : decision }))
+  await fs.rename(temp, file)
+  return true
+}
+
+export const dropReservation = (pool, runId, { dir = null } = {}) => pool ? fs.rm(reservationFile(pool, runId, dir), { force: true }) : Promise.resolve()
+
+/**
+ * The reservations of a pool that stand now: `[{runId, project, issueId, modules, since, decision, state}]`.
+ * One stands while the issue's run lock names its run and that owner is alive (`waiting`) or unknown
+ * (`unknown`: never dropped, as a lock of an unknown owner is never taken over), or while its run awaits
+ * the next start's automatic continuation after a service shutdown (`interrupted`, only when that
+ * continuation is on). A dead owner, a lock naming another run, a deleted run or a refused continuation:
+ * it does not stand and is ignored.
+ */
+export async function readReservations (pool, { dir = null, platform = hostPlatform(), resumeAfterShutdown = true } = {}) {
+  const directory = path.join(poolDirectory(pool, dir), 'reservations')
+  const names = (await fs.readdir(directory).catch(() => [])).filter((n) => n.endsWith('.json'))
+  const out = []
+  for (const name of names) {
+    const r = await readJson(path.join(directory, name))
+    if (!r?.runId || !r.issuePath || !Array.isArray(r.modules)) continue
+    const run = await readJson(path.join(r.issuePath, 'runs', r.runId, 'run.json'))
+    if (!run) continue
+    const lock = await readJson(path.join(r.issuePath, '.run.lock'))
+    let state = null
+    if (lock?.owner?.runId === r.runId) {
+      const liveness = await ownerLiveness(lock.owner, { platform })
+      if (liveness === 'alive') state = 'waiting'
+      else if (liveness === 'unknown') state = 'unknown'
+    }
+    if (!state && resumeAfterShutdown && awaitsRestart(run)) state = 'interrupted'
+    if (!state) continue
+    out.push({ runId: r.runId, project: r.project ?? null, issueId: r.issueId ?? null, modules: normalize(r.modules), since: r.since ?? null, decision: r.decision ?? null, state })
+  }
+  return out.sort((a, b) => (a.since ?? '') < (b.since ?? '') ? -1 : 1)
+}
+
+/** Reservations that stand in the way of `modules`, one entry per module, with the runs holding it now (`behind`); a module its reserver holds is a lock, not a reservation. */
+export function reservedAgainst (reservations, locks, modules) {
+  const wanted = new Set(normalize(modules))
+  const out = []
+  for (const r of reservations ?? []) {
+    for (const module of r.modules) {
+      if (!wanted.has(module)) continue
+      const holders = (locks ?? []).filter((l) => l.module === module && ['held', 'unknown'].includes(l.state))
+      if (holders.some((l) => l.runId === r.runId)) continue
+      out.push({ module, runId: r.runId, project: r.project, issueId: r.issueId, reserved: true, since: r.since, decision: r.decision, state: r.state, behind: [...new Set(holders.map((l) => l.runId).filter(Boolean))] })
+    }
+  }
+  return out
 }
 
 /** The continuation went on: its locks now stand for a live run, and the marker is no longer needed. */

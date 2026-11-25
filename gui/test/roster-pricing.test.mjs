@@ -32,7 +32,9 @@ export default async function (t) {
     const second = await resolvePlaybook('implementation', { root })
     t.ok('the playbook resolves', first.ok && second.ok, JSON.stringify(second.errors ?? null))
     t.eq('with the same configHash', second.resolved?.configHash, first.resolved?.configHash)
-    t.ok('and the snapshot does not carry it', !JSON.stringify(second.resolved ?? {}).includes('inputUsdPerMillionTokens'))
+    const seated = await resolvePlaybook('implementation', { root, runOptions: { participants: { 'auditor-1': { model: MODEL } } } })
+    t.eq('a seat on the priced model carries the price in the snapshot, frozen with the run', seated.resolved?.participants?.['auditor-1']?.model.pricing?.inputUsdPerMillionTokens, 2)
+    t.ok('and a seat on an unpriced model carries none', Object.values(second.resolved?.participants ?? {}).filter((p) => p.model.id !== MODEL).every((p) => p.model.pricing === null))
 
     t.section('a host file wins, as in every category')
     await write(path.join(hostDir, 'roster-pricing'), MODEL, price(MODEL, 3))

@@ -32,7 +32,7 @@ export function createQuotaFallback ({ loadModels, availability, probeFor, root 
       if (engine.controller.signal.aborted) return null
       const replacement = { model: { id: model.id, wire: model.model, harness: model.harness, profile: model.profile ?? 'default',
         endpointRef: model.endpointRef ?? null, credentialRef: model.credentialRef ?? null, account: model.account ?? null,
-        verification: model.verification, file: model.file, hash: model.hash },
+        verification: model.verification, file: model.file, hash: model.hash, pricing: model.pricing ?? null },
       effort: (model.efforts ?? []).includes(spec.effort) ? spec.effort : model.defaultEffort ?? null }
       const probe = probeFor(engine.harnesses)
       let result

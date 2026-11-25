@@ -101,7 +101,7 @@ export async function launchReadiness ({
   // prerequisite of that configuration; otherwise it is reported beside the reading.
   const locks = moduleLocks ? await Promise.resolve().then(moduleLocks).catch((error) => ({ unavailable: error.message })) : null
   if (locks?.conflicts?.length && configuration?.locksModules) {
-    configuration.prerequisites.push({ condition: 'module-lock', state: locks.conflicts.map((c) => `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; '), needs: 'the holding run ends (the supervisor\'s ready queue waits for it: blockedBy module-lock)', holders: locks.conflicts })
+    configuration.prerequisites.push({ condition: 'module-lock', state: locks.conflicts.map((c) => c.reserved ? `${c.module} is reserved by run ${c.runId} of ${c.project}/${c.issueId}, ${c.state === 'interrupted' ? 'interrupted by a service shutdown' : `waiting since ${c.since}`}${c.behind?.length ? ` behind run ${c.behind.join(', ')}` : ''}` : `${c.module} is locked by run ${c.runId} of ${c.project}/${c.issueId}`).join('; '), needs: 'the holding run ends (the supervisor\'s ready queue waits for it: blockedBy module-lock)', holders: locks.conflicts })
     configuration.ready = false
   }
 

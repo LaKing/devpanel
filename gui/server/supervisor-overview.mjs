@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import * as store from './runtime/store.mjs'
 import { emptyMetricsTotals, absorbMetrics, reportMetrics } from './runtime/run-metrics.mjs'
+import { runCost } from './runtime/run-cost.mjs'
 
 /*
  * The panel, as one bounded reading.
@@ -29,7 +30,9 @@ import { emptyMetricsTotals, absorbMetrics, reportMetrics } from './runtime/run-
  *  - Every rate carries its numerator and denominator. "100%" over one run is
  *    not a measurement, and a reader given only the percentage cannot tell.
  *  - Unknown stays unknown. Unpriced runs are counted as unpriced rather than
- *    folded into a total as zero.
+ *    folded into a total as zero; reported and estimated money are summed apart,
+ *    and a run with known money beside unknown steps is partial, not priced
+ *    (runtime/run-cost.mjs).
  */
 
 const LIVE = ['preflighting', 'pending', 'running', 'stopping']
@@ -68,7 +71,7 @@ function emptyRuns () {
     byStatus: {}, byOutcome: {},
     delivered: { engine: 0, manual: 0 },
     durationMs: { total: 0, counted: 0, unknown: 0 },
-    cost: { usd: 0, priced: 0, unpriced: 0, tokens: 0 },
+    cost: { usd: 0, estimatedUsd: 0, tokens: 0, priced: 0, partial: 0, unpriced: 0, unpricedSteps: 0, estimatedSteps: 0 },
     metrics: emptyMetricsTotals()
   }
 }
@@ -103,8 +106,12 @@ function absorb (into, run, { role = null } = {}) {
   absorbMetrics(into.metrics, run, { role })
 
   const used = run.budgets?.used ?? {}
-  if (typeof used.costUsd === 'number' && Number.isFinite(used.costUsd)) { into.cost.usd += used.costUsd; into.cost.priced++ }
-  else into.cost.unpriced++
+  const cost = runCost(used)
+  into.cost.usd += cost.reportedUsd ?? 0
+  into.cost.estimatedUsd += cost.estimatedUsd
+  into.cost.unpricedSteps += cost.unknownSteps
+  into.cost.estimatedSteps += cost.estimatedSteps
+  into.cost[cost.pricing]++
   if (typeof used.tokens === 'number' && Number.isFinite(used.tokens)) into.cost.tokens += used.tokens
 }
 
@@ -113,7 +120,7 @@ function report (runs) {
   return {
     ...runs,
     durationMs: { ...runs.durationMs, mean: runs.durationMs.counted ? Math.round(runs.durationMs.total / runs.durationMs.counted) : null },
-    cost: { ...runs.cost, usd: Math.round(runs.cost.usd * 10000) / 10000 },
+    cost: { ...runs.cost, usd: Math.round(runs.cost.usd * 10000) / 10000, estimatedUsd: Math.round(runs.cost.estimatedUsd * 10000) / 10000 },
     metrics: reportMetrics(runs.metrics),
     successRate: rate(runs.succeeded, runs.terminal, 'runs that completed AND resolved, over runs that reached a terminal state; live and paused runs are excluded'),
     deliveryRate: { ...rate(runs.delivered.engine + runs.delivered.manual, runs.terminal, 'terminal runs whose candidate reached its destination, delivered by the engine or landed by hand (counted apart in engine and manual), over runs that reached a terminal state'), ...runs.delivered }

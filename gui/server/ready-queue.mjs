@@ -88,7 +88,8 @@ async function rowOf (project, issue, { state, holders, reportLevels, lookup, mo
   // Modules its triage named that another live run of the pool holds (module-locks.mjs): the start
   // would be refused as occupied, so it waits, and the release wakes the supervisor (capacity-freed).
   const locked = moduleConflicts[key] ?? []
-  if (!latest?.live && locked.length) blocks.push({ kind: 'module-lock', modules: [...new Set(locked.map((c) => c.module))], holders: locked.map(({ module, runId, project: p, issueId }) => ({ module, runId, project: p, issueId })), until: until('module-lock') })
+  // A holder may be a run whose recorded decision waits for the module (`reserved`, since when, behind whom): it is not overtaken.
+  if (!latest?.live && locked.length) blocks.push({ kind: 'module-lock', modules: [...new Set(locked.map((c) => c.module))], holders: locked.map(({ module, runId, project: p, issueId, reserved, since, behind, state: s }) => ({ module, runId, project: p, issueId, ...(reserved ? { reserved: true, since, behind, state: s } : {}) })), until: until('module-lock') })
 
   let rowState
   if (latest?.live) {
@@ -96,7 +97,12 @@ async function rowOf (project, issue, { state, holders, reportLevels, lookup, mo
     blocks.unshift({ kind: 'own-run', runId: latest.runId, status: latest.status, until: until(latest.status === 'paused' ? 'its question is answered' : 'the run settles') })
     // A started run waiting for a module its revision needs: it takes it itself when freed.
     const wait = moduleWaits[key]
-    if (wait) blocks.push({ kind: 'module-lock', waiting: true, runId: wait.runId, modules: wait.wants ?? [], holders: wait.holders ?? [], until: until('module-lock') })
+    if (wait) blocks.push({ kind: 'module-lock', waiting: true, runId: wait.runId, modules: wait.wants ?? [], holders: wait.holders ?? [], ...(wait.since ? { since: wait.since } : {}), ...(wait.decision ? { decision: wait.decision } : {}), until: until('module-lock') })
+  } else if (moduleWaits[key]?.state === 'interrupted' && moduleWaits[key].runId === latest?.runId) {
+    // Its decision was interrupted by a service shutdown: the next start carries it on, and its modules stay reserved meanwhile.
+    const wait = moduleWaits[key]
+    blocks.push({ kind: 'module-lock', waiting: true, interrupted: true, runId: wait.runId, modules: wait.reserved ?? wait.wants ?? [], since: wait.since, until: until('module-lock') })
+    rowState = 'decide'
   } else rowState = latest ? 'decide' : blocks.length ? 'blocked' : 'ready'
 
   return {

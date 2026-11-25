@@ -1,5 +1,6 @@
 /*
- * What one supervisor model call cost, when the runtime does not say.
+ * What one model call cost (a supervisor call, a consult seat, a run step), when
+ * the runtime does not say.
  *
  * An estimate is this call's own tokens times the roster-pricing rates, or it is
  * nothing: unknown is not zero, and a number that may hold another invocation's
@@ -49,8 +50,9 @@ export function estimateCallCost (usage, pricing, { resumed = false, ownUsage = 
     cachedInput: pricing.cachedInputUsdPerMillionTokens,
     cacheWrite: pricing.cacheWriteUsdPerMillionTokens ?? pricing.inputUsdPerMillionTokens
   }
-  // OpenAI counts cached input inside input; the others report each category apart.
-  const freshInput = usage.provider === 'openai' ? Math.max(0, input - cacheRead) : input
+  // OpenAI counts cached input inside input, and so does the Gemini CLI (its adapter
+  // says so with `inputIncludesCached`); the others report each category apart.
+  const freshInput = usage.provider === 'openai' || usage.inputIncludesCached === true ? Math.max(0, input - cacheRead) : input
   const usd = (freshInput * rates.input + cacheRead * rates.cachedInput + cacheWrite * rates.cacheWrite + output * rates.output) / 1e6
   return { usd, tokens: { input, output, cacheRead, cacheWrite }, rates, source: pricing.source, asOf: pricing.asOf, tokensBasis }
 }

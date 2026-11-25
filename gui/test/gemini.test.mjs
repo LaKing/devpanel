@@ -611,6 +611,7 @@ export default async function (t) {
     t.ok('the whole answer is returned, not its last chunk', turn.response.includes('Here is the work.') && turn.response.trim().endsWith('```'), turn.response.slice(0, 40))
     t.eq('the provider total is the runtime\'s own', turn.usage.tokens, 4333)
     t.eq('the cached share is recorded, not added again', turn.usage.cacheReadTokens, 4000)
+    t.eq('and the usage says its input includes it, for the estimator', turn.usage.inputIncludesCached, true)
     t.eq('cost is unknown rather than estimated', turn.usage.costUsd, null)
     t.eq('and attributed to the provider that billed it', turn.usage.provider, 'google')
     t.eq('the turn completed', turn.outcome, 'completed')

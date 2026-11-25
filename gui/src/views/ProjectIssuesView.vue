@@ -111,6 +111,9 @@ const lockRuns = computed(() => {
   return [...runs.values()]
 })
 const lockCount = computed(() => moduleLocks.value?.held?.length ?? 0)
+// Runs whose recorded decision waits for modules (module-locks.mjs reservations): a start needing one is refused until they have it.
+const waiters = computed(() => moduleLocks.value?.reservations ?? [])
+const behindOf = (r) => [...new Set((r.behind ?? []).flatMap((b) => b.runIds ?? []))]
 
 async function load () {
   const seq = ++loadSeq
@@ -239,7 +242,9 @@ function onChanged (payload) {
    one reload. */
 let runPending = null
 function onRunEvent (payload) {
-  if (payload?.project !== project.value) return
+  // A module lock or wait of another member of the pool changes this page's alert too.
+  const poolEvent = String(payload?.type ?? '').startsWith('module-lock') && (moduleLocks.value?.members ?? []).includes(payload?.project)
+  if (payload?.project !== project.value && !poolEvent) return
   if (payload.type === 'live' || payload.type === 'activity') return
   clearTimeout(runPending)
   runPending = setTimeout(load, 200)
@@ -306,13 +311,20 @@ watch([project, archived], () => {
       </details>
     </v-alert>
 
-    <v-alert v-if="lockCount" type="info" variant="tonal" density="compact" class="mb-3"
+    <v-alert v-if="lockCount || waiters.length" type="info" variant="tonal" density="compact" class="mb-3"
              data-test="module-locks">
       <details class="issues__locks">
         <summary :title="`Pool of ${moduleLocks.pool}: ${moduleLocks.members.join(', ')}`">
           Module locks: {{ lockCount }} {{ lockCount === 1 ? 'module' : 'modules' }} held by
-          {{ lockRuns.length }} {{ lockRuns.length === 1 ? 'run' : 'runs' }} in the pool of {{ moduleLocks.pool }}; a start that needs one of them waits.
+          {{ lockRuns.length }} {{ lockRuns.length === 1 ? 'run' : 'runs' }}<span v-if="waiters.length">, {{ waiters.length }} {{ waiters.length === 1 ? 'run waits' : 'runs wait' }} for modules</span> in the pool of {{ moduleLocks.pool }}; a start that needs one of them waits.
         </summary>
+        <div v-for="w in waiters" :key="`wait-${w.runId}`" class="mt-1" data-test="module-locks-waiter">
+          <router-link :to="`/projects/${encodeURIComponent(w.project)}/${encodeURIComponent(w.issueId)}`">{{ w.issueId }}</router-link>
+          <span :title="w.runId"> (run {{ w.runId.slice(-8) }}<span v-if="w.project !== String(project)"> of {{ w.project }}</span>)</span>
+          <span v-if="w.state === 'interrupted'"> was interrupted by a service shutdown and keeps its modules reserved</span>
+          <span v-else> waits since {{ w.since }}<span v-if="behindOf(w).length"> behind run {{ behindOf(w).map((id) => id.slice(-8)).join(', ') }}</span></span>:
+          <span v-for="(m, i) in w.modules" :key="m"><code>{{ m }}</code><span v-if="i < w.modules.length - 1">, </span></span>
+        </div>
         <div v-for="r in lockRuns" :key="r.runId" class="mt-1" data-test="module-locks-run">
           <router-link :to="`/projects/${encodeURIComponent(r.project)}/${encodeURIComponent(r.issueId)}`">{{ r.issueId }}</router-link>
           <span :title="r.runId"> (run {{ r.runId.slice(-8) }}<span v-if="r.project !== String(project)"> of {{ r.project }}</span><span v-if="r.state !== 'held'">, {{ r.state }}</span><span v-if="r.waiting">, waiting for another module</span>)</span>:

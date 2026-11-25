@@ -17,7 +17,7 @@ import { setIssueDependencies, openDependencies } from './issue-dependencies.mjs
 import { readReporters, reportStartLevel } from './reporters.mjs'
 import { startAdmission } from './start-admission.mjs'
 import { launchReadiness } from './supervisor-readiness.mjs'
-import { conflictsWith, readWaits } from './runtime/module-locks.mjs'
+import { conflictsWith, readWaits, reservedAgainst } from './runtime/module-locks.mjs'
 import { projectPath } from './project-path.mjs'
 import { performanceForModel } from './model-performance.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
@@ -143,10 +143,13 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
      const locks=config&&supervisor.moduleLockReading?await supervisor.moduleLockReading({project,config,pools}).catch(()=>null):null
      if(!locks)continue
      for(const issue of rows){
-      const conflicts=conflictsWith(locks.held,issue.sizing?.affectedModules??[],{project,issueId:issue.id})
+      // A run whose recorded decision waits for a module reserves it: named first, behind its holders (module-locks.mjs); the issue's own waiter is its own row.
+      const conflicts=[...reservedAgainst((locks.reservations??[]).filter((r)=>r.project!==project||r.issueId!==issue.id),locks.held,issue.sizing?.affectedModules??[]),...conflictsWith(locks.held,issue.sizing?.affectedModules??[],{project,issueId:issue.id})]
       if(conflicts.length)moduleConflicts[`${project}/${issue.id}`]=conflicts
      }
      for(const wait of await readWaits(locks.pool))if(wait.project===project&&wait.issueId)moduleWaits[`${project}/${wait.issueId}`]=wait
+     // A waiter's reservation: since when it waits and for which decision, or, interrupted by a shutdown, until the next start carries it on.
+     for(const r of locks.reservations??[])if(r.project===project&&r.issueId){const k=`${project}/${r.issueId}`;moduleWaits[k]={...(moduleWaits[k]??{runId:r.runId,wants:r.modules,holders:r.behind.flatMap((b)=>b.runIds.map((runId)=>({module:b.module,runId})))}),since:r.since,reserved:r.modules,decision:r.decision,state:r.state}}
     }
     return {holders,reportLevels,moduleConflicts,moduleWaits}
    },
