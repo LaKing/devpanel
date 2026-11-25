@@ -1,9 +1,10 @@
 # The consult panel (docs/consult.md), "Consultation" on the Playbooks page: up to
 # three senior seats (consultant-1..3, each optional, at least one occupied) that
 # read everything read-only and answer a question before it reaches a person. Not
-# seats of any run. What every occupied seat agrees on is the decision; with one
-# seat, that seat's answer. A file of the same name under host-config/consult/
-# replaces this one (the Playbooks page writes it).
+# seats of any run. What the seats asked agree on is the decision; with one seat,
+# that seat's answer. Of three, the third is asked only when the first two differ,
+# and after the last round the majority decides. A file of the same name under
+# host-config/consult/ replaces this one (the Playbooks page writes it).
 enabled: true
 seats:
   consultant-1:
@@ -12,7 +13,7 @@ seats:
   consultant-2:
     model: gpt-6.2-astra
     effort: medium
-maxRounds: 2            # a second round shows each seat the others' opinions, once
+maxRounds: 2            # a second round shows each seat the others' opinions, once; after the last one the majority decides
 turnTimeoutMinutes: 20
 maxTurnCostUsd: 5       # reserved on the spending ledger per seat turn
 maxPerRun: 6            # consults one run may ask; past it a question goes to a person as before

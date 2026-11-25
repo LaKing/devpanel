@@ -124,7 +124,7 @@ export function createOwnerQuestionConsult ({ consult, answer, getIssue, emit = 
     const answered = await answer({
       project, issueId, runId, actor,
       answers: Object.fromEntries(asked.questions.map((q) => [q.id, results[q.id].answerText])),
-      note: `Every occupied seat of the consult panel chose each of these answers independently, before the owner was asked (consults ${asked.questions.map((q) => results[q.id].id).join(', ')}, under runs/${runId}/consults/). The owner may overrule them with a note on the issue.`
+      note: `The consult panel decided each of these answers (the seats asked agreeing, or the majority after its last round), before the owner was asked (consults ${asked.questions.map((q) => results[q.id].id).join(', ')}, under runs/${runId}/consults/). The owner may overrule them with a note on the issue.`
     })
     return { outcome: 'resolved', results, answered }
   }

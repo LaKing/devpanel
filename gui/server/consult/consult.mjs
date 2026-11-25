@@ -456,24 +456,35 @@ export function createConsult ({
         return finish({ outcome: 'escalated', reason: 'reserved to a person', brief: briefFor([turn], 'the decision is reserved to a person') })
       }
 
+      // Three occupied seats: the third is the tie-breaker. Two that agree are already the majority, so it is asked
+      // only once the first two differ, and then blind, in the same round, like the others were.
+      let asked = needed.length === 3 ? needed.slice(0, 2) : needed
       let previous = null
       for (let round = 1; round <= panel.maxRounds; round++) {
         await ensureRound(dir, round)
-        const current = await Promise.all(needed.map((seat) => {
+        // A second round shows a seat the others' opinions: a single seat has none to be shown.
+        const last = round === panel.maxRounds || needed.length === 1
+        const ask = (seats) => Promise.all(seats.map((seat) => {
           const mine = previous?.find((t) => t.seat === seat.seat)
           const others = previous?.filter((t) => t.seat !== seat.seat) ?? []
-          const prompt = round === 1 ? decidePrompt({ ...promptArgs, options, others: needed.length - 1 }) : reconcilePrompt({ options, others, language: language() })
+          const prompt = mine ? reconcilePrompt({ options, others, language: language(), last, seats: needed.length }) : decidePrompt({ ...promptArgs, options, others: seats === asked ? asked.length - 1 : needed.length - 1 })
           return seatTurn({ ...common, seat, round, prompt, session: mine?.session ?? null, options, brief: false })
         }))
+        let current = await ask(asked)
         turns.push(...current)
         if (signal?.aborted) throw Object.assign(new Error('the consult was cancelled'), { name: 'AbortError' })
-        const verdict = judge(options, current)
-        if (verdict.outcome === 'resolved') return finish({ outcome: 'resolved', choice: verdict.choice, answer: verdict.answer, conditions: verdict.conditions, answerText: answerText(verdict) })
-        if (verdict.outcome === 'unavailable') return unavailable(`${verdict.why}: ${current.filter((t) => !t.opinion).map((t) => `${t.seat}: ${t.error?.message}`).join('; ')}`)
-        // A second round shows a seat the others' opinions: a single seat has none to be shown.
-        if (verdict.outcome === 'escalated' || round === panel.maxRounds || needed.length === 1) {
-          return finish({ outcome: 'escalated', reason: verdict.why, brief: briefFor(current, verdict.why) })
+        let verdict = judge(options, current, { last: last && asked.length === needed.length })
+        if (verdict.outcome === 'undecided' && asked.length < needed.length) {
+          const joined = await ask(needed.slice(asked.length))
+          turns.push(...joined)
+          if (signal?.aborted) throw Object.assign(new Error('the consult was cancelled'), { name: 'AbortError' })
+          current = [...current, ...joined]
+          asked = needed
+          verdict = judge(options, current, { last })
         }
+        if (verdict.outcome === 'resolved') return finish({ outcome: 'resolved', choice: verdict.choice, answer: verdict.answer, conditions: verdict.conditions, answerText: answerText(verdict), ...(verdict.dissent?.length ? { dissent: verdict.dissent } : {}) })
+        if (verdict.outcome === 'unavailable') return unavailable(`${verdict.why}: ${current.filter((t) => !t.opinion).map((t) => `${t.seat}: ${t.error?.message}`).join('; ')}`)
+        if (verdict.outcome === 'escalated' || last) return finish({ outcome: 'escalated', reason: verdict.why, brief: briefFor(current, verdict.why) })
         options = nextOptions(options, current)
         previous = current
       }

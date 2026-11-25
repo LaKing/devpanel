@@ -20,8 +20,8 @@ import { canonical, editedText, refuse, sameSeat } from './seat-edit.mjs'
  */
 
 export const CONSULTATION = 'consultation'
-const DESCRIPTION = 'The consult panel: a question that would go to a person is put to these seats first. Each reads the project read-only and answers alone; what every occupied seat agrees on is the decision.'
-const SEAT_NOTE = { 'consultant-1': 'Answers independently, and writes the question for a person when the decision is reserved to one.', 'consultant-2': 'A second, independent answer.', 'consultant-3': 'A third, independent answer.' }
+const DESCRIPTION = 'The consult panel: a question that would go to a person is put to these seats first. Each reads the project read-only and answers alone. What the seats asked agree on is the decision; if they still differ after the last round, the majority decides.'
+const SEAT_NOTE = { 'consultant-1': 'Answers independently, and writes the question for a person when the decision is reserved to one.', 'consultant-2': 'A second, independent answer.', 'consultant-3': 'The tie-breaker: asked, blind, only when the first two do not agree. With it the majority can decide.' }
 const sha256 = (text) => `sha256:${crypto.createHash('sha256').update(text).digest('hex')}`
 const rest = (text) => { const { seats, ...other } = YAML.parse(text) ?? {}; return canonical(other) }
 

@@ -360,8 +360,9 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   its related projects, the issue's folder and the asking run's worktree read-only, as the adapters' read seat inside a
   proved fence (`roots.mjs`; credentials masked with the fence's `masks`; no fence, no consult), and answers with a
   validated opinion (`consult-opinion.schema.json`: verdict answer | owner, an option key, conditions, evidence,
-  confidence, and always an `ownerBrief`). `rule.mjs` decides mechanically, the same for any number of occupied seats: `resolved` when every seat names the same option
-  with no low confidence (one seat: its own answer), one more round showing each the others' opinions (`other` answers become `alt-<n>` options),
+  confidence, and always an `ownerBrief`). `rule.mjs` decides mechanically, with the same authority for any number of occupied seats: `resolved` when every seat asked names the same option
+  with no low confidence (one seat: its own answer; of three, the third is the tie-breaker, asked blind only when the first two differ), and after the
+  last round by majority (`dissent` names who chose otherwise; an `owner` verdict is never outvoted); one more round showing each the others' opinions (`other` answers become `alt-<n>` options),
   else `escalated` with the brief for a person, or `unavailable`. `consult.mjs` records everything under
   `<caller>/consults/<id>/` before returning (same key, question and mode = one consult, replayed from the record) and
   puts each seat turn on the spending ledger. `engine.consultFirst` asks it before an owner-hold or `owner-gate` /

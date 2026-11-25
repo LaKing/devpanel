@@ -3857,7 +3857,7 @@ export class Engine {
       ...(consult ? { consult } : {}) }
     const opinions = (consult?.opinions ?? []).map((o) => `### ${o.seat} (${o.model}${o.effort ? ` @ ${o.effort}` : ''})${NL}${NL}${o.error ? `No opinion: ${o.error.message}` : `**${o.verdict}** ${o.choice ?? ''}, confidence ${o.confidence}. ${o.answer ?? ''}${NL}${NL}${o.reasoning ?? ''}${NL}${(o.evidence ?? []).map((e) => `- \`${e.location}\`: ${e.observation}`).join(NL)}`}`).join(NL + NL)
     const response = consult
-      ? `# Decision by the consult panel${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}${consult.outcome === 'resolved' ? 'Every occupied seat of the panel chose this answer independently' : 'The panel did not settle it; this step records what each seat said'} (consult ${consult.id}, recorded ${decision.at}).${NL}${NL}${opinions}${NL}`
+      ? `# Decision by the consult panel${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}${consult.outcome !== 'resolved' ? 'The panel did not settle it; this step records what each seat said' : consult.dissent?.length ? `The panel decided this by majority after its last round; ${consult.dissent.map((d) => `${d.seat} chose ${d.choice}`).join(', ')}` : 'Every seat of the panel that was asked chose this answer'} (consult ${consult.id}, recorded ${decision.at}).${NL}${NL}${opinions}${NL}`
       : `# Operator decision${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}Recorded by ${decision.actor} at ${decision.at}.${NL}`
     const created = await this.stepStore.create({ name: 'decision', response, invocationId })
     if (!this.run.steps.some((s) => s.invocationId === invocationId)) {
@@ -3875,7 +3875,7 @@ export class Engine {
    * A question for a person goes to the consult panel first (docs/consult.md,
    * execution-contract.md "The consult panel answers first").
    *
-   * `answered`: every occupied seat of the panel chose the same answer; it is recorded as the
+   * `answered`: the panel decided (the seats asked agreed, or the majority after the last round); it is recorded as the
    * decision and the run goes on. `ask`: a person must be asked, and `ask` now
    * carries what the panel said (`consult`) and the question written for a
    * person (`brief`). `stopped`: the run was stopped while the panel worked.
@@ -3963,7 +3963,7 @@ export class Engine {
     this.run.consults[result.id] = { key: ask.key, category, mode, outcome: result.outcome, reason: result.reason ?? null, rounds: result.rounds, costUsd: result.costUsd ?? null, costUnknown: Boolean(result.costUnknown), durationMs: result.durationMs, at: result.recordedAt ?? this.clock.iso() }
     const seats = result.opinions.filter((o, i, all) => all.findLast((x) => x.seat === o.seat) === o)
     const actor = `consult panel (${seats.map((o) => `${o.model}${o.effort ? `@${o.effort}` : ''}`).join(' + ')})`
-    const consult = { id: result.id, outcome: result.outcome, choice: result.choice ?? null, conditions: result.conditions ?? [], reason: result.reason ?? null, opinions: seats }
+    const consult = { id: result.id, outcome: result.outcome, choice: result.choice ?? null, conditions: result.conditions ?? [], reason: result.reason ?? null, ...(result.dissent?.length ? { dissent: result.dissent } : {}), opinions: seats }
     const invocationId = `decision-consult-${result.id}`
     if (result.outcome === 'resolved') {
       const { decision, created } = await this.recordDecision(ask, { answer: result.answerText, actor, consult, invocationId, waitedMs: 0 })

@@ -37,12 +37,36 @@ export function nextOptions (options, opinions) {
  * What one round of opinions settles. The rule is the same however many seats are occupied: every occupied seat
  * names the same option and none with low confidence. With one seat that is the seat's own answer.
  *
+ * After the last round (`last`) seats that still differ are settled by the majority: an option more than half of the
+ * seats asked chose with confidence is the decision, and who dissented is named (`dissent`). Two against one decides;
+ * one against one, or three different answers, does not.
+ * Decision: a seat that says the question is a person's (`owner`: production, irreversible loss, spending, a written
+ * rule, product intent) is never outvoted. Those are the decisions the owner reserved; a vote among models must not
+ * take one of them because two of three thought it was not reserved.
+ *
  * @param options   the options that round offered ([{key, label}])
  * @param opinions  [{ seat, opinion }] — a validated opinion per seat, or null for a seat that gave none
- * @returns { outcome: 'resolved', choice, answer, conditions } | { outcome: 'undecided', why }
+ * @param last      true when no further round follows: the majority may decide
+ * @returns { outcome: 'resolved', choice, answer, conditions, dissent? } | { outcome: 'undecided', why }
  *        | { outcome: 'escalated', why } | { outcome: 'unavailable', why }
  */
-export function judge (options, opinions) {
+export function judge (options, opinions, { last = false } = {}) {
+  const agreed = unanimous(options, opinions)
+  if (agreed.outcome !== 'undecided' || !last) return agreed
+  // More than half of the seats asked, each naming the same offered option with confidence. An answer of a seat's own
+  // (`other`) is nobody else's, so it never forms a majority.
+  const votes = new Map()
+  for (const o of opinions) if (o.opinion.confidence !== 'low' && o.opinion.choice !== OTHER) votes.set(o.opinion.choice, [...(votes.get(o.opinion.choice) ?? []), o])
+  const [choice, voters] = [...votes].find(([, seats]) => seats.length * 2 > opinions.length) ?? []
+  const option = options.find((o) => o.key === choice)
+  if (!option) return agreed
+  const conditions = [...new Set([...(option.conditions ?? []), ...voters.flatMap((o) => o.opinion.conditions ?? [])])]
+  const dissent = opinions.filter((o) => !voters.includes(o)).map((o) => ({ seat: o.seat, choice: o.opinion.choice, confidence: o.opinion.confidence }))
+  return { outcome: 'resolved', choice, answer: option.label, conditions, dissent }
+}
+
+/** Every seat on one option: resolved, or why not. */
+function unanimous (options, opinions) {
   const missing = opinions.filter((o) => !o.opinion)
   if (missing.length) return { outcome: 'unavailable', why: `no usable opinion from ${missing.map((o) => o.seat).join(', ')}` }
   const owner = opinions.filter((o) => o.opinion.verdict === 'owner')
@@ -63,7 +87,7 @@ export function judge (options, opinions) {
   return { outcome: 'resolved', choice, answer: option.label, conditions }
 }
 
-/** The answer as later turns read it: the agreed text, then the conditions both seats attached. */
+/** The answer as later turns read it: the agreed text, then the conditions the agreeing seats attached. */
 export function answerText ({ answer, conditions = [] }) {
   return conditions.length ? `${answer}\n\nConditions:\n${conditions.map((c) => `- ${c}`).join('\n')}` : answer
 }

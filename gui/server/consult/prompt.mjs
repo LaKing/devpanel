@@ -95,7 +95,7 @@ export function decidePrompt ({ request, options, roots, scratchDir, language, o
 }
 
 /** The second round: the same seat, shown the other's opinion. */
-export function reconcilePrompt ({ options, others, language }) {
+export function reconcilePrompt ({ options, others, language, last = false, seats = others.length + 1 }) {
   const shown = (o) => JSON.stringify({ verdict: o.verdict, choice: o.choice, answer: o.answer, conditions: o.conditions ?? [], reasoning: o.reasoning, evidence: o.evidence ?? [], confidence: o.confidence }, null, 2)
   const one = others.length === 1
   return [
@@ -105,6 +105,7 @@ export function reconcilePrompt ({ options, others, language }) {
     one ? 'Check its evidence where it differs from yours, then give your final opinion in the same JSON form. Change your answer only if its evidence convinces you; agreeing to end the disagreement helps nobody.'
       : 'Check their evidence where it differs from yours, then give your final opinion in the same JSON form. Change your answer only if evidence convinces you; agreeing to end the disagreement helps nobody.',
     'An answer any of you gave as "other" is now an option of its own (alt-1, alt-2, ...): to keep or to adopt it, choose its key.',
+    ...(last && seats > 2 ? ['This is the last round. If the panel still differs after it, the option most of you chose is the decision; a verdict "owner" is never outvoted.'] : []),
     '',
     '## Options now',
     ...options.map((x) => `- \`${x.key}\`: ${x.label}${x.conditions?.length ? ` (conditions: ${x.conditions.join('; ')})` : ''}`),

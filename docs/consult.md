@@ -5,9 +5,10 @@ occupied. They are not seats of any run: they read the project read-only, each a
 do not agree, or the decision is a person's by its nature, is a person asked, in plain words the panel wrote. A weaker model never has to put a demanding technical
 question to a person, and a person is not asked what the code already answers.
 
-It is advice with one piece of authority: when every occupied seat chooses the same answer, that answer is recorded as
-the decision the question asked for. The number of occupied seats does not change that (the owner's decision,
-2026-11-25): with one seat, that seat's answer is the decision. It grants no capability. It cannot approve a revision, accept a check result,
+It is advice with one piece of authority: what the panel decides is recorded as the decision the question asked for.
+It decides when the seats asked choose the same answer, or, when they still differ after the last round, by majority.
+The number of occupied seats does not change that authority (the owner's decisions, 2026-11-25): with one seat, that
+seat's answer is the decision; with three, the panel is meant to settle the question without a person. It grants no capability. It cannot approve a revision, accept a check result,
 deliver, deploy or archive; whoever acts on its answer does so within their own limits.
 
 ## Who asks
@@ -119,18 +120,28 @@ that breaks the contract gets one repair turn in the same session.
 Agreement is never a model's reading of the texts (`consult/rule.mjs`, pure), and the rule is the same for one, two or
 three occupied seats:
 
-- **resolved**: every occupied seat says `answer`, they name the same option other than `other`, and no confidence is
-  `low`. The answer is that option's text with the conditions of every seat. A single seat has nobody to agree with: an
+- **resolved**: every seat asked says `answer`, they name the same option other than `other`, and no confidence is
+  `low`. The answer is that option's text with the conditions of those seats. A single seat has nobody to agree with: an
   answer of its own (`other`) is the decision too, named `alt-1`.
-- **escalated**: a seat says `owner`, or the seats still differ after the last round (two against one is a
-  difference), or a single seat answered with low confidence. The result carries the `brief`: the first seat's
-  `ownerBrief` with each seat's position.
+- **resolved by majority**: after the last round, an option more than half of the seats asked chose with confidence is
+  the decision, with the conditions of the seats that chose it; `dissent` on the result names each seat that chose
+  otherwise. Two against one decides. One against one, three different answers, or a vote given with low confidence
+  left over, does not.
+- **escalated**: a seat says `owner`, or the seats still differ after the last round with no majority, or a single
+  seat answered with low confidence. The result carries the `brief`: the first seat's `ownerBrief` with each seat's
+  position. A seat's `owner` verdict is never outvoted: those are the decisions the owner reserved (production,
+  irreversible loss, spending, a written rule, product intent).
 - **unavailable**: a seat gave no usable opinion (failed, timed out, could not read, broke the contract twice), a
   seat's model is unverified or held, the spending policy refused the call, or the host runs no fence.
 
-When the seats differ and a round is left, each seat's own session is resumed and shown every other seat's opinion. An
-answer given as `other` becomes a named option (`alt-1`, `alt-2`, ...) that any seat can then choose. The same rule
-decides. A single seat gets no second round: there is no other opinion to show it.
+With three occupied seats the third is the tie-breaker: the first two are asked, and when they agree that is the
+decision and the third is never asked (two of three are the majority already). When they differ the third is asked in
+the same round, blind, as they were.
+
+When the seats differ and a round is left, each seat's own session is resumed and shown every other seat's opinion (and
+told, in the last round of a panel of three, that the majority decides after it). Two against one is a difference: it
+gets its second round before the majority counts. An answer given as `other` becomes a named option (`alt-1`,
+`alt-2`, ...) that any seat can then choose. A single seat gets no second round: there is no other opinion to show it.
 
 ## Records
 
