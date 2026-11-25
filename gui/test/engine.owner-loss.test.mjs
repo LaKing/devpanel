@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process'
+
 import { startRun, resumeRun, releaseWorkspace } from '../server/runtime/launch.mjs'
 import * as store from '../server/runtime/store.mjs'
 import { supportedActions } from '../server/supervisor.mjs'
@@ -68,6 +70,35 @@ export default async function (t) {
     t.eq('it is recorded once', run.steps.filter((s) => s.stepId === 'implement').length, 1)
     t.eq('and the run completes', run.outcome, 'resolved')
     await releaseWorkspace(engine)
+  }
+
+  t.section('owner lost mid-turn while its process group is still alive: recovery refuses until it is gone')
+  {
+    const f = await engineFixture({ loseMarker: true })
+    const runId = await lostOwner(f, 'afterInvokeBeforePersist', (e) => e.run.steps.length === 2)
+    // A real group of its own, standing in for the lost owner's runtime.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { detached: true, stdio: 'ignore' })
+    const exited = new Promise((resolve) => child.once('exit', resolve))
+    try {
+      const run = await store.readRun(f.issuePath, runId)
+      const role = Object.keys(run.participants).find((r) => run.participants[r].pendingInvocation)
+      t.ok('the lost turn is still pending', role, JSON.stringify(Object.keys(run.participants)))
+      run.participants[role].pendingInvocation.activity = { ...run.participants[role].pendingInvocation.activity, pid: child.pid }
+      await store.writeRun(f.issuePath, runId, run)
+      const engine = await reopen(f, runId)
+      const refused = await engine.recoverOwnerLoss().catch((e) => e)
+      t.eq('a live group of the lost owner refuses recovery', refused?.status, 409)
+      t.ok('and says so', /process group \d+ from the lost owner is still running/.test(refused?.message ?? ''), refused?.message)
+      process.kill(-child.pid, 'SIGKILL')
+      await exited
+      const outcome = await engine.recoverOwnerLoss()
+      t.ok('once the group is gone, recovery resumes it', outcome.resumed, outcome.reason)
+      const done = await engine.drive()
+      t.eq('and the run completes', done.outcome, 'resolved')
+      await releaseWorkspace(engine)
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) { try { process.kill(-child.pid, 'SIGKILL') } catch {} }
+    }
   }
 
   t.section('owner lost while waiting for another run\'s modules: the wait is excused, and a refused recovery leaves Resume')

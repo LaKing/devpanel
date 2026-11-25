@@ -96,6 +96,7 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
   if (!resolution.ok) return { ok: false, errors: resolution.errors }
 
   const r = resolution.resolved
+  if (r.kind === 'engine-only') return previewEngineOnly(r)
   const stepsById = indexSteps(r.phases)
   const ctx = knownContext(issue, project, r.playbook)
 
@@ -284,6 +285,34 @@ export async function previewRun ({ playbookId, configRoot, issue = null, projec
     ...(locks ? { moduleLocks: locks } : {}),
     ...(coverage ? { modulesCoverage: coverage } : {}),
     ...(retained ? { retainedWork: retained } : {}),
+    configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
+    liveEligible: r.liveExecution.eligible
+  }
+}
+
+/**
+ * An engine-only playbook (config/load.mjs resolveEngineOnly): its engine phases and why it cannot start.
+ * No seats, models, prompts or paid preflight to describe, and nothing about a workspace or checks is read.
+ */
+function previewEngineOnly (r) {
+  const prerequisites = r.liveExecution.blockers.map((b) => ({ category: 'blocking', kind: b.kind, detail: `${b.reason}. ${b.remedy ?? ''}`.trim(), file: b.file }))
+  return {
+    ok: true,
+    kind: r.kind,
+    runOptions: r.runOptions,
+    parameterDefinitions: r.parameterDefinitions,
+    playbook: r.playbook,
+    strategy: null,
+    tactic: null,
+    release: null,
+    intent: null,
+    participants: [],
+    phases: r.phases.map((phase, index) => ({ order: index + 1, id: phase.id, title: phase.title ?? null, kind: 'engine', engine: phase.engine, loop: null, steps: [], branches: [] })),
+    prompts: {},
+    checks: r.checks,
+    limits: { budgets: {}, rounds: [] },
+    configHash: r.configHash,
+    prerequisites,
     configurationReady: !prerequisites.some((p) => p.category === 'blocking'),
     liveEligible: r.liveExecution.eligible
   }

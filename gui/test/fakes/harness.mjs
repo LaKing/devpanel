@@ -14,6 +14,15 @@ import path from 'node:path'
 
 const uuid = () => crypto.randomUUID()
 
+/*
+ * The pid the fake runtime reports as its own. It has no process of its own,
+ * and reporting the test runner's pid made owner-loss recovery's group probe
+ * (`alive(-pid)`) find the runner itself "still running" whenever the runner
+ * led its own process group (a shell job, setsid, a detached spawn). Above
+ * Linux's highest pid_max (2^22) and darwin's pid range, so no group has it.
+ */
+export const FAKE_RUNTIME_PID = 2 ** 22 + 1
+
 export class Ledger {
   constructor (file) { this.file = file }
 
@@ -104,7 +113,7 @@ export function createFakeHarness ({
 
     // A real runtime is seen doing things before it answers. One event is
     // enough to prove the engine records what it is told.
-    observe?.onActivity?.({ at: clock ? clock.iso() : new Date().toISOString(), pid: process.pid, kind: 'tool-use', detail: 'fake' })
+    observe?.onActivity?.({ at: clock ? clock.iso() : new Date().toISOString(), pid: FAKE_RUNTIME_PID, kind: 'tool-use', detail: 'fake' })
     observe?.onSpawn?.({ pid: process.pid, command: 'fake-runtime', args: ['--role', role], cwd: meta.cwd ?? process.cwd() })
     observe?.onOutput?.('stdout', JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file: 'source.txt' } }] } }) + String.fromCharCode(10))
     observe?.onOutput?.('stderr', 'fake runtime: working' + String.fromCharCode(10))

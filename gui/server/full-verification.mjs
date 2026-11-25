@@ -25,9 +25,9 @@ import { gitWorktreeProvider } from './runtime/launch.mjs'
 import { gitStoreDir } from './runtime/git-store.mjs'
 import { resolveDriveHost } from './runtime/drive-slots.mjs'
 import { snapshotRepositories } from './runtime/source-lock.mjs'
-import { cycleSnapshotCoverage, deliveriesOf as projectDeliveries, NOT_MATERIALIZED } from './staging-coverage.mjs'
+import { commitDeliveries, COVERAGE_BASELINE, cycleSnapshotCoverage, deliveriesOf as projectDeliveries, NOT_MATERIALIZED } from './staging-coverage.mjs'
 import { deliveryCounts } from './verification-trigger.mjs'
-import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
+import { CHANGE_PATHS, checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, rangeCommits, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, stepCommits, testedViews, treeReader, viewReader } from './runtime/full-verification-snapshot.mjs'
 
 /*
  * The full verification (docs/tactical-playbooks.md "Full verification cycles",
@@ -81,6 +81,11 @@ import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_M
  *      every attempt's commit is compared with the tested bytes (step.afterCommit,
  *      outcome.bump.untestedCommitted; reported, never reverted); any stage red, no action
  *      runs and one issue opens per red project with its failing tests and their excerpts;
+ *      Before the outcome it records what changed since the last verification (cycleChanges, `record.changes`): per
+ *      checkout it snapshotted, the commits since the previous cycle's snapshot, each attributed to a cycle checkpoint,
+ *      delivered runs (by content) or by hand, the deliveries the last verification did not test and the uncommitted
+ *      paths. Information only, bounded by `changesMs` on its own: it never interrupts the cycle or delays the outcome
+ *      further, and nothing it records decides anything. A red issue quotes it after its failing tests;
  *   5. opens admission and resumes the runs it paused;
  *   6. writes issues/.verification/<date>/cycle.json at every step, and tells the
  *      top-level supervisor (`onEnded`) the outcome and where the evidence is. The cycle
@@ -90,6 +95,14 @@ import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_M
 export const HOUR = 60 * 60 * 1000
 /** Failing tests shown in a red issue's body; every one is in its failing-tests attachment. */
 export const SHOWN_FAILURES = 30
+/** How long the change list may take before the cycle goes on to its outcome without it (`changes.error`). */
+export const CHANGES_MS = 120_000
+/** What the change list cannot see, stated on every record that holds one (execution-contract.md "Full verification freeze"). */
+export const CHANGE_LIMITS = [
+  'A commit is read against the previous cycle\'s snapshot HEAD, not its tested tree: hand-made content that was already uncommitted (and so tested) at the previous snapshot reads as by hand once someone commits it.',
+  'A delivery from before the previous snapshot that the previous cycle read as indeterminate (not covered) is not listed as delivered; a commit of the range that carries it still names it.',
+  'A delivery whose bytes are not on record (mode-only change, landed with hand changes, unreadable patch) is never attributed: its paths read as by hand.'
+]
 const EXCERPT_CHARS = 2000
 const STACK_LINES = 20
 const LIVE = ['pending', 'preflighting', 'running', 'stopping']
@@ -375,8 +388,189 @@ export function failureAttachments ({ name, failures, unread = [], flaky = [], m
   return parts.map((blocksOf, i) => ({ name: parts.length === 1 ? 'failing-tests.md' : `failing-tests-${i + 1}.md`, text: head(i + 1, parts.length) + blocksOf.join('\n') }))
 }
 
-/** The report of a red project's issue: the cycle, the run, why it is red, the first failing tests. */
-export function redIssueReport ({ record, entry, name, stage, failures, unread = [], flaky = [], parts = [] }) {
+// ------------------------------------------------- what changed since the last verification
+
+const boundedPaths = (paths, max = CHANGE_PATHS) => ({ paths: paths.slice(0, max), total: paths.length })
+const realOf = (p) => fs.realpath(p).catch(() => p)
+const inLink = (rel, at) => rel === at || rel.startsWith(`${at}/`)
+
+/**
+ * What changed since the last verification in every checkout a cycle snapshotted (`record.changes`; information only):
+ * - the range: from the same checkout's `to` in the newest earlier record that has one (a record from before this, its
+ *   entry's snapshot.base.headCommit), else every commit since COVERAGE_BASELINE; to the HEAD the snapshot was cut from
+ *   (`snapshot-base`), or for a checkout an entry read through a link, its HEAD read right after (`read-after-snapshot`);
+ * - each commit with its author and subject, attributed to a cycle checkpoint (an earlier record's chain step), else to
+ *   the delivered runs it carries (staging-coverage.mjs commitDeliveries, by content), else by hand; `handPaths` are its
+ *   paths no carried delivery explains;
+ * - the deliveries since the last verification that it did not cover, and the paths git status listed after the snapshot.
+ * `records` are the earlier cycle records, newest first. A checkout that cannot be read is `{checkout, error}`.
+ */
+export async function cycleChanges ({ record, records, projectPathOf, listIssues, listHomes = null, git = readGit, clock = systemClock }) {
+  const ownMemo = new Map()
+  const ownCheckout = (project) => {
+    if (!ownMemo.has(project)) ownMemo.set(project, Promise.resolve().then(() => projectPathOf(project)).then((dir) => (dir ? realOf(dir) : null), () => null))
+    return ownMemo.get(project)
+  }
+  const repos = new Map()
+  const repoOf = (checkout) => {
+    if (!repos.has(checkout)) repos.set(checkout, { checkout, project: null, readBy: new Set(), to: null, uncommitted: null, error: null, links: [] })
+    return repos.get(checkout)
+  }
+  for (const entry of record.projects ?? []) {
+    const at = entry.atSnapshot
+    if (!at?.checkouts) continue
+    const own = await ownCheckout(entry.project)
+    for (const c of at.checkouts) {
+      const repo = repoOf(await realOf(c.checkout))
+      repo.readBy.add(entry.project)
+      if (c.error) repo.error ??= c.error
+      else repo.uncommitted ??= c.uncommitted ?? null
+      if (repo.checkout === own) {
+        repo.project = entry.project
+        const head = entry.snapshot?.base?.headCommit ?? null
+        repo.to = head ? { commit: head, at: entry.snapshotAt ?? at.readAt ?? null, basis: 'snapshot-base' } : c.head ? { commit: c.head, at: at.readAt ?? entry.snapshotAt ?? null, basis: 'read-after-snapshot' } : repo.to
+      } else if (!repo.to && c.head) repo.to = { commit: c.head, at: at.readAt ?? entry.snapshotAt ?? null, basis: 'read-after-snapshot' }
+    }
+    for (const l of entry.snapshot?.links ?? []) {
+      if (l.owner) repoOf(await realOf(l.owner)).links.push({ project: entry.project, path: l.path, prefix: l.prefix ?? '' })
+    }
+  }
+  // A checkout no entry owns may still be a project's (a framework read only through its instances' links).
+  for (const repo of repos.values()) {
+    if (repo.project) continue
+    for (const e of record.projects ?? []) if (await ownCheckout(e.project) === repo.checkout) { repo.project = e.project; break }
+  }
+
+  const fromOf = async (checkout) => {
+    for (const r of records) {
+      const covered = new Map((r.projects ?? []).flatMap((e) => (e.coverage?.covered ?? []).map((c) => [c.runId, r.id])))
+      const prior = (r.changes?.repositories ?? []).find((x) => x.checkout === checkout && x.range?.to?.commit)
+      if (prior) return { commit: prior.range.to.commit, at: prior.range.to.at ?? null, cycleId: r.id, basis: 'previous-cycle', covered }
+      for (const e of r.projects ?? []) {
+        if (e.snapshot?.base?.headCommit && await ownCheckout(e.project) === checkout) return { commit: e.snapshot.base.headCommit, at: e.snapshotAt ?? null, cycleId: r.id, basis: 'previous-cycle-snapshot', covered }
+      }
+    }
+    return null
+  }
+  const checkpointsOf = async (checkout) => {
+    const out = new Map()
+    for (const r of records) {
+      for (const step of r.outcome?.bump?.chain ?? []) {
+        if (!step.afterCommit?.commit || await ownCheckout(step.project) !== checkout) continue
+        for (const sha of await stepCommits({ checkout, headBefore: step.headBefore ?? null, commit: step.afterCommit.commit, git })) if (!out.has(sha)) out.set(sha, { cycleId: r.id, project: step.project })
+      }
+    }
+    return out
+  }
+
+  const repositories = []
+  for (const repo of [...repos.values()].sort((a, b) => (a.checkout < b.checkout ? -1 : a.checkout > b.checkout ? 1 : 0))) {
+    const head = { checkout: repo.checkout, project: repo.project, readBy: [...repo.readBy].sort() }
+    try {
+      if (!repo.to?.commit) throw new Error(repo.error ? `the checkout could not be read after the snapshot: ${repo.error}` : 'no HEAD of this checkout was read at the snapshot')
+      const from = await fromOf(repo.checkout)
+      const since = from ? from.at : COVERAGE_BASELINE
+      const range = await rangeCommits({ checkout: repo.checkout, from: from?.commit ?? null, to: repo.to.commit, since: from ? null : COVERAGE_BASELINE, git })
+      const byProject = new Map()
+      for (const l of repo.links) byProject.set(l.project, [...(byProject.get(l.project) ?? []), l])
+      const sources = [
+        ...(repo.project ? [{ project: repo.project, projectPath: repo.checkout, own: true, translate: (rel) => rel }] : []),
+        ...[...byProject].filter(([project]) => project !== repo.project).map(([project, links]) => ({
+          project, projectPath: null, own: false,
+          translate: (rel) => { const l = links.find((x) => inLink(rel, x.path)); return l ? [l.prefix, rel.slice(l.path.length + 1)].filter(Boolean).join('/') : null }
+        }))
+      ].map((s) => ({ ...s, listIssues, ...(listHomes ? { listHomes } : {}) }))
+      const { delivered, perCommit } = await commitDeliveries({ sources, commits: range.commits, readAt: treeReader(repo.checkout, { git }), since, snapshotAt: repo.to.at, verified: from?.covered ?? new Map() })
+      const checkpoints = await checkpointsOf(repo.checkout)
+      const list = range.commits.map((c) => {
+        const carried = perCommit[c.sha] ?? { runs: [], explained: [] }
+        const checkpoint = checkpoints.get(c.sha) ?? null
+        return {
+          sha: c.sha, parent: c.parent, author: c.author, authoredAt: c.authoredAt, subject: c.subject,
+          attribution: checkpoint ? 'cycle-checkpoint' : carried.runs.length ? 'delivered' : 'by-hand',
+          ...(checkpoint ? { checkpoint } : {}),
+          runs: carried.runs,
+          handPaths: boundedPaths(c.paths.filter((p) => !carried.explained.includes(p)))
+        }
+      })
+      repositories.push({
+        ...head,
+        range: { from: from ? { commit: from.commit, at: from.at, cycleId: from.cycleId } : null, to: repo.to, basis: from ? from.basis : 'since-coverage-baseline', since, fromIsAncestor: range.fromIsAncestor },
+        commits: { list, total: range.total },
+        deliveries: delivered,
+        uncommitted: repo.uncommitted ?? { paths: [], total: 0 }
+      })
+    } catch (error) {
+      repositories.push({ ...head, error: error.message })
+    }
+  }
+  return { computedAt: clock.iso(), limits: CHANGE_LIMITS, repositories }
+}
+
+/**
+ * The change list as the API, the page and a red issue show it: `not-computed` (a cycle still running, or a record from
+ * before change lists), `failed` with its error, or per repository its sections in this order: the issues delivered, the
+ * commits by hand (a delivered commit that also changed paths no delivery explains is one too, `mixed`), the uncommitted
+ * paths. A cycle checkpoint is never a commit by hand.
+ */
+export function changeList (record) {
+  const changes = record?.changes
+  if (!changes) return { state: 'not-computed' }
+  if (changes.error) return { state: 'failed', error: changes.error }
+  return {
+    state: 'computed', computedAt: changes.computedAt ?? null, limits: changes.limits ?? [],
+    repositories: (changes.repositories ?? []).map((r) => {
+      const head = { checkout: r.checkout, project: r.project ?? null, readBy: r.readBy ?? [] }
+      if (r.error) return { ...head, error: r.error }
+      const byHand = (r.commits?.list ?? []).filter((c) => c.attribution === 'by-hand' || (c.attribution === 'delivered' && c.handPaths?.total > 0))
+      return {
+        ...head, range: r.range, commits: { shown: r.commits?.list?.length ?? 0, total: r.commits?.total ?? 0 },
+        sections: [
+          { kind: 'delivered', items: r.deliveries ?? [] },
+          { kind: 'by-hand', items: byHand.map((c) => ({ sha: c.sha, author: c.author, authoredAt: c.authoredAt, subject: c.subject, handPaths: c.handPaths, ...(c.attribution === 'delivered' ? { mixed: true, runs: c.runs } : {}) })) },
+          { kind: 'uncommitted', paths: r.uncommitted?.paths ?? [], total: r.uncommitted?.total ?? 0 }
+        ]
+      }
+    })
+  }
+}
+
+const short = (sha) => String(sha ?? '').slice(0, 10)
+
+/**
+ * The change list of the repositories a red project's snapshot read (`projects`: the entry's, a derived entry's sources
+ * too), as its issue quotes it after the failing tests: at most SHOWN_FAILURES issues delivered and commits by hand and
+ * SHOWN_PATHS uncommitted paths per repository, the rest named in the record.
+ */
+export function changesSection (list, { record, projects }) {
+  const where = `\`issues/.verification/${record.date}/cycle.json\` (\`changes\`)`
+  const lines = ['## Changes since the last verification', '']
+  if (list.state === 'not-computed') return [...lines, 'The cycle recorded no change list.', ''].join('\n')
+  if (list.state === 'failed') return [...lines, `The change list could not be computed: ${list.error}`, ''].join('\n')
+  const repos = list.repositories.filter((r) => projects.includes(r.project) || (r.readBy ?? []).some((p) => projects.includes(p)))
+  if (!repos.length) return [...lines, 'No checkout this project\'s snapshot read is in the change list.', ''].join('\n')
+  const more = (shown, total) => (total > shown ? [`- … ${total - shown} more in ${where}`] : [])
+  for (const r of repos) {
+    lines.push(`### \`${r.checkout}\`${r.project ? ` (${r.project})` : ''}`, '')
+    if (r.error) { lines.push(`Not read: ${r.error}`, ''); continue }
+    const range = r.range ?? {}
+    lines.push(range.from ? `Commits \`${short(range.from.commit)}..${short(range.to?.commit)}\`, since cycle ${range.from.cycleId} (${r.commits.total} ${plural(r.commits.total, 'commit', 'commits')}).` : `Commits of \`${short(range.to?.commit)}\` since ${range.since} (no earlier verification of this checkout; ${r.commits.total} ${plural(r.commits.total, 'commit', 'commits')}).`, '')
+    const [delivered, byHand, uncommitted] = r.sections
+    lines.push(`#### Issues delivered (${delivered.items.length})`, '')
+    for (const d of delivered.items.slice(0, SHOWN_FAILURES)) lines.push(`- \`${d.project}/${d.issueId}\`${d.issueName ? ` ${d.issueName}` : ''}: run \`${d.runId}\`, delivered ${d.at ?? 'at an unknown time'}, ${d.commits.length ? `committed in ${d.commits.map((s) => `\`${short(s)}\``).join(', ')}` : 'uncommitted'}`)
+    lines.push(...more(Math.min(SHOWN_FAILURES, delivered.items.length), delivered.items.length), ...(delivered.items.length ? [] : ['None.']), '')
+    lines.push(`#### Commits by hand (${byHand.items.length})`, '')
+    for (const c of byHand.items.slice(0, SHOWN_FAILURES)) lines.push(`- \`${short(c.sha)}\` ${c.author}: ${c.subject}${c.mixed ? ` (also carries ${c.runs.length} delivered ${plural(c.runs.length, 'run', 'runs')}; ${c.handPaths.total} ${plural(c.handPaths.total, 'path', 'paths')} no delivery explains)` : ''}`)
+    lines.push(...more(Math.min(SHOWN_FAILURES, byHand.items.length), byHand.items.length), ...(byHand.items.length ? [] : ['None.']), '')
+    lines.push(`#### Uncommitted changes (${uncommitted.total})`, '')
+    for (const p of uncommitted.paths.slice(0, SHOWN_PATHS)) lines.push(`- \`${p}\``)
+    lines.push(...more(Math.min(SHOWN_PATHS, uncommitted.paths.length), uncommitted.total), ...(uncommitted.total ? [] : ['None.']), '')
+  }
+  return lines.join('\n')
+}
+
+/** The report of a red project's issue: the cycle, the run, why it is red, the first failing tests, then what changed. */
+export function redIssueReport ({ record, entry, name, stage, failures, unread = [], flaky = [], parts = [], changes = null }) {
   const lines = [`# ${name}`, '',
     `The full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
     `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
@@ -410,6 +604,8 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
     if (failures.length > SHOWN_FAILURES) lines.push(`The first ${SHOWN_FAILURES} are shown here; every one is in the attachment named below.`, '')
     for (const f of failures.slice(0, SHOWN_FAILURES)) lines.push(failureBlock(f))
   } else lines.push('## Failing tests', '', entry.derived ? 'The instance entries it is derived from name no failing test; the lines above say why each is not green.' : 'The check names no failing test; the run status above says why the stage is red.', '')
+  // What changed since the last verification, right after the failing tests (changesSection).
+  if (changes) lines.push(changes)
   if (unread.length) lines.push('## Reports that could not be read', '', ...unread.map((u) => `- \`${u.command}\`: ${u.reason}`), '')
   if (flaky.length) lines.push(flakySection(flaky))
   if (parts.length) lines.push(`All ${failures.length} failing ${plural(failures.length, 'test', 'tests')} with ${plural(failures.length, 'its excerpt', 'their excerpts')}: ${parts.map((p) => `\`${p.name}\``).join(', ')} on the report step (000).`, '')
@@ -520,7 +716,10 @@ export function createFullVerification ({
   // Note 001: whatever the frozen cycle waits for is bounded (fullVerification.maxWaitMinutes, default 240); at the bound
   // the cycle ends interrupted, not run, and admission opens. `graceMs`: how long the stops it asks for are waited for.
   maxWaitMs = null,
-  graceMs = 60_000
+  graceMs = 60_000,
+  // The change list (cycleChanges): what a cycle records of what changed since the last verification, and how long it may take.
+  changesOf = null,
+  changesMs = CHANGES_MS
 } = {}) {
   const infrastructureOf = injectedInfrastructureOf ?? ((project) => projectInfrastructure(project, { root: configRoot }))
   const projectsConfig = injectedProjectsConfig ?? (async () => (await loadConfig({ root: configRoot })).projects)
@@ -1015,6 +1214,8 @@ export function createFullVerification ({
       // the bump commits. It never throws: admission always reopens after it.
       // Bounded like every other frozen await (the checkpoint chain, its after-commit comparisons, the record writes):
       // at the bound the cycle settles as interrupted and admission opens, whatever the outcome still does.
+      // What changed since the last verification: information only, on a bound of its own (never the cycle's).
+      if (!record.interruption) await recordChanges(record)
       if (!record.interruption) await bounded(record, 'outcome', outcome(record)).catch((error) => { if (!(error instanceof CycleInterrupted)) record.error ??= `outcome: ${error.message}` })
       if (record.interruption) await settleInterruption(record)
       seal(record)
@@ -1140,6 +1341,39 @@ export function createFullVerification ({
     entry.snapshotDuringEdits = entry.snapshotMotion.moving
   }
 
+  /**
+   * The reading just after the snapshot as the change list needs it (cycleChanges): per checkout its HEAD then and the
+   * paths git status listed (uncommitted). Nothing else reads it.
+   */
+  async function noteSnapshotState (entry, after) {
+    if (!after?.checkouts || after.error) { entry.atSnapshot = { error: after?.error ?? 'no reading after the snapshot' }; return }
+    const checkouts = []
+    for (const c of after.checkouts) {
+      if (c.error) { checkouts.push({ checkout: c.checkout, error: c.error }); continue }
+      const paths = Object.keys(c.paths ?? {}).sort()
+      checkouts.push({ checkout: c.checkout, head: await Promise.resolve().then(() => headOf(c.checkout)).catch(() => null), uncommitted: boundedPaths(paths) })
+    }
+    entry.atSnapshot = { readAt: typeof after.at === 'number' ? new Date(after.at).toISOString() : clock.iso(), checkouts }
+  }
+
+  /**
+   * The change list (cycleChanges) on its own bound, `changesMs` on the cycle's clock: whatever happens it never
+   * interrupts the cycle. A throw or the bound records `changes.error`; a computation left behind cannot write the record.
+   */
+  async function recordChanges (record) {
+    let disarm = null
+    const timedOut = new Promise((resolve) => { disarm = clock.after(changesMs, () => resolve(TIMED_OUT)) })
+    try {
+      const compute = changesOf ?? (async (r) => cycleChanges({ record: r, records: (await cycleRecords(verificationDir)).filter((x) => x.id !== r.id), projectPathOf, listIssues: (p, o) => issues.listIssues(p, o), listHomes: issues.listRunHomes ? (p) => issues.listRunHomes(p) : null, clock }))
+      const result = await Promise.race([Promise.resolve().then(() => compute(record)), timedOut])
+      record.changes = result === TIMED_OUT ? { error: `not computed within ${Math.round(changesMs / 1000)} s; the cycle went on without it` } : result
+    } catch (error) {
+      record.changes = { error: error.message }
+    } finally {
+      disarm?.()
+    }
+  }
+
   /** An entry's snapshot as the record keeps it, with where it lives so a later comparison needs nothing from memory. */
   const snapshotOf = async ({ workspace, policy, projectDir }) => ({
     baseCommit: workspace.baseCommit ?? null, base: workspace.base ?? null,
@@ -1185,6 +1419,7 @@ export function createFullVerification ({
       if (record.interruption || signalOf(record)?.aborted) throw new CycleInterrupted('interrupted while provisioning')
       const after = await readMotion({ projectDir, policy, extra: (workspace.symlinks?.owners ?? []).map((o) => o.owner?.path).filter(Boolean) }).catch((error) => ({ error: error.message }))
       noteMotion(entry, before, after)
+      await noteSnapshotState(entry, after)
       Object.assign(entry, { workspace: { path: workspace.path, repository: workspace.repository ?? null }, snapshot: await snapshotOf({ workspace, policy, projectDir }), snapshotAt: clock.iso(), state: 'running' })
       snapshotInputs.set(entry.project, { projectDir, policy, root: home, runId: driveId })
       await write(record)
@@ -1339,6 +1574,7 @@ export function createFullVerification ({
         await wait(pollMs)
       }
       noteMotion(entry, before, after ?? { error: 'the run recorded no workspace, so there is no reading after its snapshot' }, { basis: 'around-run-provisioning' })
+      await noteSnapshotState(entry, after ?? { error: before.error ?? 'the run recorded no workspace, so there is no reading after its snapshot' })
       if (run.workspace?.baseCommit && projectDir) {
         entry.snapshot = await snapshotOf({ workspace: run.workspace, policy, projectDir })
         snapshotInputs.set(entry.project, { projectDir, policy, root: path.join(verificationDir, record.date, record.id, entry.project), runId: driveIdOf(record.id, entry.project) })
@@ -1628,8 +1864,9 @@ export function createFullVerification ({
         item.failingCount = failures.length
         if (flaky.length) item.flaky = flaky.map((f) => `${f.command}: ${f.test}`)
         const parts = failures.length || unread.length || flaky.length ? failureAttachments({ name, failures, unread, flaky, maxBytes: maxAttachmentBytes }) : []
+        const changes = changesSection(changeList(record), { record, projects: [entry.project, ...(entry.derived?.from ?? []).map((f) => f.project)] })
         const issue = await issues.createIssue(entry.project, {
-          input: redIssueReport({ record, entry, name, stage, failures, unread, flaky, parts }),
+          input: redIssueReport({ record, entry, name, stage, failures, unread, flaky, parts, changes }),
           openedBy: { user: 'engine', from: { project: entry.project, runId: entry.runId ?? null, via: 'full-verification', cycle: record.id } }
         })
         item.issueId = issue?.id ?? null
@@ -1782,12 +2019,15 @@ export function createFullVerification ({
     },
     async latest () {
       const s = readSettings()
+      const cycle = running ? current : await latestRecord({ strict: true })
       return {
         schedule: s ? { at: s.at, timeZone: s.timeZone, next: new Date(nextTrigger(s, clock.now())).toISOString() } : null,
         active: Boolean(running),
         frozen: supervisor.frozen?.() ?? null,
         deliveries: lastDeliveryCheck,
-        cycle: running ? current : await latestRecord({ strict: true })
+        cycle,
+        // What changed since the last verification, per repository: issues delivered, commits by hand, uncommitted (changeList).
+        changes: changeList(cycle)
       }
     },
     /** For tests: the cycle in progress settles. */

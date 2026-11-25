@@ -103,4 +103,42 @@ export default async function (t) {
       await fs.rm(dir2, { recursive: true, force: true })
     }
   }
+
+  t.section('an engine-only preview is never startable: start_run reserves nothing on the ledger and moves no counter (engine-only AC7)')
+  {
+    const dir3 = await fs.mkdtemp(path.join(os.tmpdir(), 'devpanel-supervisor-limits-'))
+    const seen = []
+    let at = 0, starts = 0, launchStates = 0
+    const steps = [
+      { type: 'preview', project: 'p', issueId: 'a', playbook: 'engine-check' },
+      (e) => ({ type: 'start_run', project: 'p', issueId: 'a', previewId: e.result?.previewId ?? 'none' })
+    ]
+    const invoke = async (a) => {
+      const event = JSON.parse(a.prompt).event
+      seen.push(event)
+      const next = event.type === 'user' || event.result !== undefined || event.error !== undefined ? steps[at++] : null
+      const action = typeof next === 'function' ? next(event) : next ?? null
+      return { session: a.session ?? { id: 's' }, response: JSON.stringify({ message: 'ok', action }), usage: { costUsd: 0 } }
+    }
+    const engineOnly = { ...tools,
+      preview: async () => ({ ok: true, kind: 'engine-only', configHash: 'h', phases: [{ id: 'freeze', kind: 'engine', engine: 'freeze-admission' }], seats: [], participants: [], limits: { budgets: {}, rounds: [] }, configurationReady: false }),
+      launchState: async () => { launchStates++; return { key: 'k' } },
+      start: async () => { starts++; return { runId: 'r1', status: 'running' } } }
+    const agent3 = await createTopSupervisor({ dir: dir3, models, adapter: { invoke }, tools: engineOnly, pollMs: 20 })
+    try {
+      await agent3.start({ model: 'test-model', projects: ['p'], message: 'go', limits: { maxCalls: 50, maxRuns: 5, maxConcurrent: 1, maxStartsPerIssue: 2 } })
+      await wait(() => at >= steps.length && seen.filter((e) => e.type === 'tool-result').length >= steps.length && agent3.get().status === 'active')
+      const results = seen.filter((e) => e.type === 'tool-result')
+      t.eq('the preview carries no previewId and says it is not startable', [results[0]?.result?.previewId, results[0]?.result?.startable], [undefined, false])
+      t.ok('start_run is refused for want of a matching preview', /A matching preview is required/.test(JSON.stringify(results[1] ?? {})), JSON.stringify(results[1]))
+      t.eq('neither the launch condition nor the start was reached', [launchStates, starts], [0, 0])
+      const state = agent3.get()
+      t.eq('no start counted, no launch recorded', [state.starts, state.startsByIssue?.['p/a'] ?? 0, state.launches?.length ?? 0], [0, 0, 0])
+      const ledger = (await fs.readFile(path.join(dir3, 'ledger.jsonl'), 'utf8').catch(() => '')).split('\n').filter((l) => l.includes('run-start'))
+      t.eq('the ledger holds no run-start line', ledger, [])
+      await agent3.stop()
+    } finally {
+      await fs.rm(dir3, { recursive: true, force: true })
+    }
+  }
 }

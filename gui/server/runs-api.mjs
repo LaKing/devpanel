@@ -397,9 +397,11 @@ export async function listPlaybooks ({ root, includeDeprecated = false } = {}) {
           id,
           title: resolution.resolved.playbook.title,
           description: resolution.resolved.playbook.description,
-          strategy: resolution.resolved.strategy.id,
+          kind: resolution.resolved.kind ?? 'seats',
+          strategy: resolution.resolved.strategy?.id ?? null,
           intent: resolution.resolved.intent?.id ?? null,
           intents: resolution.resolved.parameterDefinitions.intents,
+          ...(resolution.resolved.kind === 'engine-only' ? { phases: resolution.resolved.phases } : {}),
           participants: Object.fromEntries(Object.entries(resolution.resolved.participants)
             .map(([role, p]) => [role, { model: p.model.id, harness: p.model.harness, effort: p.effort }])),
           liveEligible: resolution.resolved.liveExecution.eligible,

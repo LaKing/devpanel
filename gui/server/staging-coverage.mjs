@@ -444,6 +444,62 @@ export async function cycleSnapshotCoverage ({ snapshotPath, snapshotAt, candida
   return record
 }
 
+/**
+ * Which deliveries each commit of a checkout's range carries, read by content as a release's snapshot is read: for the
+ * full verification's change list (full-verification.mjs cycleChanges), information only, nothing written.
+ *
+ * `sources`: the projects whose deliveries can reach this checkout, each with `translate(rel)` from its own paths to the
+ * checkout's (null: not in it) and `own` when it is the checkout's own project. `commits`: oldest first, `{sha, parent,
+ * paths}`; `readAt(sha)(rel)` what a commit holds at a checkout path. A delivery is carried by a commit when one of its
+ * paths that commit changed is new there (neither its bytes nor a later delivery's built on them stood at the parent) and
+ * none of its paths that commit changed differs from its bytes or a later delivery's built on them. Unknown content is
+ * never carried. `verified` (runId -> cycle id) are the deliveries the previous verification covered.
+ *
+ * `delivered`: the deliveries since the last verification, delivered after `since` and not after `snapshotAt`, that
+ * `verified` does not name: the own project's, and another source's when a commit of the range carries it. `perCommit`:
+ * per sha, the runs it carries (`verifiedBy` on one the previous verification covered) and the checkout paths they explain.
+ */
+export async function commitDeliveries ({ sources, commits, readAt, since = null, snapshotAt = null, verified = new Map() }) {
+  const candidates = []
+  for (const source of sources) {
+    const state = await projectState(source)
+    for (const d of state.deliveries) {
+      if (snapshotAt && d.at && !before(d, snapshotAt)) continue
+      candidates.push({ d, state, source })
+    }
+  }
+  const translated = (source, read) => async (rel) => { const t = source.translate(rel); return t === null ? null : read(t) }
+  const perCommit = {}
+  const carriedBy = new Map()
+  for (const c of commits) {
+    const changed = new Set(c.paths)
+    const runs = []
+    const explained = new Set()
+    for (const { d, state, source } of candidates) {
+      if (!(await contentOf(d)).entries) continue
+      const mine = d.content.entries.filter((e) => { const t = source.translate(e.path); return t !== null && changed.has(t) })
+      if (!mine.length) continue
+      const { paths } = await compare(d, state.deliveries, translated(source, readAt(c.sha)), null)
+      if (paths.some((p) => mine.some((e) => e.path === p))) continue
+      const atParent = c.parent ? translated(source, readAt(c.parent)) : async () => null
+      let brought = false
+      for (const e of mine) {
+        const found = await atParent(e.path)
+        if (!(await chainPosts(d, e, state.deliveries, null)).some((post) => holds(post, found))) { brought = true; break }
+      }
+      if (!brought) continue
+      runs.push({ project: source.project, issueId: d.issueId, runId: d.runId, ...(verified.has(d.runId) ? { verifiedBy: verified.get(d.runId) } : {}) })
+      for (const e of mine) explained.add(source.translate(e.path))
+      carriedBy.set(d.runId, [...(carriedBy.get(d.runId) ?? []), c.sha])
+    }
+    perCommit[c.sha] = { runs, explained: [...explained] }
+  }
+  const after = (d) => !since || (Boolean(d.at) && Date.parse(d.at) > Date.parse(since))
+  const delivered = candidates.filter(({ d, source }) => after(d) && !verified.has(d.runId) && (source.own || carriedBy.has(d.runId)))
+    .map(({ d, source }) => ({ project: source.project, issueId: d.issueId, issueName: d.issue?.name ?? null, runId: d.runId, at: d.at ?? null, kind: d.kind, action: d.action, commits: carriedBy.get(d.runId) ?? [] }))
+  return { delivered, perCommit }
+}
+
 /** Whether the checkout holds a run's bytes now: information, or the live list's test for a hand change. */
 async function checkoutHolds (d, deliveries, read) {
   if (!d.content.entries || !read) return { reading: 'unknown', paths: [] }

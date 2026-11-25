@@ -56,6 +56,10 @@ const open = computed({
 })
 
 const selected = computed(() => playbooks.value.find((p) => p.id === chosen.value) ?? null)
+// An engine-only playbook (server/config/load.mjs resolveEngineOnly): no seats, models or limits to choose,
+// its engine phases instead; its start is refused, so the preview's blocker keeps Start disabled.
+const engineOnly = computed(() => selected.value?.kind === 'engine-only' || previewData.value?.kind === 'engine-only')
+const pickSub = (p) => !p?.ok ? 'does not resolve' : p.kind === 'engine-only' ? `${p.title || p.id} · engine-only, no seats` : (p.title || p.strategy)
 
 /**
  * The preview on screen has to be the preview of the thing about to start.
@@ -404,7 +408,7 @@ async function start (override = false) {
             >
               <span class="pick__body">
                 <span class="pick__id">{{ p.id }}</span>
-                <span class="pick__sub">{{ p.ok ? (p.title || p.strategy) : 'does not resolve' }}</span>
+                <span class="pick__sub">{{ pickSub(p) }}</span>
               </span>
               <v-icon icon="$chevronRight" size="16" class="pick__go" />
             </button>
@@ -417,7 +421,7 @@ async function start (override = false) {
           <div class="chosen">
             <span class="chosen__body">
               <span class="chosen__id">{{ chosen }}</span>
-              <span class="chosen__sub">{{ selected?.ok ? (selected.title || selected.strategy) : 'does not resolve' }}</span>
+              <span class="chosen__sub">{{ pickSub(selected) }}</span>
             </span>
             <v-chip v-if="previewMatches && blockers.length" size="x-small" variant="tonal" color="warning">
               {{ noGreenStaging ? 'no green staging release' : 'cannot start' }}
@@ -436,7 +440,11 @@ async function start (override = false) {
              and what that resolves to — so the whole step is in view at once.
              Narrow screens stack them. -->
         <div class="stage mt-3">
-        <div v-if="parameterData?.parameterDefinitions" class="run-settings stage__settings">
+        <div v-if="engineOnly" class="run-settings stage__settings" data-test="engine-only-settings">
+          <h3 class="section">No seats</h3>
+          <p class="dim">An engine-only playbook: its phases are engine steps. There are no seats, models or limits to choose, and nothing is spent on models.</p>
+        </div>
+        <div v-else-if="parameterData?.parameterDefinitions" class="run-settings stage__settings">
           <fieldset :disabled="starting" class="settings-fields">
             <!-- Who does the work comes first: it is the choice most runs are
                  about. One block per seat, model and effort side by side. -->
@@ -476,7 +484,7 @@ async function start (override = false) {
           <p v-if="!previewMatches && !previewing" class="muted">These settings are previewed before Start is enabled.</p>
         </div>
 
-        <div v-if="parameterData?.parameterDefinitions" class="run-settings stage__limits">
+        <div v-if="parameterData?.parameterDefinitions && !engineOnly" class="run-settings stage__limits">
           <label v-if="parameterData.parameterDefinitions.delivery?.length && !inPlace" class="setting setting--wide">
             <span>Delivery</span>
             <select aria-label="Delivery" :value="runOptions.delivery ?? parameterData.delivery.action" @change="runOptions = { ...runOptions, delivery: $event.target.value }">
@@ -593,6 +601,15 @@ async function start (override = false) {
         <div v-if="previewing" class="muted">Resolving…</div>
 
         <template v-else-if="previewMatches">
+          <template v-if="engineOnly">
+          <h3 class="section">Engine phases</h3>
+          <div v-for="ph in previewData.phases" :key="ph.id" class="row" data-test="engine-phase">
+            <span class="row__role">{{ ph.id }}</span>
+            <span>{{ ph.engine }}</span>
+            <span v-if="ph.title" class="dim">{{ ph.title }}</span>
+          </div>
+          </template>
+          <template v-else>
           <h3 class="section">Participants</h3>
           <div v-for="p in previewData.participants" :key="p.role" class="row">
             <span class="row__role">{{ p.role }}</span>
@@ -674,6 +691,7 @@ async function start (override = false) {
             </div>
           </template>
           <p class="dim mt-1">requires {{ previewData.completion.requires.join(', ') }}</p>
+          </template>
 
           <v-alert v-if="blockers.length" type="error" variant="tonal" density="compact" class="mt-4" title="Cannot start">
             <p v-for="pre in blockers" :key="pre.kind + pre.detail" class="readiness-note">{{ pre.detail }}</p>

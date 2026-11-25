@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
-import { createFakeHarness } from './harness.mjs'
+import { createFakeHarness, FAKE_RUNTIME_PID } from './harness.mjs'
 import { scriptFor } from './fixture.mjs'
 
 /*
@@ -109,7 +109,7 @@ export async function reconcile (invocationId) {
 export async function invoke (args) {
   const { cfg, harness } = await build()
   if (cfg.failInvoke) throw new Error(cfg.failInvoke)
-  args.observe?.onActivity?.({ at: new Date().toISOString(), pid: process.pid, kind: 'tool-use', detail: 'fake' })
+  args.observe?.onActivity?.({ at: new Date().toISOString(), pid: FAKE_RUNTIME_PID, kind: 'tool-use', detail: 'fake' })
   args.observe?.onSpawn?.({ pid: process.pid, command: 'fake-runtime', args: ['--role', args.meta?.role ?? 'unknown'], cwd: args.cwd ?? process.cwd() })
   args.observe?.onOutput?.('stdout', JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Read', input: { file: 'source.txt' } }] } }) + String.fromCharCode(10))
 

@@ -130,13 +130,18 @@ onMounted(load)
         </div>
       </div>
       <v-alert v-if="p.errors.length" :type="p.resolves ? 'info' : 'error'" variant="tonal" density="compact" class="mx-4 mb-2">
-        {{ p.kind === 'consultation' ? (p.resolves ? 'The panel' : 'As it stands the panel cannot be asked') : p.resolves ? 'As it stands a run of this playbook needs more than its seats' : 'This playbook does not resolve' }}: {{ p.errors.join(' · ') }}
+        {{ p.kind === 'consultation' ? (p.resolves ? 'The panel' : 'As it stands the panel cannot be asked') : p.kind === 'engine-only' && p.resolves ? 'It cannot be started yet' : p.resolves ? 'As it stands a run of this playbook needs more than its seats' : 'This playbook does not resolve' }}: {{ p.errors.join(' · ') }}
       </v-alert>
       <v-alert v-if="refusal?.id === p.id" type="error" variant="tonal" density="compact" class="mx-4 mb-2">
         Not saved: {{ refusal.message }}<span v-if="refusal.detail.length">: {{ refusal.detail.join(' · ') }}</span>
       </v-alert>
 
-      <v-table density="comfortable" class="playbooks__table">
+      <!-- An engine-only playbook (server/config/load.mjs) has no seats to edit: its engine phases, read-only. -->
+      <div v-if="p.kind === 'engine-only'" class="mx-4 mb-2" data-test="engine-only-phases">
+        <p class="playbooks__muted">Engine-only: no seats and no models. Its phases are engine steps:</p>
+        <p v-for="ph in p.phases" :key="ph.id">{{ ph.id }} <span class="playbooks__muted">· engine {{ ph.engine }}{{ ph.title ? ` · ${ph.title}` : '' }}</span></p>
+      </div>
+      <v-table v-else density="comfortable" class="playbooks__table">
         <thead>
           <tr><th>Seat</th><th>Model</th><th>Effort</th></tr>
         </thead>
@@ -162,8 +167,10 @@ onMounted(load)
 
       <div class="playbooks__actions">
         <span class="playbooks__muted playbooks__hash" :title="p.configHash ?? ''">configuration {{ p.configHash ? p.configHash.replace('sha256:', '').slice(0, 12) : 'unresolved' }}</span>
+        <template v-if="p.kind !== 'engine-only'">
         <v-btn size="small" variant="text" :disabled="!dirty(p) || busy === p.id" @click="reset(p)">Discard changes</v-btn>
         <v-btn size="small" color="primary" variant="flat" :disabled="!dirty(p)" :loading="busy === p.id" @click="save(p)">Save seats</v-btn>
+        </template>
       </div>
     </v-card>
     <p v-if="report && !report.playbooks.length" class="playbooks__muted">No playbooks in the catalogue.</p>

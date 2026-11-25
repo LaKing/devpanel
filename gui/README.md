@@ -836,10 +836,17 @@ token; the service worker has no fetch handler. State is `issues/.notifications/
 
 ## Full verification
 
-`GET /api/verification/latest` returns `{schedule, active, frozen, deliveries, cycle}`:
+`GET /api/verification/latest` returns `{schedule, active, frozen, deliveries, cycle, changes}`:
 `cycle` is the cycle in progress, else the latest `issues/.verification/<date>/cycle.json`,
 as written (`server/full-verification.mjs`; docs/execution-contract.md "Full verification
-freeze"). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
+freeze"). `changes` is what changed since the last verification, read from the cycle's
+`record.changes` (`changeList`): `{state: 'not-computed'}` (a cycle still running, or a record
+from before change lists), `{state: 'failed', error}`, or `{state: 'computed', computedAt, limits,
+repositories}`, each repository `{checkout, project, readBy, range, commits: {shown, total},
+sections}` (or `{checkout, error}`) with `sections` in this order: `delivered` (the issues
+delivered, each `{project, issueId, issueName, runId, at, commits}`, `commits` empty while
+uncommitted), `by-hand` (commits `{sha, author, authoredAt, subject, handPaths}`, `mixed` with its
+`runs` when it also carries deliveries) and `uncommitted` (`{paths, total}`). `POST /api/verification/start` starts one by hand (409 `FULL_VERIFICATION_RUNNING`
 while one runs). The socket event `verification:changed` names the cycle and its state; the
 top-level supervisor is told `verification-ended` once it ended.
 

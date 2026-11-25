@@ -416,6 +416,26 @@ or functional changes require a separate decision. Plan and candidate audits che
 both simplification and preserved behavior against the exact artifact; missing
 verification is reported honestly, never treated as a passed check.
 
+## Engine-only playbooks
+
+A playbook with `kind: engine-only` has no seats: it binds no strategy and no
+participants, and declares its own `phases`, each an engine step naming the
+operation it performs (`{ id, title?, engine }`, `schemas/playbook.schema.json`).
+Seat keys (`strategy`, `participants`, `budgets`, `workspace`, …) are refused at
+load, and so are run options at resolution. It resolves without the roster or
+any prompt (`config/load.mjs` `resolveEngineOnly`), so `config:check`, `npm run
+preview`, the start dialog and the Playbooks page show its engine phases and no
+seat, model or model cost; the Playbooks page has no seat to edit and the
+seat-edit API refuses one.
+
+The engine does not execute engine steps yet, so such a playbook cannot be
+started: it resolves with one `engine-only-unsupported` blocker. Preflight
+returns before probing any harness, and a start is refused with
+`ENGINE_ONLY_NOT_RUNNABLE` before anything is locked, reserved or probed
+(`supervisor.start`, and again in `reserveRun`). The top-level supervisor's
+preview of one carries no previewId, so `start_run` never reaches the start gate
+or the spending ledger. No engine-only playbook is in the catalogue.
+
 ## Configuring releases
 
 Before mutation, the release operator examines the configured procedure and target read-only. The coordinator must return an explicit release decision, and blocking preparation findings or open questions prevent execution. Operators and verifiers return `releaseAssessment` with a verdict, severity and blocking status per finding, plus observations. Minor nonblocking findings do not cause recovery. Superseded malformed attempts and operator answer steps are not release assessments.

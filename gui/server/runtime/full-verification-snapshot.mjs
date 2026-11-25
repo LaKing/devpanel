@@ -20,7 +20,10 @@ import { GIT_OUTPUT_LIMIT, gitRead } from './working-tree.mjs'
  *   (approach (a)): each side is listed in the repository that holds it and compared by blob
  *   id, so an instance's snapshot can vouch for a framework commit it cannot resolve.
  *
- * Every git command here only reads (rev-parse, ls-tree, cat-file, diff-tree, status).
+ * - rangeCommits / stepCommits / treeReader: the commits since the last verification and what
+ *   each holds, for the cycle's change list (information only, full-verification.mjs cycleChanges).
+ *
+ * Every git command here only reads (rev-parse, ls-tree, cat-file, diff-tree, status, log, rev-list, merge-base).
  * Nothing is reverted, stashed or committed.
  */
 
@@ -353,5 +356,64 @@ export function viewReader (views, { git = readGit } = {}) {
       if (!seen.length) return null
       return seen.every((s) => JSON.stringify(s) === JSON.stringify(seen[0])) ? seen[0] : { other: true }
     }
+  }
+}
+
+// ------------------------------------------------- what changed since the last verification
+
+/** Commits of a range kept in a cycle's change list (full-verification.mjs cycleChanges); every list carries its total. */
+export const CHANGE_COMMITS = 200
+/** Paths kept per list of a cycle's change list (uncommitted paths, a commit's paths no delivery explains). */
+export const CHANGE_PATHS = 200
+
+const US = String.fromCharCode(31)
+
+/**
+ * The commits of a checkout's range, oldest first: `from..to`, or with no `from` every commit of `to` since `since`. At most
+ * `max` (the newest), each with its first parent, author name, author date, subject and the paths it changed against that
+ * parent (`--root` for a root commit); `total` counts the whole range, `fromIsAncestor` whether `from` is one of `to`.
+ */
+export async function rangeCommits ({ checkout, from = null, to, since = null, max = CHANGE_COMMITS, git = readGit }) {
+  const where = ['-C', checkout]
+  const select = [...(!from && since ? [`--since=${since}`] : []), from ? `${from}..${to}` : to]
+  const total = Number((await git([...where, 'rev-list', '--count', ...select])).trim())
+  const listed = (await git([...where, 'log', `--max-count=${max}`, '-z', `--format=%H${US}%P${US}%an${US}%aI${US}%s`, ...select])).split(NUL).filter(Boolean)
+  const commits = []
+  for (const line of listed.reverse()) {
+    const [sha, parents, author, authoredAt, subject] = line.replace(/^\n/, '').split(US)
+    const parent = parents.split(' ').filter(Boolean)[0] ?? null
+    const paths = (await git([...where, 'diff-tree', '-r', '-z', '--no-renames', '--name-only', '--no-commit-id', ...(parent ? [parent, sha] : ['--root', sha])])).split(NUL).filter(Boolean)
+    commits.push({ sha, parent, author, authoredAt, subject, paths })
+  }
+  const fromIsAncestor = from ? await git([...where, 'merge-base', '--is-ancestor', from, to]).then(() => true, () => false) : null
+  return { total, commits, fromIsAncestor }
+}
+
+/** The commits `headBefore..commit` of a checkout (a checkpoint step's), or the commit alone when that cannot be listed. */
+export async function stepCommits ({ checkout, headBefore = null, commit, git = readGit }) {
+  if (!headBefore) return [commit]
+  return (await git(['-C', checkout, 'rev-list', `${headBefore}..${commit}`]).catch(() => `${commit}\n`)).split('\n').filter(Boolean)
+}
+
+/**
+ * What a commit of a checkout holds at a path, as staging-coverage.mjs `holds` reads it ({mode, sha1|sha256}, null when
+ * absent, `{other: true}` for a directory): `treeReader(checkout)(sha)(rel)`, each (commit, path) listed once.
+ */
+export function treeReader (checkout, { git = readGit } = {}) {
+  const memo = new Map()
+  return (sha) => (rel) => {
+    const key = `${sha}${NUL}${rel}`
+    if (!memo.has(key)) {
+      memo.set(key, git(['-C', checkout, 'ls-tree', '-z', '--full-tree', sha, '--', rel]).then((out) => {
+        for (const line of out.split(NUL).filter(Boolean)) {
+          const tab = line.indexOf('\t')
+          if (line.slice(tab + 1) !== rel) continue
+          const [mode, type, oid] = line.slice(0, tab).split(' ')
+          return type === 'tree' ? { other: true } : { mode, [oid.length === 64 ? 'sha256' : 'sha1']: oid }
+        }
+        return null
+      }))
+    }
+    return memo.get(key)
   }
 }

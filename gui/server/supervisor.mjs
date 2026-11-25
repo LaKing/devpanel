@@ -47,7 +47,7 @@ import { readChat, coordinatorRole, instructionRefusal, chatView, recordInstruct
 import { captureIntegrity, integrityChanges, readIntegrity } from './runtime/integrity.mjs'
 import { createAvailabilityStore } from './runtime/failure.mjs'
 import { inspectSourceRepository, repositoryFaultError, usesSourceRepository } from './runtime/source-repository.mjs'
-import { resolvePlaybook, loadConfig } from './config/load.mjs'
+import { resolvePlaybook, loadConfig, engineOnlyRefusal } from './config/load.mjs'
 import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { OVERRIDE_REASON_MAX, PregateHold } from './decisions/pregate.mjs'
 import { inquiryState, inquiryPackable, inquiryClosed } from './inquiry.mjs'
@@ -693,6 +693,10 @@ export function createSupervisor ({
       let stagedRelease = null
       const resolution = await resolveWithRelease(playbookId, { root, runOptions, projectId: project },
         async () => (stagedRelease = await selectStagedRelease({ project, projectPath, listIssues: (p, o) => issues.listIssues(p, o) })))
+      // An engine-only playbook has no seats and its engine steps are not executed yet: refused before
+      // anything is locked, reserved or probed, so no run and no seat step exist (config/load.mjs).
+      const engineOnly = resolution.ok ? engineOnlyRefusal(resolution.resolved) : null
+      if (engineOnly) throw engineOnly
       // The full verification's freeze holds back what can write the checkout, nothing else.
       // Only a writing run the freeze holds whole is refused: a contained one starts, its drives and writes wait.
       // Bound to the cycle that classified it; a cycle that thawed meanwhile refuses nothing, a newer one classifies again.

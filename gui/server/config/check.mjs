@@ -115,6 +115,14 @@ for (const id of ids) {
 
   const p = r.resolved
   const live = p.liveExecution.eligible ? `${c.green}live-eligible${c.off}` : `${c.yellow}preview only${c.off}`
+  if (p.kind === 'engine-only') {
+    // No seats, strategy, workspace or closure policy to show: its phases, and why it cannot start.
+    console.log(`${c.green}✓${c.off} ${c.cyan}${id}${c.off} v${p.playbook.version}  ${c.dim}→ engine-only, ${p.phases.length} engine phase${p.phases.length === 1 ? '' : 's'}, no seats${c.off}  ${live}`)
+    if (target) {
+      for (const phase of p.phases) console.log(`    ${phase.id.padEnd(12)} ${c.dim}engine${c.off} ${phase.engine}${phase.title ? `  ${c.dim}${phase.title}${c.off}` : ''}`)
+      console.log(`    ${c.dim}config${c.off}     ${p.configHash}`)
+    }
+  } else {
   console.log(`${c.green}✓${c.off} ${c.cyan}${id}${c.off} v${p.playbook.version}  ${c.dim}→ ${p.strategy.id} v${p.strategy.version}${c.off}  ${live}`)
   // Which timing the modules tier has, for every playbook it is the check target of.
   if (modulesTiming(p.checks.target)) console.log(`    ${c.dim}modules${c.off}    timing=${modulesTiming(p.checks.target)}`)
@@ -135,7 +143,8 @@ for (const id of ids) {
     console.log(`    ${c.dim}budgets${c.off}    ${Object.entries(p.budgets).map(([k, v]) => `${k}=${v}`).join(' ')}`)
     console.log(`    ${c.dim}config${c.off}     ${p.configHash}`)
   }
-  for (const b of p.liveExecution.blockers) console.log(`    ${c.yellow}!${c.off} ${b.role}: ${b.model ? b.model + ' ' : ''}${b.reason}`)
+  }
+  for (const b of p.liveExecution.blockers) console.log(`    ${c.yellow}!${c.off} ${b.role ? `${b.role}: ` : ''}${b.model ? b.model + ' ' : ''}${b.reason}`)
 
   if (flag('--preflight')) {
     // Diagnostics default to the FREE depth. Reaching further spends money, and a

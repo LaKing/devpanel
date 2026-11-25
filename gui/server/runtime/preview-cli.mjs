@@ -47,6 +47,21 @@ if (!p.ok) {
   process.exit(1)
 }
 
+if (p.kind === 'engine-only') {
+  // No seats, models or model cost: the engine phases, and why a start is refused.
+  console.log(`${c.cyan}${c.bold}${p.playbook.id}${c.off} v${p.playbook.version}  ${c.dim}→ engine-only${c.off}`)
+  console.log(`${c.dim}dry run — nothing is invoked, probed, locked or created${c.off}`)
+  console.log(`${c.dim}config${c.off} ${p.configHash}`)
+  console.log(`${c.dim}no seats and no models: nothing is spent on models${c.off}`)
+  head('Engine phases')
+  for (const phase of p.phases) console.log(`  ${String(phase.order).padStart(2)}. ${c.bold}${phase.id}${c.off}  ${c.dim}engine${c.off} ${phase.engine}${phase.title ? `  ${c.dim}${phase.title}${c.off}` : ''}`)
+  for (const pre of p.prerequisites.filter((x) => x.category === 'blocking')) {
+    head('Cannot start')
+    console.log(`  ${c.yellow}!${c.off} ${pre.detail}`)
+  }
+  process.exit(0)
+}
+
 console.log(`${c.cyan}${c.bold}${p.playbook.id}${c.off} v${p.playbook.version}  ${c.dim}→ ${p.strategy.id} v${p.strategy.version}${c.off}`)
 console.log(`${c.dim}dry run — nothing is invoked, probed, locked or created${c.off}`)
 console.log(`${c.dim}config${c.off} ${p.configHash}`)

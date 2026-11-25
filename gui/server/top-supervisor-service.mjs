@@ -217,6 +217,7 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
     const resolved=await resolveWithRelease(p.playbook,{root:configRoot,runOptions:p.runOptions,projectId:p.project},()=>selectStagedRelease({project:p.project,projectPath:projectPath(p.project),listIssues:(q,o)=>issues.listIssues(q,o)}))
     if(!resolved.ok)return {blockedReason:resolved.errors.map(e=>e.message).join('; ')}
     if(resolved.resolved.configHash!==p.configHash)return {blockedReason:'Configuration changed since preview; preview again before starting'}
+    if(resolved.resolved.kind==='engine-only')return {blockedReason:'engine-only playbooks cannot be started',code:'ENGINE_ONLY_NOT_RUNNABLE'}
     return inspectLaunchState({projectPath:projectPath(p.project),workspace:resolved.resolved.workspace,configHash:p.configHash})
    },
    start:async p=>{

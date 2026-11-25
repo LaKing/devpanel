@@ -39,6 +39,16 @@ const runs = computed(() => (runSet.value.cycleId === (cycle.value?.id ?? null) 
 // Entries the cycle drives itself (instance mode), derives from them (a framework) or holds back for them.
 const driven = computed(() => (cycle.value?.projects ?? []).filter((p) => !p.runId && (p.mode === 'instance' || p.mode === 'derived' || p.state === 'deferred')))
 const minutes = (ms) => typeof ms === 'number' ? `${(ms / 60000).toFixed(1)} min` : null
+/** What changed since the last verification (full-verification.mjs changeList): its sections come in the order shown. */
+const changes = computed(() => state.value?.changes ?? { state: 'not-computed' })
+const SECTION_TITLES = { delivered: 'Issues delivered', 'by-hand': 'Commits by hand', uncommitted: 'Uncommitted changes' }
+const short = (sha) => String(sha ?? '').slice(0, 10)
+function rangeLine (repo) {
+  const r = repo.range ?? {}
+  const n = repo.commits?.total ?? 0
+  const count = `${n} ${n === 1 ? 'commit' : 'commits'}${repo.commits?.shown < n ? `, newest ${repo.commits.shown} listed` : ''}`
+  return r.from ? `${short(r.from.commit)}..${short(r.to?.commit)} since cycle ${r.from.cycleId} · ${count}` : `${short(r.to?.commit)}, since ${r.since} (no earlier verification) · ${count}`
+}
 function entryLine (p) {
   const parts = [p.verdict ?? p.state ?? '—']
   if (p.mode === 'derived') parts.push(`derived from ${(p.derived?.from ?? []).map((f) => f.project).join(', ') || 'its instances'}`)
@@ -155,6 +165,46 @@ function invocationOf (project) {
       </v-card-text>
     </v-card>
 
+    <v-card v-if="cycle" elevation="0" border class="mb-4" data-test="cycle-changes">
+      <v-card-item>
+        <v-card-title>Changes since the last verification</v-card-title>
+        <v-card-subtitle v-if="changes.state === 'computed'">per repository: issues delivered, commits by hand, uncommitted changes</v-card-subtitle>
+      </v-card-item>
+      <v-card-text class="verify__facts">
+        <div v-if="changes.state === 'not-computed'">Not computed yet: the list is computed when the cycle's stages are done.</div>
+        <div v-else-if="changes.state === 'failed'">Not computed: {{ changes.error }}</div>
+        <template v-else>
+          <div v-if="!changes.repositories.length">No repository was read after a snapshot.</div>
+          <div v-for="repo in changes.repositories" :key="repo.checkout" class="verify__repo">
+            <div><strong>{{ repo.checkout }}</strong><template v-if="repo.project"> · {{ repo.project }}</template></div>
+            <div v-if="repo.error">Not read: {{ repo.error }}</div>
+            <template v-else>
+              <div>{{ rangeLine(repo) }}</div>
+              <div v-for="section in repo.sections" :key="section.kind">
+                <div class="verify__section">{{ SECTION_TITLES[section.kind] }} ({{ section.kind === 'uncommitted' ? section.total : section.items.length }})</div>
+                <template v-if="section.kind === 'delivered'">
+                  <div v-for="d in section.items" :key="d.runId">
+                    <router-link :to="`/projects/${d.project}/${d.issueId}`">{{ d.issueName ?? d.issueId }}</router-link>
+                    · run <code>{{ d.runId }}</code> · {{ d.commits.length ? `committed in ${d.commits.map(short).join(', ')}` : 'uncommitted' }}
+                  </div>
+                </template>
+                <template v-else-if="section.kind === 'by-hand'">
+                  <div v-for="c in section.items" :key="c.sha">
+                    <code>{{ short(c.sha) }}</code> · {{ c.author }} · {{ c.subject }}<template v-if="c.mixed"> (also carries {{ c.runs.length }} delivered {{ c.runs.length === 1 ? 'run' : 'runs' }})</template>
+                  </div>
+                </template>
+                <template v-else>
+                  <div v-for="p in section.paths" :key="p"><code>{{ p }}</code></div>
+                  <div v-if="section.total > section.paths.length">and {{ section.total - section.paths.length }} more</div>
+                </template>
+                <div v-if="section.kind === 'uncommitted' ? !section.total : !section.items.length">None.</div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </v-card-text>
+    </v-card>
+
     <v-card v-if="cycle?.outcome" elevation="0" border class="mb-4">
       <v-card-item>
         <v-card-title>Outcome</v-card-title>
@@ -222,4 +272,6 @@ function invocationOf (project) {
 .verify__title { font-size: 1.5rem; font-weight: 650; margin: 0; }
 .verify__facts { display: grid; gap: 4px; font-size: 0.875rem; }
 .verify__detail { white-space: pre-wrap; }
+.verify__repo { display: grid; gap: 2px; margin-bottom: 8px; }
+.verify__section { font-weight: 600; margin-top: 4px; }
 </style>

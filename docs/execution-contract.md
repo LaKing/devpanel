@@ -4102,6 +4102,43 @@ the verdict, which it never changes. A red entry with `snapshotDuringEdits` says
 `verification-ended` event (`snapshotDuringEdits`, `movingPaths`, `newestChangeAt`); a green
 entry records it the same way.
 
+**What changed since the last verification.** The reading just after each snapshot is kept as
+`entry.atSnapshot` (per checkout its HEAD and the paths `git status` listed, 200 with the total).
+After the stages and before the outcome, the cycle records `record.changes` (`cycleChanges`), one
+entry per checkout it snapshotted (`readBy` names the entries that read it, a framework read
+through its instances' links included):
+- the range: from the same checkout's `range.to` in the newest earlier cycle record that has one,
+  whatever its verdict (a record from before change lists: its entry's `snapshot.base.headCommit`
+  and `snapshotAt`), else every commit since `COVERAGE_BASELINE` (`basis: since-coverage-baseline`);
+  to the HEAD the snapshot was cut from (`snapshot-base`), or for a checkout read through a link its
+  HEAD read just after (`read-after-snapshot`). `fromIsAncestor` says whether the history still
+  holds the start. At most 200 commits are kept, the newest, with `total`;
+- each commit with its author, author date and subject, attributed to a `cycle-checkpoint` (a
+  chain step of an earlier record, `headBefore..afterCommit.commit`), else `delivered` (the runs it
+  carries, `staging-coverage.mjs` `commitDeliveries`: a delivery is carried when one of its paths the
+  commit changed is new there, neither its bytes nor a later delivery's built on them standing at
+  the parent, and none of those paths differs from them; an instance's delivery is read through the
+  link into the framework's checkout), else `by-hand`; `handPaths` are its paths no carried delivery
+  explains, and a carried run the previous verification covered has `verifiedBy`;
+- `deliveries`: the issues delivered since the last verification: delivered after its start and not
+  after the snapshot, not in the previous cycle's `coverage.covered` (that cycle tested its working
+  tree, uncommitted deliveries included, so its checkpoint commit does not bring them back here);
+  another project's delivery only when a commit of the range carries it;
+- `uncommitted`: the paths of `entry.atSnapshot`.
+
+`changes.limits` states what it cannot see: a commit is read against the previous snapshot's HEAD,
+not its tested tree, so hand-made content that was already uncommitted (and tested) then reads as by
+hand once committed; a delivery from before the previous snapshot that the previous cycle read as
+indeterminate is not listed as delivered (a range commit that carries it still names it); a delivery
+whose bytes are not on record is never attributed. It is information only: no verdict, coverage,
+retirement, recheck, checkpoint or thaw reads it, and it has a bound of its own (`changesMs`, 2
+minutes on the cycle's clock, never `maxWaitMinutes`): a throw or the bound records `changes.error`
+and the outcome runs as before. `GET /api/verification/latest` returns it as `changes` (gui/README.md),
+per repository in this order: issues delivered, commits by hand (a delivered commit with `handPaths`
+is one too, `mixed`; a cycle checkpoint never), uncommitted changes; the Full verification page shows
+the same order, and a red issue quotes it right after its failing tests ("Changes since the last
+verification", at most 30 issues and commits and 20 paths per repository, the rest named in `cycle.json`).
+
 **The rerun of failed tests.** One test failing once in a suite of thousands does not decide
 a cycle. When an instance entry's drive is not green, `rerunPlan` decides, before the instance
 is destroyed, whether its failed tests run again alone, and the entry always records why or

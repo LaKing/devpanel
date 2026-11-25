@@ -133,7 +133,7 @@ Diagnostics go to `logs/devpanel.jsonl` (tail it), with the journal as a seconda
 | `harness/*.mjs` | runtime adapters (`claude`, `codex`, `gemini`, `antigravity`); the contract is `harness/README.md` | developers |
 | `roster/*.yaml` | concrete models bound to a harness, with `efforts` and `verification.status` | operators |
 | `strategy-templates/<id>/` | `strategy.yaml` (roles, phases, loops, review policy, completion) + `prompts/*.md` + `intents/*.yaml` (prompt overlays per kind of work, keyed by step id) | operators |
-| `playbooks/*.yaml` | a strategy bound to participants, budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
+| `playbooks/*.yaml` | a strategy bound to participants (or, `kind: engine-only`, no seats and its own engine `phases`: resolved, checked and previewed, never started yet; docs/tactical-playbooks.md "Engine-only playbooks"), budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
 | `consult/panel.yaml` | the consult panel (`gui/server/consult/`, `schemas/consult-panel.schema.json`), *Consultation* on the Playbooks page: its seats (`consultant-1..3`, each optional, at least one occupied; roster models with efforts), rounds, bounds per run, `alwaysHuman` categories, further `readOnly` paths and `deny` masks; a `host-config/consult/panel.yaml` replaces it whole; read at every consult, never part of a run's snapshot; see `docs/consult.md` | operators |
 | `decisions/<id>.yaml` | advisory decision provider (`jev`: TypeSafe Jev, the default; `openai`: the OpenAI Decisions API, beta; `model`: a verified roster model through its CLI, `decisions/model-oracle.mjs`), its client `kind`, endpoint, `credentialRef`, `threshold`, pricing (`decision-provider.schema.json`); `decisions/active.yaml` (`provider: <id>`) selects the one active provider, Jev when absent; see `docs/decisions.md` | operators |
 | `projects/<id>.yaml` | optional per-project source repository and integration branch, workspace policy (`base`, `symlinks`, `excludes`, seat `tooling` mounts and commands), infrastructure, local `checks` (a project without SSH staging; docs/project-infrastructure.md "Local checks") and `actions` (`project.schema.json`) | operators |
@@ -492,7 +492,12 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   around it (`runtime/full-verification-snapshot.mjs`: a `git status` reading with modification times just before and just
   after the snapshot; `snapshotMotion` names the newest change, the paths changed within 5 minutes before it and those that
   differ between the readings; `snapshotDuringEdits` true/false, null when any checkout's reading failed; information only, no verdict changes; a red entry
-  shows it in `cycle.json`, its issue text and the event's `movingPaths`); still frozen, handles the
+  shows it in `cycle.json`, its issue text and the event's `movingPaths`); before the outcome, information only and on a
+  2-minute bound of its own (`changesMs`; a throw or the bound is `changes.error`, never an interruption), `record.changes`
+  (`cycleChanges`): per snapshotted checkout the commits since the previous cycle's snapshot HEAD (else since `COVERAGE_BASELINE`),
+  each a cycle checkpoint, delivered runs by content (`staging-coverage.mjs commitDeliveries`) or by hand with author and subject,
+  the deliveries the last verification did not cover and the uncommitted paths; `GET /api/verification/latest` `changes` (`changeList`:
+  issues delivered, commits by hand, uncommitted), the page and a red issue (after its failing tests) show it in that order; still frozen, handles the
   outcome (all green: every green entry snapshotted again first (`entry.recheck`); a pool whose checkouts moved since,
   a framework's seen through an instance's link included, runs no checkpoint (`outcome.bump.withheld` with the moved
   checkouts and paths, `outcome.committed: false`, `entry.commitWithheld`; entries stay green; such an entry retires only

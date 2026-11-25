@@ -144,6 +144,11 @@ async function inspectConfiguration ({ playbook, runOptions, project, projectPat
     }
   }
   const resolved = resolution.resolved
+  // An engine-only playbook (config/load.mjs) has no workspace, delivery or seats to read: it cannot start.
+  if (resolved.kind === 'engine-only') {
+    return { playbook, kind: resolved.kind, configHash: resolved.configHash, ready: false, observedAt,
+      prerequisites: resolved.liveExecution.blockers.map((b) => ({ condition: 'configuration', state: b.reason, needs: b.remedy })) }
+  }
   const action = resolved.workspace?.isolation === 'in-place' ? 'in-place' : resolved.completion?.delivery?.action
   const writesSource = ['apply-to-source', 'in-place'].includes(action)
   const identity = { playbook, intent: resolved.intent?.id ?? null, configHash: resolved.configHash, base: resolved.workspace?.base ?? 'head', locksModules: locksModules(resolved),

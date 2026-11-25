@@ -52,7 +52,10 @@ export async function playbookSeats ({ root = CONFIG_ROOT, hostDir, held = async
       id,
       title: playbook.title ?? id,
       description: playbook.description ?? '',
-      strategy: playbook.strategy,
+      kind: playbook.kind ?? 'seats',
+      strategy: playbook.strategy ?? null,
+      // An engine-only playbook (config/load.mjs resolveEngineOnly) has no seats: its engine phases instead.
+      ...(playbook.kind === 'engine-only' ? { phases: playbook.phases.map((p) => ({ id: p.id, title: p.title ?? null, engine: p.engine })) } : {}),
       deprecated: playbook.deprecated === true,
       source: entry?.source ?? 'tree',
       drift: entry?.shadows ? await drifted(playbook.file, entry.shadows) : false,
@@ -104,6 +107,7 @@ async function save (id, seats, { root = CONFIG_ROOT, hostDir, actor = 'operator
   }
   const playbook = config.playbooks.get(id)
   if (!playbook) throw refuse(`no playbook "${id}"`, 404)
+  if (playbook.kind === 'engine-only') throw refuse(`${id} is an engine-only playbook: it has no seats to edit`, 400)
   const roles = config.strategies.get(playbook.strategy)?.roles ?? {}
   const changes = []
   for (const [role, seat] of Object.entries(seats)) {

@@ -10,7 +10,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { promisify } from 'node:util'
 
-import { resolvePlaybook } from '../config/load.mjs'
+import { engineOnlyRefusal, resolvePlaybook } from '../config/load.mjs'
 import { preflight, assertLaunchable } from '../config/preflight.mjs'
 import { systemClock } from './clock.mjs'
 import { baselineOf, escapingLinks, FENCE_STUBS, fingerprint, workspaceProjection } from './fingerprint.mjs'
@@ -762,6 +762,9 @@ export async function reserveRun ({
     error.errors = resolution.errors
     throw error
   }
+  // The only place a run is created: an engine-only playbook never gets one (config/load.mjs).
+  const engineOnly = engineOnlyRefusal(resolution.resolved)
+  if (engineOnly) throw engineOnly
 
   if (Object.keys(runOptions).length && !expectConfigHash) {
     throw Object.assign(new Error('preview the run settings before starting'), { status: 400 })

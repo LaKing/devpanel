@@ -167,6 +167,21 @@ export default async function (t) {
     await s.supervisor.settle()
   }
 
+  t.section('4b2. an engine-only playbook is refused before reservation: no probe, no run, no seat step (engine-only AC7)')
+  {
+    const s = await supervisorOver(undefined, { playbook: 'engine-check' })
+    await fs.writeFile(path.join(s.f.configRoot, 'playbooks', 'engine-check.yaml'), ['id: engine-check', 'version: 1', 'kind: engine-only', 'phases:', '  - id: freeze', '    engine: freeze-admission', ''].join(NL))
+    const error = await refusal(() => s.start())
+    t.eq('the start is refused as engine-only', [error?.status, error?.code], [422, 'ENGINE_ONLY_NOT_RUNNABLE'])
+    t.eq('as a start that never happened', [error?.started, error?.retryable], [false, false])
+    t.eq('no model was probed', await s.probes(), 0)
+    t.eq('no run was reserved', await s.runs(), [])
+    const { reserveRun } = await import('../server/runtime/launch.mjs')
+    const direct = await refusal(() => reserveRun({ playbookId: 'engine-check', issue: { project: 'devpanel-project', id: s.f.issue.id, path: s.f.issuePath }, issuePath: s.f.issuePath, configRoot: s.f.configRoot }))
+    t.eq('reserveRun, where runs are created, refuses it too', [direct?.code, await s.runs()], ['ENGINE_ONLY_NOT_RUNNABLE', []])
+    await s.supervisor.settle()
+  }
+
   t.section('4c. a green release whose identity matches but whose archive is gone is not filled: the start is refused before reservation')
   {
     const repo = await checkout()

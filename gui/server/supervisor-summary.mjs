@@ -297,6 +297,8 @@ export function summarisePreview (preview) {
   if (!preview?.ok) return preview
   return {
     ok: true,
+    // An engine-only playbook (no seats; top-supervisor.mjs never stores such a preview as startable).
+    ...(preview.kind ? { kind: preview.kind } : {}),
     configHash: preview.configHash,
     playbook: preview.playbook ? { id: preview.playbook.id, title: preview.playbook.title, description: preview.playbook.description } : null,
     strategy: preview.strategy ? { id: preview.strategy.id, version: preview.strategy.version } : null,
@@ -311,7 +313,7 @@ export function summarisePreview (preview) {
     releasePlan: preview.release ?? null,
     prerequisitesBlocking: (preview.prerequisites ?? []).filter((p) => p.category === 'blocking').map((p) => ({ kind: p.kind, detail: p.detail, ...(p.latestGreen !== undefined ? { latestGreen: p.latestGreen } : {}) })),
     participants: (preview.participants ?? []).map((p) => ({ role: p.role, model: p.model, harness: p.connection?.harness ?? null, effort: p.effort, verification: p.verification })),
-    phases: (preview.phases ?? []).map((p) => ({ id: p.id, kind: p.kind, maxRounds: p.loop?.maxRounds ?? null, steps: p.steps.map((s) => `${s.role}:${s.id}`) })),
+    phases: (preview.phases ?? []).map((p) => p.kind === 'engine' ? { id: p.id, kind: 'engine', engine: p.engine } : { id: p.id, kind: p.kind, maxRounds: p.loop?.maxRounds ?? null, steps: p.steps.map((s) => `${s.role}:${s.id}`) }),
     workspace: preview.workspace ?? null,
     checks: preview.checks ? { ...preview.checks, target: compactTarget(preview.checks.target) } : null,
     modulesTiming: preview.modulesTiming ?? null,

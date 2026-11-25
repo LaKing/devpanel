@@ -88,6 +88,23 @@ function projectOnlyTooling (data, file, errors) {
   return found.length > 0 || data.workspace?.reconcile !== undefined
 }
 
+// An engine-only playbook (docs/tactical-playbooks.md "Engine-only playbooks") has no seats and binds no
+// strategy: what a seat playbook declares is refused with a sentence rather than the schema's "must NOT be valid".
+export const ENGINE_ONLY = 'engine-only'
+const SEAT_KEYS = ['strategy', 'strategyVersion', 'participants', 'fallbackModels', 'overrides', 'intent', 'checks', 'autoClose', 'workspace', 'delivery', 'budgets']
+/** The refusal of a start of an engine-only playbook, before anything is reserved or probed; null for any other. */
+export function engineOnlyRefusal (resolved) {
+  if (resolved?.kind !== ENGINE_ONLY) return null
+  const error = new Error(resolved.liveExecution.blockers[0]?.reason ?? 'an engine-only playbook cannot be started')
+  return Object.assign(error, { status: 422, code: 'ENGINE_ONLY_NOT_RUNNABLE', started: false, retryable: false })
+}
+function engineOnlyErrors (data, file, errors) {
+  if (data?.kind !== ENGINE_ONLY) return false
+  const found = SEAT_KEYS.filter((key) => data[key] !== undefined)
+  for (const key of found) err(errors, `an engine-only playbook declares no ${key}: it has no seats, binds no strategy and its phases are engine steps`, file, `/${key}`)
+  return found.length > 0
+}
+
 function sha256 (text) {
   return 'sha256:' + crypto.createHash('sha256').update(text).digest('hex')
 }
@@ -244,6 +261,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
 
   for (const { file } of await hostFiles('playbooks')) {
     const { data, hash } = await readYaml(file)
+    if (engineOnlyErrors(data, file, errors)) continue
     if (!validate(await validator(),'playbook', data, file, errors)) continue
     if (projectOnlyTooling(data, file, errors)) continue
     if (playbooks.has(data.id)) { err(errors, `duplicate playbook id "${data.id}"`, file, '/id'); continue }
@@ -456,6 +474,8 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
   if (!playbook) {
     return { ok: false, errors: [...errors, new ConfigError(`no playbook "${id}"`, { file: path.join(root, 'playbooks') }).toJSON()] }
   }
+
+  if (playbook.kind === ENGINE_ONLY) return resolveEngineOnly(playbook, { errors, runOptions, project, infrastructure })
 
   playbook = applyRunOptions(playbook, runOptions)
 
@@ -794,6 +814,55 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     if (errors.length) return { ok: false, errors }
   }
 
+  return { ok: true, resolved: deepFreeze(resolved), errors: [] }
+}
+
+/**
+ * An engine-only playbook: no seats, no strategy, no prompts. Its phases are engine steps, which the
+ * engine does not execute yet, so it resolves for config:check, preview and the panel's lists and
+ * carries one blocker: a start is refused before anything is reserved (supervisor.mjs start,
+ * launch.mjs reserveRun), and preflight returns before probing any harness.
+ */
+function resolveEngineOnly (playbook, { errors, runOptions, project, infrastructure }) {
+  const options = Object.keys(runOptions ?? {})
+  if (options.length) err(errors, `an engine-only playbook takes no run options (${options.join(', ')}): it has no seats, budgets or workspace to set`, playbook.file, '/runOptions')
+  const seen = new Set()
+  for (const phase of playbook.phases) {
+    if (seen.has(phase.id)) err(errors, `duplicate phase id "${phase.id}"`, playbook.file, '/phases')
+    seen.add(phase.id)
+  }
+  if (errors.length) return { ok: false, errors }
+  const operations = [...new Set(playbook.phases.map((p) => p.engine))]
+  const contributing = [playbook.hash, ...(project ? [project.hash] : []), sha256(`fence:${JSON.stringify(FENCE_POLICY)}`)].sort()
+  const resolved = {
+    kind: ENGINE_ONLY,
+    fence: { ...FENCE_POLICY },
+    infrastructure,
+    tactic: null,
+    runOptions: {},
+    parameterDefinitions: { seats: [], models: [], intents: [], budgetCaps: {}, repairCap: 0, release: null },
+    playbook: { id: playbook.id, version: playbook.version, title: playbook.title ?? null, description: playbook.description ?? null, file: playbook.file, hash: playbook.hash },
+    strategy: null,
+    intent: null,
+    participants: {},
+    roles: {},
+    phases: playbook.phases.map((p) => ({ id: p.id, title: p.title ?? null, engine: p.engine })),
+    prompts: {},
+    contracts: null,
+    budgets: {},
+    checks: { requirement: 'none', target: null, boundToRevision: true },
+    liveExecution: {
+      eligible: false,
+      blockers: [{
+        kind: 'engine-only-unsupported',
+        reason: `the engine does not execute engine steps yet (operations: ${operations.join(', ')}); this playbook can be resolved and previewed, not started`,
+        remedy: 'none until the engine implements these operations; no harness is probed and nothing is spent',
+        file: playbook.file
+      }]
+    },
+    configHash: sha256(contributing.join('\n')),
+    resolvedAt: new Date().toISOString()
+  }
   return { ok: true, resolved: deepFreeze(resolved), errors: [] }
 }
 
