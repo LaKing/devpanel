@@ -14,14 +14,15 @@ import { fencePolicy } from '../runtime/confinement-policy.mjs'
 import { classifyFailure } from '../runtime/failure.mjs'
 import { writeAtomic, writeJson } from '../runtime/persistence.mjs'
 import { bareObjects, fencedObjects } from '../runtime/structured-output.mjs'
-import { loadPanel, resolveSeats } from './panel.mjs'
+import { loadPanel, resolveSeats, seatsFor } from './panel.mjs'
 import { briefPrompt, decidePrompt, reconcilePrompt, repairPrompt } from './prompt.mjs'
 import { consultRoots } from './roots.mjs'
 import { answerText, briefFor, judge, nextOptions, optionsFor } from './rule.mjs'
 
 /*
- * The consult panel (docs/consult.md): a question is put to two senior seats
- * that read everything read-only, before it reaches a person.
+ * The consult panel (docs/consult.md): a question is put to the panel's senior
+ * seats (one to three, whichever are occupied), which read everything
+ * read-only, before it reaches a person.
  *
  * Called by the engine for a run's questions and by the top-level supervisor
  * for its own. It decides nothing about runs: it returns `resolved` with the
@@ -44,7 +45,9 @@ const SEAT_INSTRUCTIONS = 'You are a read-only consultant. You may read files an
 const sha = (text) => crypto.createHash('sha256').update(text).digest('hex')
 const readJson = (file) => fs.readFile(file, 'utf8').then(JSON.parse, (error) => { if (error.code === 'ENOENT') return null; throw error })
 
-export const consultId = ({ key, question, mode = 'decide' }) => sha(canonical({ key: key ?? null, question, mode })).slice(0, 16)
+// The asker's own seats are part of the identity only when it named some: the same question put to other models is
+// another consult, and a consult asked of the panel's own seats keeps the id it always had.
+export const consultId = ({ key, question, mode = 'decide', seats = null }) => sha(canonical({ key: key ?? null, question, mode, ...(seats && Object.keys(seats).length ? { seats } : {}) })).slice(0, 16)
 
 /** The fence of one seat turn: every root read-only, the scratch writable, credentials masked. Null when this host runs no fence. */
 function defaultFence ({ roots, scratchDir }) {
@@ -97,9 +100,9 @@ export function createConsult ({
     return { opinion }
   }
 
-  // Admission reads the ledger's usage and the reservation changes it: the two
-  // seats of a round start together, so each must see the other's reservation
-  // or both pass on the last dollars. One at a time through this chain.
+  // Admission reads the ledger's usage and the reservation changes it: the
+  // seats of a round start together, so each must see the others' reservations
+  // or all pass on the last dollars. One at a time through this chain.
   let admitting = Promise.resolve()
   function reserveTurn ({ gate, panel, seat, tag }) {
     const turn = admitting.then(async () => {
@@ -373,7 +376,8 @@ export function createConsult ({
     },
 
     /**
-     * @param request   { key, mode: 'decide' | 'brief', question, reason?, recommendation?, options?, category?, askedBy?, project, issueDir?, worktree? }
+     * @param request   { key, mode: 'decide' | 'brief', question, reason?, recommendation?, options?, category?, askedBy?, project, issueDir?, worktree?,
+     *                    seats?: { '<seat>': { model, effort? } | null } the asker's own choice over the panel's seats (panel.mjs seatsFor) }
      * @param callerDir where the caller keeps its records (a run's directory, the supervisor's)
      * @returns { id, outcome: 'resolved' | 'escalated' | 'unavailable', answer?, answerText?, choice?, conditions?, opinions, brief?, reason?, rounds, costUsd, costUnknown, durationMs, replayed }
      */
@@ -425,11 +429,12 @@ export function createConsult ({
       if (!panel) return unavailable('no consult panel is configured', { record: false })
       if (!panel.enabled) return unavailable('the consult panel is switched off', { record: false })
 
-      if (!await readJson(path.join(dir, 'request.json'))) await writeJson(path.join(dir, 'request.json'), { ...request, mode, id, panel: { hash: panel.hash, seats: panel.seats } })
+      if (!await readJson(path.join(dir, 'request.json'))) await writeJson(path.join(dir, 'request.json'), { ...request, mode, id, panel: { hash: panel.hash, seats: seatsFor(panel, request.seats ?? null).seats } })
 
-      const { seats, problems } = await resolveSeats(panel, { roster: await loadRoster(), availability })
-      const needed = mode === 'brief' ? seats.filter((s) => s.seat === 'consultant-1') : seats
-      if (mode === 'brief' ? !needed.length : problems.length) return unavailable(problems.join('; '))
+      // Every occupied seat must be usable for a decision; the question for a person is written by the first that is.
+      const { seats, problems } = await resolveSeats(panel, { roster: await loadRoster(), availability, overrides: request.seats ?? null })
+      const needed = mode === 'brief' ? seats.slice(0, 1) : seats
+      if (mode === 'brief' ? !needed.length : problems.length || !needed.length) return unavailable(problems.join('; ') || 'no seat of the panel is occupied')
 
       let roots
       try {
@@ -456,8 +461,8 @@ export function createConsult ({
         await ensureRound(dir, round)
         const current = await Promise.all(needed.map((seat) => {
           const mine = previous?.find((t) => t.seat === seat.seat)
-          const other = previous?.find((t) => t.seat !== seat.seat)
-          const prompt = round === 1 ? decidePrompt({ ...promptArgs, options }) : reconcilePrompt({ options, other, language: language() })
+          const others = previous?.filter((t) => t.seat !== seat.seat) ?? []
+          const prompt = round === 1 ? decidePrompt({ ...promptArgs, options, others: needed.length - 1 }) : reconcilePrompt({ options, others, language: language() })
           return seatTurn({ ...common, seat, round, prompt, session: mine?.session ?? null, options, brief: false })
         }))
         turns.push(...current)
@@ -465,7 +470,8 @@ export function createConsult ({
         const verdict = judge(options, current)
         if (verdict.outcome === 'resolved') return finish({ outcome: 'resolved', choice: verdict.choice, answer: verdict.answer, conditions: verdict.conditions, answerText: answerText(verdict) })
         if (verdict.outcome === 'unavailable') return unavailable(`${verdict.why}: ${current.filter((t) => !t.opinion).map((t) => `${t.seat}: ${t.error?.message}`).join('; ')}`)
-        if (verdict.outcome === 'escalated' || round === panel.maxRounds) {
+        // A second round shows a seat the others' opinions: a single seat has none to be shown.
+        if (verdict.outcome === 'escalated' || round === panel.maxRounds || needed.length === 1) {
           return finish({ outcome: 'escalated', reason: verdict.why, brief: briefFor(current, verdict.why) })
         }
         options = nextOptions(options, current)

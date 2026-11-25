@@ -1,12 +1,13 @@
 # The consult panel
 
-A question that would go to a person goes to two senior models first. They are not seats of any run: they read the
-project read-only, each answers on its own, and only when they do not agree, or the decision is a person's by its
-nature, is a person asked, in plain words the panel wrote. A weaker model never has to put a demanding technical
+A question that would go to a person goes to the panel's senior models first: one to three seats, whichever are
+occupied. They are not seats of any run: they read the project read-only, each answers on its own, and only when they
+do not agree, or the decision is a person's by its nature, is a person asked, in plain words the panel wrote. A weaker model never has to put a demanding technical
 question to a person, and a person is not asked what the code already answers.
 
-It is advice with one piece of authority: when both consultants choose the same answer, that answer is recorded as
-the decision the question asked for. It grants no capability. It cannot approve a revision, accept a check result,
+It is advice with one piece of authority: when every occupied seat chooses the same answer, that answer is recorded as
+the decision the question asked for. The number of occupied seats does not change that (the owner's decision,
+2026-11-25): with one seat, that seat's answer is the decision. It grants no capability. It cannot approve a revision, accept a check result,
 deliver, deploy or archive; whoever acts on its answer does so within their own limits.
 
 ## Who asks
@@ -33,10 +34,10 @@ in mode `brief` only: one seat reads and writes the question for the person, and
 
 ```yaml
 enabled: true
-seats:
+seats:                  # consultant-1, consultant-2, consultant-3: each optional, at least one occupied
   consultant-1: { model: fable-5-2, effort: medium }
   consultant-2: { model: gpt-6.2-astra, effort: medium }
-maxRounds: 2            # a second round shows each seat the other's opinion, once
+maxRounds: 2            # a second round shows each seat the others' opinions, once
 turnTimeoutMinutes: 20
 maxTurnCostUsd: 5       # reserved on the spending ledger per seat turn
 maxPerRun: 6            # consults one run may ask
@@ -45,6 +46,16 @@ alwaysHuman: [authorization]
 readOnly: []            # further absolute paths every consult may read
 deny: []                # absolute paths shown empty even inside a readable directory
 ```
+
+**Consultation.** The panel is seated like a playbook and shown as one: the Playbooks page lists it as *Consultation*
+with its three seats, and an edit there writes `host-config/consult/panel.yaml` with only `seats` changed (a copy that
+came to say the same as the tracked file is removed; `consult/.history.jsonl` beside it records who changed what;
+`gui/server/consultation-seats.mjs`). It is not a catalogue playbook: a strategy file is the phase interpreter's
+contract, and the panel is asked through `consult/consult.mjs`, not started as a run. One consult may be asked of other
+seats than the panel's: a request's `seats` (`{ "consultant-3": { "model": "...", "effort": "..." } }` occupies a
+seat, `null` leaves one empty) is laid over them, by the supervisor's `consult` action or `npm run consult -- --seat
+consultant-3=<model>[@<effort>]` (`--seat consultant-1=` empties). The same question put to other seats is another
+consult, with its own record.
 
 A seat names a verified roster entry on any harness. A Gemini seat reads with its file tools and has no shell, so it
 sees the checkouts as they stand and cannot run git; its roster entry lists no efforts, so the seat names none. Its
@@ -105,18 +116,21 @@ that breaks the contract gets one repair turn in the same session.
 
 ## The rule
 
-Agreement is never a model's reading of two texts (`consult/rule.mjs`, pure):
+Agreement is never a model's reading of the texts (`consult/rule.mjs`, pure), and the rule is the same for one, two or
+three occupied seats:
 
-- **resolved**: both seats say `answer`, name the same option other than `other`, and neither confidence is `low`.
-  The answer is that option's text with the conditions of both seats.
-- **escalated**: a seat says `owner`, or the seats still differ after the last round. The result carries the `brief`:
-  the first seat's `ownerBrief` with each seat's position.
+- **resolved**: every occupied seat says `answer`, they name the same option other than `other`, and no confidence is
+  `low`. The answer is that option's text with the conditions of every seat. A single seat has nobody to agree with: an
+  answer of its own (`other`) is the decision too, named `alt-1`.
+- **escalated**: a seat says `owner`, or the seats still differ after the last round (two against one is a
+  difference), or a single seat answered with low confidence. The result carries the `brief`: the first seat's
+  `ownerBrief` with each seat's position.
 - **unavailable**: a seat gave no usable opinion (failed, timed out, could not read, broke the contract twice), a
   seat's model is unverified or held, the spending policy refused the call, or the host runs no fence.
 
-When the seats differ and a round is left, each seat's own session is resumed and shown the other's opinion. An
-answer given as `other` becomes a named option (`alt-1`, `alt-2`) that either seat can then choose. The same rule
-decides.
+When the seats differ and a round is left, each seat's own session is resumed and shown every other seat's opinion. An
+answer given as `other` becomes a named option (`alt-1`, `alt-2`, ...) that any seat can then choose. The same rule
+decides. A single seat gets no second round: there is no other opinion to show it.
 
 ## Records
 
@@ -131,7 +145,7 @@ records nothing, so enabling it later asks.
 
 Each seat turn is on the spending ledger (`subject: 'decision'`, `meta.purpose: 'consult'`, the panel's
 `maxTurnCostUsd` reserved, the known or estimated cost settled) under the same windows as every other call.
-Admission and reservation are one step, so the two seats of a round cannot both pass on the last dollars. A failed
+Admission and reservation are one step, so the seats of a round cannot all pass on the last dollars. A failed
 turn that states its cost is settled at it, one that never started is released, and any other failure stays
 reserved, the ledger's rule for a charge nobody can state. A quota
 failure records the model in the availability store.
@@ -139,7 +153,7 @@ failure records the model in the availability store.
 ## In a run
 
 `engine.consultFirst` is called where a run would pause for a person. `run.consulting` is set while the panel works
-(the run reads "two senior models are answering a question"), `run.consults` keeps every consult's outcome.
+(the run reads "the consult panel is answering a question"), `run.consults` keeps every consult's outcome.
 
 - **resolved**: a decision step is recorded through the same recorder as a person's answer (`engine.recordDecision`):
   role `operator`, `decision.actor` `consult panel (<model>@<effort> + <model>@<effort>)`, `decision.consult` with the
@@ -203,4 +217,4 @@ printed result. The record is kept under `issues/.supervisor/consults/`.
 - It does not ask a person anything itself: it returns, and the caller asks.
 - It does not change a file outside its scratch directory, start a service or reach a remote host.
 - It does not widen what a coordinator, a seat or the supervisor may do.
-- It does not hide a disagreement: two answers that differ go to a person with both positions.
+- It does not hide a disagreement: answers that differ go to a person with every position.

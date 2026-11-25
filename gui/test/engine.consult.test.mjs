@@ -60,7 +60,7 @@ const planRun = async (turns, { consult = null, ...options } = {}) => {
 }
 
 export default async (t) => {
-  t.section('1. an owner hold both consultants answer the same way never reaches the owner')
+  t.section('1. an owner hold every seat answers the same way never reaches the owner')
   {
     const prompts = {}
     const panel = fakePanel(resolved)

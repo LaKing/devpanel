@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /*
  * One consult from the command line (docs/consult.md): the question is put to
- * the panel's two seats, which read the project read-only, and the result is
+ * the panel's occupied seats, which read the project read-only, and the result is
  * printed as JSON.
  *
  *   npm run --silent consult -- --project <id> --question <file> [--issue <id>] [--run <id>]
- *       [--recommendation <text>] [--reason <text>] [--mode brief] [--plan]
+ *       [--recommendation <text>] [--reason <text>] [--mode brief] [--seat <seat>=<model>[@<effort>]]... [--plan]
  *
  * PAID: it launches the installed CLIs of the panel's models, so it refuses
  * without DEVPANEL_LIVE=1 unless --plan is given, which prints the seats, what
@@ -28,12 +28,19 @@ import { consultRoots } from '../server/consult/roots.mjs'
 import { optionsFor } from '../server/consult/rule.mjs'
 import { createAvailabilityStore } from '../server/runtime/failure.mjs'
 
-const USAGE = 'usage: npm run consult -- --project <id> --question <file> [--issue <id>] [--run <id>] [--recommendation <text>] [--reason <text>] [--mode brief] [--plan]'
+const USAGE = 'usage: npm run consult -- --project <id> --question <file> [--issue <id>] [--run <id>] [--recommendation <text>] [--reason <text>] [--mode brief] [--seat <seat>=<model>[@<effort>] | --seat <seat>=]... [--plan]'
 const VALUE = ['--project', '--question', '--issue', '--run', '--recommendation', '--reason', '--mode']
 const args = process.argv.slice(2)
 const given = {}
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--plan') { given.plan = true; continue }
+  // --seat consultant-3=gemini-4-neon occupies a seat for this consult, --seat consultant-1= leaves it empty.
+  if (args[i] === '--seat') {
+    const [, seat, model, effort] = /^([^=]+)=(?:([^@]*)(?:@(.+))?)?$/.exec(args[++i] ?? '') ?? []
+    if (!seat) { console.error('--seat takes <seat>=<model>[@<effort>], or <seat>= to leave it empty'); console.error(USAGE); process.exit(2) }
+    (given.seats ??= {})[seat] = model ? { model, ...(effort ? { effort } : {}) } : null
+    continue
+  }
   if (!VALUE.includes(args[i]) || args[i + 1] === undefined) { console.error(`unknown or incomplete argument: ${args[i]}`); console.error(USAGE); process.exit(2) }
   given[args[i].slice(2)] = args[++i]
 }
@@ -53,16 +60,16 @@ if (given.run) {
 const request = {
   key: `cli:${given.project}:${given.issue ?? ''}:${given.run ?? ''}`, mode: given.mode ?? 'decide', question,
   reason: given.reason ?? null, recommendation: given.recommendation ?? null, askedBy: { role: 'operator' },
-  project: given.project, issueDir, worktree
+  project: given.project, issueDir, worktree, ...(given.seats ? { seats: given.seats } : {})
 }
 const related = relatedProjects(config.projects, given.project)
 
 if (given.plan) {
   const panel = await loadPanel()
   if (!panel) { console.error('no consult panel is configured (consult/panel.yaml)'); process.exit(1) }
-  const { seats, problems } = await resolveSeats(panel, { roster: config.roster })
+  const { seats, problems } = await resolveSeats(panel, { roster: config.roster, overrides: request.seats ?? null })
   const roots = await consultRoots({ project: given.project, issueDir, worktree, related, files: projectFiles(config.projects, given.project), panel })
-  const prompt = (request.mode === 'brief' ? briefPrompt : decidePrompt)({ request, options: optionsFor(request), roots: roots.roots, scratchDir: '<scratch>', language: hostSettings().operatorLanguage })
+  const prompt = (request.mode === 'brief' ? briefPrompt : decidePrompt)({ request, options: optionsFor(request), roots: roots.roots, scratchDir: '<scratch>', language: hostSettings().operatorLanguage, others: seats.length - 1 })
   console.log(JSON.stringify({ plan: true, mode: request.mode, seats: seats.map((s) => ({ seat: s.seat, model: s.model.id, harness: s.model.harness, effort: s.effort })), problems, cwd: roots.cwd, roots: roots.roots, masks: roots.masks, prompt }, null, 2))
   process.exit(problems.length ? 1 : 0)
 }

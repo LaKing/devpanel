@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { playbookSeats, savePlaybookSeats } from '../server/playbook-seats.mjs'
+import { CONFIG_ROOT } from '../server/config/load.mjs'
 import { sandbox, patch } from './helpers.mjs'
 
 export const name = 'playbook seats — the Playbooks page reads every playbook\'s seats and writes an edit as a host copy'
@@ -90,4 +91,35 @@ export default async function (t) {
   t.eq('the copy is removed', [back.changed, back.removed, back.written, await exists(copy)], [true, true, null, false])
   const restored = await read()
   t.eq('the playbook is the tracked one again, in its old configuration group', [restored.source, restored.configHash], ['tree', implementation.configHash])
+  t.section('Consultation: the consult panel, seated and edited like a playbook')
+  t.eq('without a panel file there is no such entry', (await playbookSeats(at)).playbooks.some((p) => p.id === 'consultation'), false)
+  const trackedPanel = path.join(root, 'consult', 'panel.yaml')
+  const hostPanel = path.join(hostDir, 'consult', 'panel.yaml')
+  await fs.mkdir(path.dirname(trackedPanel), { recursive: true })
+  await fs.copyFile(path.join(CONFIG_ROOT, 'consult', 'panel.yaml'), trackedPanel)
+  const panelText = await fs.readFile(trackedPanel, 'utf8')
+  let panel = await read('consultation')
+  t.eq('it is listed with three optional seats, the third empty', [panel.title, panel.kind, panel.source, panel.resolves, panel.seats.map((s) => [s.role, s.optional, s.model])],
+    ['Consultation', 'consultation', 'tree', true, [['consultant-1', true, 'fable-5-2'], ['consultant-2', true, 'gpt-6.2-astra'], ['consultant-3', true, null]]])
+  const seated = await savePlaybookSeats('consultation', { 'consultant-3': { model: 'gemini-4-neon' }, 'consultant-2': { model: 'gpt-6.2-sol', effort: 'low' } }, { ...at, actor: 'tester', now: () => new Date('2026-11-25T00:00:00Z') })
+  t.eq('an edit is written as the installation\'s own panel file', [seated.changed, seated.written, await fs.readFile(trackedPanel, 'utf8') === panelText], [true, hostPanel, true])
+  const hostText = await fs.readFile(hostPanel, 'utf8')
+  t.ok('which says it is a copy and keeps everything but the seats', hostText.startsWith('# Host copy of consult/panel.yaml') && hostText.includes('maxRounds: 2') && hostText.includes('alwaysHuman:'), hostText.slice(0, 200))
+  panel = seated.playbooks.find((p) => p.id === 'consultation')
+  t.eq('the view shows the three seats, a model without efforts taking none', [panel.source, panel.seats.map((s) => [s.model, s.effort])], ['host', [['fable-5-2', 'medium'], ['gpt-6.2-sol', 'low'], ['gemini-4-neon', null]]])
+  t.eq('the change is recorded with who made it', JSON.parse((await fs.readFile(path.join(hostDir, 'consult', '.history.jsonl'), 'utf8')).trim().split('\n').at(-1)).actor, 'tester')
+
+  const single = await savePlaybookSeats('consultation', { 'consultant-1': null, 'consultant-3': null }, at)
+  t.eq('two seats may be emptied: one occupied seat is a panel', single.playbooks.find((p) => p.id === 'consultation').seats.map((s) => s.model), [null, 'gpt-6.2-sol', null])
+  const empty = await refused(() => savePlaybookSeats('consultation', { 'consultant-2': null }, at))
+  t.ok('the last seat cannot be emptied', empty?.status === 422 && /at least one occupied seat/.test(empty.message), empty?.message)
+  const noSuchSeat = await refused(() => savePlaybookSeats('consultation', { 'consultant-4': { model: 'fable-5-2' } }, at))
+  t.ok('a seat the panel does not have is refused', noSuchSeat?.status === 400 && /not a seat of the panel/.test(noSuchSeat.message), noSuchSeat?.message)
+  const noEffort = await refused(() => savePlaybookSeats('consultation', { 'consultant-1': { model: 'gemini-4-neon', effort: 'high' } }, at))
+  t.ok('an effort the model does not take is refused, naming it', noEffort?.status === 422 && noEffort.detail.some((d) => /has no effort "high"/.test(d)), JSON.stringify(noEffort?.detail))
+  t.eq('a refusal wrote nothing', (await read('consultation')).seats.map((s) => s.model), [null, 'gpt-6.2-sol', null])
+
+  const tracking = await savePlaybookSeats('consultation', { 'consultant-1': { model: 'fable-5-2', effort: 'medium' }, 'consultant-2': { model: 'gpt-6.2-astra', effort: 'medium' } }, at)
+  t.eq('back to the tracked seats: the copy is removed', [tracking.removed, await exists(hostPanel), tracking.playbooks.find((p) => p.id === 'consultation').source], [true, false, 'tree'])
 }
+

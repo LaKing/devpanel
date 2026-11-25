@@ -4,12 +4,12 @@ import path from 'node:path'
 
 import { CONFIG_ROOT } from './helpers.mjs'
 import { createConsult, consultId } from '../server/consult/consult.mjs'
-import { loadPanel, resolveSeats } from '../server/consult/panel.mjs'
+import { loadPanel, resolveSeats, seatsFor } from '../server/consult/panel.mjs'
 import { judge, nextOptions, optionsFor, briefFor, answerText } from '../server/consult/rule.mjs'
 import { decidePrompt } from '../server/consult/prompt.mjs'
 import { consultRoots } from '../server/consult/roots.mjs'
 
-export const name = 'consult panel — two read-only seats answer before a person is asked'
+export const name = 'consult panel — its read-only seats answer before a person is asked'
 
 const brief = { question: 'May the list grow?', why: 'The check starts failing otherwise.', options: [{ label: 'Yes', consequence: 'Old cases are listed.' }, { label: 'No', consequence: 'They are fixed now.' }], recommendation: 'Yes, as before.' }
 const opinion = (over = {}) => ({ verdict: 'answer', choice: 'recommended', answer: 'Do as recommended.', conditions: [], reasoning: 'Read it.', evidence: [{ location: 'a.mjs:1', observation: 'it says so' }], confidence: 'high', ownerBrief: brief, ...over })
@@ -124,6 +124,52 @@ export default async function (t) {
   service = fakePanel({ 'fake-a': [opinion(), opinion()], 'fake-b': [opinion({ choice: 'b' }), opinion({ choice: 'b' })] })
   result = await service.consult(request(), { callerDir: dir })
   t.eq('no convergence escalates with a brief naming both positions', [result.outcome, result.brief.positions.map((p) => p.choice), result.rounds], ['escalated', ['recommended', 'b'], 2])
+
+  t.section('one seat, or three: the rule does not change with the number of occupied seats')
+  {
+    const alone = (o) => [{ seat: 'consultant-2', opinion: o }]
+    t.eq('a single seat naming an option decides', judge(options, alone(opinion({ choice: 'b', conditions: ['date it'] }))), { outcome: 'resolved', choice: 'b', answer: 'Fix the 16 now.', conditions: ['date it'] })
+    t.eq('its own answer is the decision, named as the alternative a second round would have made of it', judge(options, alone(opinion({ choice: 'other', answer: 'List 16, annotate 56.', conditions: ['annotate in this run'] }))),
+      { outcome: 'resolved', choice: 'alt-1', answer: 'List 16, annotate 56.', conditions: ['annotate in this run'] })
+    t.eq('a single seat that is not confident decides nothing', [judge(options, alone(opinion({ confidence: 'low' }))).outcome, judge(options, alone(opinion({ choice: 'other', confidence: 'low' }))).why], ['undecided', 'consultant-2 answered with low confidence'])
+    t.eq('and one that leaves it to a person escalates', judge(options, alone(owner())).outcome, 'escalated')
+    const three = (a, b, c) => [{ seat: 'consultant-1', opinion: a }, { seat: 'consultant-2', opinion: b }, { seat: 'consultant-3', opinion: c }]
+    t.eq('three seats on one option resolve, with the conditions of all', judge(options, three(opinion({ conditions: ['a'] }), opinion({ conditions: ['b'] }), opinion({ conditions: ['a', 'c'] }))).conditions, ['a', 'b', 'c'])
+    t.eq('two against one is not agreement', judge(options, three(opinion(), opinion(), opinion({ choice: 'b' }))).outcome, 'undecided')
+    t.eq('every answer of its own becomes an option of the next round', nextOptions(options, three(opinion({ choice: 'other', answer: 'X' }), opinion(), opinion({ choice: 'other', answer: 'Y' }))).slice(-2).map((o) => [o.key, o.label]), [['alt-1', 'X'], ['alt-2', 'Y']])
+
+    // The seats of one consult: the panel's, with the asker's own choice over them.
+    t.eq('an asker may empty a seat and occupy another', seatsFor(panel, { 'consultant-1': null, 'consultant-3': { model: 'gpt-6-astra' } }), { seats: { 'consultant-2': { model: 'gpt-6-astra', effort: 'medium' }, 'consultant-3': { model: 'gpt-6-astra' } }, problems: [] })
+    t.ok('a seat the panel does not have is a problem', /not a seat of the panel/.test(seatsFor(panel, { 'consultant-4': { model: 'fable-5-2' } }).problems[0]))
+    const none = await resolveSeats(panel, { roster, overrides: { 'consultant-1': null, 'consultant-2': null } })
+    t.eq('with every seat empty there is nobody to ask', [none.seats, none.problems], [[], ['no seat of the panel is occupied']])
+    t.ok('the same question put to other seats is another consult', consultId(request()) !== consultId(request({ seats: { 'consultant-2': null } })) && consultId(request()) === consultId(request({ seats: {} })))
+
+    // One occupied seat: asked once, told it is alone, and its answer is the result.
+    let calls = []
+    let dir = await callerDir()
+    const one = await fakePanel({ 'fake-b': [opinion({ choice: 'b' })] }, { calls }).consult(request({ key: 'seats:one', seats: { 'consultant-1': null } }), { callerDir: dir })
+    t.eq('one seat resolves alone, in one turn', [one.outcome, one.choice, one.rounds, calls.map((c) => c.harness)], ['resolved', 'b', 1, ['fake-b']])
+    t.ok('and is told nobody else answers', /You are the only consultant asked/.test(calls[0].prompt) && !/Another consultant/.test(calls[0].prompt), calls[0].prompt.slice(0, 400))
+    t.eq('the record names the seats this consult was asked of', Object.keys(JSON.parse(await fs.readFile(path.join(dir, 'consults', one.id, 'request.json'), 'utf8')).panel.seats), ['consultant-2'])
+    calls = []
+    const unsure = await fakePanel({ 'fake-b': [opinion({ confidence: 'low' })] }, { calls }).consult(request({ key: 'seats:one-low', seats: { 'consultant-1': null } }), { callerDir: await callerDir() })
+    t.eq('a single seat without confidence goes to a person at once: a second round would show it nobody\'s opinion', [unsure.outcome, unsure.rounds, calls.length, unsure.brief?.question], ['escalated', 1, 1, 'May the list grow?'])
+
+    // Three occupied seats: two against one gets a second round in which each is shown BOTH others.
+    calls = []
+    const third = { 'consultant-3': { model: 'gpt-6-astra', effort: 'medium' } }
+    const split = await fakePanel({ 'fake-a': [opinion(), opinion({ choice: 'b' })], 'fake-b': [opinion({ choice: 'b' }), opinion({ choice: 'b' }), opinion({ choice: 'b' }), opinion({ choice: 'b' })] }, { calls })
+      .consult(request({ key: 'seats:three', seats: third }), { callerDir: await callerDir() })
+    t.eq('three seats that come to agree resolve in the second round', [split.outcome, split.choice, split.rounds, calls.length], ['resolved', 'b', 2, 6])
+    t.ok('the first round says how many others answer', /2 other consultants answer the same question/.test(calls[0].prompt), calls[0].prompt.slice(0, 300))
+    const second = calls.find((c) => c.harness === 'fake-a' && /did not agree/.test(c.prompt))
+    t.ok('the second round shows a seat every other seat\'s opinion', second && /### consultant-2/.test(second.prompt) && /### consultant-3/.test(second.prompt) && !/### consultant-1/.test(second.prompt), second?.prompt.slice(0, 300))
+    calls = []
+    const stuck = await fakePanel({ 'fake-a': [opinion(), opinion()], 'fake-b': [opinion({ choice: 'b' }), opinion({ choice: 'b' }), opinion({ choice: 'b' }), opinion({ choice: 'b' })] }, { calls })
+      .consult(request({ key: 'seats:three-stuck', seats: third }), { callerDir: await callerDir() })
+    t.eq('three seats still two against one after the last round go to a person, with every position', [stuck.outcome, stuck.brief.positions.map((p) => p.choice)], ['escalated', ['recommended', 'b', 'b']])
+  }
 
   t.section('a person\'s decision')
   calls = []

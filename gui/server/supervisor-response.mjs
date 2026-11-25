@@ -35,7 +35,7 @@ const fields = {
   readiness: ['project'],
   // A question for the operator, shown in Needs attention; answered later as an event.
   ask_operator: ['question'],
-  // A second opinion from the consult panel (two senior read-only seats); the result arrives later as an event.
+  // A second opinion from the consult panel (its senior read-only seats, one to three); the result arrives later as an event.
   consult: ['question','recommendation','project'],
   // The operator's Authorize/Decline for one previewed production release, written by the server.
   ask_release_authorization: ['previewId'],
@@ -73,8 +73,13 @@ function validate (value) {
     if(action.type==='consult'){
       for(const k of ['issueId','runId','reason'])if(action[k]!==undefined&&(typeof action[k]!=='string'||!action[k].trim()))throw Error(`${k} must be a non-empty string`)
       if(action.runId!==undefined&&action.issueId===undefined)throw Error('runId needs its issueId')
+      // The asker's own seats for this consult: shape only here; the panel checks the seat names and the roster.
+      if(action.seats!==undefined){
+        if(!action.seats||typeof action.seats!=='object'||Array.isArray(action.seats)||!Object.keys(action.seats).length)throw Error('seats must be an object: {"consultant-2": {"model": "<roster id>", "effort": "<level>"}} occupies a seat, null leaves it empty')
+        for(const [seat,to] of Object.entries(action.seats))if(to!==null&&(!to||typeof to!=='object'||Array.isArray(to)||typeof to.model!=='string'||!to.model.trim()||(to.effort!=null&&typeof to.effort!=='string')))throw Error(`seats.${seat} must be {model, effort?} or null`)
+      }
     }
-    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options','kind','reservedBy','consultId','runId']:[]),...(action.type==='consult'?['issueId','runId','reason']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='get_verification_file'?['offset']:[]),...(action.type==='get_context'?['project']:[]),...(action.type==='overview'?['stats']:[])]
+    const allowed=['type',...fields[action.type],...(action.type==='ask_operator'?['project','issueId','options','kind','reservedBy','consultId','runId']:[]),...(action.type==='consult'?['issueId','runId','reason','seats']:[]),...(['preview','inquire'].includes(action.type)?['runOptions']:[]),...(action.type==='inquire'?['relatedIssue']:[]),...(action.type==='create_issue'?['fromInquiry']:[]),...(action.type==='set_disposition'?['runId','related','acceptRisks']:[]),...(action.type==='readiness'?['issueId','playbook','runOptions']:[]),...(action.type==='set_dependencies'?['dependsOn','reason']:[]),...(action.type==='mark_landed'?['commit','checkout','landedAt']:[]),...(action.type==='accept_check_result_run'?['failures']:[]),...(['list_issues','get_result'].includes(action.type)?['offset','limit']:[]),...(action.type==='get_verification_file'?['offset']:[]),...(action.type==='get_context'?['project']:[]),...(action.type==='overview'?['stats']:[])]
     if(Object.keys(action).some(k=>!allowed.includes(k)))throw Error('Unexpected action argument')
     for(const k of ['offset','limit'])if(action[k]!==undefined&&(!Number.isSafeInteger(action[k])||action[k]<0))throw Error(`${k} must be a non-negative integer`)
     if(action.stats!==undefined&&action.stats!==true&&action.stats!==false&&(!Array.isArray(action.stats)||action.stats.some(x=>!['byPlaybook','bySeat'].includes(x))))throw Error('stats must be true, false or a list of byPlaybook, bySeat')

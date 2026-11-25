@@ -3857,7 +3857,7 @@ export class Engine {
       ...(consult ? { consult } : {}) }
     const opinions = (consult?.opinions ?? []).map((o) => `### ${o.seat} (${o.model}${o.effort ? ` @ ${o.effort}` : ''})${NL}${NL}${o.error ? `No opinion: ${o.error.message}` : `**${o.verdict}** ${o.choice ?? ''}, confidence ${o.confidence}. ${o.answer ?? ''}${NL}${NL}${o.reasoning ?? ''}${NL}${(o.evidence ?? []).map((e) => `- \`${e.location}\`: ${e.observation}`).join(NL)}`}`).join(NL + NL)
     const response = consult
-      ? `# Decision by the consult panel${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}${consult.outcome === 'resolved' ? 'Both consultants chose this answer independently' : 'The consultants did not agree; this step records what each said'} (consult ${consult.id}, recorded ${decision.at}).${NL}${NL}${opinions}${NL}`
+      ? `# Decision by the consult panel${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}${consult.outcome === 'resolved' ? 'Every occupied seat of the panel chose this answer independently' : 'The panel did not settle it; this step records what each seat said'} (consult ${consult.id}, recorded ${decision.at}).${NL}${NL}${opinions}${NL}`
       : `# Operator decision${NL}${NL}**Question** ${ask.question}${NL}${NL}**Answer** ${answer}${NL}${NL}Recorded by ${decision.actor} at ${decision.at}.${NL}`
     const created = await this.stepStore.create({ name: 'decision', response, invocationId })
     if (!this.run.steps.some((s) => s.invocationId === invocationId)) {
@@ -3875,7 +3875,7 @@ export class Engine {
    * A question for a person goes to the consult panel first (docs/consult.md,
    * execution-contract.md "The consult panel answers first").
    *
-   * `answered`: both consultants chose the same answer; it is recorded as the
+   * `answered`: every occupied seat of the panel chose the same answer; it is recorded as the
    * decision and the run goes on. `ask`: a person must be asked, and `ask` now
    * carries what the panel said (`consult`) and the question written for a
    * person (`brief`). `stopped`: the run was stopped while the panel worked.

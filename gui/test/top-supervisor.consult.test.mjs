@@ -16,6 +16,7 @@ export default async function (t) {
     const ok = (action) => { try { parseSupervisorResponse(JSON.stringify({ message: 'm', action })); return true } catch { return false } }
     t.ok('consult needs a question, a recommendation and a project', ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p' }) && !ok({ type: 'consult', question: 'q', project: 'p' }))
     t.ok('it may name an issue and a run', ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p', issueId: 'i', runId: 'x', reason: 'why' }) && !ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p', runId: 'x' }))
+    t.ok('it may choose the seats of this one consult, an occupied seat or an empty one', ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p', seats: { 'consultant-3': { model: 'gemini-4-neon' }, 'consultant-2': null } }) && !ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p', seats: {} }) && !ok({ type: 'consult', question: 'q', recommendation: 'r', project: 'p', seats: { 'consultant-3': 'gemini-4-neon' } }))
     t.ok('ask_operator takes its kind', ok({ type: 'ask_operator', question: 'q', kind: 'reserved', reservedBy: 'production' }) && ok({ type: 'ask_operator', question: 'q', kind: 'undecided', consultId: 'sc-1' }))
     t.ok('an unknown kind or reason is refused', !ok({ type: 'ask_operator', question: 'q', kind: 'technical' }) && !ok({ type: 'ask_operator', question: 'q', kind: 'reserved', reservedBy: 'because' }))
   }
@@ -44,11 +45,12 @@ export default async function (t) {
   const agent = await createTopSupervisor({ dir, models, adapter, tools, emit: () => {}, pollMs: 20 })
   try {
     t.section('2. a consult runs in the background and its result wakes the supervisor')
-    script = [() => ({ type: 'consult', question: 'Which layer takes the fix?', recommendation: 'The framework.', project: 'one-project', issueId: 'issue-1' })]
+    script = [() => ({ type: 'consult', question: 'Which layer takes the fix?', recommendation: 'The framework.', project: 'one-project', issueId: 'issue-1', seats: { 'consultant-2': null } })]
     await agent.start({ model: 'test-model', projects: ['one-project'], message: 'Coordinate' })
     await wait(() => events().some((e) => e?.type === 'consult-result'))
     const woken = events().find((e) => e?.type === 'consult-result')
     t.eq('the panel got the question, the recommendation and what it concerns', consults.map((c) => [c.mode, c.question, c.recommendation, c.project, c.issueId]), [['decide', 'Which layer takes the fix?', 'The framework.', 'one-project', 'issue-1']])
+    t.eq('and the seats the supervisor chose for it', consults[0].seats, { 'consultant-2': null })
     t.eq('the result carries the agreed answer and what to do with it', [woken.outcome, woken.answer, woken.conditions, /act on it within your authority/.test(woken.next)], ['resolved', 'Fix it in the framework.', ['keep the API'], true])
     t.eq('each seat\'s position is in it', woken.positions.map((p) => [p.seat, p.choice]), [['consultant-1', 'recommended'], ['consultant-2', 'recommended']])
     const charter = invocations[0].instructions ?? ''

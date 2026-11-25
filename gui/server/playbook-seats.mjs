@@ -4,6 +4,8 @@ import path from 'node:path'
 import YAML from 'yaml'
 import { CONFIG_ROOT, getValidator, loadConfig, resolvePlaybook, schemaId } from './config/load.mjs'
 import { discover } from './config/host-config.mjs'
+import { CONSULTATION, consultationEntry, saveConsultationSeats } from './consultation-seats.mjs'
+import { canonical, editedText, refuse, requested, sameSeat } from './seat-edit.mjs'
 
 /*
  * The Playbooks page: every playbook's seats as they stand (the model and effort bound to each role of its
@@ -23,10 +25,7 @@ import { discover } from './config/host-config.mjs'
  * file outside `participants`: the tracked file changed after the copy was written, or the copy was edited by hand.
  */
 
-const refuse = (message, status, detail) => Object.assign(new Error(message), { status, ...(detail ? { detail } : {}) })
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex')
-const canonical = (value) => JSON.stringify(value, (_key, v) => (v && typeof v === 'object' && !Array.isArray(v)) ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v)
-const sameSeat = (a, b) => (a?.model ?? null) === (b?.model ?? null) && (a?.effort ?? null) === (b?.effort ?? null) && Boolean(a) === Boolean(b)
 const messages = (errors) => errors.map((e) => `${e.field && e.field !== '/' ? `${e.field}: ` : ''}${e.message}`)
 // A blocker is { role, model, reason } (config/load.mjs): what keeps a start from being launched with these seats.
 const blocked = (blockers) => (blockers ?? []).map((b) => `${b.role ? `${b.role}: ` : ''}${b.model ? `${b.model} ` : ''}${b.reason ?? b.message ?? 'cannot launch'}`)
@@ -78,36 +77,11 @@ export async function playbookSeats ({ root = CONFIG_ROOT, hostDir, held = async
     models.push({ id: m.id, title: m.title ?? m.id, harness: m.harness, efforts: Array.isArray(m.efforts) ? m.efforts : [], defaultEffort: m.defaultEffort ?? null,
       verified: m.verification?.status === 'verified', heldUntil: await held(m.id).catch(() => null) })
   }
+  // The consult panel is seated like a playbook and shown as one (consultation-seats.mjs); a catalogue playbook of
+  // that id, should one ever exist, is the one shown.
+  const consultation = config.playbooks.has(CONSULTATION) ? null : await consultationEntry({ root: config.root, hostDir: config.hostDir, roster: config.roster })
+  if (consultation) playbooks.push(consultation)
   return { playbooks: playbooks.sort((a, b) => a.title.localeCompare(b.title)), models: models.sort((a, b) => a.title.localeCompare(b.title)), errors: messages(config.errors) }
-}
-
-/** The request's seats, checked for shape only: `{ role: null | { model, effort? } }`. */
-function requested (seats) {
-  if (!seats || typeof seats !== 'object' || Array.isArray(seats) || !Object.keys(seats).length) throw refuse('seats must name at least one role', 400)
-  for (const [role, seat] of Object.entries(seats)) {
-    if (seat === null) continue
-    if (typeof seat !== 'object' || Array.isArray(seat) || typeof seat.model !== 'string' || !seat.model) throw refuse(`seat "${role}" needs a model, or null to leave it empty`, 400)
-    if (seat.effort != null && typeof seat.effort !== 'string') throw refuse(`seat "${role}": effort is a level name, or absent for the model's default`, 400)
-    if (Object.keys(seat).some((key) => !['model', 'effort'].includes(key))) throw refuse(`seat "${role}": only model and effort can be set here`, 400)
-  }
-  return seats
-}
-
-/** The playbook's text with the seats changed and nothing else: comments stay, except on a value that changed. */
-function editedText (text, changes) {
-  const doc = YAML.parseDocument(text)
-  for (const { role, to } of changes) {
-    const at = ['participants', role]
-    if (!to) { doc.deleteIn(at); continue }
-    if (!doc.hasIn(at)) { doc.setIn(at, doc.createNode(to.effort ? { model: to.model, effort: to.effort } : { model: to.model })); continue }
-    for (const key of ['model', 'effort']) {
-      const node = doc.getIn([...at, key], true)
-      if (to[key] == null) { if (node) doc.deleteIn([...at, key]); continue }
-      // A trailing comment explained the old value ("the default since ..."); beside a new one it would mislead.
-      if (node && node.value !== to[key]) { node.value = to[key]; node.comment = null } else if (!node) doc.setIn([...at, key], to[key])
-    }
-  }
-  return doc
 }
 
 let saving = Promise.resolve()
@@ -124,6 +98,10 @@ export function savePlaybookSeats (id, seats, options = {}) {
 
 async function save (id, seats, { root = CONFIG_ROOT, hostDir, actor = 'operator', held, now = () => new Date() } = {}) {
   const config = await loadConfig(hostDir ? { root, hostDir } : { root })
+  if (id === CONSULTATION && !config.playbooks.has(id)) {
+    const saved = await saveConsultationSeats(seats, { root: config.root, hostDir: config.hostDir, roster: config.roster, actor, now })
+    return { ...saved, ...await playbookSeats({ root, hostDir, held }) }
+  }
   const playbook = config.playbooks.get(id)
   if (!playbook) throw refuse(`no playbook "${id}"`, 404)
   const roles = config.strategies.get(playbook.strategy)?.roles ?? {}

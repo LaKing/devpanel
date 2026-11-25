@@ -82,7 +82,7 @@ async function save (playbook) {
     take(result)
     error.value = ''
     notice.value = `${playbook.title}: ${(result.changes ?? []).map((c) => `${c.role} ${said(c.from)} → ${said(c.to)}`).join('; ')}. ` +
-      (result.removed ? 'These are the tracked defaults again, so the host copy was removed.' : `Saved to ${result.written}. Runs started from now on get these seats.`)
+      (result.removed ? 'These are the tracked defaults again, so the host copy was removed.' : `Saved to ${result.written}. ${playbook.kind === 'consultation' ? 'Questions put to the panel from now on get these seats.' : 'Runs started from now on get these seats.'}`)
   } catch (err) {
     refusal.value = { id: playbook.id, message: err.message, detail: err.body?.detail ?? [] }
   } finally { busy.value = '' }
@@ -130,7 +130,7 @@ onMounted(load)
         </div>
       </div>
       <v-alert v-if="p.errors.length" :type="p.resolves ? 'info' : 'error'" variant="tonal" density="compact" class="mx-4 mb-2">
-        {{ p.resolves ? 'As it stands a run of this playbook needs more than its seats' : 'This playbook does not resolve' }}: {{ p.errors.join(' · ') }}
+        {{ p.kind === 'consultation' ? (p.resolves ? 'The panel' : 'As it stands the panel cannot be asked') : p.resolves ? 'As it stands a run of this playbook needs more than its seats' : 'This playbook does not resolve' }}: {{ p.errors.join(' · ') }}
       </v-alert>
       <v-alert v-if="refusal?.id === p.id" type="error" variant="tonal" density="compact" class="mx-4 mb-2">
         Not saved: {{ refusal.message }}<span v-if="refusal.detail.length">: {{ refusal.detail.join(' · ') }}</span>

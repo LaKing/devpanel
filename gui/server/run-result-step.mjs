@@ -118,7 +118,7 @@ export function renderResult (run, outputs = {}, { approvedPatch = false } = {})
   // Questions the consult panel settled instead of a person; the owner may overrule them like an assumption.
   const consulted = (run.steps ?? []).filter((s) => s.role === 'operator' && s.decision?.consult?.outcome === 'resolved')
   if (consulted.length) {
-    lines.push('## Decided by the consult panel', '', 'Two senior models answered these independently and agreed, so nobody was asked. The opinions are in the named step.', '')
+    lines.push('## Decided by the consult panel', '', 'Every occupied seat of the consult panel gave the same answer to these, each on its own, so nobody was asked. The opinions are in the named step.', '')
     for (const s of consulted) lines.push(`- **${s.decision.question}**`, `  - ${s.decision.answer.split('\n').join('\n    ')} (step ${String(s.number).padStart(3, '0')})`)
     lines.push('')
   }

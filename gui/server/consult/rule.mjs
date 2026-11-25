@@ -1,7 +1,7 @@
 /*
  * The consult panel's decision rule (docs/consult.md "The rule"), pure.
  *
- * Whether two opinions agree is never a model's reading of two texts: each seat
+ * Whether opinions agree is never a model's reading of the texts: each seat
  * names one of the options it was offered, and agreement is the same key. An
  * answer no option covers (`other`) becomes a named option of the next round
  * (`alt-1`, `alt-2`), which the other seat can then choose.
@@ -34,7 +34,8 @@ export function nextOptions (options, opinions) {
 }
 
 /**
- * What one round of opinions settles.
+ * What one round of opinions settles. The rule is the same however many seats are occupied: every occupied seat
+ * names the same option and none with low confidence. With one seat that is the seat's own answer.
  *
  * @param options   the options that round offered ([{key, label}])
  * @param opinions  [{ seat, opinion }] — a validated opinion per seat, or null for a seat that gave none
@@ -49,11 +50,15 @@ export function judge (options, opinions) {
   const choices = new Set(opinions.map((o) => o.opinion.choice))
   if (choices.size !== 1) return { outcome: 'undecided', why: `the seats chose differently (${opinions.map((o) => `${o.seat}: ${o.opinion.choice}`).join(', ')})` }
   const [choice] = choices
-  if (choice === OTHER) return { outcome: 'undecided', why: 'each seat gave an answer of its own' }
-  const option = options.find((o) => o.key === choice)
-  if (!option) return { outcome: 'undecided', why: `"${choice}" is not one of the options offered` }
+  const single = opinions.length === 1
   const low = opinions.filter((o) => o.opinion.confidence === 'low')
-  if (low.length) return { outcome: 'undecided', why: `${low.map((o) => o.seat).join(' and ')} agreed with low confidence` }
+  // One occupied seat has nobody to agree with: an answer of its own is the decision, named as the option
+  // (`alt-1`) a second round would have made of it, so callers read it like any agreed alternative.
+  if (choice === OTHER && single && !low.length) return { outcome: 'resolved', choice: 'alt-1', answer: opinions[0].opinion.answer, conditions: [...new Set(opinions[0].opinion.conditions ?? [])] }
+  if (choice === OTHER && !single) return { outcome: 'undecided', why: 'each seat gave an answer of its own' }
+  const option = options.find((o) => o.key === choice)
+  if (!option && choice !== OTHER) return { outcome: 'undecided', why: `"${choice}" is not one of the options offered` }
+  if (low.length) return { outcome: 'undecided', why: single ? `${low[0].seat} answered with low confidence` : `${low.map((o) => o.seat).join(' and ')} agreed with low confidence` }
   const conditions = [...new Set([...(option.conditions ?? []), ...opinions.flatMap((o) => o.opinion.conditions ?? [])])]
   return { outcome: 'resolved', choice, answer: option.label, conditions }
 }

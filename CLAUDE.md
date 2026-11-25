@@ -69,7 +69,8 @@ npm run --silent supervisor-calls -- --from <YYYY-MM-DD> --to <YYYY-MM-DD>   # t
                              # for a stated period (inclusive UTC days) as JSON, from the ledger and run records, with what the
                              # ledger covers; read-only, no session (tools/supervisor-calls.mjs)
 npm run --silent consult -- --project <id> --question <file> [--issue <id>] [--run <id>] [--recommendation <text>] [--mode brief] [--plan]
-                             # one consult of the panel's two seats (docs/consult.md), result as JSON; --plan prints seats,
+                             # one consult of the panel's occupied seats (docs/consult.md; --seat <seat>=<model>[@<effort>] changes one for
+                             # this consult, --seat <seat>= empties it), result as JSON; --plan prints seats,
                              # readable roots, masks and the prompt and invokes nothing; otherwise PAID and needs DEVPANEL_LIVE=1
 npm run contract             # launches the INSTALLED claude/codex CLIs to prove they still honour
                              # CLAUDE_CONFIG_DIR / CODEX_HOME. Local, read-only, spends nothing — but it
@@ -125,7 +126,7 @@ Diagnostics go to `logs/devpanel.jsonl` (tail it), with the journal as a seconda
 | `roster/*.yaml` | concrete models bound to a harness, with `efforts` and `verification.status` | operators |
 | `strategy-templates/<id>/` | `strategy.yaml` (roles, phases, loops, review policy, completion) + `prompts/*.md` + `intents/*.yaml` (prompt overlays per kind of work, keyed by step id) | operators |
 | `playbooks/*.yaml` | a strategy bound to participants, budgets, `checks.requirement`, `autoClose`, default `intent`. The normal catalogue contains `analysis`, `triage`, `implementation`, `plan-and-implement`, and `deployment` (staging releases are its `staging` environment); older IDs remain available for compatibility | operators |
-| `consult/panel.yaml` | the consult panel (`gui/server/consult/`, `schemas/consult-panel.schema.json`): its two seats (roster models with efforts), rounds, bounds per run, `alwaysHuman` categories, further `readOnly` paths and `deny` masks; a `host-config/consult/panel.yaml` replaces it whole; read at every consult, never part of a run's snapshot; see `docs/consult.md` | operators |
+| `consult/panel.yaml` | the consult panel (`gui/server/consult/`, `schemas/consult-panel.schema.json`), *Consultation* on the Playbooks page: its seats (`consultant-1..3`, each optional, at least one occupied; roster models with efforts), rounds, bounds per run, `alwaysHuman` categories, further `readOnly` paths and `deny` masks; a `host-config/consult/panel.yaml` replaces it whole; read at every consult, never part of a run's snapshot; see `docs/consult.md` | operators |
 | `decisions/<id>.yaml` | advisory decision provider (`jev`: TypeSafe Jev, the default; `openai`: the OpenAI Decisions API, beta; `model`: a verified roster model through its CLI, `decisions/model-oracle.mjs`), its client `kind`, endpoint, `credentialRef`, `threshold`, pricing (`decision-provider.schema.json`); `decisions/active.yaml` (`provider: <id>`) selects the one active provider, Jev when absent; see `docs/decisions.md` | operators |
 | `projects/<id>.yaml` | optional per-project source repository and integration branch, workspace policy (`base`, `symlinks`, `excludes`, seat `tooling` mounts and commands), infrastructure, local `checks` (a project without SSH staging; docs/project-infrastructure.md "Local checks") and `actions` (`project.schema.json`) | operators |
 | `host-config/` | an installation's own `projects/`, `roster/` entries naming a login or carrying its dated verification evidence, `roster-pricing/`, `playbooks/` and `decisions/` overrides, release `releases/<site>-targets.json`, `live-reports/`, `settings.json` (its defaults: projects root, proxy users directory, script header markers, test-drive unit user and drive cap per staging host, forbidden prefixes, seat guidance; opt-in, all off by default: `projectDiscovery`, `dataRoot` (issues, logs, cert, token and host-config outside the checkout), `gitStore` (`runtime/git-store.mjs`), `nestedRepositories: include`, `operatorLanguage`, `harnesses.disabled`, `fence.readOnly`, `selection.allowedHomePaths` — the last two are refused when they reach a login entry of the home or the panel's data, `runtime/private-paths.mjs`; `config/host-settings.mjs`, `host-settings.schema.json`), `publish-denylist.txt` (what `npm run publish:check` must not find in the tracked tree) and `docs/`; git-ignored, `DEVPANEL_HOST_CONFIG_DIR` (relative to the config root; default `<config root>/host-config`, `config/host-config.mjs`). Each category is the union with the in-tree directory by file name, the host-config file winning (reported as shadowed). `examples/host-config/` shows it; `tools/migrate-host-config.mjs` (run by a person, never by a run) moves tracked files there and carries out a move manifest (`tools/host-move/manifest.json` when one is shipped). See `docs/host-config.md` | operators |
@@ -350,14 +351,17 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   in memory by the schema and by `resolvePlaybook` (only what the edit itself breaks is refused), then written as the installation's own copy
   `<host-config>/playbooks/<file>` with only `participants` changed and comments kept, never into the tracked catalogue; a copy equal to the tracked
   file is removed, `drift` marks one that differs outside its seats, and `playbooks/.history.jsonl` records who changed what. Later starts only; a new
-  configHash. The top-level supervisor has no such action. docs/host-config.md "Precedence".
-- `consult/` — the consult panel (docs/consult.md): a question that would go to a person goes first to two senior
-  models that are not run seats (defaults: Fable 5.2 and GPT-6.2 Astra at medium). Each reads the project's live checkout,
+  configHash. The top-level supervisor has no such action. docs/host-config.md "Precedence". The page also lists the consult panel as
+  *Consultation* (`consultation-seats.mjs`; id `consultation`, `kind: consultation`): its three optional seats are edited the same way, the edit written
+  as `<host-config>/consult/panel.yaml` with only `seats` changed; the shared file editing is `seat-edit.mjs`.
+- `consult/` — the consult panel (docs/consult.md): a question that would go to a person goes first to its senior
+  models, one to three seats that are not run seats (defaults: Fable 5.2 and GPT-6.2 Astra at medium, the third empty; seated on the
+  Playbooks page as *Consultation*, `consultation-seats.mjs`, and per consult through a request's `seats`). Each reads the project's live checkout,
   its related projects, the issue's folder and the asking run's worktree read-only, as the adapters' read seat inside a
   proved fence (`roots.mjs`; credentials masked with the fence's `masks`; no fence, no consult), and answers with a
   validated opinion (`consult-opinion.schema.json`: verdict answer | owner, an option key, conditions, evidence,
-  confidence, and always an `ownerBrief`). `rule.mjs` decides mechanically: `resolved` when both name the same option
-  with no low confidence, one more round showing each the other's opinion (`other` answers become `alt-<n>` options),
+  confidence, and always an `ownerBrief`). `rule.mjs` decides mechanically, the same for any number of occupied seats: `resolved` when every seat names the same option
+  with no low confidence (one seat: its own answer), one more round showing each the others' opinions (`other` answers become `alt-<n>` options),
   else `escalated` with the brief for a person, or `unavailable`. `consult.mjs` records everything under
   `<caller>/consults/<id>/` before returning (same key, question and mode = one consult, replayed from the record) and
   puts each seat turn on the spending ledger. `engine.consultFirst` asks it before an owner-hold or `owner-gate` /

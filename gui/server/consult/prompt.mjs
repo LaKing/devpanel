@@ -5,7 +5,7 @@ import { OTHER } from './rule.mjs'
  *
  * One text for both seats of a round: they differ only in their model, so a
  * disagreement is about the question and not about what each was shown. The
- * first round never shows the other seat's opinion; the second shows nothing else new.
+ * first round never shows another seat's opinion; the second shows nothing else new.
  */
 
 const NL = String.fromCharCode(10)
@@ -46,10 +46,15 @@ function briefRules (language) {
   ].join(NL)
 }
 
-function header ({ request, roots, scratchDir }) {
+/** What a seat is told about the rest of the panel: `others` is how many other seats answer the same question. */
+const panelNote = (others) => (others === 0 ? 'You are the only consultant asked: your answer, when you give one, is the decision.'
+  : others === 1 ? 'Another consultant answers the same question independently. You are not shown its answer and must not look for it.'
+    : `${others} other consultants answer the same question independently. You are not shown their answers and must not look for them.`)
+
+function header ({ request, roots, scratchDir, note }) {
   return [
     `You are a member of a consult panel: a senior second opinion asked before a question is put to a person. ${['operator', 'supervisor'].includes(request.askedBy?.role) || !request.askedBy?.role ? `It was raised by ${request.askedBy?.role === 'operator' ? 'an operator' : 'the supervisor of automated runs'}` : `It was raised by the ${request.askedBy.role} of an automated run`} on the project ${request.project}.`,
-    'Another consultant answers the same question independently. You are not shown its answer and must not look for it.',
+    note,
     '',
     'You can read everything listed below and change nothing. Read the code, the rules and the record yourself: verify what the question claims (numbers, precedents, quoted rules) instead of trusting it. If you cannot read what you need, say so in reasoning and answer with confidence "low".',
     '',
@@ -71,9 +76,9 @@ function question ({ request, options }) {
 }
 
 /** The first round: decide, or say it is a person's. */
-export function decidePrompt ({ request, options, roots, scratchDir, language }) {
+export function decidePrompt ({ request, options, roots, scratchDir, language, others = 1 }) {
   return [
-    header({ request, roots, scratchDir }),
+    header({ request, roots, scratchDir, note: panelNote(others) }),
     '',
     question({ request, options }),
     '',
@@ -90,16 +95,16 @@ export function decidePrompt ({ request, options, roots, scratchDir, language })
 }
 
 /** The second round: the same seat, shown the other's opinion. */
-export function reconcilePrompt ({ options, other, language }) {
-  const o = other.opinion
+export function reconcilePrompt ({ options, others, language }) {
+  const shown = (o) => JSON.stringify({ verdict: o.verdict, choice: o.choice, answer: o.answer, conditions: o.conditions ?? [], reasoning: o.reasoning, evidence: o.evidence ?? [], confidence: o.confidence }, null, 2)
+  const one = others.length === 1
   return [
-    'The other consultant answered the same question differently. Its opinion:',
-    '```json',
-    JSON.stringify({ verdict: o.verdict, choice: o.choice, answer: o.answer, conditions: o.conditions ?? [], reasoning: o.reasoning, evidence: o.evidence ?? [], confidence: o.confidence }, null, 2),
-    '```',
+    one ? 'The other consultant answered the same question differently. Its opinion:' : 'The panel did not agree on the same question. The other consultants\' opinions:',
+    ...others.flatMap((other) => [...(one ? [] : ['', `### ${other.seat}`]), '```json', shown(other.opinion), '```']),
     '',
-    'Check its evidence where it differs from yours, then give your final opinion in the same JSON form. Change your answer only if its evidence convinces you; agreeing to end the disagreement helps nobody.',
-    'An answer either of you gave as "other" is now an option of its own (alt-1, alt-2): to keep or to adopt it, choose its key.',
+    one ? 'Check its evidence where it differs from yours, then give your final opinion in the same JSON form. Change your answer only if its evidence convinces you; agreeing to end the disagreement helps nobody.'
+      : 'Check their evidence where it differs from yours, then give your final opinion in the same JSON form. Change your answer only if evidence convinces you; agreeing to end the disagreement helps nobody.',
+    'An answer any of you gave as "other" is now an option of its own (alt-1, alt-2, ...): to keep or to adopt it, choose its key.',
     '',
     '## Options now',
     ...options.map((x) => `- \`${x.key}\`: ${x.label}${x.conditions?.length ? ` (conditions: ${x.conditions.join('; ')})` : ''}`),
@@ -114,7 +119,7 @@ export function reconcilePrompt ({ options, other, language }) {
 /** Mode `brief`: the decision is a person's; the seat only writes the question for them. */
 export function briefPrompt ({ request, options, roots, scratchDir, language }) {
   return [
-    header({ request, roots, scratchDir }).replace('Another consultant answers the same question independently. You are not shown its answer and must not look for it.', 'This question is reserved to a person: you do not decide it. Your task is to put it so that the person can answer it quickly and well.'),
+    header({ request, roots, scratchDir, note: 'This question is reserved to a person: you do not decide it. Your task is to put it so that the person can answer it quickly and well.' }),
     '',
     question({ request, options }),
     '',
