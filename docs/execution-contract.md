@@ -3096,6 +3096,50 @@ write, file sync, close, rename, then directory sync. Ancestor directories are
 synced as well; journal appends are synced before events are emitted. A sync
 failure is an operation failure, not an acknowledged save.
 
+**The per-append journal check** (`runtime/store.mjs`). A full read-and-validate of
+`events.jsonl` (a contiguous, newline-committed prefix, never skipping a bad record)
+records, when it finds the journal clean, a trusted entry for it: the journal's
+identity (device, inode, size, mtime, ctime) and the last 8 KiB of the bytes it parsed,
+with their hash. `inspectRunJournal`, `readRun`, `readEvents` and the read-only
+`inspectJournalReadOnly` always read in full, and seed or drop the entry. A check
+(before every append, and `requireCompleteEvents`: the engine's check before each
+save, integration, applying an artifact) compares the identity and the last 8 KiB
+with that entry; if they match, the journal is reached through a name the entry was
+validated or written through (a name belongs to at most one entry: one that now
+resolves to another file, by replacement or a link, loses its old membership, and its
+first check under the new file reads it in full, even when that file was trusted
+under it before), and neither `journal-recovery.json` nor
+`legacy-journal-disposition.json` exists beside that name, the journal is not read
+further. Bytes
+before that 8 KiB suffix are not re-read, even when they belong to the last record.
+Otherwise the same check runs the full read-and-validate at once: a clean result
+records a fresh entry and the check passes (a well-formed outside append or a
+truncation at a record boundary ends here, and the next append uses the fresh
+entry, the name joining it); a refusal (`EVENT_JOURNAL_RECOVERY_REQUIRED`, never
+appended to) for the journal's content leaves no entry, so every later check validates
+in full again. A refusal that comes only from the caller's own recovery or disposition
+record (journal content read whole and clean) keeps the entry for the journal's other
+names, such as another run hard-linked to the same file. There is no entry, and the first
+check reads the whole journal, at a process's first open of the journal (load,
+resume, recovery, restart). The entry is also dropped before an append writes (a
+failed write leaves none), when the append's re-read after its own write does not
+show the previous 8 KiB suffix and the new last 8 KiB it expects, on any read error,
+and for a journal whose identity cannot be read. It is kept when an append is refused
+with `EVENT_RECORD_INVALID`: a record the parser would reject is refused after the
+journal check and before anything is written. Appends, checks and full reads of one
+journal take turns inside the process, keyed by the file's identity so every name of
+it (symlinks, hard links) shares the turn; a check never sees this process's own
+append half written. An append that the trusted entry vouches for reads at most 24 KiB
+(the 8 KiB check and the two 8 KiB re-reads after its write), so it costs the same at
+any journal length; an append whose check misses reads and validates the whole journal
+once, as before.
+
+The writer contract: a concurrent foreign writer is not detected reliably; the journal has one writer under the run lock.
+Integration and its reconcile (`integrateRun`, `reconcileIntegration`) currently
+append from the panel process without `.run.lock`; their appends take turns with the
+engine's inside the process, per journal, as above. A second process writing the
+journal is the foreign writer this sentence excludes.
+
 Availability updates hold a process-safe lock for the full read/modify/write,
 including operator clears. A missing store starts empty; an invalid store refuses
 operations. New pauses carry a unique `pause.id`; answers must supply that value

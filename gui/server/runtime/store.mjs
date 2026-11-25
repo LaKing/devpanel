@@ -166,29 +166,252 @@ export async function writeRun (issuePath, runId, run) {
   return run
 }
 
-export async function appendEvent (issuePath, runId, event, { clock = systemClock, emit = null } = {}) {
-  const file = path.join(runDir(issuePath, runId), 'events.jsonl')
-  await requireCompleteEvents(issuePath, runId)
+/*
+ * The per-append journal check (execution-contract.md "Persistence and decision
+ * identity"). A clean full read leaves a trusted entry for the journal: its
+ * identity (dev, ino, size, mtime, ctime) and an owned copy of its last 8 KiB
+ * with their hash. An append whose journal still matches that entry, with no
+ * recovery or legacy-disposition record beside it, does not read the journal
+ * again; anything else gets the full read-and-validate at once. After its own
+ * write an append re-reads the old and the new last 8 KiB before it trusts the
+ * new state. An append the trusted entry vouches for reads at most 24 KiB, so it
+ * costs the same at any length; one whose check misses reads the whole journal.
+ * An entry vouches only for the names (paths) it was validated or written
+ * through, and a name belongs to at most one entry (pathOwner): a name that now
+ * resolves to another file loses its old membership and gets the full read.
+ *
+ * Appends, checks and full reads of one journal take turns in this process
+ * (journalChains), so a check never sees this process's own append half
+ * written. Chain and cache are keyed by the file's identity (dev:ino), which
+ * every name of one journal shares: symlinks, hard links, bind mounts. Inside a
+ * slot only the unchained *Locked functions may run; a public journal function
+ * called from inside a slot would wait on itself.
+ */
+const JOURNAL_TAIL = 8192
+const SIDE_FILES = ['journal-recovery.json', 'legacy-journal-disposition.json']
+const journalCache = new Map()
+const journalChains = new Map()
+const journalQueued = new Map()
+const pathOwner = new Map()   // resolved journal name -> the one cache key whose entry vouches for it
+
+/** Drop a name's membership in any entry other than `key` (it now resolves elsewhere). */
+function releaseElsewhere (name, key) {
+  const owner = pathOwner.get(name)
+  if (owner === undefined || owner === key) return
+  journalCache.get(owner)?.paths.delete(name)
+  pathOwner.delete(name)
+}
+
+const journalPath = (issuePath, runId) => path.join(runDir(issuePath, runId), 'events.jsonl')
+const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
+const identityOf = (s) => ({ dev: s.dev, ino: s.ino, size: s.size, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs })
+const sameIdentity = (a, s) => a.dev === s.dev && a.ino === s.ino && a.size === s.size && a.mtimeNs === s.mtimeNs && a.ctimeNs === s.ctimeNs
+// A copy in an allocation of its own: a view would keep the whole journal, or a large event, alive.
+const ownedTail = (bytes) => {
+  const n = Math.min(bytes.length, JOURNAL_TAIL)
+  const out = Buffer.allocUnsafeSlow(n)
+  bytes.copy(out, 0, bytes.length - n)
+  return out
+}
+const isEventRecord = (value) => !!value && !Array.isArray(value) && typeof value === 'object' &&
+  typeof value.type === 'string' && !!value.type && typeof value.at === 'string'
+
+/** The realpath of a path that may not exist yet: its nearest existing ancestor, the rest rejoined. */
+async function existingRealpath (target) {
+  const rest = []
+  let current = path.resolve(target)
+  for (;;) {
+    try { return path.join(await fs.realpath(current), ...rest) } catch (error) {
+      const parent = path.dirname(current)
+      if (error.code !== 'ENOENT' || parent === current) throw error
+      rest.unshift(path.basename(current))
+      current = parent
+    }
+  }
+}
+
+/** ino:<dev>:<ino> when the journal exists; its resolved path when it does not; else lexical, never cached. */
+async function journalKey (file) {
+  try {
+    const s = await fs.stat(file, { bigint: true })
+    return { key: `ino:${s.dev}:${s.ino}`, canonical: true }
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      try { return { key: 'path:' + await existingRealpath(file), canonical: true } } catch {}
+    }
+    return { key: 'lex:' + path.resolve(file), canonical: false }
+  }
+}
+
+function enqueue (key, fn) {
+  const run = (journalChains.get(key) ?? Promise.resolve()).then(() => fn())
+  const tail = run.then(() => {}, () => {})
+  journalChains.set(key, tail)
+  journalQueued.set(key, (journalQueued.get(key) ?? 0) + 1)
+  tail.then(() => {
+    const left = journalQueued.get(key) - 1
+    if (left) journalQueued.set(key, left); else journalQueued.delete(key)
+    if (journalChains.get(key) === tail) journalChains.delete(key)
+  })
+  return run
+}
+
+/** Run fn in the journal's slot, under the key that is current when the work starts. */
+async function inJournalChain (file, fn) {
+  let ident = await journalKey(file)
+  for (let attempt = 0; ; attempt++) {
+    const outcome = await enqueue(ident.key, async () => {
+      const now = await journalKey(file)
+      if (now.key === ident.key) return { value: await fn(now) }
+      if (attempt > 0) return { value: await fn({ key: now.key, canonical: false }) }
+      return { next: now }
+    })
+    if (!outcome.next) return outcome.value
+    ident = outcome.next
+  }
+}
+
+/*
+ * After a full read. `stat` is the identity the bytes were read under, or null when the content
+ * was refused, unreadable or moved: then the entry goes. Content read whole and clean is
+ * trusted even when a caller's own side file refuses it (one hard-linked run's recovery
+ * record says nothing about the shared journal); the caller's name joins the names the entry
+ * vouches for only when its whole result is clean.
+ */
+function seed (ident, file, stat, bytes, cleanForCaller) {
+  const name = path.resolve(file)
+  releaseElsewhere(name, ident.key)
+  if (!ident.canonical || !stat || ident.key !== `ino:${stat.dev}:${stat.ino}`) return journalCache.delete(ident.key)
+  const tail = ownedTail(bytes)
+  const known = journalCache.get(ident.key)
+  const paths = new Set(known && sameIdentity(known, stat) && known.tail.equals(tail) ? known.paths : [])
+  if (cleanForCaller) { paths.add(name); pathOwner.set(name, ident.key) } else {
+    paths.delete(name)
+    if (pathOwner.get(name) === ident.key) pathOwner.delete(name)
+  }
+  journalCache.set(ident.key, { ...identityOf(stat), tail, tailHash: sha256(tail), paths })
+}
+
+/**
+ * The trusted entry if the journal still matches it, read through a name it was validated or
+ * written through: an fstat, at most 8 KiB read, two stats. A name the entry does not own (new
+ * to it, or last recorded under another file, such as a path switched to a link elsewhere and
+ * back) gets the full read; a name now resolving elsewhere first loses its old membership.
+ */
+async function quickCheck (dir, file, ident) {
+  const name = path.resolve(file)
+  releaseElsewhere(name, ident.key)
+  const entry = ident.canonical ? journalCache.get(ident.key) : null
+  if (!entry || !entry.paths.has(name) || pathOwner.get(name) !== ident.key) return null
+  let handle
+  try {
+    handle = await fs.open(file, 'r')
+    const s = await handle.stat({ bigint: true })
+    if (!sameIdentity(entry, s)) return null
+    const n = entry.tail.length
+    const bytes = Buffer.alloc(n)
+    const { bytesRead } = await handle.read(bytes, 0, n, Number(s.size) - n)
+    if (bytesRead !== n || !bytes.equals(entry.tail) || sha256(bytes) !== entry.tailHash) return null
+  } catch { return null } finally { await handle?.close().catch(() => {}) }
+  for (const name of SIDE_FILES) {
+    try { await fs.stat(path.join(dir, name)); return null } catch (error) { if (error.code !== 'ENOENT') return null }
+  }
+  return entry
+}
+
+/** The quick check, else today's full validation and refusal. Returns the entry an append may build on. */
+async function vouchLocked (issuePath, runId, file, ident) {
+  const entry = await quickCheck(path.dirname(file), file, ident)
+  if (entry) return { journal: { status: 'complete', complete: true, recoveryRequired: false, stoppedAt: null, message: null }, entry }
+  // The full read below replaces or drops the entry from what it finds.
+  const journal = await inspectLocked(issuePath, runId, file, ident)
+  if (journal.recoveryRequired || journal.retired) {
+    throw Object.assign(new Error(journal.message), { code: 'EVENT_JOURNAL_RECOVERY_REQUIRED', status: 409, journal })
+  }
+  return { journal, entry: ident.canonical ? journalCache.get(ident.key) ?? null : null }
+}
+
+/**
+ * After our own write: the old last 8 KiB are still what we vouched for, the new
+ * last 8 KiB are what we computed, and nothing moved meanwhile. Only then is the
+ * new state trusted. Any failure leaves no entry; the append itself stands.
+ */
+async function proveAppend (file, ident, vouched, line) {
+  let handle
+  try {
+    handle = await fs.open(file, 'r')
+    const s1 = await handle.stat({ bigint: true })
+    if (s1.dev !== vouched.dev || s1.ino !== vouched.ino || s1.size !== vouched.size + BigInt(line.length)) return
+    const old = vouched.tail
+    const oldBytes = Buffer.alloc(old.length)
+    if ((await handle.read(oldBytes, 0, old.length, Number(vouched.size) - old.length)).bytesRead !== old.length || !oldBytes.equals(old)) return
+    const m = Math.min(line.length, JOURNAL_TAIL)
+    const k = Math.min(old.length, JOURNAL_TAIL - m)
+    const tail = Buffer.allocUnsafeSlow(k + m)
+    old.copy(tail, 0, old.length - k)
+    line.copy(tail, k, line.length - m)
+    const newBytes = Buffer.alloc(tail.length)
+    if ((await handle.read(newBytes, 0, tail.length, Number(s1.size) - tail.length)).bytesRead !== tail.length || !newBytes.equals(tail)) return
+    const s2 = await handle.stat({ bigint: true })
+    if (!sameIdentity(s1, s2) || !ident.canonical || ident.key !== `ino:${s1.dev}:${s1.ino}`) return
+    journalCache.set(ident.key, { ...identityOf(s1), tail, tailHash: sha256(tail), paths: vouched.paths })
+  } catch {} finally { await handle?.close().catch(() => {}) }
+}
+
+async function appendLocked (issuePath, runId, file, ident, event, clock) {
+  // The journal is checked first: a damaged journal refuses before the record is judged.
+  const { entry: vouched } = await vouchLocked(issuePath, runId, file, ident)
   const record = { at: clock.iso(), ...event }
+  let text, parsed = null
+  try { text = JSON.stringify(record); parsed = JSON.parse(text) } catch {}
+  if (typeof text !== 'string' || text.includes(NL) || !isEventRecord(parsed)) {
+    throw Object.assign(new Error('Event record refused before writing: an event needs a type and an at string'), { code: 'EVENT_RECORD_INVALID', status: 400 })
+  }
+  const line = Buffer.from(text + NL)
+  journalCache.delete(ident.key)
   await fs.mkdir(path.dirname(file), { recursive: true })
-  await appendDurable(file, JSON.stringify(record) + NL)
-  // Emission happens only after the durable write.
+  await appendDurable(file, line)
+  if (vouched) await proveAppend(file, ident, vouched, line)
+  return record
+}
+
+export async function appendEvent (issuePath, runId, event, { clock = systemClock, emit = null } = {}) {
+  const file = journalPath(issuePath, runId)
+  const record = await inJournalChain(file, (ident) => appendLocked(issuePath, runId, file, ident, event, clock))
+  // Emission happens only after the durable write, outside the journal's slot.
   if (emit) emit(record)
   return record
 }
 
+/** The whole journal through one handle, with the identity it had while read (null if it moved). */
+async function readJournal (file) {
+  let handle
+  try { handle = await fs.open(file, 'r') } catch (error) { return { error } }
+  try {
+    const s0 = await handle.stat({ bigint: true })
+    const bytes = await handle.readFile()
+    const s1 = await handle.stat({ bigint: true })
+    return { bytes, stat: sameIdentity(s0, s1) && s1.size === BigInt(bytes.length) ? s1 : null }
+  } catch (error) { return { error } } finally { await handle.close().catch(() => {}) }
+}
+
 /** Read only a contiguous, newline-committed prefix. Never skip a bad record. */
-async function parseEvents (issuePath, runId) {
+async function parseEvents (file) {
   const events = []
-  let bytes
   const problem = (status, line, byteOffset, detail) => ({
     events, status, complete: false, recoveryRequired: true,
     stoppedAt: { line, byteOffset },
     message: `Event journal ${status} at line ${line}, byte ${byteOffset}: ${detail}. Readable history is diagnostic only; execution requires recovery.`
   })
-  try { bytes = await fs.readFile(path.join(runDir(issuePath, runId), 'events.jsonl')) } catch (error) {
-    return problem(error.code === 'ENOENT' ? 'missing' : 'unreadable', 1, 0, error.code ?? error.message)
+  const read = await readJournal(file)
+  if (read.error) {
+    return { journal: problem(read.error.code === 'ENOENT' ? 'missing' : 'unreadable', 1, 0, read.error.code ?? read.error.message), bytes: null, stat: null }
   }
+  const { bytes, stat } = read
+  return { journal: parseBytes(bytes, events, problem), bytes, stat }
+}
+
+function parseBytes (bytes, events, problem) {
   let offset = 0, line = 1
   while (offset < bytes.length) {
     const end = bytes.indexOf(10, offset)
@@ -197,7 +420,7 @@ async function parseEvents (issuePath, runId) {
     try {
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(offset, terminated ? end : bytes.length))
       value = JSON.parse(text)
-      if (!value || Array.isArray(value) || typeof value !== 'object' || typeof value.type !== 'string' || !value.type || typeof value.at !== 'string') throw new Error('Expected an event object with type and at strings')
+      if (!isEventRecord(value)) throw new Error('Expected an event object with type and at strings')
     } catch (error) {
       const incomplete = !terminated && /unexpected end|unterminated/i.test(error.message)
       return problem(incomplete ? 'incomplete-tail' : terminated ? 'corrupt-record' : 'corrupt-tail', line, offset, error.message)
@@ -213,7 +436,19 @@ async function parseEvents (issuePath, runId) {
 
 /** No caller may infer execution authority from a recovered prefix. */
 export async function inspectRunJournal (issuePath, runId) {
-  const journal = await parseEvents(issuePath, runId)
+  const file = journalPath(issuePath, runId)
+  return inJournalChain(file, (ident) => inspectLocked(issuePath, runId, file, ident))
+}
+
+async function inspectLocked (issuePath, runId, file, ident) {
+  const { journal, bytes, stat } = await parseEvents(file)
+  const result = await judgeJournal(issuePath, runId, journal)
+  const clean = result.complete && !result.recoveryRequired && !result.retired && !result.finding && !result.recoveryPersistenceError
+  seed(ident, file, journal.complete ? stat : null, bytes, clean)
+  return result
+}
+
+async function judgeJournal (issuePath, runId, journal) {
   try {
     const disposition = await legacyJournalDisposition(issuePath, runId)
     if (disposition) return { ...journal, complete: false, recoveryRequired: false, retired: true, disposition,
@@ -253,7 +488,17 @@ export const readEvents = inspectRunJournal
  * on disk, an unreadable finding or a retired legacy journal all as "not clean".
  */
 export async function inspectJournalReadOnly (issuePath, runId) {
-  const { events, ...journal } = await parseEvents(issuePath, runId)
+  const file = journalPath(issuePath, runId)
+  return inJournalChain(file, async (ident) => {
+    const { journal, bytes, stat } = await parseEvents(file)
+    const verdict = await judgeReadOnly(issuePath, runId, journal)
+    // A clean read-only reading is as good a validation as any: it seeds the entry too.
+    seed(ident, file, journal.complete ? stat : null, bytes, verdict.clean)
+    return verdict
+  })
+}
+
+async function judgeReadOnly (issuePath, runId, journal) {
   if (journal.recoveryRequired) return { clean: false, reason: journal.message }
   try {
     if (await legacyJournalDisposition(issuePath, runId)) return { clean: false, reason: 'legacy journal retired' }
@@ -267,12 +512,16 @@ export async function inspectJournalReadOnly (issuePath, runId) {
   return { clean: true, reason: null }
 }
 
+/** Throws EVENT_JOURNAL_RECOVERY_REQUIRED as before; a journal matching its trusted entry is not read again. */
 export async function requireCompleteEvents (issuePath, runId) {
-  const journal = await inspectRunJournal(issuePath, runId)
-  if (journal.recoveryRequired || journal.retired) {
-    throw Object.assign(new Error(journal.message), { code: 'EVENT_JOURNAL_RECOVERY_REQUIRED', status: 409, journal })
-  }
-  return journal
+  const file = journalPath(issuePath, runId)
+  return inJournalChain(file, async (ident) => (await vouchLocked(issuePath, runId, file, ident)).journal)
+}
+
+/** Test seam: the trusted entry for a journal, and how many calls are queued on it. */
+export const __journalCache = {
+  async get (issuePath, runId) { return journalCache.get((await journalKey(journalPath(issuePath, runId))).key) ?? null },
+  async queued (issuePath, runId) { return journalQueued.get((await journalKey(journalPath(issuePath, runId))).key) ?? 0 }
 }
 
 /**
