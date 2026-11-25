@@ -473,7 +473,7 @@ function reopenedFindings (rounds, last) {
 /**
  * Where are we? A pure function of the snapshot and what has been recorded.
  */
-export function plan (snapshot, steps, outputs, { skip = null, checkResults = [], notice = null, diagnostics = [] } = {}) {
+export function plan (snapshot, steps, outputs, { skip = null, checkResults = [], notice = null, diagnostics = [], decided = null } = {}) {
   const policy = snapshot.reviewPolicy
   const maxRepair = policy.protocolRepair.maxAttempts
   const prior = priorFindings(steps, outputs, policy)
@@ -650,7 +650,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
     // A round's reviews folded into its verdict, the revision they examined,
     // their substantial findings and how many of those only the checks'
     // result can settle (`awaitsCheck`).
-    const tally = () => ({ review: phase.loop.consensus ? { verdict: 'approved', substantial: false } : null, reviewed: null, findings: 0, substantial: 0, awaiting: 0, reviews: [], named: new Map() })
+    const tally = () => ({ review: phase.loop.consensus ? { verdict: 'approved', substantial: false } : null, reviewed: null, findings: 0, substantial: 0, awaiting: 0, reviews: [], named: new Map(), seats: new Map(), blocking: [] })
     const count = (t, step, r) => {
       const result = summariseReview(r.output, policy, priorBefore(prior, r.done.number))
       const blockers = result.findings.filter((f) => isSubstantial([f], policy))
@@ -663,6 +663,19 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
       t.reviewed = r.output?.artifactRevision ?? t.reviewed
       t.reviews.push({ step, r, blocking: blockers.length > 0 })
       t.named.set(step.role, new Set([...(t.named.get(step.role) ?? []), ...blockers.map((f) => f.id)]))
+      // What a decided round reports (`decided`, Engine.recordReviewRounds): each seat's verdict and the
+      // round's blocking findings as the engine weighs them, deferred prior findings included.
+      t.seats.set(step.role, result.verdict)
+      t.blocking.push(...blockers.map((f) => ({ id: f.id, seat: step.role, severity: f.severity ?? null, location: f.location ?? null,
+        ...(f.criterion ? { criterion: f.criterion } : {}), ...(f.disposition === 'deferred' ? { deferred: true } : {}), ...(f.source ? { source: f.source } : {}) })))
+    }
+    // A round the loop has decided, for the caller that records rounds (engine.recordReviewRounds):
+    // only where every seat, repair, re-review and check of the round is behind it.
+    const decide = (round, t, review, approved, extra = {}) => {
+      if (!decided || !t.reviews.length) return
+      decided.push({ phase: phase.id, round, reviewed: t.reviewed ?? null, approved, verdict: approved ? 'approved' : 'changes-needed',
+        checksFailed: Boolean(review?.checksFailed), operatorContinued: Boolean(review?.operatorContinued), ...extra,
+        seats: [...t.seats].map(([role, verdict]) => ({ role, verdict })), blocking: t.blocking })
     }
     for (let round = 0; round < maxRounds && !satisfied; round++) {
       extensionDenied = null
@@ -773,12 +786,16 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
         // same bytes, and the recorded result fails it again: further rounds
         // could only replay that result. Stop here; refresh-checks reruns the
         // checks on this revision, Continue asks the author again.
-        if (review.verdict === 'approved' && reviewed === checksOnlyFailed && !continued.has(round)) return terminal('checks-failed-unchanged')
+        if (review.verdict === 'approved' && reviewed === checksOnlyFailed && !continued.has(round)) {
+          decide(round, t, { ...review, checksFailed: true }, false, { stop: 'checks-failed-unchanged' })
+          return terminal('checks-failed-unchanged')
+        }
         checksOnlyFailed = review.verdict === 'approved' ? reviewed : null
         review = { ...review, verdict: 'changes-needed', checksFailed: true }
       } else checksOnlyFailed = null
       if (review && continued.has(round)) review = { ...review, verdict: 'changes-needed', operatorContinued: true }
-      if (review && round > reopenedAfter && evaluate(phase.loop.until, { review })) satisfied = true
+      const passed = Boolean(review && round > reopenedAfter && evaluate(phase.loop.until, { review }))
+      if (passed) satisfied = true
       weight[round] = findings + (review?.checksFailed || review?.operatorContinued ? 1 : 0)
       named[round] = t.named
       // One extra round, never asked for, when the last regular round made
@@ -808,6 +825,7 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
         else if (modulesApproved(snapshot) && substantial > awaiting) driveNotRun = { phase: phase.id, round, revision: reviewed, result: 'not-run', reason: 'rejected-round' }
         else if (!continued.has(round)) return { kind: 'checks', revision: reviewed, phase, round, ...owed }
       }
+      decide(round, t, review, passed)
     }
     if (!satisfied) {
       if (phase.loop.onExhausted === 'await-input') {
@@ -841,6 +859,42 @@ export function plan (snapshot, steps, outputs, { skip = null, checkResults = []
  *
  * Both name their steps, so the tie between plan and audit is inspectable.
  */
+/*
+ * Review rounds for the top-level supervisor's non-convergence wake (docs/top-level-supervisor.md
+ * "When a review loop does not converge"). plan() reports the rounds it decided (`decided`); a round
+ * counts once the engine has moved past it: its next step is not in the same phase and round (a repair,
+ * re-review, recheck or the round's own check) and no check is running on the revision it reviewed. A
+ * plan review names no revision, so a running check never holds it.
+ */
+export function settledRounds (decided, next, { checkingRevision = null } = {}) {
+  const openRound = next && ['turn', 'diagnostic', 'checks'].includes(next.kind) && next.phase?.id ? { phase: next.phase.id, round: next.round } : null
+  return decided.filter((row) => !(openRound && openRound.phase === row.phase && openRound.round === row.round) &&
+    !(checkingRevision != null && row.reviewed === checkingRevision))
+}
+
+export const reviewRoundKey = (windowResetAfter, phase, round) => `${windowResetAfter ?? -1}:${phase}:${round}`
+
+/**
+ * The run's recorded rounds with the newly settled ones appended, once each: a round is keyed by
+ * restart window, loop and round, so a replay, a resumed loop or Continue's reopened round adds no
+ * second row. A key in `baseline` (decided before this run was first loaded with this code) is never
+ * recorded. `nonApproving` counts the loop's recorded rounds that did not pass, across restart windows.
+ */
+export function appendReviewRounds (existing = [], rows, { windowResetAfter = null, baseline = [], at = new Date().toISOString() } = {}) {
+  const list = [...existing]
+  const added = []
+  for (const row of rows) {
+    const key = reviewRoundKey(windowResetAfter, row.phase, row.round)
+    if (baseline.includes(key) || list.some((r) => r.key === key)) continue
+    const ofPhase = list.filter((r) => r.phase === row.phase)
+    const entry = { key, window: windowResetAfter ?? -1, ...row, ordinal: ofPhase.length + 1,
+      ...(row.approved ? {} : { nonApproving: ofPhase.filter((r) => !r.approved).length + 1 }), decidedAt: at }
+    list.push(entry)
+    added.push(entry)
+  }
+  return { list, added }
+}
+
 export function planOf (steps, outputs, policy) {
   let current = null
   let approved = null
@@ -1079,6 +1133,10 @@ export class Engine {
     this.openDriveWaits ??= new Map()
     this.workspaceReleasedAt = null
     this.invocationStoppedAt = null
+    // The top-level supervisor's admission of a newly recorded non-approving review round
+    // (supervisor.mjs armAutoReconcile wires it); waited for at most this long.
+    this.admitReviewRounds = null
+    this.reviewRoundAdmissionMs = 15_000
   }
 
   participantSpec (role) {
@@ -1106,6 +1164,11 @@ export class Engine {
    * delivery. Wins over a pause or anything else the same commit would start.
    */
   async blockForCleanup () {
+    // A review the turn just committed may have decided a round: recorded and admitted while the run is live.
+    // A check running beside that review decides the round too, so it settles first. Its own failure is
+    // logged, not raised: the run blocks for its cleanup either way, and a resume drives the revision again.
+    if (this.checksInFlight) await this.settleChecks().catch((error) => console.warn('[devpanel] check before cleanup block failed', { runId: this.runId, error: error.message }))
+    await this.recordReviewRounds()
     this.run.status = 'blocked'
     this.run.blockedReason = 'cleanup-unproved'
     this.run.outcome = 'unresolved'
@@ -1401,7 +1464,49 @@ export class Engine {
     // A record from before interrupted turns were kept: read them off its journal, once.
     if (!Array.isArray(this.run.interruptedTurns)) this.run.interruptedTurns = interruptedFromEvents((await store.inspectRunJournal(this.issuePath, this.runId)).events, this.run)
     this.applyControlOverrides()
+    // A run first loaded by code that records review rounds: the rounds it had already decided are
+    // never counted (only rounds decided from now on are). Read before recovery can adopt a turn.
+    if (this.run.reviewRounds === undefined && this.snapshot?.reviewPolicy) {
+      let baseline = []
+      try {
+        const decided = []
+        const next = plan(this.snapshot, this.activeSteps(), this.outputs, { ...this.planEvidence(), decided })
+        baseline = settledRounds(decided, next).map((row) => reviewRoundKey(this.run.windowResetAfter, row.phase, row.round))
+      } catch (error) { console.warn('[devpanel] review rounds baseline not read', { runId: this.runId, error: error.message }) }
+      this.run.reviewRounds = []
+      this.run.reviewRoundsBaseline = baseline
+    }
     return this
+  }
+
+  /**
+   * Record the review rounds the engine has decided and moved past (settledRounds) on run.reviewRounds,
+   * once each, and wait (bounded) for the top-level supervisor to admit a new non-approving one before
+   * anything else happens: its next turn, a stop, finish. It observes and decides nothing, so a failure
+   * here is logged, never the run's.
+   */
+  async recordReviewRounds () {
+    try {
+      if (!this.snapshot?.reviewPolicy) return
+      const decided = []
+      const next = plan(this.snapshot, this.activeSteps(), this.outputs, { ...this.planEvidence(), decided })
+      const settled = settledRounds(decided, next, { checkingRevision: this.checksInFlight ? this.checksRevision : null })
+      const { list, added } = appendReviewRounds(this.run.reviewRounds ?? [], settled, { windowResetAfter: this.run.windowResetAfter, baseline: this.run.reviewRoundsBaseline ?? [], at: this.clock.iso() })
+      if (!added.length) return
+      this.run.reviewRounds = list
+      await this.persist({ type: 'review-round-decided', rounds: added.map((r) => ({ key: r.key, phase: r.phase, round: r.round, approved: r.approved, nonApproving: r.nonApproving ?? null })) })
+      if (!this.admitReviewRounds || added.every((r) => r.approved)) return
+      let timer
+      const outcome = await Promise.race([
+        Promise.resolve().then(() => this.admitReviewRounds({ rows: added })).then((o) => o ?? { state: 'admitted' }, (error) => ({ state: 'failed', error: error.message })),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ state: 'timeout' }), this.reviewRoundAdmissionMs) })
+      ]).finally(() => clearTimeout(timer))
+      const admission = { state: outcome.state ?? 'admitted', at: this.clock.iso(), ...(outcome.thresholds ? { thresholds: outcome.thresholds } : {}), ...(outcome.error ? { error: outcome.error } : {}) }
+      for (const row of added) if (!row.approved) row.admission = admission
+      await this.persist({ type: 'review-round-admission', keys: added.filter((r) => !r.approved).map((r) => r.key), ...admission })
+    } catch (error) {
+      console.warn('[devpanel] review rounds not recorded', { runId: this.runId, error: error.message })
+    }
   }
 
   /*
@@ -4559,6 +4664,8 @@ export class Engine {
       this.run.checkRefresh.completedAt = this.clock.iso()
       const latest = this.run.checkResults.at(-1)
       if (latest?.revision !== this.run.checkRefresh.revision || gatingResult(latest, this.run) !== 'passed') {
+        // The refreshed result may decide a round left open (now vetoed): recorded and admitted while the run is live.
+        await this.recordReviewRounds()
         this.run.status = 'blocked'; this.run.blockedReason = 'refreshed-checks-failed'; this.run.endedAt = this.clock.iso()
         await this.persist({ type: 'checks-refresh-failed' }); return this.run
       }
@@ -4570,6 +4677,8 @@ export class Engine {
 
     try {
     for (let i = 0; i < turnLimit; i++) {
+      // Rounds the last turn or check decided, before anything can stop the run (a cancel, a budget, a pause, a hold).
+      await this.recordReviewRounds()
       if (this.controller.signal.aborted) {
         // Aborted between turns: nothing is in flight, so termination is already
         // true and the run settles without waiting for a process to die.
@@ -4778,6 +4887,7 @@ export class Engine {
     } catch (error) {
       // Background checks belong to this drive: never left running past it.
       await this.settleChecks().catch(() => {})
+      if (!error.injected) await this.recordReviewRounds()
       // A batch cut at the deadline ends as the cut turn would have; a crash leaves it live for recovery.
       if (!error.injected && this.deadlineCuts?.length && this.run.status === 'running') await this.blockAtDeadline(this.deadlineCuts).catch(() => {})
       this.deadlineCuts = null
@@ -4794,6 +4904,8 @@ export class Engine {
       throw error
     }
     await this.settleChecks()
+    // A round the drive's last turn decided, however the loop ended (its turn limit included).
+    await this.recordReviewRounds()
     await this.settleEnding({ explicitMax })
     // However the drive ended: a pause has no time limit, and nothing here waits on staging.
     await this.discardKeptInstance('run-ended')

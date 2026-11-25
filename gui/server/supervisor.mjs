@@ -117,6 +117,9 @@ export function createSupervisor ({
   failureAdvisor = null,
   // The consult panel (consult/consult.mjs): asked by a run before a person is. Optional: without it runs ask as before.
   consult = null,
+  // The top-level supervisor's admission of a run's newly recorded non-approving review round
+  // ({project, issueId, runId, rows} => {state}); without it runs record rounds and wake nobody.
+  onReviewRounds = null,
   // Host-wide memory of exhausted models, beside the issues. One file for every
   // project: a quota burnt by one run is a quota burnt for all of them.
   availabilityFile = path.join(issues.ISSUES_DIR ?? process.env.DEVPANEL_ISSUES_DIR ?? '.', '.availability.json'),
@@ -972,6 +975,8 @@ export function createSupervisor ({
     engine.reconcilePolicy = () => reconcilePolicyOf(project)
     engine.reconcileOwner = instanceId
     engine.releaseCoverage = async (args) => stagingRunCoverage({ ...args, project, projectPath: await resolveProjectPath(project, { projectsDir }).catch(() => null), listIssues: (p, o) => issues.listIssues(p, o) })
+    // A newly recorded non-approving review round goes to the top-level supervisor before the run goes on (engine.recordReviewRounds).
+    engine.admitReviewRounds = onReviewRounds ? (a) => onReviewRounds({ ...a, project, issueId: engine.run?.issue?.id, runId: engine.runId }) : null
   }
   // No record is left to hold a decision, so nothing is left to wait on.
   const recordGone = (error) => error.status === 404 || error.code === 'ENOENT'

@@ -268,6 +268,9 @@ export async function getRun (issuePath, runId, { issues, project, issueId, isAc
     // Convergence measurements read off the record: rounds and restarts, the
     // time split, and distinct findings versus confirmations.
     metrics: runMetrics(counted, { outputs }),
+    // Review rounds the engine decided, once each (engine.mjs recordReviewRounds): the top-level supervisor's
+    // review-rounds wake counts them and carries their blocking findings.
+    reviewRounds: run.reviewRounds ?? [],
     // What the wall-clock budget has used, as Resume and Continue will read it.
     wallClock: counted.budgets?.limits?.wallClockMinutes
       ? { ...wallClockStanding(counted, outputs, Date.now(), { liveCheckSince, stoppedAt: Date.parse(run.pause?.at ?? run.endedAt ?? '') || null }), startedUnderRule: run.wallClockRule ?? null,

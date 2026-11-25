@@ -24,8 +24,9 @@ import { confidentAnswer } from './index.mjs'
  * failed, blocked, paused (an operator request or question) or were cancelled,
  * a run that ended unresolved (budgets, disagreement), a run whose delivery was
  * decided (`changed` names a delivery key), model substitutions after a quota
- * failure, capacity freeing for an issue that waited (`capacity-freed`), and the end of a
- * full verification cycle (`verification-ended`).
+ * failure, capacity freeing for an issue that waited (`capacity-freed`), the end of a
+ * full verification cycle (`verification-ended`), and a review loop of an owned run reaching a
+ * configured count of non-approving rounds (`review-rounds`).
  *
  * A live run's progress (phase, checks verdict, a status between live statuses) is
  * never put to the provider and does not wake: monitoring merges it per run
@@ -38,7 +39,8 @@ const MAX_MISSION_CHARS = 8000
 const MAX_ISSUES = 40
 
 // verification-ended: a full verification cycle ended (full-verification.mjs), with its outcome and evidence.
-const ALWAYS = ['user', 'tool-result', 'protocol-repair', 'model-substituted', 'deferred-events', 'capacity-freed', 'verification-ended']
+// review-rounds: a review loop of an owned run reached a configured count of non-approving rounds (top-supervisor.mjs).
+const ALWAYS = ['user', 'tool-result', 'protocol-repair', 'model-substituted', 'deferred-events', 'capacity-freed', 'verification-ended', 'review-rounds']
 // What a run-changed may name without being about its delivery.
 const PROGRESS_KEYS = ['status', 'phase', 'checks', 'blockedReason']
 const ATTENTION_STATUSES = ['failed', 'blocked', 'paused', 'cancelled']

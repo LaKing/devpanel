@@ -397,7 +397,7 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   `confidentAnswer()` is the only thing a caller may branch on. All callers go through `advisor.mjs` (the real
   client, the top-level supervisor's ledger, nothing asked without either). `pregate.mjs` asks before a Triage start
   and a confident close/needs-input HOLDS it (`PREGATE_HOLD`); only an operator confirms a proposal or overrides with a
-  reason. `wake-filter.mjs` holds routine supervisor events (failures, pauses, unresolved endings never), and issue-list changes
+  reason. `wake-filter.mjs` holds routine supervisor events (failures, pauses, unresolved endings, `review-rounds` never), and issue-list changes
   outside the operator's declared `state.campaign` or confidently judged outside the mission with no timer, merged per project, until the next wake; one that cannot be placed wakes.
   `failure-advisor.mjs` may turn a `runtime` failure into `transient`/`rate-limit`, never `quota`/`auth`.
   `GET /api/decisions/triage-shadow` reports agreement. The issue page's Assess bar (`AssessBar.vue`) asks the pre-gate questions of the provider (default) or of any verified roster model at any of its efforts (`decisions/model-oracle.mjs`: one tool-free CLI turn, answers checked by `checkAnswers`, recorded as provider `model:<id>` with the provider's threshold, under the same ledger, admission and availability holds). The provider is on the Model availability page as
@@ -570,6 +570,14 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   with `blockedBy[].until {event, at}`; an observation, `start_run` still decides. When an issue that waited could start
   now (`supervisor.checkoutHolder` reads which live in-place run holds a project's checkout, owned run or not) a `capacity-freed` event wakes it with `next`,
   past the wake filter. A poll reads the queue only when its inputs moved (listings, owned runs, counters), else once per `queueIdleMs` (ten polls). docs/top-level-supervisor.md "The ready queue".
+- Review-rounds wake (docs/top-level-supervisor.md "When a review loop does not converge"): the engine records each review
+  round it has decided and moved past on `run.reviewRounds` once (`recordReviewRounds`, keyed restart window : phase : round,
+  blocking findings with locations, a per-loop `nonApproving` count; a run first loaded by this code keeps its already decided
+  keys in `reviewRoundsBaseline`), and hands a new non-approving one to the top-level supervisor, waiting at most 15 s
+  (`supervisor.mjs` `onReviewRounds`, `top-supervisor.mjs` `admitReviewRounds`). At each count in the host setting
+  `supervisor.reviewRoundWakes` (default `[3]`) one always-waking `review-rounds` event per run, loop and threshold is
+  admitted, durably in state.json before the engine goes on; its record on the owned run is queued/sent/delivered, delivery
+  at-least-once (delivered only once the reply is in the chat; a crash, a discarded session-mismatch reply, a retried failed call or a Stop that aborted the call, then Start, can repeat it); an event whose run record is gone is dropped with a log line.
 - `runtime/run-metrics.mjs` — convergence measurements read off the run record, never stored by the engine:
   round EXECUTIONS per phase ((cycle, round) pairs a seat ran in, with `cycles` and `maxDepth`) beside cycle
   restarts and ignored `restartPlan` requests; the elapsed time split into agent time / operator wait /

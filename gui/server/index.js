@@ -1093,7 +1093,9 @@ const consult = createConsult({
   relatedOf: async (project) => relatedProjects((await loadConfig({ root: consultRoot })).projects, project),
   filesOf: async (project) => projectFiles((await loadConfig({ root: consultRoot })).projects, project)
 })
-supervisor = createSupervisor({ issues, emit: emitRunEvent, pregate, failureAdvisor: createFailureAdvisor({ advisor }), consult })
+supervisor = createSupervisor({ issues, emit: emitRunEvent, pregate, failureAdvisor: createFailureAdvisor({ advisor }), consult,
+  // A run's review loop recorded a non-approving round: the top-level supervisor admits its threshold event before the run goes on.
+  onReviewRounds: (args) => topSupervisor ? topSupervisor.admitReviewRounds(args) : { state: 'inactive' } })
 // A triage's questions for the owner go to the panel first; its agreed answers take the owner's own path.
 const ownerQuestionConsult = createOwnerQuestionConsult({
   consult, getIssue: (project, issueId) => issues.getIssue(project, issueId), emit: emitRunEvent,

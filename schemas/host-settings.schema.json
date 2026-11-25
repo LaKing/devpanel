@@ -41,6 +41,20 @@
       "type": "boolean",
       "description": "Whether the next start resumes the runs a service shutdown cancelled (run.stoppedBy: service-shutdown), limits unchanged. Default true; false leaves them cancelled and marked, for a person to resume."
     },
+    "supervisor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The top-level supervisor (docs/top-level-supervisor.md).",
+      "properties": {
+        "reviewRoundWakes": {
+          "type": "array",
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 1 },
+          "description": "Counts of non-approving rounds of one review loop at which a run the supervisor owns wakes it with a `review-rounds` event, once per run, loop and count (\"When a review loop does not converge\"). Default [3]; [] turns it off; e.g. [3, 6, 9]."
+        }
+      }
+    },
     "projectDiscovery": {
       "type": "object",
       "additionalProperties": false,

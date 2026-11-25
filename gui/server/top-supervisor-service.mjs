@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { acquire } from './runtime/lock.mjs'
 import { createTopSupervisor } from './top-supervisor.mjs'
 import { CONFIG_ROOT, loadConfig, resolvePlaybook } from './config/load.mjs'
+import { hostSettings } from './config/host-settings.mjs'
 import { getRun, listPlaybooks, listRuns, preview, readStepResponse } from './runs-api.mjs'
 import { resolveWithRelease, selectStagedRelease } from './release-selection.mjs'
 import { summariseIssue, summarisePackedRun, summarisePreview, summariseRun, summariseStep } from './supervisor-summary.mjs'
@@ -100,6 +101,8 @@ export async function topSupervisorService ({ issues, supervisor, modelPerforman
  const lock=await acquire(path.join(dir,'.owner.lock'),{purpose:'top-level-supervisor'})
  let service
  try { service=await createTopSupervisor({dir,models,adapter,emit,decisions,...(pollMs?{pollMs}:{}),
+  // The review-rounds wake's thresholds, read at each use like every host setting (docs/host-config.md).
+  reviewRoundWakes:()=>hostSettings({root:configRoot}).supervisor.reviewRoundWakes,
   tools:{
    // The consult panel for the supervisor's own questions (consult/consult.mjs): it reads the project, the
    // issue's folder and, when a run is named, that run's worktree; recorded under the supervisor's directory.

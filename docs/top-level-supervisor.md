@@ -936,6 +936,74 @@ recovery marked it interrupted, or a delivery failed) stays owed on its record (
 pending`) and is told once the supervisor exists (`announcePending` at the panel's start), once
 (`announce: delivered`, `announcedAt`).
 
+### When a review loop does not converge
+
+A review loop of a run the supervisor owns that keeps rejecting wakes it while the run is still live,
+not only at the run's end: a `review-rounds` event, which the wake filter never holds and never puts
+to the decision provider (`alwaysWakes`).
+
+**When it fires.** The engine records each review round once it has decided it and moved past it
+(`run.reviewRounds`, `runtime/engine.mjs` `recordReviewRounds`): every seat answered, repairs and
+same-round re-reviews are done, the round's own check has its result, and no check is still running
+on the revision it reviewed. A round counts as *non-approving* when the loop's `until` did not hold:
+a reviewer asked for changes, a deferred plan finding kept it open, a failed check vetoed an
+approval, or the loop stopped on `checks-failed-unchanged`. A round stopped only by an inconclusive
+check is not counted (Refresh checks can still settle it either way). Rounds are counted per loop
+(phase) and across plan restarts and evidence refreshes: a round is keyed by restart window, loop and
+round, so a replay, a resumed loop, Continue's reopened round or a panel restart never counts a round
+twice. When a loop's count reaches a configured threshold, one event is admitted for that run, loop
+and threshold, and never again. Nothing fires before the threshold is reached.
+
+**Before the run goes on.** The engine hands a newly recorded non-approving round to the supervisor
+(`admitReviewRounds`) and waits, at most 15 s, before its next step, finish included. The supervisor
+puts the event into its queue past the wake filter and answers only once `issues/.supervisor/state.json`
+holds it, outside the poll and its advisory calls. The answer is kept on the round (`admission`:
+`admitted`, `nothing-due`, `not-owned`, `inactive`, `failed` or `timeout`); none of them stops the run.
+A stopped supervisor admits nothing: the first poll after Start queues the crossing, even if the run
+has ended by then. An event admitted while Start is still reading is sent once Start has finished.
+Start, New session and a `perWakeCalls` refusal keep an admitted event (a refusal holds it with the
+deferred events).
+
+**What it carries.** `eventId` (`review-rounds:<runId>:<phase>:<threshold>`), `runId`, `project`,
+`issueId`, `phase`, `threshold`, `round` (the engine's round number of the crossing round), `ordinal`,
+`nonApproving`, `window`, `run` (the run delta), and `rounds`: every recorded round of that loop up to
+and including the crossing, each with `round`, `ordinal`, `window`, `approved`, `verdict`,
+`checksFailed`, `stop`, each seat's verdict and every blocking finding as `{id, seat, severity,
+location}` (with `deferred` and `source` for a deferred plan finding). Ids and locations are never
+capped or clipped, so the supervisor can tell product code from a test's fixture code from plan
+text; descriptions and evidence are behind `get_run` and `get_step`. What the supervisor does with
+the event is its own decision.
+
+**Thresholds.** Default `[3]`: the third non-approving round of a loop. Configured in the host settings
+(`host-config/settings.json`) as `supervisor.reviewRoundWakes`, e.g. `{"supervisor": {"reviewRoundWakes":
+[3, 6, 9]}}`; each threshold fires once per run and loop, `[]` switches the event off. Read at each use,
+so an edit needs no restart (docs/host-config.md).
+
+**Cost.** The event makes no model call of its own. It opens or joins a wake like any other event, and
+the call that wake makes for it counts in `perWakeCalls`.
+
+**Delivery is at-least-once.** The event's record on the owned run says `queued`, `sent` (claimed by a
+call, in the same step that takes it off the queue) or `delivered`, which is written only once the
+call's accepted reply is in the chat. A duplicate is therefore possible in four cases: after a crash,
+when a call returned but its reply never reached the chat; after a reply discarded for a session
+mismatch, when the event is sent again on a new session; after a call that started and then failed
+(a runtime or connection error the activation carries on from), when the same event goes back to the
+front of the queue and the next call carries it again; and after an operator's Stop (or a service
+shutdown) aborted a call that was carrying it, when the next Start sends the same event again, with
+the same `eventId`. All four are harmless: the supervisor reads the run's current state. Once
+shutdown has begun no new call starts: an event admitted meanwhile stays `queued` in `state.json` for
+the next Start. The event is admitted only once per run, loop and threshold. A timed
+`deferred-events` wake that finds nothing left to carry when its turn comes makes no call.
+
+**Residual limits.**
+- An event whose run record or owned entry is gone (a deleted run, or one retired by New session) is
+  dropped with a log line, whether still queued, deferred or carried; a timed `deferred-events` wake
+  left with nothing to carry is skipped, and no call is made for either.
+- A run that predates this event counts only rounds decided after it was first loaded by this code
+  (`run.reviewRoundsBaseline` keeps the rounds it had already decided); its count and its payload start
+  there. A round still open at that moment, including one later decided only by a check, counts.
+- A review phase named `constructor` is not supported by the run-detail reader, so its threshold wake fails admission.
+
 ### Calls per started run
 
 `npm run --silent supervisor-calls -- --from YYYY-MM-DD --to YYYY-MM-DD` (from `gui/`;

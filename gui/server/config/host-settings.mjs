@@ -67,7 +67,7 @@ const lastValid = new Map()
 const expandHome = (p) => p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
 
 /**
- * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, fullVerification, verificationTrigger, projectDiscovery, proxyLogin, projectActions,
+ * The effective settings for a config root: {file, pending, projectsRoot, dataRoot, gitStore, nestedRepositories, resumeAfterShutdown, supervisor, fullVerification, verificationTrigger, projectDiscovery, proxyLogin, projectActions,
  * testDrive, selection, harnesses, fence, skill, reporter, seatGuidance, operatorLanguage}, defaults filled in. Read at call time and
  * cached by file identity, so an edit is seen without a restart.
  */
@@ -119,6 +119,8 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     gitStore: data.gitStore === true,
     nestedRepositories: data.nestedRepositories ?? 'gitlink',
     resumeAfterShutdown: data.resumeAfterShutdown !== false,
+    // The top-level supervisor's review-rounds wake (top-supervisor.mjs): counts of non-approving rounds of a loop, ascending.
+    supervisor: { reviewRoundWakes: [...(data.supervisor?.reviewRoundWakes ?? [3])].sort((a, b) => a - b) },
     // The full verification (server/full-verification.mjs); null: no scheduled cycle.
     fullVerification: data.fullVerification?.at ? { at: data.fullVerification.at, timeZone: data.fullVerification.timeZone } : null,
     // The full verification's delivery trigger (server/verification-trigger.mjs): a cycle per this many deliveries on a stage; 0 is off.

@@ -5,7 +5,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSupervisorResponse } from './supervisor-response.mjs'
-import { deliveryReading, progressReading, remainingBudget, runDelta, runReading } from './supervisor-summary.mjs'
+import { deliveryReading, progressReading, remainingBudget, reviewRoundsEvent, runDelta, runReading } from './supervisor-summary.mjs'
 import { buildReadyQueue, freedSince, queueFingerprint, queueObservation, shownQueue } from './ready-queue.mjs'
 import { createLedger, toMicros, toUsd } from './runtime/ledger.mjs'
 import { estimateCallCost, leavesCleanBaseline } from './runtime/call-cost.mjs'
@@ -78,7 +78,7 @@ Archive is allowed only when the current activation permits it. Archiving is not
 A run blocked with protocol-repair-exhausted carries a diagnostics.protocol list: each failed attempt's classification (no-structured-output, contract-violation, ambiguous-output) and exact error. Read it before deciding. A contract violation is the agent's; a failure to find output the agent did produce is the engine's, and neither is fixed by a cheaper model or a smaller round cap. Do not spend a run start on a retry that changes nothing the diagnostics point at.
 There is no activation time limit; owned runs end on their own budgets or when you stop them.
 A Triage start may be refused with code PREGATE_HOLD: the decision provider confidently judged the issue closable or lacking information. Its "pregate.proposals" say what an operator could confirm on the issue page. You cannot confirm them or start past the hold; tell the user, or choose other work.
-Routine monitoring events may be held rather than wake you. A live run's progress (phase, checks, a status between live statuses) never wakes you: it is merged per run, with progress:true, and rides with the next event that does. Other held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, capacity freeing, user messages and your own action results always wake you.
+Routine monitoring events may be held rather than wake you. A live run's progress (phase, checks, a status between live statuses) never wakes you: it is merged per run, with progress:true, and rides with the next event that does. Other held events arrive as "event.deferred" with the next event that does wake you, or as a "deferred-events" event after at most 15 minutes. Issue-list changes outside your declared "campaign" (the projects it covers, the reporters whose issues it leaves to someone else) or judged outside your mission are held too, as entries with outside:true merged per project: they have no time limit and wait for the next event that wakes you, and you can still see and act on them. "campaign" is the operator's to set, on the Supervisor page; when an operator's message leaves work to someone else and "campaign" does not declare it, say so in your reply. Failures, pauses, cancellations, unresolved endings, capacity freeing, user messages and your own action results always wake you, and so does a review-rounds event: a review loop of a run you own reached a configured count of rounds that did not pass, with every round of that loop so far and each blocking finding's id and location (product code, a test's fixture or plan text); what you do with it is yours to decide.
 A run-changed event's "changed" lists what moved since the last observation: status, phase, checks, blockedReason, reconcile (run.reconciliation is the latest reconcile that ended; its checks name the gate's reason and the directory get_check_log reads), landing (run.landed), delivery (run.delivery, its application or merge). A reconcile, landing or delivery always wakes you, so a run whose delivery someone else decided, with its status unchanged, is learned here; your own reconcile or landing is told by its action result instead. A run read with reconcilePending true has an automatic reconcile undecided: it is not settled and you are not woken for it; do not land or reconcile it, the decision arrives as a run-changed event.
 Limits: maxCalls is a runaway guard on your own calls; maxStartsPerIssue bounds starts of each project/issue; maxRuns bounds all start attempts. All three are SESSION limits: Start and a server restart resume the same allowance, and only an operator's New session opens a fresh one — you cannot reset them yourself. Dollar costs and calendar spending totals are accounting only unless enforceAllowances is explicitly true. Never stop, defer work, or ask for a larger budget because of estimated costs, maxCostUsd, or advisory daily/monthly amounts. A provider quota failure stops what met it, and no other model is ever substituted automatically: a run fails with failure.class quota and keeps its workspace, sessions and completed steps, the model is held as unavailable until its recorded reset, and the operator resumes the run once it answers again; your own activation stops the same way and leaves your runs running. Do not start a run on a seat model that is held unavailable, and never ask for a larger budget because of it. maxConcurrent counts live owned runs plus unresolved launch reservations. Failed launches with unchanged inputs are blocked for the rest of the session. A start refused with retryable: true (something is occupied right now) is not a failed launch and uses no start: the same start may be tried again once that clears. A new preview ID alone is not a changed input. One live run per issue: several issues of one project may run at once, so concurrency can mean the same project. A start is refused (occupied, retryable) only beside a live in-place run, which holds the checkout, for a staging or deployment run beside another of its project, or for a coding run whose issue's modules another live run of its module pool holds (code MODULE_LOCKED, naming the holder; starts with disjoint modules run in parallel). Deliveries into one repository take turns on its delivery lock, and a remote test drive waits for a slot on its staging host; neither fails for waiting.`
 
@@ -124,7 +124,11 @@ const OWN_FAILURE_MAX_MS = 600_000
 /** Consults one session may ask (the supervisor's own and the plain wording of reserved questions); a New session renews it. */
 const MAX_CONSULTS = 40
 
-export async function createTopSupervisor ({ dir, models, adapter, tools, emit = () => {}, pollMs = 3000, queueIdleMs = pollMs * 10, decisions = null, maxDeferMs = DEFAULT_MAX_DEFER_MS, resendAfterChars = RESEND_AFTER_CHARS }) {
+export async function createTopSupervisor ({ dir, models, adapter, tools, emit = () => {}, pollMs = 3000, queueIdleMs = pollMs * 10, decisions = null, maxDeferMs = DEFAULT_MAX_DEFER_MS, resendAfterChars = RESEND_AFTER_CHARS,
+  // Counts of non-approving rounds of one review loop that wake the supervisor (host settings supervisor.reviewRoundWakes), read at each use.
+  reviewRoundWakes = () => [3],
+  // How state.json is written: a test can hold a write to see what waits for it.
+  writeState = writeAtomic }) {
   await fs.mkdir(dir, { recursive: true })
   const file = path.join(dir, 'state.json')
   let state
@@ -135,6 +139,12 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   // The conversation, beside the state (supervisor-chat.mjs): loaded, or migrated from a state that still holds it, below.
   let chat = createChat({ dir, file: chatFileName(state.chatFile) })
   let chain = Promise.resolve(), task = null, controller = null, timer = null, closing = false, asking = null, pollPending = false
+  // The drive may start only once Start has made the activation's controller (kick).
+  let activationReady = false
+  // The call the drive is preparing or making now: a review-rounds record claimed by it is in flight.
+  let currentInvocation = null
+  // The state write that first held each admitted review-rounds event (insertReviewWake): admission answers after it.
+  const recordWrites = new Map()
   // The running activation is ending because of the supervisor itself, not on an operator's Stop (settleStop).
   let ownEnding = false
   // The service is shutting down (shutdown()): the activation ends, its runs are the run supervisor's to stop as
@@ -219,7 +229,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     const into = chat
     const write = writes.then(async () => {
       if (owed) await into.flush()
-      if (bytes !== written) { await writeAtomic(file, bytes); written = bytes }
+      if (bytes !== written) { await writeState(file, bytes); written = bytes }
       emit(event)
     })
     writes = write.catch(() => {})
@@ -337,6 +347,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
     message('system', state.reason)
     await save()
   }
+  // A review-rounds event claimed by a call this process never finished: delivered if its reply is in the chat.
+  resolveReviewWakes()
   if (['active', 'working', 'stopping'].includes(state.status)) {
     state.status = state.pending ? 'recovery-required' : 'stopped'
     message('system', state.pending ? 'Server restarted during an operation. Automatic replay is blocked; the pending operation must be reconciled before this session can restart.' : 'Server restarted. Session retained; press Start to continue.')
@@ -775,7 +787,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
             // An event whose call failed (or came back on another session) is owed its retry: the refusal does
             // not drop it. It is held like a deferred event, so it rides with the next event that wakes, or wakes
             // by itself after maxDeferMs, in a wake with its own allowance.
-            for (const owed of state.queue.filter((e) => e?.retryOwed)) {
+            // A review-rounds event was admitted once and is never admitted again: it is held the same way.
+            for (const owed of state.queue.filter((e) => e?.retryOwed || e?.type === 'review-rounds')) {
               const { retryOwed: _r, deferred: _d, ...rest } = owed
               ;(state.deferred ??= []).push({ at: new Date().toISOString(), event: rest, reason: `refused by ${verdict.limit} before its retry`, retry: true })
             }
@@ -795,8 +808,40 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // that never started, a failure, a stop, a crash) must not lose them, and being
         // told twice costs less than never being told.
         const carried = state.deferred?.length ? [...state.deferred] : []
+        // A timed wake exists only to carry what was held. Queued while a call already carrying those entries
+        // was in flight, it finds them delivered: nothing is left to tell, so no call is made.
+        if (event.type === 'deferred-events' && !carried.length) { await save(); continue }
         if (carried.length) event.deferred = carried
         const invocationId = crypto.randomUUID()
+        // Claimed by this call before anything is awaited, so no second copy can be admitted meanwhile.
+        currentInvocation = invocationId
+        markReviewWakes(reviewWakeEvents(event, carried), { state: 'sent', invocationId })
+        // A review-rounds event whose run record is gone is dropped (docs/top-level-supervisor.md).
+        if (reviewWakeEvents(event, carried).length) {
+          const hadCarried = carried.length
+          const droppedCarried = []
+          for (const d of [...carried]) {
+            if (d.event?.type !== 'review-rounds' || !await goneReviewWake(d.event)) continue
+            dropReviewWake(d.event)
+            droppedCarried.push(d.event)
+            carried.splice(carried.indexOf(d), 1)
+            state.deferred = (state.deferred ?? []).filter((x) => x !== d)
+          }
+          if (carried.length) event.deferred = carried
+          else delete event.deferred
+          const eventGone = event.type === 'review-rounds' && await goneReviewWake(event)
+          // A timed wake with nothing left to carry would only spend a call: one warning in all.
+          const emptyWake = event.type === 'deferred-events' && hadCarried > 0 && carried.length === 0
+          if (eventGone || emptyWake) {
+            if (eventGone) dropReviewWake(event)
+            const dropped = [...(eventGone ? [event] : []), ...droppedCarried].map((e) => ({ runId: e.runId, phase: e.phase, threshold: e.threshold }))
+            console.warn(emptyWake ? 'deferred-events wake skipped: every carried entry was dropped (review-rounds run record gone)' : 'review-rounds event dropped: run record gone', { dropped })
+            currentInvocation = null
+            await save()
+            continue
+          }
+          for (const e of droppedCarried) console.warn('review-rounds event dropped: run record gone', { runId: e.runId, phase: e.phase, threshold: e.threshold })
+        }
         const queueReading = await queueForPrompt()
         const remaining = remainingBudget(state, { policy: spending, usage: spending.active ? ledger.usage() : null, wakeCalls: state.wake ? ledger.wakeCalls(state.wake.id) : 0 })
         const context = await contextForPrompt(remaining.history)
@@ -810,11 +855,14 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           remaining: { ...remaining, history: context.fields.history },
           ...queueReading.field,
           // Monitoring's own baselines (observed*) say nothing the model acts on.
-          allowArchive: state.allowArchive, playbooks: context.fields.playbooks, ownedRuns: state.ownedRuns.map(({ observedStatus: _s, observedDelivery: _d, observedSubstitutions: _u, observedProgress: _p, ...owned }) => owned),
+          allowArchive: state.allowArchive, playbooks: context.fields.playbooks, ownedRuns: state.ownedRuns.map(({ observedStatus: _s, observedDelivery: _d, observedSubstitutions: _u, observedProgress: _p, reviewWakes: _w, ...owned }) => owned),
           ...(Object.hasOwn(context.fields, 'seatModels') ? { seatModels: context.fields.seatModels } : {}),
           infrastructure: context.fields.infrastructure ?? {}
         })
         if (controller.signal.aborted) break
+        // Shutdown began while this call was being prepared: no call. The event goes back to the queue and its
+        // review-rounds records to `queued`, so the next Start sends it (at-least-once, like Stop and Start).
+        if (closing) { giveBack(event, carried); await save(); break }
         // Accounted for BEFORE it is spent. A call's price is known only after it
         // returns, so it reserves nothing and settles what it cost — but if the
         // reservation itself cannot be written, the call does not happen. Money
@@ -846,12 +894,14 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // may still have grown the session, so its prompt is never left out of the bound.
         state.contextSent = countAttempt(state.contextSent ?? null, { sessionId: priorSessionId, chars: prompt.length })
         state.pending = { kind: 'model', invocationId, promptBytes: prompt.length, at: new Date().toISOString() }; await save()
-        if (controller.signal.aborted) {
-          // Stop may arrive while the reservation or pending marker is saved.
+        if (controller.signal.aborted || closing) {
+          // Stop or shutdown may arrive while the reservation or pending marker is saved.
           // No adapter call happened, so the reservation goes back: it is no call, on any reading of the ledger.
           state.pending = null; state.calls--
           if (baselineClean) state.ownUsageSession = priorSessionId
+          if (!controller.signal.aborted) giveBack(event, carried)
           if (state.wake) await ledger.release({ id: invocationId, reason: 'stopped before the call was made' })
+          if (!controller.signal.aborted) await save()
           break
         }
         let response
@@ -941,6 +991,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           if (carried.length) state.deferred = [...carried, ...(state.deferred ?? []).filter((d) => !carried.includes(d))]
           state.pending = null
           state.queue.unshift(Object.assign(event, { retryOwed: true }))
+          // Its reply is discarded, so its review-rounds events are owed again (at-least-once).
+          markReviewWakes(reviewWakeEvents(event, carried), { state: 'queued', invocationId: null })
           throw Object.assign(fail(`The supervisor's runtime answered a resume of session ${priorSessionId} from ${sessionId ? `another session (${sessionId})` : 'no session'}. That reply is not acted on; the next call opens a new session with every block in full.`), { carryOn: true })
         }
         state.session = response.session
@@ -965,6 +1017,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // How long the call took, beside its tokens: what the panel reports a call cost.
         message('assistant', response.response, { usage: response.usage, cost: spent.cost, durationMs: Date.now() - callStarted, invocationId, promptBytes: prompt.length, rawResponse: response.response })
         const assistantMessage = chat.entries.at(-1)
+        // Delivered only now that its reply is in the chat: a save flushes the chat before state.json,
+        // so no state on disk says delivered without the reply that proves it.
+        markReviewWakes(reviewWakeEvents(event, carried), { state: 'delivered', deliveredAt: new Date().toISOString() })
         state.pending = null; await save()
         if (controller.signal.aborted) break
         let answer
@@ -1020,6 +1075,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         controller.abort()
       }
     } finally {
+      currentInvocation = null
       // The chain is over when there is nothing left to process. Closing the wake
       // here means the next event opens a new one with its own call allowance,
       // and that a restart before this point resumes the old one instead.
@@ -1068,7 +1124,127 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   }
 
   function kick () {
-    if (!task && state.status === 'active' && state.queue.length) task = drive()
+    // Once shutdown has begun nothing starts a call: what is queued stays in state for the next Start.
+    if (!task && !closing && activationReady && state.status === 'active' && state.queue.length) task = drive()
+  }
+
+  /*
+   * The review-rounds wake (docs/top-level-supervisor.md "When a review loop does not converge"): a review loop of an
+   * owned run reached a configured count of non-approving rounds (engine.mjs recordReviewRounds). One event per run,
+   * loop and count, admitted once; its record on the owned run says queued, sent (claimed by a call) or delivered (the
+   * call's reply is in the chat). Delivery is at-least-once: a claim no accepted reply answers is owed again.
+   */
+  function ownedEntry (e) { return state.ownedRuns.find((r) => r.runId === e.runId && r.project === e.project && r.issueId === e.issueId) }
+  function reviewWakeEvents (event, carried = []) { return [event, ...carried.map((d) => d.event)].filter((e) => e?.type === 'review-rounds') }
+  /** A dequeued event whose call was never made: back at the front of the queue, its carried entries still held. */
+  function giveBack (event, carried) {
+    markReviewWakes(reviewWakeEvents(event, carried), { state: 'queued', invocationId: null })
+    delete event.deferred
+    state.queue.unshift(event)
+    currentInvocation = null
+  }
+  /*
+   * reviewWakes is keyed by phase id. The strategy schema allows lowercase letters, digits and hyphens, so `constructor`
+   * is a legal id that names an inherited member (the tests also try `toString` and `__proto__`, which the schema refuses):
+   * read only own properties and write by definition, so no key reaches Object.prototype or an inherited member.
+   */
+  function ownKey (o, k) { return o != null && Object.hasOwn(o, k) ? o[k] : undefined }
+  function setOwnKey (o, k, v) { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); return v }
+  function reviewWake (r, phase, threshold) { return ownKey(ownKey(r?.reviewWakes, phase), threshold) }
+  function markReviewWakes (events, patch) {
+    for (const e of events) {
+      const rec = reviewWake(ownedEntry(e), e.phase, e.threshold)
+      if (rec) Object.assign(rec, patch)
+    }
+  }
+  function dropReviewWake (e) {
+    const byPhase = ownKey(ownedEntry(e)?.reviewWakes, e.phase)
+    if (byPhase && Object.hasOwn(byPhase, e.threshold)) delete byPhase[e.threshold]
+  }
+  async function goneReviewWake (e) {
+    if (!ownedEntry(e)) return true
+    try { await tools.getRun(e.project, e.issueId, e.runId, { monitoring: true }); return false } catch (error) { return error?.status === 404 }
+  }
+  function acceptedReply (invocationId) { return chat.entries.some((m) => m.role === 'assistant' && m.invocationId === invocationId && !m.discarded) }
+  function reviewWakeWaiting (eventId) { return state.queue.some((e) => e?.eventId === eventId) || (state.deferred ?? []).some((d) => d.event?.eventId === eventId) }
+  /** A record claimed by a call that is not in flight: delivered if that call's reply is in the chat, else owed again. */
+  function resolveReviewWakes () {
+    for (const r of state.ownedRuns ?? []) {
+      for (const byPhase of Object.values(r.reviewWakes ?? {})) {
+        for (const rec of Object.values(byPhase)) {
+          if (rec.state !== 'sent' || (currentInvocation !== null && rec.invocationId === currentInvocation)) continue
+          if (acceptedReply(rec.invocationId)) Object.assign(rec, { state: 'delivered' })
+          else Object.assign(rec, { state: 'queued', invocationId: null })
+        }
+      }
+    }
+  }
+  /** The run's crossings: each recorded non-approving round whose count is a configured threshold. */
+  function reviewCrossings (current) {
+    const thresholds = reviewRoundWakes() ?? []
+    return (current.reviewRounds ?? []).filter((row) => !row.approved && thresholds.includes(row.nonApproving))
+  }
+  /** The event and its record, inserted together with no await, and the save that first holds them (admission awaits it). */
+  function insertReviewWake (r, current, row) {
+    const event = reviewRoundsEvent(current, row.phase, row, row.nonApproving)
+    if (!alwaysWakes(event)) return null
+    event.admittedAt = new Date().toISOString()
+    state.queue.push(event)
+    const byPhase = ownKey(r.reviewWakes ??= {}, row.phase) ?? setOwnKey(r.reviewWakes, row.phase, {})
+    setOwnKey(byPhase, row.nonApproving, { state: 'queued', eventId: event.eventId, admittedAt: event.admittedAt })
+    const written = save()
+    recordWrites.set(event.eventId, written)
+    written.then(() => { if (recordWrites.get(event.eventId) === written) recordWrites.delete(event.eventId) }, () => {})
+    return event
+  }
+  /** Admit every crossing of this run that has no record yet; one with a record was admitted before. */
+  function noticeReviewRounds (r, current) {
+    const crossings = reviewCrossings(current)
+    for (const row of crossings) if (!reviewWake(r, row.phase, row.nonApproving)) insertReviewWake(r, current, row)
+    return crossings
+  }
+  /** An owed event (queued, but in neither the queue nor the deferred list) goes back as the same event; never admitted twice. */
+  function restoreReviewWakes (r, current) {
+    for (const [phase, byPhase] of Object.entries(r.reviewWakes ?? {})) {
+      for (const [threshold, rec] of Object.entries(byPhase)) {
+        if (rec.state !== 'queued' || reviewWakeWaiting(rec.eventId)) continue
+        const row = (current.reviewRounds ?? []).find((x) => x.phase === phase && !x.approved && x.nonApproving === Number(threshold))
+        if (!row) { delete byPhase[threshold]; console.warn('review-rounds event dropped: its round is no longer recorded', { runId: r.runId, phase, threshold }); continue }
+        const event = reviewRoundsEvent(current, phase, row, Number(threshold))
+        event.admittedAt = rec.admittedAt
+        state.queue.push(event)
+        rec.redeliveries = (rec.redeliveries ?? 0) + 1
+      }
+    }
+  }
+  /**
+   * The engine recorded a run's non-approving round (supervisor.mjs onReviewRounds): its threshold events are admitted
+   * past the wake filter and the state write holding them is awaited, outside the poll and its advisory calls, before
+   * the engine goes on. Not owned or not active: nothing is admitted here (a later poll after Start catches up).
+   */
+  // Admissions in flight: shutdown waits for them before the owner lock is released (one writer of state.json).
+  const admissions = new Set()
+  function admitReviewRounds (args) {
+    const admission = admitOnce(args)
+    admissions.add(admission)
+    admission.finally(() => admissions.delete(admission)).catch(() => {})
+    return admission
+  }
+  async function admitOnce ({ project, issueId, runId, rows = null }) {
+    if (closing) return { state: 'inactive' }
+    if (!ownedEntry({ project, issueId, runId })) return { state: 'not-owned' }
+    if (!['active', 'working'].includes(state.status)) return { state: 'inactive' }
+    const current = await tools.getRun(project, issueId, runId, { monitoring: true })
+    // A shutdown or stop that began during the read: nothing is changed or saved any more.
+    if (closing || !['active', 'working'].includes(state.status)) return { state: 'inactive' }
+    const r = ownedEntry({ project, issueId, runId })
+    if (!r) return { state: 'not-owned' }
+    const keys = rows ? new Set(rows.map((x) => x.key)) : null
+    const due = noticeReviewRounds(r, current).filter((row) => !keys || keys.has(row.key))
+    if (!due.length) return { state: 'nothing-due' }
+    await Promise.all(due.map((row) => recordWrites.get(`review-rounds:${runId}:${row.phase}:${row.nonApproving}`)))
+    kick()
+    return { state: 'admitted', thresholds: due.map((row) => row.nonApproving) }
   }
   /**
    * Finish: the opposite of Stop. Nothing new is started, owned runs are left
@@ -1193,6 +1369,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   async function poll () {
     if (task || state.status !== 'active') return
     try {
+      resolveReviewWakes()
       for (const r of [...state.ownedRuns]) {
         let current
         try { current = await tools.getRun(r.project, r.issueId, r.runId, { monitoring: true }) } catch (e) {
@@ -1218,6 +1395,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
           r.observedSubstitutions = substitutions
           state.queue.push({ type: 'model-substituted', run: runDelta(current) })
         }
+        // Review-rounds events: an owed one back in the queue, a new crossing admitted (admitReviewRounds is the prompt path).
+        restoreReviewWakes(r, current)
+        noticeReviewRounds(r, current)
         // An automatic reconcile is undecided: the block is not its ending yet, and the decision arrives as the ordinary change.
         if (current.reconcilePending) continue
         // Without a stored reading (a run not yet observed, or owned before this was recorded) the present
@@ -1285,6 +1465,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
   rearmConsults()
   return {
     autoStart,
+    admitReviewRounds,
     /**
      * A full verification cycle ended (full-verification.mjs onEnded): queued as a `verification-ended`
      * event, which always wakes (wake-filter.mjs), with its outcome and where each entry's evidence is.
@@ -1381,15 +1562,17 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         state.session = null
       }
       state.model = model; state.focus = focus; state.limits = limits; state.allowArchive = options.allowArchive === true; state.mission = options.message
+      activationReady = false
       state.calls??=0;state.activationStarts=0;state.activationId=crypto.randomUUID();state.previews={};state.reason=null;state.finishing=false;state.status='active'
       // A consult that finished while the supervisor was stopped is still news: its result survives the new start.
-      state.queue = [{ type:'user',text:options.message }, ...(state.queue ?? []).filter((e) => e?.type === 'consult-result')]
+      // So does an admitted review-rounds event (admitted once, never again).
+      state.queue = [{ type:'user',text:options.message }, ...(state.queue ?? []).filter((e) => ['consult-result', 'review-rounds'].includes(e?.type))]
       // A new activation starts its readings over: what the first prompt carries is the baseline.
       delete state.queueObserved; delete state.readyQueueShown; delete state.capacityRefused
       message('user',options.message)
       await fs.mkdir(path.join(dir,'workspace'),{recursive:true})
       state.observedIssues = Object.fromEntries(await Promise.all((await tools.projects()).map(async ({id:project})=>[project,JSON.stringify((await tools.listIssues(project)).map(i=>({id:i.id,status:i.status,name:i.name})))])))
-      controller = new AbortController(); ownEnding = false; await save()
+      controller = new AbortController(); ownEnding = false; activationReady = true; await save()
       // One poll queued or running at a time: a tick that finds one pending is skipped. Queued behind a slow poll
       // they used to pile up in the serial chain, and every operator action (chat, answer, stop) waited behind them all.
       timer = setInterval(()=>{if(pollPending)return;pollPending=true;serial(poll).catch(()=>{}).finally(()=>{pollPending=false})},pollMs);timer.unref()
@@ -1534,6 +1717,8 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       if (asking) throw fail('A side question is still being answered; wait for it before starting a fresh session', 409)
       clearInterval(timer)
       const archivedAt = new Date().toISOString()
+      // A review-rounds claim is settled against this chat before it is archived.
+      resolveReviewWakes()
       const archive = path.join(dir, `state.${archivedAt.replace(/[:.]/g, '-')}.json`)
       const previous = { session: state.session, messages: chat.total, pending: state.pending ?? null, ownedRuns: state.ownedRuns.length, costUsd: state.costUsd, cost: costReading() }
       // The archive keeps its format: the whole previous chat inline, as `messages`.
@@ -1550,7 +1735,7 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
       // The new conversation gets a file of its own: until the state naming it is saved, the old state still names the old one.
       const previousChat = chat
       chat = createChat({ dir, file: `chat-${archivedAt.replace(/[:.]/g, '-')}.jsonl` })
-      state = { status: 'stopped', session: null, model, focus, campaign, deferred, limits, allowArchive, mission, chatFile: chat.file, queue: [], ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
+      state = { status: 'stopped', session: null, model, focus, campaign, deferred, limits, allowArchive, mission, chatFile: chat.file, queue: (state.queue ?? []).filter((e) => e?.type === 'review-rounds'), ownedRuns, previews: {}, calls: 0, activationStarts: 0, starts: 0, startsByIssue: {}, launches, failedLaunches: {}, history, startBudgetVersion, startLimitMigration, costUsd: 0, unknownCostCalls: 0,
         reset: { at: archivedAt, archive: path.basename(archive), previous, retired } }
       message('system', `Fresh session. The previous conversation (${previous.messages} messages${previous.pending ? ', one unreconciled operation' : ''}) is archived as ${path.basename(archive)}.` +
         (retired.runs ? ` ${retired.runs} settled run${retired.runs === 1 ? '' : 's'} moved into that archive; ${ownedRuns.length === 0 ? 'nothing is still open' : `${ownedRuns.length} still open`}.` : '') +
@@ -1566,6 +1751,9 @@ export async function createTopSupervisor ({ dir, models, adapter, tools, emit =
         // Status changes before the final save finishes. Shutdown must also
         // drain a task that has already set stopped/recovery-required.
         if (task) await task
+        // An admission still reading its run decides nothing after `closing`; its earlier writes are drained below.
+        // Bounded: one that outlasts it can change nothing (it re-checks `closing` after its read).
+        await Promise.race([Promise.allSettled([...admissions]), new Promise((resolve) => setTimeout(resolve, 15_000).unref())])
         await writes
         return view()
       })

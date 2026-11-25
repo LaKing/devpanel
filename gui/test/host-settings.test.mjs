@@ -43,6 +43,21 @@ export default async function (t) {
       await write(path.join(hostDir, 'settings.json'), JSON.stringify({ resumeAfterShutdown: false, projectsRoot: '/opt/projects' }))
       t.eq('the automatic resume can be switched off', hostSettings({ hostDir }).resumeAfterShutdown, false)
 
+      // The top-level supervisor's review-rounds wake (docs/top-level-supervisor.md "When a review loop does not converge").
+      t.eq('the review-rounds wake fires at the third non-approving round by default', hostSettings({ hostDir }).supervisor.reviewRoundWakes, [3])
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ supervisor: { reviewRoundWakes: [9, 3, 6] }, projectsRoot: '/opt/projects/x' }))
+      t.eq('further thresholds are read, ascending', hostSettings({ hostDir }).supervisor.reviewRoundWakes, [3, 6, 9])
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ supervisor: { reviewRoundWakes: [] }, projectsRoot: '/opt/projects/xy' }))
+      t.eq('and an empty list switches it off', hostSettings({ hostDir }).supervisor.reviewRoundWakes, [])
+      for (const [label, wakes] of [['zero', [0]], ['a duplicate', [3, 3]], ['a fraction', [2.5]], ['a string', ['3']]]) {
+        const bad = await temp('devpanel-settings-wakes-')
+        await write(path.join(bad, 'settings.json'), JSON.stringify({ supervisor: { reviewRoundWakes: wakes } }))
+        let refused = null
+        try { hostSettings({ hostDir: bad }) } catch (e) { refused = e.message }
+        t.ok(`a threshold list with ${label} is refused`, /reviewRoundWakes/.test(refused ?? ''), refused)
+      }
+      await write(path.join(hostDir, 'settings.json'), JSON.stringify({ resumeAfterShutdown: false, projectsRoot: '/opt/projects' }))
+
       const projects = await temp('devpanel-settings-projects-')
       for (const name of ['production.app.example', 'stage.app.example', 'staging.app.example', 'app-project']) await fs.mkdir(path.join(projects, name))
       const roots = await forbiddenRoots({ projectsDir: projects, prefixes: ['production', 'stage'], mountinfo: '/nonexistent' })

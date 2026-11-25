@@ -284,7 +284,7 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
         // observedStatus is the monitoring poll's own baseline, set here because refresh() rewrites `status`.
         // The settle timer runs refresh() while a supervisor call is in flight (status 'working') and the poll
         // is not, so a run that ended during that call would otherwise already read as seen and never wake it.
-        state.ownedRuns.push({ project: preview.project, issueId: preview.issueId, runId: result.runId, status: result.status, observedStatus: result.status, launchId: attempt.id })
+        state.ownedRuns.push({ project: preview.project, issueId: preview.issueId, runId: result.runId, status: result.status, observedStatus: result.status, launchId: attempt.id, reviewWakes: {} })
         await save()
       })
       return result
@@ -314,7 +314,7 @@ export function createStartGate ({ getState, save, tools, stopping = () => false
         if (!attempt.migrated && run.supervisorLaunchId !== launchId) throw fail('That run does not carry this launch reservation identifier')
         if (state.launches.some((a) => a !== attempt && a.runId === runId && a.project === attempt.project && a.issueId === attempt.issueId)) throw fail('That run is already attributed to another reservation')
         attempt.status = 'started'; attempt.runId = runId; attempt.runStatus = run.status
-        state.ownedRuns.push({ project: attempt.project, issueId: attempt.issueId, runId, status: run.status, observedStatus: run.status, launchId: attempt.id })
+        state.ownedRuns.push({ project: attempt.project, issueId: attempt.issueId, runId, status: run.status, observedStatus: run.status, launchId: attempt.id, reviewWakes: {} })
       } else attempt.status = 'failed'
       attempt.reconciliation = { reason, notStarted, runId, at: new Date().toISOString() }
       await save()

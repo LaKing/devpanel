@@ -176,6 +176,18 @@ totals.
 
 ## Reviews
 
+The engine records each review round it has decided and moved past on `run.reviewRounds`, once
+(`engine.mjs` `recordReviewRounds`, at the top of every pass of the main loop, after the loop and before a
+rethrow): keyed `<windowResetAfter|-1>:<phase>:<round>`, with each seat's verdict, the round's blocking
+findings as the loop weighed them (deferred prior findings included) with their locations, and a per-loop
+`nonApproving` count across restart windows. A round is decided only once every seat, repair and same-round
+re-review is behind it, its own check has a result and no check runs on the revision it reviewed; a
+`checks-failed-unchanged` stop records its round as not approved, an inconclusive check records none. Rows are
+append-only. A run first loaded by code that records rounds keeps the keys it had already decided in
+`run.reviewRoundsBaseline` and never records them. A newly recorded non-approving round is handed to the
+top-level supervisor, and the engine waits at most 15 s for it before its next step (top-level-supervisor.md
+"When a review loop does not converge"); recording and admission decide nothing and never fail the run.
+
 An auditor returns `approved` or `changes-needed` with findings. Each finding
 carries a severity and an explicit `blocking` flag. The strategy defines what
 counts as **substantial**; only substantial findings keep a loop going. Outstanding

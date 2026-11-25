@@ -132,10 +132,34 @@ export function runDelta (run, { from = null } = {}) {
   }
 }
 
+/**
+ * A review loop reached a configured count of non-approving rounds (top-supervisor.mjs, docs/top-level-supervisor.md
+ * "When a review loop does not converge"): the run, the loop and the crossing round, and every recorded round of that
+ * loop up to it with each blocking finding's id and location, whole. Descriptions stay behind get_run / get_step.
+ */
+export function reviewRoundsEvent (run, phase, crossing, threshold) {
+  const delta = runDelta(run)
+  const rounds = (run.reviewRounds ?? []).filter((r) => r.phase === phase && r.ordinal <= crossing.ordinal).map((r) => ({
+    round: r.round, ordinal: r.ordinal, window: r.window ?? -1, approved: r.approved, verdict: r.verdict ?? null,
+    ...(r.checksFailed ? { checksFailed: true } : {}), ...(r.operatorContinued ? { operatorContinued: true } : {}), ...(r.stop ? { stop: r.stop } : {}),
+    seats: r.seats ?? [],
+    blocking: (r.blocking ?? []).map((f) => ({ id: f.id, seat: f.seat ?? null, severity: f.severity ?? null, location: f.location ?? null, ...(f.deferred ? { deferred: true } : {}), ...(f.source ? { source: f.source } : {}) }))
+  }))
+  return {
+    type: 'review-rounds',
+    eventId: `review-rounds:${delta.runId}:${phase}:${threshold}`,
+    runId: delta.runId, project: delta.project, issueId: delta.issueId,
+    phase, threshold, round: crossing.round, ordinal: crossing.ordinal, nonApproving: crossing.nonApproving, window: crossing.window ?? -1,
+    run: delta,
+    rounds,
+    detail: 'Each round of this loop so far with its blocking findings; descriptions and evidence: get_run {project, issueId, runId}, then get_step.'
+  }
+}
+
 /** A run of a packed issue, read from its bundle's record (`record` is run.json): no steps, its ending and its delivery. */
 export function summarisePackedRun ({ runId, project, issueId, record }) {
   return { runId, project, issueId, packed: true, actions: [], status: record.status, outcome: record.outcome ?? null, blockedReason: record.blockedReason ?? null,
-    budgets: record.budgets ?? null, modelSubstitutions: record.modelSubstitutions ?? [],
+    budgets: record.budgets ?? null, modelSubstitutions: record.modelSubstitutions ?? [], reviewRounds: record.reviewRounds ?? [],
     landed: record.landed ?? null, reconciliation: decidedReconciliation(record.reconciliations), artifactApplication: record.artifactApplication ?? null,
     delivery: record.delivery ? { action: record.delivery.action, completedAt: record.delivery.completedAt, application: record.delivery.application ?? null } : null,
     integration: record.integration ? { mergeCommit: record.integration.mergeCommit ?? null } : null,
@@ -207,6 +231,7 @@ export function summariseRun (detail) {
     endedAt: detail.endedAt ?? null,
     budgets: detail.budgets ?? null,
     metrics: detail.metrics ?? null,
+    reviewRounds: detail.reviewRounds ?? [],
     currentRevision: detail.currentRevision ?? null,
     approvals: (detail.approvals ?? []).map((a) => ({ role: a.role, step: a.step, appliesToCurrentRevision: a.appliesToCurrentRevision })),
     outstandingFindings: (detail.outstandingFindings ?? []).map((f) => ({ id: f.id, severity: f.severity, blocking: f.blocking, source: f.source ?? null, description: clip(f.description, 200) })),

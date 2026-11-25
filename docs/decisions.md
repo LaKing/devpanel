@@ -258,7 +258,9 @@ session keeps them. Any held event leaves `state.deferred` only once a call has 
 started, failed or was stopped leaves it held for the next one. The panel says what is held under Status details.
 
 Never asked, always woken: user messages, action results, format repairs, model substitutions, capacity freeing for an
-issue that waited (`capacity-freed`, top-level-supervisor.md "The ready queue"), runs that failed, blocked, paused or were
+issue that waited (`capacity-freed`, top-level-supervisor.md "The ready queue"), a review loop of an owned run reaching a
+configured count of non-approving rounds (`review-rounds`, top-level-supervisor.md "When a review loop does not converge"),
+runs that failed, blocked, paused or were
 cancelled, runs with a failure, pause or pause request, runs completed with any outcome other than `resolved`, a
 `run-changed` whose `changed` names a delivery key (reconcile, landing, delivery), and any event type the filter does not
 know. A held `run-changed` is kept as the delta a wake would have carried (status, phase, checks, blocked reason, `changed`); the
