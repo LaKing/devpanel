@@ -9,7 +9,7 @@ import { exitedOnItsOwn } from './modules-tier.mjs'
 import { modulesTarget } from '../infrastructure.mjs'
 
 /*
- * The full check of a daily full verification run (execution-contract.md "Full
+ * The full check of a full verification run (execution-contract.md "Full
  * verification freeze"): after its staging release completed, the project's full
  * test-drive tier drives the run's own snapshot (the development checkout as it
  * stood), and its failures are compared with the drive of the latest cycle in

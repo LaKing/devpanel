@@ -219,8 +219,8 @@ later or set `tiers.continueSmoke: false`, which is also the choice when a smoke
 finalizer changes application data: a smoke's finalizers run before the commands that
 continue.
 
-The smoke and full tiers are the **full verification** of a project: the daily cycle and
-the Deployment playbook (tactical-playbooks.md "The daily full verification": a cycle run
+The smoke and full tiers are the **full verification** of a project: the full verification cycle and
+the Deployment playbook (tactical-playbooks.md "Full verification cycles": a cycle run
 drives the full tier on its released snapshot and compares it with the previous green
 cycle; `infrastructure.staging.fullVerification: instances` records a project as verified
 through its instances instead). The coding playbooks (Implementation, Plan and implement, Prompt,
@@ -513,7 +513,7 @@ creating an instance reads the candidate and manages units.
 
 On a staging host where any project declares `modules.instance` (one verified through its
 instances, `fullVerification: instances`, included), the full verification
-(tactical-playbooks.md "The daily full verification") never releases to, loads into,
+(tactical-playbooks.md "Full verification cycles") never releases to, loads into,
 restarts or writes the base instance. It starts no run there: for each project it snapshots
 the development checkout as it stands (always a `working-tree` snapshot, whatever base the
 project's runs take, under the delivery locks), creates a dynamic instance of the cycle's own from it with the tier's `create`
@@ -1327,11 +1327,11 @@ node gui/server/project-action-cli.mjs <project-id> checkpoint
 node gui/server/project-action-cli.mjs <project-id> --list
 ```
 
-### The daily full verification's bump
+### The full verification's bump
 
-One engine caller runs `checkpoint` by itself: the daily full verification, when
-every stage of a cycle is green (tactical-playbooks.md "The daily full
-verification", "What the outcome does"). This is a fixed rule of the cycle, not the
+One engine caller runs `checkpoint` by itself: the full verification, when
+every stage of a cycle is green (tactical-playbooks.md "Full verification
+cycles", "What the outcome does"). This is a fixed rule of the cycle, not the
 top-level supervisor deciding to run an action, and it runs while admission is
 still closed, so no run delivers into a checkout it commits. For each framework,
 a project that another project's file names as `framework: <id>` (the module

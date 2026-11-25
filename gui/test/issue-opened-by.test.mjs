@@ -42,7 +42,7 @@ export default async function (t) {
     t.eq('from the source issue and run, as a follow-up', [followUp.openedBy?.from?.issueId, followUp.openedBy?.from?.runId, followUp.openedBy?.from?.via], [source.id, 'run-1', 'follow-up'])
   }
 
-  t.section('3b. a red daily full verification names its cycle, not a parent issue')
+  t.section('3b. a red full verification names its cycle, not a parent issue')
   {
     const issue = await f.issues.createIssue(project, { input: 'Full verification 2026-11-07: devpanel-project red on stage', openedBy: { user: 'engine', from: { project, runId: 'run-9', via: 'full-verification', cycle: '2026-11-07.1' } } })
     t.eq('from the cycle and its stage run, with no parent issue', issue.openedBy?.from, { project, issueId: null, runId: 'run-9', via: 'full-verification', cycle: '2026-11-07.1' })

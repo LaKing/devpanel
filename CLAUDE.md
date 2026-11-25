@@ -447,7 +447,12 @@ documents the HTTP/socket API, issue storage rules, the front-end conventions, a
   deliveries per stage that no cycle covered (`verification-trigger.mjs`: a delivery retires only from an entry whose
   whole suite ran, `coverageEstablished`; a stage whose last automatic cycle proved nothing waits for as many more), on
   request (`POST /api/verification/start`), or at the optional `fullVerification {at, timeZone}`, `supervisor.freeze`
-  closes admission to writing runs (`run-exclusivity.mjs writesCheckout`: delivery, release or in place; starts,
+  closes admission to the writing runs of the projects it verifies (its scope, `cycleScope`: projects with a stage it drives plus
+  each one's whole module pool, a pool with no driven stage outside it, decided from one reading, `readCycleConfig`, kept as `record.scope`; a run of any other
+  project is never paused, withheld, refused or waited for; an unreadable listing or configuration refuses the cycle
+  `FULL_VERIFICATION_SCOPE_UNREADABLE`, nothing frozen; the thaw resumes only the scope's pauses, others in `leftPaused`;
+  only pools wholly in scope are checkpointed; a release whose resolved target drifted is `STAGE_DRIFTED`, one a fresh reading
+  cannot clear `STAGE_UNVERIFIABLE`) (`run-exclusivity.mjs writesCheckout`: delivery, release or in place; starts,
   continuations, finalize and reconcile refused `FULL_VERIFICATION_FREEZE`, an automatic reconcile deferred to the thaw,
   operations still in admission tracked as `pendingWrites` and re-checked before delivery; Analysis, Triage and inquiries
   go on; `run.freezeRequested` withholds any seat turn not yet invoked, checked as the last

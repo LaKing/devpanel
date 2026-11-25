@@ -36,7 +36,7 @@ infrastructure:
       notes: Read-only during authoring; promoted only through the Deployment playbook.
   testDrive:
     requirement: required
-    # The full verification (the daily cycle, the Deployment playbook): an isolated
+    # The full verification (its cycle, the Deployment playbook): an isolated
     # drive of the whole application. A `tiers.smoke` subset may stay declared here
     # too; coding playbooks run neither per revision.
     commands:

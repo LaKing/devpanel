@@ -10,7 +10,7 @@ import os from 'node:os'
  * the machine their browser connected from, or a panel process (`supervisor`,
  * `engine`) and the panel's own host. `from` names the issue it came out of,
  * when there is one: a residual-risk follow-up, an accepted split, an inquiry's
- * proposal, or a run's finding. A red daily full verification names its cycle
+ * proposal, or a run's finding. A red full verification names its cycle
  * instead (`via: 'full-verification'`, `cycle`, the stage run): the cycle is
  * not an issue, so such an issue has no parent issue. Issues opened before this existed carry none;
  * what their own record implies is derived on read, never written back.

@@ -119,7 +119,7 @@ function resolve (data, { root, file, pending, impliedDataRoot = null }) {
     gitStore: data.gitStore === true,
     nestedRepositories: data.nestedRepositories ?? 'gitlink',
     resumeAfterShutdown: data.resumeAfterShutdown !== false,
-    // The daily full verification (server/full-verification.mjs); null: no scheduled cycle.
+    // The full verification (server/full-verification.mjs); null: no scheduled cycle.
     fullVerification: data.fullVerification?.at ? { at: data.fullVerification.at, timeZone: data.fullVerification.timeZone } : null,
     // The full verification's delivery trigger (server/verification-trigger.mjs): a cycle per this many deliveries on a stage; 0 is off.
     verificationTrigger: { afterDeliveries: data.fullVerification?.afterDeliveries ?? 10 },

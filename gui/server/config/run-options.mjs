@@ -55,7 +55,7 @@ const validate = new Ajv2020({ allErrors: true }).compile({
     // findings stay proposals and publish nothing. Only the engine's inquiry
     // path sets it; resolution accepts it for the analysis tactic alone.
     inquiry: { const: true },
-    // A run of the daily full verification (server/full-verification.mjs): a
+    // A run of the full verification (server/full-verification.mjs): a
     // staging Deployment that also drives the project's full check tier on its
     // snapshot. Only the cycle sets it (index.js refuses it in a start body).
     fullVerification: { const: true }

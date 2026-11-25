@@ -19,7 +19,7 @@ const state = reactive({
   /* Whether the process answering is older than the code on disk — the reason a
      freshly built page can call a route the server has never heard of. */
   source: null,
-  /* The last `verification:changed` event of the daily full verification: the
+  /* The last `verification:changed` event of the full verification: the
      dashboard card and the verification page reload when it moves. */
   verification: null,
   error: null

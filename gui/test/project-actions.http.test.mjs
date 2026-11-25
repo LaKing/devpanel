@@ -33,7 +33,7 @@ export default async function (t) {
     t.eq('an unknown action is 404', (await stage.request(`/api/projects/${stage.project}/actions/deploy`, { method: 'POST' })).status, 404)
 
     t.section('starting and streaming')
-    // A browser cannot pass arguments: only the daily full verification appends any.
+    // A browser cannot pass arguments: only the full verification appends any.
     const started = await stage.request(`/api/projects/${stage.project}/actions/checkpoint`, { method: 'POST', body: JSON.stringify({ args: ['--minor'] }) })
     t.eq('starting answers 202 with the running record', [started.status, started.body.operation.status, started.body.operation.action], [202, 'running', 'checkpoint'])
     t.eq('arguments in the request body are ignored', started.body.operation.args, [])

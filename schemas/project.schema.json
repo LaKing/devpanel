@@ -259,7 +259,7 @@
         },
         "fullVerification": {
           "enum": ["instances"],
-          "description": "Staging only. `instances`: the daily full verification starts no run for this stage and records the project as verified through its instances (a framework whose applications are the projects that deploy it). Without it, a configured staging environment is a stage of the cycle."
+          "description": "Staging only. `instances`: the full verification starts no run for this stage and records the project as verified through its instances (a framework whose applications are the projects that deploy it). Without it, a configured staging environment is a stage of the cycle."
         },
         "ssh": {
           "$ref": "https://devpanel/schemas/playbook.schema.json#/$defs/checkTarget/properties/ssh"

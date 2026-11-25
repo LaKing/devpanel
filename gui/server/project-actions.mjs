@@ -21,7 +21,7 @@ import { hostSettings } from './config/host-settings.mjs'
  *
  * What runs is installed configuration — a script on disk or a saved command —
  * never text supplied by a model or a browser. The caller names an action id.
- * Only an engine caller (the daily full verification) may append `args`, each a
+ * Only an engine caller (the full verification) may append `args`, each a
  * bare flag (ARG_RE), passed as separate words through "$@"; the HTTP route and
  * the CLI never pass any.
  *
@@ -39,7 +39,7 @@ const OUTPUT_MAX_BYTES = Number(process.env.DEVPANEL_ACTION_OUTPUT_MAX_BYTES ?? 
 const TAIL_CHARS = 16 * 1024
 const ID_RE = /^[a-z0-9-]+$/
 const OPERATION_ID_RE = /^[0-9TZ-]+-[0-9a-f]{8}$/
-// Arguments an engine caller may append (the daily full verification's `--minor`): flags only, never text.
+// Arguments an engine caller may append (the full verification's `--minor`): flags only, never text.
 const ARG_RE = /^--?[a-z][a-z0-9-]*$/
 
 const fail = (message, status = 400) => Object.assign(new Error(message), { status })

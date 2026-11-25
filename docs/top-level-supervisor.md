@@ -906,8 +906,17 @@ prompt in between showed it.
 
 ### When a full verification cycle ends
 
-A cycle (tactical-playbooks.md "The daily full verification": after ten deliveries per stage,
-on request, or daily) tells the supervisor its end as a `verification-ended` event
+A cycle (tactical-playbooks.md "Full verification cycles": after ten deliveries per stage,
+on request, or at an optional configured time) freezes only the projects it verifies: those
+with a stage it drives (`infrastructure.staging`, not `fullVerification: instances`) and the whole
+module pool of each (framework and instances; a pool with no driven stage stays outside),
+decided when it starts and kept as `scope` in its record. Within the scope, writing runs pause
+and a `start_run`, `continue_run` or finalize of one is refused `FULL_VERIFICATION_FREEZE`
+(retryable); a run of any other project is untouched, never paused, refused or waited for, so
+such a refusal never concerns it. A cycle whose configuration cannot be read does not start
+(`FULL_VERIFICATION_SCOPE_UNREADABLE`), and the end resumes only the scope's paused runs: a pause
+of another project left by an earlier cycle is named in the record's `leftPaused`, resumed at
+the next service start or by a plain resume. The cycle tells the supervisor its end as a `verification-ended` event
 (`topSupervisor.noteVerification`, queued while it is not active), which the wake filter never
 holds. It carries `cycleId`, `trigger`, `verdict`, `record` (the file that holds that cycle's
 record when it is told: `issues/.verification/<date>/cycle.json`, or the `cycle.<n>.json` a later

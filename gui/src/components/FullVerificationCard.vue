@@ -5,10 +5,11 @@ import { api } from '@/api'
 import { connection } from '@/socket'
 
 /*
- * The daily full verification on the dashboard (server/full-verification.mjs):
+ * The full verification on the dashboard (server/full-verification.mjs):
  * the latest cycle, one line per project, and "Full verification now", which
- * starts the same cycle the schedule does: admission closes, live runs pause at
- * their next step boundary, and one staging Deployment runs per stage.
+ * starts the same cycle the delivery count and the optional schedule do: admission closes
+ * for the projects it verifies, their live writing runs pause at their next step boundary,
+ * runs of other projects go on, and each stage is verified.
  */
 
 const state = ref(null)
@@ -68,7 +69,7 @@ const outcome = computed(() => {
         </template>
         <span v-else>No cycle has run yet.</span>
         <div class="fv__schedule">
-          <template v-if="state?.schedule">Daily at {{ state.schedule.at }} ({{ state.schedule.timeZone }}), next {{ new Date(state.schedule.next).toLocaleString() }}</template>
+          <template v-if="state?.schedule">Scheduled at {{ state.schedule.at }} ({{ state.schedule.timeZone }}), next {{ new Date(state.schedule.next).toLocaleString() }}</template>
           <template v-else>No schedule: host settings have no fullVerification block.</template>
           <template v-if="state?.frozen"> · admission closed since {{ new Date(state.frozen.at).toLocaleTimeString() }}</template>
         </div>

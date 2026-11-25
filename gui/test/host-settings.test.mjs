@@ -106,7 +106,7 @@ export default async function (t) {
       t.ok('a privileged command needs no unit user', managedRemoteCommand('/opt/c', { id: 'p', kind: 'privileged', run: 'true' }, false, { control: controlDir('/opt/c'), units: {}, confinement: none }).includes('unshare'))
     }
 
-    t.section('6. the daily full verification: the block schedules it, without it the cycle is off')
+    t.section('6. the full verification: the block schedules it, without it the cycle is off')
     {
       const root = await temp('devpanel-settings-fv-root-')
       t.eq('absent: off', hostSettings({ root, hostDir: path.join(root, 'host-config'), env: {} }).fullVerification, null)

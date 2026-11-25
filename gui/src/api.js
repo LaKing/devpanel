@@ -135,7 +135,7 @@ export const api = {
   // ---- runs -------------------------------------------------------------
   /** Every agent currently invoked, across every project. */
   listAgents: () => request('/api/agents'),
-  /** The daily full verification: the latest cycle, and "Full verification now" (server/full-verification.mjs). */
+  /** The full verification: the latest cycle, and "Full verification now" (server/full-verification.mjs). */
   verificationLatest: () => request('/api/verification/latest'),
   /** The commands of one entry's drive in the latest cycle and, with `command`, its text from byte `after` on. */
   verificationOutput: (project, command = null, after = 0) => request(`/api/verification/output?project=${enc(project)}${command ? `&command=${enc(command)}&after=${after}` : ''}`),

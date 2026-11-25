@@ -246,7 +246,7 @@ async function readOperationFiles (issue) {
 /** The project as this reading needs it: deliveries in order, staging releases, deployments, what is live. */
 async function projectState ({ project, projectPath = null, lists = null, listIssues, listHomes = null, readRuns = runsOf, readPackedRuns = packedRunsOf, readOperations = readOperationFiles }) {
   const [open, archived] = lists ? [lists.open, lists.archived] : await Promise.all([listIssues(project), listIssues(project, { archived: true })])
-  // The daily full verification releases to staging from its run homes: what those carried is covered too.
+  // The full verification releases to staging from its run homes: what those carried is covered too.
   const homes = await (listHomes ?? (await import('./issues.js')).listRunHomes)(project).catch(() => [])
   const checkouts = projectPath ? [projectPath, await fs.realpath(projectPath).catch(() => projectPath)] : []
   const state = { project, projectPath, deliveries: [], history: 0, stagings: [], deployments: [], liveRuns: [] }

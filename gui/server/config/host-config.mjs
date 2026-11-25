@@ -29,20 +29,40 @@ export const HOST_CONFIG_ENV = 'DEVPANEL_HOST_CONFIG_DIR'
 export const DEFAULT_CONFIG_ROOT = process.env.DEVPANEL_CONFIG_ROOT || path.resolve(HERE, '..', '..', '..')
 
 export const DATA_ROOT_ENV = 'DEVPANEL_DATA_ROOT'
-const isDir = (dir) => { try { return fsSync.statSync(dir).isDirectory() } catch { return false } }
+/** Error codes that mean a category directory is simply not there; any other read error (ENOTDIR: a file in its place) means it could not be read. */
+const ABSENT = new Set(['ENOENT'])
+/** Choosing the host-config directory passes over a candidate that is not a directory, as it always did. */
+const NOT_A_CANDIDATE = new Set(['ENOENT', 'ENOTDIR'])
 
 /** The data root a host-config directory may live in before any settings are read: DEVPANEL_DATA_ROOT from `env`, else none. */
 export function bootDataRoot (env = process.env) {
   return env[DATA_ROOT_ENV] ? path.resolve(env[DATA_ROOT_ENV]) : null
 }
 
+/**
+ * The choice hostConfigDir makes, with what it could not read: `{ dir, unreadable: [{path, code}] }`. A
+ * candidate whose stat fails for another reason than absence is passed over as hostConfigDir always did, and
+ * named in `unreadable`, so a caller that must not mistake it for a missing directory (the full verification's
+ * scope) can refuse. A directory named by DEVPANEL_HOST_CONFIG_DIR is taken as given; its reads report themselves.
+ */
+export function hostConfigSelection ({ root = DEFAULT_CONFIG_ROOT, env = process.env } = {}) {
+  if (env[HOST_CONFIG_ENV]) return { dir: path.resolve(root, env[HOST_CONFIG_ENV]), unreadable: [] }
+  const unreadable = []
+  const isDir = (dir) => {
+    try { return fsSync.statSync(dir).isDirectory() } catch (error) {
+      if (!NOT_A_CANDIDATE.has(error.code)) unreadable.push({ path: dir, code: error.code ?? 'EIO' })
+      return false
+    }
+  }
+  const inTree = path.resolve(root, 'host-config')
+  if (isDir(inTree)) return { dir: inTree, unreadable }
+  const data = bootDataRoot(env)
+  return { dir: data && isDir(path.join(data, 'host-config')) ? path.join(data, 'host-config') : inTree, unreadable }
+}
+
 /** Where host configuration lives for this config root; read at call time. */
 export function hostConfigDir ({ root = DEFAULT_CONFIG_ROOT, env = process.env } = {}) {
-  if (env[HOST_CONFIG_ENV]) return path.resolve(root, env[HOST_CONFIG_ENV])
-  const inTree = path.resolve(root, 'host-config')
-  if (isDir(inTree)) return inTree
-  const data = bootDataRoot(env)
-  return data && isDir(path.join(data, 'host-config')) ? path.join(data, 'host-config') : inTree
+  return hostConfigSelection({ root, env }).dir
 }
 
 /*
@@ -62,21 +82,28 @@ export const CATEGORIES = [
 ]
 export const category = (id) => CATEGORIES.find((c) => c.id === id)
 
-async function names (dir, match) {
+async function names (dir, match, unreadable = []) {
   try {
     return (await fs.readdir(dir, { withFileTypes: true })).filter((e) => !e.isDirectory() && match(e.name)).map((e) => e.name)
-  } catch {
+  } catch (error) {
+    if (!ABSENT.has(error.code)) unreadable.push({ dir, code: error.code ?? 'EIO' })
     return []
   }
 }
 
-/** The union of two directories by file name, sorted; the host file wins and records the one it shadows. */
+/**
+ * The union of two directories by file name, sorted; the host file wins and records the one it shadows.
+ * A directory that could not be read for another reason than absence lists as empty, as always, and is named
+ * in the array's `unreadable` property ([{dir, code}]).
+ */
 export async function overlay ({ tree, host, match }) {
-  const fromTree = new Set(await names(tree, match))
-  const fromHost = new Set(await names(host, match))
-  return [...new Set([...fromTree, ...fromHost])].sort().map((name) => fromHost.has(name)
+  const unreadable = []
+  const fromTree = new Set(await names(tree, match, unreadable))
+  const fromHost = new Set(await names(host, match, unreadable))
+  const files = [...new Set([...fromTree, ...fromHost])].sort().map((name) => fromHost.has(name)
     ? { name, file: path.join(host, name), source: 'host', shadows: fromTree.has(name) ? path.join(tree, name) : null }
     : { name, file: path.join(tree, name), source: 'tree', shadows: null })
+  return Object.assign(files, { unreadable })
 }
 
 /** One category's effective files for a config root and host directory. */

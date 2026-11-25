@@ -44,7 +44,8 @@ export const isProjectName = (name) => name.endsWith(PROJECT_SUFFIX)
 export const projectLabel = (name) => name.slice(0, -PROJECT_SUFFIX.length)
 
 const segmentPattern = (glob) => new RegExp(`^${glob.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`)
-const isDir = (p) => { try { return fsSync.statSync(p).isDirectory() } catch { return false } }
+/** The error code that means a path is simply not there; any other read error (ENOTDIR: a file where a directory belongs) means it could not be read. */
+const ABSENT = new Set(['ENOENT'])
 
 /*
  * Discovery walks the tree synchronously and projectPath() runs on most requests,
@@ -79,17 +80,26 @@ function discoveryWalk (root, discovery) {
   return walk
 }
 
+/*
+ * The walk also records every read that failed for another reason than absence
+ * (`unreadable`: a directory it could not list or enter, a marker it could not
+ * stat), so a caller that must not mistake an unreadable tree for an empty one
+ * (the full verification's scope, readProjectDirs) can refuse instead.
+ */
 function walkDiscovery (root, discovery) {
+  const unreadable = []
+  const failed = (p, error) => { if (!ABSENT.has(error.code)) unreadable.push({ path: p, code: error.code ?? 'EIO' }) }
+  const dirAt = (p) => { try { return fsSync.statSync(p).isDirectory() } catch (error) { failed(p, error); return false } }
   let dirs = ['']
   for (const glob of discovery.pattern.split('/').filter(Boolean)) {
     const match = segmentPattern(glob)
     const next = []
     for (const rel of dirs) {
       let names = []
-      try { names = fsSync.readdirSync(path.join(root, rel)) } catch { continue }
+      try { names = fsSync.readdirSync(path.join(root, rel)) } catch (error) { failed(path.join(root, rel), error); continue }
       for (const name of names.sort()) {
         if ((name.startsWith('.') && !glob.startsWith('.')) || !match.test(name)) continue
-        if (isDir(path.join(root, rel, name))) next.push(path.join(rel, name))
+        if (dirAt(path.join(root, rel, name))) next.push(path.join(rel, name))
       }
     }
     dirs = next
@@ -98,12 +108,45 @@ function walkDiscovery (root, discovery) {
   const collisions = []
   for (const rel of dirs) {
     const dir = path.join(root, rel)
-    if (!discovery.markers.some((marker) => fsSync.existsSync(path.join(dir, marker)))) continue
+    const marked = discovery.markers.some((marker) => {
+      try { fsSync.statSync(path.join(dir, marker)); return true } catch (error) { failed(path.join(dir, marker), error); return false }
+    })
+    if (!marked) continue
     const id = rel.split(path.sep).join('-') + PROJECT_SUFFIX
     if (!found.has(id)) found.set(id, dir)
     else collisions.push({ id, kept: path.relative(root, found.get(id)), dropped: rel })
   }
-  return { found: new Map([...found].sort(([a], [b]) => a.localeCompare(b))), collisions }
+  return { found: new Map([...found].sort(([a], [b]) => a.localeCompare(b))), collisions, unreadable }
+}
+
+/**
+ * The projects under `root` as the listing reads them, read now (never the cached walk),
+ * with every read that failed for another reason than absence: `{ projects: [{id, dir}],
+ * unreadable: [{path, code}] }`. The full verification decides its scope from this, so a
+ * directory it cannot read refuses the cycle rather than leaving a project out.
+ */
+export async function readProjectDirs (root = projectsRoot(), discovery = projectDiscovery()) {
+  if (discovery) {
+    const walk = walkDiscovery(root, discovery)
+    return { projects: [...walk.found].map(([id, dir]) => ({ id, dir })), unreadable: walk.unreadable }
+  }
+  const unreadable = []
+  let entries
+  try { entries = await fs.readdir(root, { withFileTypes: true }) } catch (error) {
+    if (!ABSENT.has(error.code)) unreadable.push({ path: root, code: error.code ?? 'EIO' })
+    return { projects: [], unreadable }
+  }
+  const dirs = await Promise.all(entries
+    .filter((entry) => (entry.isDirectory() || entry.isSymbolicLink()) && isProjectName(entry.name))
+    .map(async (entry) => {
+      const dir = path.join(root, entry.name)
+      if (entry.isDirectory()) return { id: entry.name, dir }
+      try { return (await fs.stat(dir)).isDirectory() ? { id: entry.name, dir } : null } catch (error) {
+        if (!ABSENT.has(error.code)) unreadable.push({ path: dir, code: error.code ?? 'EIO' })
+        return null
+      }
+    }))
+  return { projects: dirs.filter(Boolean).sort((a, b) => a.id.localeCompare(b.id)), unreadable }
 }
 
 /**

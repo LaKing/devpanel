@@ -1,6 +1,6 @@
 /*
- * The full verification's delivery trigger (docs/tactical-playbooks.md "The daily full
- * verification"): a cycle starts by itself once `afterDeliveries` deliveries to the source
+ * The full verification's delivery trigger (docs/tactical-playbooks.md "Full verification
+ * cycles"): a cycle starts by itself once `afterDeliveries` deliveries to the source
  * have happened on one stage since the last cycle that covered them (host settings
  * `fullVerification.afterDeliveries`, default 10, 0 = off).
  *

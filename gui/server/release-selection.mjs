@@ -36,7 +36,7 @@ const sha256File = (file) => new Promise((resolve, reject) => {
 
 const issuesModule = () => import('./issues.js')
 
-/** The daily full verification's run homes of a project (issues.js listRunHomes): their staging releases count too. */
+/** The full verification's run homes of a project (issues.js listRunHomes): their staging releases count too. */
 export const runHomesOf = async (project, listHomes = null) => (listHomes ?? (await issuesModule()).listRunHomes)(project).catch(() => [])
 
 /** Every green staging release of a project, newest first, with the issue (or run home) that holds it. */

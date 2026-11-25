@@ -3510,15 +3510,38 @@ approval of any outstanding finding or automatic resolution of the issue.
 
 ### Full verification freeze
 
-The full verification (tactical-playbooks.md "The daily full verification",
+The full verification (tactical-playbooks.md "Full verification cycles",
 `server/full-verification.mjs`; started after `fullVerification.afterDeliveries` deliveries on
 a stage, on request, or at `fullVerification.at`) closes admission to *writing* runs while it
-runs. A run writes when what it can do to the checkout says so (run-exclusivity.mjs
+runs, and only for the projects it verifies. A run writes when what it can do to the checkout says so (run-exclusivity.mjs
 `writesCheckout`): its playbook delivers anything (`completion.delivery.action` other than
 `none`), it releases (staging, deployment), or it works in place; a run whose snapshot cannot
 be read is taken to write. Analysis, Triage and inquiries only read: the freeze neither asks,
-refuses nor waits for them, and they may start. `supervisor.freeze(cycleId)` sets the freeze
-and asks every writing run this process drives to stop:
+refuses nor waits for them, and they may start.
+
+**Its scope.** Before anything is frozen or recorded, the cycle reads the project listing and
+the configuration once, together (`readCycleConfig`: the listing read now, uncached; one
+`loadConfig` in the host-config directory chosen now; each project's infrastructure from that
+load), and decides its scope (`cycleScope`): every project with a stage the cycle drives
+(`infrastructure.staging`, not declared `fullVerification: instances`, not refused by the
+configuration before anything runs: `HOST_HAS_INSTANCES`, `FULL_SUITE_UNDECLARED`, or a release
+stage with no staging release target, `TARGET_MISSING`), and the whole module pool
+of each (its framework, through `poolIdOf`, and every instance naming it). A pool with no driven
+stage (an instances-only framework whose members have no staging) is not verified: it is outside
+the scope and its checkpoint never runs. The record keeps it (`scope {projects, decidedAt}`); its stages and its checkpoint chain
+come from that same reading, so a project that gains staging later gets no stage in this cycle,
+and a stage the reading left out (a missing release target included) is refused before anything
+resolves or starts, with the reason that reading gave (`TARGET_MISSING`, else
+`OUTSIDE_FREEZE_SCOPE`), whatever the configuration says later.
+A run of a project outside the scope is never asked to pause, never has a turn withheld, and
+is never refused a start, continuation, delivery, finalize or reconcile because of the cycle;
+the cycle does not wait for it. A read that fails for another reason than absence (an
+unreadable projects root, project directory or marker, host-config directory or `projects/`
+category) refuses the cycle with 503 `FULL_VERIFICATION_SCOPE_UNREADABLE` before anything is
+frozen; a project file that loads but fails its schema is a red `INFRASTRUCTURE_INVALID`
+entry, as before. `supervisor.freeze(cycleId, { projects })` sets the freeze for that scope (an
+empty list freezes no project; only a call that omits the scope argument holds every project, as
+before) and asks every writing run of it this process drives to stop:
 
 - **No writing run starts.** `supervisor.start()` refuses a start whose resolved playbook writes,
   and every start of another cycle, with 409 `FULL_VERIFICATION_FREEZE` (`started: false`,
@@ -3546,8 +3569,9 @@ and asks every writing run this process drives to stop:
   full-verification` with `pause.cycleId`. A plain resume continues such a pause, like a
   manual one. When an operator's pause was pending as well, the pause records
   `manualPending: true`: the cycle leaves that run paused for the operator.
-- **The cycle takes its snapshot** once no writing run or pending writing operation is left in
-  the process (`supervisor.busy()`), so no seat turn or delivery writes the checkout. On a
+- **The cycle takes its snapshot** once no writing run or pending writing operation of a project
+  in its scope is left in the process (`supervisor.busy()`, filtered by the scope; runs of other
+  projects are not waited for), so no seat turn or delivery of the scope writes the checkout. On a
   stage host with dynamic instances it starts no run at all: it snapshots the checkout itself
   (`gitWorktreeProvider`, under the delivery locks), drives `modules.instance.fullSuite` on an
   instance of its own (`runtime/full-verification-drive.mjs instanceCycleTarget`, through
@@ -3560,10 +3584,18 @@ and asks every writing run this process drives to stop:
   {cycleId}`, live in the project's run home `issues/<project>/.verification-<date>/`
   (id `verification-<date>`; never an issue: no list, count or lookup of issues reads it,
   and its parent is the project's issue folder, so release and action locks, the git
-  store and the cleanup barrier are the project's own) and are exempt from the freeze; a run of an earlier cycle is not (it is frozen, waited for and
+  store and the cleanup barrier are the project's own) and are exempt from the freeze; a run of an earlier cycle is not, when its project is in this cycle's scope (it is frozen, waited for and
   refused continuation like any run of an issue).
+- **Before a release starts**, its staging target as the Deployment run resolves it (the
+  configuration `expectConfigHash` pins) must be the one the freeze decided (`STAGE_DRIFTED`
+  otherwise), and, as the last step before the start, after the checkout reading, a fresh, complete reading of every project must show its host without
+  dynamic instances (`HOST_HAS_INSTANCES`); a reading that is incomplete, unreadable or names
+  an invalid project declines it (`STAGE_UNVERIFIABLE`). The entry is red and nothing starts.
+  The hash binds the resolved Deployment configuration, not where an installed release script
+  sends what it releases.
 - **The outcome is handled while admission is still closed** (`state: outcome`, the
-  record's `outcome`): every stage green, each framework's `checkpoint` runs with
+  record's `outcome`): every stage green, each framework whose whole pool is in the scope
+  (others: `outcome.bump.notVerified`, never run) has its `checkpoint` run with
   `--minor` and then each instance's, stopping at the first that does not complete; any
   stage red, no action runs and one issue opens per red project (tactical-playbooks.md
   "What the outcome does"). It never throws: a failure of its own is `outcome.error`, and
@@ -3571,7 +3603,9 @@ and asks every writing run this process drives to stop:
 - **When the cycle ends** (its runs settled: completed, blocked, failed or paused all
   count, and the outcome handled), `supervisor.thaw()` opens admission, runs the automatic
   reconciles it put off, and the cycle resumes every run of an issue, or of an earlier cycle,
-  paused as `full-verification` without `manualPending` (`actor: service`, `origin:
+  of a project in its scope, paused as `full-verification` without `manualPending` (a pause of
+  a project outside the scope, left by an earlier cycle, is named in `leftPaused` and resumed by
+  `recover()` at the next start or by a plain resume) (`actor: service`, `origin:
   full-verification`), with every refusal of an ordinary resume; refusals and the runs
   left for an operator are in the cycle record. The top-level supervisor is then told
   (`verification-ended`, always waking: verdict, outcome, record path, each entry's evidence
@@ -3586,7 +3620,12 @@ A checkpoint step the stop left `running` is marked `interrupted` and its commit
 as below (`afterCommit.observedBy: recovery`).
 
 **A green cycle commits only what it tested.** People's own sessions keep editing the
-checkouts while a cycle runs; the freeze stops writing runs, not people. So a green
+checkouts while a cycle runs; the freeze stops writing runs of its scope, not people, and not
+runs of other projects. A run outside the scope may still write a checkout the cycle snapshots
+(through a link, or a checkout that resolves into a scoped repository after the freeze): that is
+an accepted residual risk. The recheck below compares the checkouts only before the checkpoint
+chain; a write between it and a checkpoint's commit is reported (`untestedCommitted`), not
+prevented. So a green
 cycle's checkpoint is bound to the bytes it tested
 (`runtime/full-verification-snapshot.mjs`):
 

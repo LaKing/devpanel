@@ -42,7 +42,7 @@ export const awaitsAutoResume = (run) => run?.status === 'cancelled' && run.stop
  * work to keep and nothing to verify, so resuming it is doing its setup, from its
  * snapshot (supervisor.answer). A workspace path is set once provisioning began.
  */
-/** A pause resumed by a plain resume: an operator's, or the daily full verification's freeze. */
+/** A pause resumed by a plain resume: an operator's, or the full verification's freeze. */
 export const RESUMABLE_PAUSES = ['manual', 'full-verification']
 const resumablePause = (run) => run?.status === 'paused' && RESUMABLE_PAUSES.includes(run.pause?.kind)
 

@@ -576,7 +576,7 @@ manual to protect subsequent customer writes. The target settings are in
 `host-config/releases/<site>-targets.json`. Configuration and read-only
 inspections do not deploy either instance.
 
-## The daily full verification
+## Full verification cycles
 
 A full verification cycle verifies every project on its stage with its whole suite: the
 changes delivered since the last cycle, together. It starts in three ways:
@@ -584,7 +584,7 @@ changes delivered since the last cycle, together. It starts in three ways:
 - **After every ten deliveries** to the source on one stage since the last cycle that covered
   them (the host settings' `fullVerification.afterDeliveries`, default 10; 0 turns this off).
 - **On request**: "Full verification now", `POST /api/verification/start`.
-- **Daily**, when the host settings name a time (`fullVerification.at` and `timeZone`); optional.
+- **At a configured time**, once a day, when the host settings name one (`fullVerification.at` and `timeZone`); optional.
 
 **Configure it** in the host settings (docs/host-config.md "Host settings"); every key is optional:
 
@@ -614,14 +614,21 @@ each run's end and every 15 minutes, never while a cycle runs or admission is fr
 stage a cycle can verify counts. The staging pending list (staging releases) is a separate
 reading and a cycle changes nothing there.
 
-**What freezes and resumes.** While a cycle runs, *writing* runs stop: a run whose playbook
-delivers, releases (staging, deployment) or works in place (run-exclusivity.mjs
-`writesCheckout`). None starts, continues, finalizes or reconciles, no seat turn of one begins
-beyond the one in flight, and live ones pause at their next step boundary as
-`paused: full-verification` and resume when the cycle ends; a run an operator had also asked
-to pause stays paused for that operator. Read-only runs (Analysis, Triage, inquiries) keep
-running and may start. The cycle takes its snapshot only when no writing run has a seat turn
-or a delivery in flight. Details are in execution-contract.md "Full verification freeze".
+**What freezes and resumes.** A cycle freezes only the projects it verifies: those with a stage
+it drives (`infrastructure.staging`, not declared verified through its instances), and the whole
+module pool of each (its framework and every instance naming it; a pool with no driven stage is
+not verified and stays outside), decided from one reading of the configuration when it starts and kept as
+`scope` in its record. A run of any other project is never paused, never has a turn withheld
+and is never refused a start, continuation, delivery, finalize or reconcile because of a
+cycle. Within the scope, *writing* runs stop: a run whose playbook delivers, releases
+(staging, deployment) or works in place (run-exclusivity.mjs `writesCheckout`). None starts,
+continues, finalizes or reconciles, no seat turn of one begins beyond the one in flight, and
+live ones pause at their next step boundary as `paused: full-verification` and resume when the
+cycle ends; a run an operator had also asked to pause stays paused for that operator. An
+operator's pause is a pause inside and outside the scope. Read-only runs (Analysis, Triage,
+inquiries) keep running and may start. The cycle takes its snapshot only when no writing run of
+its scope has a seat turn or a delivery in flight. Details are in execution-contract.md "Full
+verification freeze".
 
 **What runs, on a stage host with dynamic instances** (a project there declares
 `testDrive.modules.instance`, project-infrastructure.md "The full verification on a stage
@@ -660,7 +667,8 @@ cycle acts on its verdict:
 
 - **Every stage green: the framework's minor version steps, then its instances follow.**
   For each framework (a project that another project's `projects/<id>.yaml` names as
-  `framework:`), the framework's `checkpoint` action runs with `--minor` (0.4.x → 0.5.0),
+  `framework:`) whose whole pool is in the cycle's scope (a pool with no staged member was not
+  verified and is not checkpointed: `outcome.bump.notVerified`), the framework's `checkpoint` action runs with `--minor` (0.4.x → 0.5.0),
   then the `checkpoint` of each instance naming it, in id order: framework first, one at a
   time, each to its end. The record keeps each step's operation, status and version
   before and after (the project's root `version` file, else its `package.json` version).

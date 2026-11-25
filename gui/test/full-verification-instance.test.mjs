@@ -5,7 +5,6 @@ import path from 'node:path'
 import { createFullVerification, derivedVerdict, driveIdOf } from '../server/full-verification.mjs'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { driveCommands, instanceName } from '../server/runtime/instance-drive.mjs'
-import { writesCheckout } from '../server/run-exclusivity.mjs'
 import { deliveryCounts } from '../server/verification-trigger.mjs'
 import { createSupervisor, supportedActions } from '../server/supervisor.mjs'
 import { readVerificationFile, VERIFICATION_PAGE_CHARS } from '../server/runtime/check-log.mjs'
@@ -88,7 +87,7 @@ function seams ({ issuesDir, infra, outcome, deliveries = {}, covered = () => ({
   const options = {
     supervisor, issues, settings: () => null, pollMs: 1000, log: { warn () {} },
     infrastructureOf: async (project) => infra[project],
-    resolve: async (playbookId, { projectId }) => { calls.resolves.push(projectId); return { ok: true, resolved: { configHash: `hash-${projectId}`, workspace, fence: { selection: 1, repository: 1 }, liveExecution: { blockers: [] } } } },
+    resolve: async (playbookId, { projectId }) => { calls.resolves.push(projectId); return { ok: true, resolved: { configHash: `hash-${projectId}`, workspace, infrastructure: infra[projectId] ?? null, fence: { selection: 1, repository: 1 }, liveExecution: { blockers: [] } } } },
     provision: async (args) => { calls.provisions.push(args); const p = path.join(args.root, `worktree-${args.runId}`); await fs.mkdir(p, { recursive: true }); return { path: p, baseCommit: 'snap', isolation: 'git-worktree' } },
     releaseWorkspace: async (w) => { calls.releases.push(w.path) },
     drive,
@@ -238,15 +237,7 @@ export default async function (t) {
       t.eq('afterDeliveries 0: the trigger is off', [s.calls.freezes.length, off?.threshold], [3, 10])
     }
 
-    t.section('5. what writes the checkout: delivery, release or in place; Analysis, Triage and inquiries only read')
-    {
-      t.eq('an analysis (no delivery, own worktree) reads', writesCheckout({ tactic: 'analysis', workspace: { isolation: 'git-worktree' }, completion: { delivery: { action: 'none' } } }), false)
-      t.eq('a triage reads', writesCheckout({ tactic: 'triage', workspace: { isolation: 'git-worktree' }, completion: { delivery: { action: 'none' } } }), false)
-      t.eq('an analysis in place writes', writesCheckout({ tactic: 'analysis', workspace: { isolation: 'in-place' }, completion: { delivery: { action: 'none' } } }), true)
-      t.eq('a deployment writes', writesCheckout({ tactic: 'deployment', workspace: { isolation: 'git-worktree' }, completion: { delivery: { action: 'none' } } }), true)
-      t.eq('an implementation that applies to the source writes', writesCheckout({ tactic: 'implementation', workspace: { isolation: 'git-worktree' }, completion: { delivery: { action: 'apply-to-source' } } }), true)
-      t.eq('a run that cannot be read is taken to write', writesCheckout(null), true)
-    }
+    // 5. What writes the checkout (run-exclusivity.mjs writesCheckout) is tested in run-exclusivity.test.mjs.
 
     t.section('6. the freeze asks and waits for writing runs only; deliveries are refused, and one caught in admission is waited for and refused before it delivers')
     {
@@ -308,6 +299,60 @@ export default async function (t) {
       const end = Date.now() + 5000
       while ((await stateOf()).state === 'pending' && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 20))
       t.eq('after the thaw it is tried, once, and its own answer is recorded (here it cannot run on this record)', (await stateOf()).state, 'not-run')
+      supervisor.active.clear()
+    }
+
+    t.section('7b. a freeze scoped to the cycle\'s projects: a project outside it delivers, finalizes, reconciles and auto-reconciles; one inside is refused as before')
+    {
+      const dir = await temp('devpanel-fvi-scope-')
+      let release
+      const held = new Promise((resolve) => { release = resolve })
+      const issues = {
+        getRunHolder: async (project, id) => ({ id, project, path: path.join(dir, id), packed: false }),
+        getIssue: async (project, id) => { if (id === 'held') await held; return { id, project, path: path.join(dir, id), packed: false } },
+        listIssues: async () => [], listProjects: async () => []
+      }
+      const delivered = []
+      await fs.mkdir(path.join(dir, 'app-project'), { recursive: true })
+      const blocked = { status: 'blocked', blockedReason: 'delivery-unverifiable', outcome: 'unresolved', participants: {}, workspace: { path: path.join(dir, 'worktree'), state: 'active' } }
+      const resumeEngine = async ({ runId, issuePath }) => ({ runId, issuePath, run: structuredClone(blocked), runLock: { release: async () => {} },
+        finalize: async () => { delivered.push(runId); return 'delivered' },
+        reconcileDelivery: async () => { delivered.push(`reconcile:${runId}`) } })
+      const supervisor = createSupervisor({ issues, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir, resumeEngine })
+      const asked = []
+      const engineOf = (name) => ({ run: { status: 'running' }, requestFreeze (cycleId) { asked.push([name, cycleId]); return null } })
+      supervisor.active.set('lib-project/writing', { runId: 'w', project: 'lib-project', issueId: 'writing', phase: 'run', engine: engineOf('lib'), writes: true })
+      supervisor.active.set('tool-project/writing', { runId: 'o', project: 'tool-project', issueId: 'writing', phase: 'run', engine: engineOf('tool'), writes: true })
+      // An app-project finalize caught in its admission when the freeze begins: outside the scope, never waited for.
+      const pending = supervisor.finalize({ project: 'app-project', issueId: 'held', runId: 'held-run' }).then(() => 'delivered', (error) => error.code ?? error.message)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      const frozen = await supervisor.freeze('2026-11-14.3', { projects: ['lib-project'] })
+      t.eq('only the scope\'s writing run is asked and listed; the out-of-scope run and admission are not', [frozen.map((r) => r.runId), asked], [['w'], [['lib', '2026-11-14.3']]])
+      t.eq('the cycle waits only for the scope', supervisor.busy().map((r) => r.runId), ['w'])
+      t.eq('the freeze names its projects', supervisor.frozen().projects, ['lib-project'])
+      t.eq('a finalize outside the scope delivers during the freeze', await supervisor.finalize({ project: 'app-project', issueId: 'out', runId: 'out-run' }).then((r) => r.runId, (e) => e.code ?? e.message), 'out-run')
+      // This fake run is not an apply-to-source delivery, so the reconcile stops at the run's own check: past the freeze.
+      const reconciled = await supervisor.reconcileDelivery({ project: 'app-project', issueId: 'out2', runId: 'out2-run' }).then((r) => r.runId, (e) => e.code ?? e.message)
+      t.ok('a reconcile outside the scope is not refused for the cycle: it reaches the run\'s own check', reconciled !== 'FULL_VERIFICATION_FREEZE' && /cannot be reconciled/.test(reconciled), reconciled)
+      release()
+      t.eq('the held finalize outside the scope passes its re-check and delivers', await pending, 'delivered')
+      let refused = null
+      try { await supervisor.finalize({ project: 'lib-project', issueId: 'in', runId: 'in-run' }) } catch (error) { refused = error.code }
+      t.eq('a finalize inside the scope is refused as before', refused, 'FULL_VERIFICATION_FREEZE')
+      refused = null
+      try { await supervisor.reconcileDelivery({ project: 'lib-project', issueId: 'in', runId: 'in-run' }) } catch (error) { refused = error.code }
+      t.eq('a reconcile inside the scope too', refused, 'FULL_VERIFICATION_FREEZE')
+      t.eq('what was delivered: only the out-of-scope runs', delivered.sort(), ['held-run', 'out-run'])
+      // An automatic reconcile of an out-of-scope run, due while frozen, is tried at once rather than put off.
+      const runDir = path.join(dir, 'auto', 'runs', 'auto-run')
+      await fs.mkdir(runDir, { recursive: true })
+      const at = '2026-11-14T09:30:00.000Z'
+      await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify({ runId: 'auto-run', status: 'blocked', blockedReason: 'source-delivery-blocked', outcome: 'unresolved', autoReconcile: { state: 'pending', at } }))
+      await supervisor.finalize({ project: 'app-project', issueId: 'auto', runId: 'auto-run' })
+      const end = Date.now() + 5000
+      while ((await readJson(path.join(runDir, 'run.json'))).autoReconcile.state === 'pending' && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 20))
+      t.eq('the automatic reconcile outside the scope is decided while the cycle is still frozen', [supervisor.frozen()?.cycleId, (await readJson(path.join(runDir, 'run.json'))).autoReconcile.state], ['2026-11-14.3', 'not-run'])
+      supervisor.thaw('2026-11-14.3')
       supervisor.active.clear()
     }
 
@@ -480,6 +525,44 @@ export default async function (t) {
       const issuesDir = await temp(prefix)
       s.options.issues.ISSUES_DIR = issuesDir
       return (await cycle(s, path.join(issuesDir, '.verification'), manualClock(Date.parse('2026-11-14T09:00:00.000Z')))).run()
+    }
+
+    t.section('11b. a writing run of a project outside the cycle\'s scope starts through the real start path and is never frozen')
+    {
+      const f = await engineFixture({ playbook: 'analysis' })
+      const dir = await temp('devpanel-fvi-start-scope-')
+      const saved = { projects: process.env.DEVPANEL_PROJECTS_DIR, control: process.env.DEVPANEL_FAKE_CONTROL }
+      try {
+        const projectsDir = path.join(f.issuesDir, 'projects')
+        await fs.mkdir(projectsDir, { recursive: true })
+        await fs.symlink(f.projectPath, path.join(projectsDir, 'devpanel-project')).catch(() => {})
+        process.env.DEVPANEL_PROJECTS_DIR = projectsDir
+        process.env.DEVPANEL_FAKE_CONTROL = path.join(dir, 'control.json')
+        await fs.writeFile(process.env.DEVPANEL_FAKE_CONTROL, JSON.stringify({ ledger: path.join(dir, 'ledger.jsonl'), delayMs: 0 }))
+        await fs.writeFile(path.join(f.configRoot, 'harness', 'fake.mjs'), `export * from ${JSON.stringify(path.join(process.cwd(), 'test', 'fakes', 'harness-module.mjs'))}\n`)
+        const supervisor = createSupervisor({ issues: f.issues, harnessDir: path.join(f.configRoot, 'harness'), projectsDir, configRoot: f.configRoot })
+        await supervisor.freeze('2026-11-14.8', { projects: ['app-project'] })
+        const issue = await f.issues.createIssue('devpanel-project', { name: 'Write beside a cycle that does not verify this project' })
+        let started = null
+        try { started = await supervisor.start({ project: 'devpanel-project', issueId: issue.id, playbookId: 'implementation', configRoot: f.configRoot }) } catch (error) { started = { refused: error.code ?? error.message } }
+        t.ok('an implementation (it delivers) of a project outside the scope is admitted', Boolean(started?.runId), JSON.stringify(started))
+        t.eq('the cycle does not wait for it', supervisor.busy(), [])
+        if (started?.runId) {
+          // Driven to its own end while the cycle stays frozen.
+          await supervisor.settle()
+          const events = (await fs.readFile(path.join(issue.path, 'runs', started.runId, 'events.jsonl'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+          const run = JSON.parse(await fs.readFile(path.join(issue.path, 'runs', started.runId, 'run.json'), 'utf8'))
+          t.ok('it took seat turns while the cycle was frozen', events.some((e) => e.type === 'step'), JSON.stringify({ status: run.status, types: events.map((e) => e.type).slice(0, 12) }))
+          t.ok('its engine was never asked to freeze, and it never paused for the cycle', !events.some((e) => e.type === 'freeze-requested' || e.type === 'turn-withheld') && run.freezeRequested == null && run.pause?.kind !== 'full-verification', JSON.stringify({ status: run.status, pause: run.pause, types: events.map((e) => e.type).slice(0, 12) }))
+          t.ok('the cycle was frozen throughout', supervisor.frozen()?.cycleId === '2026-11-14.8')
+        }
+        supervisor.thaw('2026-11-14.8')
+      } finally {
+        for (const [key, env] of [['projects', 'DEVPANEL_PROJECTS_DIR'], ['control', 'DEVPANEL_FAKE_CONTROL']]) {
+          if (saved[key] === undefined) delete process.env[env]
+          else process.env[env] = saved[key]
+        }
+      }
     }
 
     t.section('12. a green cycle compares every checkout it snapshotted before the chain: unchanged, the chain runs and every commit is compared with the tested views (the framework derived from its instance)')

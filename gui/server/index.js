@@ -500,7 +500,7 @@ async function unpackedIssue (project, id) {
   return issue
 }
 
-// The daily full verification (server/full-verification.mjs): the latest cycle and
+// The full verification (server/full-verification.mjs): the latest cycle and
 // "Full verification now", which starts the same cycle the schedule does.
 app.get('/api/verification/latest', route(async (_req, res) => res.json(await fullVerification.latest())))
 // What the latest cycle's drives print (verification-output.mjs): an entry's commands, and one command's text from
@@ -724,7 +724,7 @@ app.post('/api/projects/:project/issues/:id/runs/:runId/chat', route(async (req,
 app.post('/api/projects/:project/issues/:id/runs', route(async (req, res) => {
   const { playbook, configHash, runOptions = {}, pregate: pregateBody = null } = req.body ?? {}
   if (!playbook) throw Object.assign(new Error('a playbook id is required'), { status: 400 })
-  if (runOptions?.fullVerification !== undefined) throw Object.assign(new Error('runOptions.fullVerification is set by the daily full verification only'), { status: 400 })
+  if (runOptions?.fullVerification !== undefined) throw Object.assign(new Error('runOptions.fullVerification is set by the full verification only'), { status: 400 })
 
   // Returns as soon as the run has an id and durable state; execution continues
   // in the background, so closing the browser does not stop it.
@@ -1089,7 +1089,7 @@ loadConfig({ root: process.env.DEVPANEL_CONFIG_ROOT ?? CONFIG_ROOT })
 // A cycle the last process left unfinished is marked interrupted, and the runs its
 // freeze paused are resumed, before anything else can start.
 // A cycle's end is the top-level supervisor's news (verification-ended), created further down.
-fullVerification = createFullVerification({ supervisor, issues, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction,
+fullVerification = createFullVerification({ supervisor, issues, projectsDir: issues.PROJECTS_DIR, emit: (event) => io?.emit('verification:changed', event), emitAction: emitProjectAction,
   // Not ready yet: the notice stays owed (cycle.json `announce: pending`) and announcePending delivers it below.
   onEnded: (notice) => { if (!topSupervisor) throw new Error('the top-level supervisor is not ready yet'); return topSupervisor.noteVerification(notice) } })
 await fullVerification.recover().catch((error) => console.warn(`[devpanel] full verification recovery: ${error.message}`))

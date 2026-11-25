@@ -4,14 +4,15 @@ import path from 'node:path'
 import { systemClock } from './runtime/clock.mjs'
 import { hostSettings } from './config/host-settings.mjs'
 import { loadConfig, resolvePlaybook } from './config/load.mjs'
-import { TARGET_MISSING } from './config/release-plan.mjs'
+import { hostConfigSelection } from './config/host-config.mjs'
+import { releasePlan, TARGET_MISSING } from './config/release-plan.mjs'
 import { projectInfrastructure } from './infrastructure.mjs'
 import { writeJson } from './runtime/persistence.mjs'
 import { stagedReleasePassed } from './runtime/run-result.mjs'
 import { failureFingerprints, selftestReport } from './runtime/baseline-failures.mjs'
-import { poolMembers } from './runtime/module-pool.mjs'
+import { poolIdOf, poolMembers } from './runtime/module-pool.mjs'
 import { startProjectAction } from './project-actions.mjs'
-import { projectPath, projectsRoot, resolveProjectPath } from './project-path.mjs'
+import { projectDiscovery, projectPath, projectsRoot, readProjectDirs, resolveProjectPath } from './project-path.mjs'
 import { cycleRecords, driveFiles, DRIVE_DIR, fullTierRanOf, fullVerificationDrive, instanceCycleTarget, notOnInstanceOf, readReports, suiteRanOf } from './runtime/full-verification-drive.mjs'
 import { flakyHistoryLines, judgeRerun, rerunCommands, rerunPlan, rerunSettings, RERUN_DIR } from './runtime/full-verification-rerun.mjs'
 import { fill, instanceName } from './runtime/instance-drive.mjs'
@@ -25,16 +26,20 @@ import { deliveryCounts } from './verification-trigger.mjs'
 import { checkoutsOf, committedBeyond, followedViews, forgetRef, MOTION_WINDOW_MS, motionOf, movingPaths, readCheckouts, readGit, SHOWN_PATHS, snapshotCheckouts, snapshotDiff, snapshotRecord, testedViews, viewReader } from './runtime/full-verification-snapshot.mjs'
 
 /*
- * The full verification (docs/tactical-playbooks.md "The daily full
- * verification", execution-contract.md "Full verification freeze").
+ * The full verification (docs/tactical-playbooks.md "Full verification cycles",
+ * execution-contract.md "Full verification freeze").
  *
  * On request (POST /api/verification/start), once `fullVerification.afterDeliveries`
  * deliveries happened on one stage (verification-trigger.mjs), and at the host settings'
  * `fullVerification.at` in its `timeZone` when given, a cycle:
- *   1. closes admission for writing runs (supervisor.freeze): none starts, continues or
- *      delivers, and every live one pauses at its next step boundary as `full-verification`;
- *      read-only runs (no delivery, no release, not in place) go on;
- *   2. waits until no writing run or delivery is left in this process (supervisor.busy);
+ *   1. decides its scope from one reading of the configuration (readCycleConfig, cycleScope:
+ *      the projects with infrastructure.staging and their whole module pools; a listing or
+ *      configuration it cannot read refuses the cycle, FULL_VERIFICATION_SCOPE_UNREADABLE,
+ *      before anything is frozen) and closes admission for the writing runs of those projects
+ *      (supervisor.freeze): none starts, continues or delivers, and every live one pauses at
+ *      its next step boundary as `full-verification`; read-only runs (no delivery, no release,
+ *      not in place) go on, and a run of a project outside the scope is never touched;
+ *   2. waits until no writing run or delivery of the scope is left in this process (supervisor.busy);
  *   3. verifies every configured stage, one at a time per staging host and hosts side by
  *      side, against the previous green cycle of the same mode
  *      (runtime/full-verification-drive.mjs):
@@ -135,6 +140,60 @@ export function stageOf (project, infra) {
   const host = infra.staging.ssh?.hostRef ?? infra.staging.id
   return infra.testDrive?.modules?.instance ? { project, stage: infra.staging.id, host, mode: 'instance' } : { project, stage: infra.staging.id, host }
 }
+
+/**
+ * The projects a cycle verifies, and so the only ones its freeze holds (supervisor.freeze): every project with a stage
+ * the cycle drives (infrastructure.staging, not declared verified through its instances, not refused up front by the
+ * configuration: HOST_HAS_INSTANCES, FULL_SUITE_UNDECLARED, a release stage without a staging release target), and
+ * the whole module pool
+ * of each (its framework, resolved through poolIdOf, and every instance naming it). A pool with no driven stage (an
+ * instances-only framework whose members have no staging) is not verified, so it is not in the scope.
+ * `infras` maps project -> infrastructure (null: none, {error}: invalid), `config` the projects' configuration
+ * (null: pools unknown). Sorted ids.
+ */
+export function cycleScope ({ infras, config }) {
+  const scope = new Set()
+  // A stage refused up front (a release to a host with dynamic instances, an instance stage without a full suite) verifies
+  // nothing: it neither enters the scope nor brings its pool in (verifiable, the delivery trigger's own predicate).
+  const hosts = protectedHosts(new Map([...infras].filter(([, infra]) => !infra?.error)))
+  for (const [id, infra] of infras) {
+    if (!infra?.staging || infra.error) continue
+    const stage = stageOf(id, infra)
+    if (!verifiable(stage, infra, hosts)) continue
+    // A release stage with no configured staging release target is refused by the Deployment resolution
+    // (TARGET_MISSING): the same release-plan check, on the same reading, keeps it and its pool out.
+    if (stage.mode !== 'instance' && targetMissing(infra)) continue
+    scope.add(id)
+    const pool = config ? poolIdOf(id, config) : null
+    if (!pool) continue
+    scope.add(pool)
+    for (const member of poolMembers(pool, config)) scope.add(member)
+  }
+  return [...scope].sort()
+}
+
+/**
+ * Everything a cycle decides from, read once and together: the project listing (project-path.mjs readProjectDirs,
+ * uncached), one load of the configuration in the host-config directory chosen now (hostConfigSelection), each listed
+ * project's infrastructure from that same load, and every read that failed for another reason than absence
+ * (`unreadable`: [{path, code}]), which refuses the cycle. A project file that loads but fails its schema is kept as
+ * `{ error }` (a red INFRASTRUCTURE_INVALID entry), as before.
+ */
+export async function readCycleConfig ({ root, projectsDir = projectsRoot(), discovery = projectDiscovery(), env = process.env, load = loadConfig } = {}) {
+  const listing = await readProjectDirs(projectsDir, discovery)
+  const selection = hostConfigSelection({ root, env })
+  const config = await load({ root, hostDir: selection.dir })
+  const infras = new Map()
+  for (const { id } of listing.projects) infras.set(id, await projectInfrastructure(id, { config }).catch((error) => ({ error: error.message })))
+  const unreadable = [...listing.unreadable, ...selection.unreadable, ...(config.unreadable ?? []).filter((u) => u.category === 'projects').map((u) => ({ path: u.dir, code: u.code }))]
+  return { projects: listing.projects.map((p) => p.id), infras, config: config.projects, unreadable }
+}
+
+/** Whether a release stage has no configured staging release target (the Deployment resolution's TARGET_MISSING). */
+const targetMissing = (infra) => releasePlan({ tactic: 'deployment', infrastructure: infra, runOptions: { environment: 'staging' } }).blockers.some((b) => b.reason === TARGET_MISSING)
+
+/** The refusal of a cycle whose scope cannot be decided: nothing is frozen, nothing recorded. */
+const scopeUnreadable = (unreadable) => Object.assign(new Error(`the full verification cannot decide which projects it verifies, so it does not start: ${unreadable.map((u) => u.message ?? `${u.path} could not be read (${u.code ?? 'error'})`).join('; ')}`), { status: 503, code: 'FULL_VERIFICATION_SCOPE_UNREADABLE', unreadable })
 
 /**
  * The staging hosts that have dynamic instances, each with the projects that declare them: no cycle releases there.
@@ -312,7 +371,7 @@ export function failureAttachments ({ name, failures, unread = [], flaky = [], m
 /** The report of a red project's issue: the cycle, the run, why it is red, the first failing tests. */
 export function redIssueReport ({ record, entry, name, stage, failures, unread = [], flaky = [], parts = [] }) {
   const lines = [`# ${name}`, '',
-    `The daily full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
+    `The full verification ${record.id} found ${entry.project} red on ${stage}. The cycle opened this issue with that cycle's evidence; no version was bumped.`, '',
     `- Cycle: \`${record.id}\` (record \`issues/.verification/${record.date}/cycle.json\`)`,
     entry.mode === 'derived' ? `- No drive of its own: the entry is derived from the instance entries of this cycle whose snapshots materialized ${entry.project}'s checkout (${entry.derived?.rule ?? 'every one green'}).`
       : entry.mode === 'instance' ? `- Drive: \`${entry.driveId}\` on stage instance \`${entry.instance?.name ?? 'none created'}\`${entry.instance?.destroyed ? (entry.instance.destroyed.passed ? ' (destroyed)' : ` (its destroy failed: ${entry.instance.destroyed.error})`) : ''}; evidence \`${entry.evidence?.dir ?? entry.runDir ?? 'none'}\`` : entry.runId ? `- Run: \`${entry.runId}\` in \`${entry.runHome}\`` : '- Run: none started']
@@ -350,9 +409,10 @@ export function redIssueReport ({ record, entry, name, stage, failures, unread =
   return lines.join('\n')
 }
 
-const report = ({ project, stage }) => `# Daily full verification of ${project} on ${stage}
+const report = ({ project, stage }) => `# Full verification of ${project} on ${stage}
 
-This is the panel's daily full verification, not a reported problem. Release the project's development
+This is the panel's full verification (a cycle after a number of deliveries, on request, or at a
+configured time), not a reported problem. Release the project's development
 checkout as it stands to the staging environment \`${stage}\` and assess that release as for any staging
 release. After the release, the engine drives the project's full check tier on the same snapshot and
 compares it with the previous green cycle; a new failure stops the run on its own.
@@ -374,11 +434,21 @@ export function createFullVerification ({
   configRoot = process.env.DEVPANEL_CONFIG_ROOT,
   verificationDir = path.join(issues.ISSUES_DIR, '.verification'),
   resolve = (playbookId, options) => resolvePlaybook(playbookId, options),
-  infrastructureOf = (project) => projectInfrastructure(project, { root: configRoot }),
+  infrastructureOf: injectedInfrastructureOf = null,
   readRun = (issuePath, runId) => fs.readFile(path.join(issuePath, 'runs', runId, 'run.json'), 'utf8').then(JSON.parse),
   emit = null,
-  /** The projects' configuration (`framework:` declarations), read when a green cycle bumps. */
-  projectsConfig = async () => (await loadConfig({ root: configRoot })).projects,
+  /** The projects' configuration (`framework:` declarations). */
+  projectsConfig: injectedProjectsConfig = null,
+  /*
+   * What a cycle decides from, read once (readCycleConfig): the project list, each project's infrastructure and
+   * the projects' configuration from one load, and what could not be read. A caller that injects
+   * infrastructureOf/projectsConfig (the tests' fakes) gets inputs built from those, with nothing unreadable.
+   */
+  cycleInputs: injectedCycleInputs = null,
+  // The projects root the issue store and supervisor read (issues.js PROJECTS_DIR, fixed at load), never a later reading.
+  projectsDir = issues.PROJECTS_DIR,
+  discovery = undefined,
+  env = process.env,
   /** Run a project action to its end; resolves with its operation record (project-actions.mjs). */
   runAction = async ({ project, actionId, args }) => (await startProjectAction({ project, actionId, args, root: configRoot, actor: 'full-verification', emit: emitAction ?? (() => {}) })).done,
   emitAction = null,
@@ -417,6 +487,18 @@ export function createFullVerification ({
   headOf = async (checkout) => (await readGit(['-C', checkout, 'rev-parse', 'HEAD'])).trim(),
   compareCommit = (args) => committedBeyond(args)
 } = {}) {
+  const infrastructureOf = injectedInfrastructureOf ?? ((project) => projectInfrastructure(project, { root: configRoot }))
+  const projectsConfig = injectedProjectsConfig ?? (async () => (await loadConfig({ root: configRoot })).projects)
+  const cycleInputs = injectedCycleInputs ?? (injectedInfrastructureOf || injectedProjectsConfig
+    ? async () => {
+      const projects = (await issues.listProjects()).map((p) => p.id ?? p)
+      const infras = new Map()
+      for (const id of projects) infras.set(id, await Promise.resolve().then(() => infrastructureOf(id)).catch((error) => ({ error: error.message })))
+      return { projects, infras, config: await Promise.resolve().then(() => projectsConfig()).catch(() => null), unreadable: [] }
+    }
+    : () => readCycleConfig({ root: configRoot, projectsDir: projectsDir ?? projectsRoot(), discovery: discovery === undefined ? projectDiscovery() : discovery, env }))
+  // The inputs of the cycle running now (one at a time): its stages and its checkpoint chain read them, never a later reading.
+  let activeInputs = null
   let cancel = null
   let cancelDeliveries = null
   let deliveryCheckRunning = null
@@ -559,19 +641,25 @@ export function createFullVerification ({
   /** Start a cycle and return a copy of its record as frozen; the cycle goes on in the background. */
   async function startCycle ({ trigger, by = null, scheduledFor = null, deliveries = null }) {
     if (running) throw Object.assign(new Error(`a full verification cycle is already running (${current.id})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: current.id })
+    // The scope, decided before anything is frozen or recorded: inputs that cannot be read refuse the cycle.
+    let inputs
+    try { inputs = await cycleInputs() } catch (error) { throw scopeUnreadable([{ path: null, code: error.code ?? null, message: error.message }]) }
+    if (inputs.unreadable?.length) throw scopeUnreadable(inputs.unreadable)
+    if (running) throw Object.assign(new Error(`a full verification cycle is already running (${current.id})`), { status: 409, code: 'FULL_VERIFICATION_RUNNING', cycleId: current.id })
     const s = readSettings()
     const timeZone = s?.timeZone ?? 'UTC'
     const date = localDate(clock.now(), timeZone)
     const record = {
       id: null, date, trigger, by, scheduledFor, ...(deliveries ? { deliveries } : {}), schedule: s ? { at: s.at, timeZone: s.timeZone } : null, timeZone,
       state: 'frozen', verdict: null, frozenAt: clock.iso(), seatsIdleAt: null, startedAt: null, endedAt: null,
-      asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], refused: [], outcome: null, error: null
+      scope: { projects: cycleScope(inputs), decidedAt: clock.iso() },
+      asked: [], waitingOn: [], projects: [], resumed: [], heldForOperator: [], leftPaused: [], refused: [], outcome: null, error: null
     }
     running = true
     current = record
     try {
       record.id = `${date}.${await rotate(date)}`
-      record.asked = await supervisor.freeze(record.id)
+      record.asked = await supervisor.freeze(record.id, { projects: record.scope.projects })
       await write(record)
     } catch (error) {
       running = null
@@ -581,11 +669,12 @@ export function createFullVerification ({
     }
     // The record as it stood when admission closed; the cycle goes on changing its own copy.
     const frozen = structuredClone(record)
-    running = cycle(record).catch((error) => log.warn?.(`[devpanel] full verification ${record.id} failed: ${error.message}`)).finally(() => { running = null })
+    activeInputs = inputs
+    running = cycle(record, inputs).catch((error) => log.warn?.(`[devpanel] full verification ${record.id} failed: ${error.message}`)).finally(() => { running = null })
     return frozen
   }
 
-  async function cycle (record) {
+  async function cycle (record, inputs) {
     snapshotInputs.clear()
     try {
       // No run of an issue left in this process: no seat turn is running.
@@ -600,11 +689,10 @@ export function createFullVerification ({
       record.seatsIdleAt = clock.iso()
       record.state = 'running'
       record.startedAt = clock.iso()
-      const projects = await issues.listProjects()
+      // The stages come from the inputs the scope was decided from (startCycle), never a later reading.
       const infras = new Map()
-      for (const p of projects) {
-        const id = p.id ?? p
-        const infra = await infrastructureOf(id).catch((error) => ({ error: error.message }))
+      for (const id of inputs.projects) {
+        const infra = inputs.infras.get(id)
         if (!infra?.error) infras.set(id, infra)
         record.projects.push(infra?.error ? { project: id, stage: null, verdict: 'red', refusal: { code: 'INFRASTRUCTURE_INVALID', message: infra.error } } : stageOf(id, infra))
       }
@@ -614,7 +702,7 @@ export function createFullVerification ({
       const drivable = (e) => e.stage && !e.verifiedThrough && !e.verdict
       // A framework one of whose pool instances is driven in this cycle waits for them: its entry may be derived from
       // theirs (deriveEntry). Unreadable projects' configuration: nothing is deferred, everything is driven as before.
-      const config = await Promise.resolve().then(() => projectsConfig()).catch(() => null)
+      const config = inputs.config
       const pools = new Map()
       if (config) {
         for (const entry of record.projects.filter(drivable)) {
@@ -625,8 +713,15 @@ export function createFullVerification ({
           }
         }
       }
+      // The scope gate: a stage the frozen reading left out of the scope is never started in this cycle, whatever the
+      // configuration says later; it is refused with the reason that reading gave (TARGET_MISSING), else as outside the freeze.
+      const inScope = new Set(record.scope?.projects ?? [])
       const refusalOf = (entry) => hostRefusal(entry, protectedOnes) ?? (entry.mode === 'instance' && !infras.get(entry.project)?.testDrive?.modules?.instance?.fullSuite
         ? { code: 'FULL_SUITE_UNDECLARED', message: `${entry.project} runs on dynamic stage instances but declares no testDrive.modules.instance.fullSuite: the whole suite has no instance command, and the base instance is never used instead` }
+        : null) ?? (record.scope && !inScope.has(entry.project)
+        ? (entry.mode !== 'instance' && targetMissing(infras.get(entry.project))
+            ? { code: 'TARGET_MISSING', message: `${TARGET_MISSING} (staging): read when the cycle froze, so this stage stays out of this cycle whatever the configuration says now` }
+            : { code: 'OUTSIDE_FREEZE_SCOPE', message: `${entry.project} was not in this cycle's scope when it froze, so its stage is not started in this cycle` })
         : null)
       for (const entry of record.projects.filter((e) => drivable(e) && e.state !== 'deferred')) {
         const refusal = refusalOf(entry)
@@ -668,7 +763,8 @@ export function createFullVerification ({
       record.state = 'resuming'
       supervisor.thaw(record.id)
       await write(record).catch(() => {})
-      await resumeFrozen(record).catch((error) => { record.error ??= `resuming: ${error.message}` })
+      await resumeFrozen(record, { scope: record.scope?.projects ?? null }).catch((error) => { record.error ??= `resuming: ${error.message}` })
+      activeInputs = null
       record.state = record.error ? 'failed' : 'ended'
       record.endedAt = clock.iso()
       // Owed to the top-level supervisor until it was told, so a restart in between still tells it (announcePending).
@@ -917,6 +1013,8 @@ export function createFullVerification ({
   }
 
   async function runStage (record, entry, hosts = new Map()) {
+    // What the freeze decided this stage is, before this function marks it a release.
+    const frozen = { host: entry.host, stage: entry.stage, mode: entry.mode ?? 'release' }
     // Never a release to a host with dynamic instances, whoever asks.
     const refused = hostRefusal(entry, hosts)
     if (refused) {
@@ -942,6 +1040,8 @@ export function createFullVerification ({
       const projectDir = await Promise.resolve().then(() => projectPathOf(entry.project)).catch(() => null)
       const before = projectDir ? await readMotion({ projectDir, policy }).catch((error) => ({ error: error.message })) : { error: 'the project checkout could not be named' }
       let after = null
+      // The last step before the start, after every awaited reading: the target and a fresh, complete protected-host read.
+      await releaseGuard(entry, frozen, resolution.resolved, hosts)
       const started = await supervisor.start({ project: entry.project, issueId: home.id, playbookId: 'deployment', expectConfigHash: resolution.resolved.configHash, runOptions, configRoot, cycle: record.id })
       Object.assign(entry, { runId: started.runId, runDir: path.join(home.path, 'runs', started.runId), state: 'running', startedAt: clock.iso() })
       await write(record)
@@ -988,6 +1088,29 @@ export function createFullVerification ({
     }
     entry.durationMs = entry.startedAt ? Math.max(0, Date.parse(entry.endedAt ?? clock.iso()) - Date.parse(entry.startedAt)) : null
     await write(record)
+  }
+
+  /**
+   * Before a release starts: the staging target the Deployment run is bound to (its resolved configuration, pinned by
+   * expectConfigHash) must be the one the freeze decided (STAGE_DRIFTED otherwise), and a fresh, complete reading of
+   * every project must show its host unprotected; a reading that cannot establish that declines it (STAGE_UNVERIFIABLE).
+   * The hash binds the resolved configuration only, not where an installed release script sends what it releases.
+   */
+  async function releaseGuard (entry, frozen, resolved, hosts) {
+    const actual = stageOf(entry.project, resolved.infrastructure ?? null)
+    if (actual.verifiedThrough || actual.host !== frozen.host || actual.stage !== frozen.stage || (actual.mode ?? 'release') !== frozen.mode) {
+      throw Object.assign(new Error(`the staging target changed since the freeze (${frozen.stage} on ${frozen.host} → ${actual.verifiedThrough ? `verified through its instances: ${actual.reason}` : `${actual.stage} on ${actual.host}`}); not released, the next cycle reads the new configuration`), { code: 'STAGE_DRIFTED' })
+    }
+    const unverifiable = (why) => Object.assign(new Error(`whether ${frozen.host} has dynamic stage instances cannot be established: ${why}; not released`), { code: 'STAGE_UNVERIFIABLE' })
+    let fresh
+    try { fresh = await cycleInputs() } catch (error) { throw unverifiable(`the configuration could not be read (${error.message})`) }
+    if (fresh.unreadable?.length) throw unverifiable(`could not read ${fresh.unreadable.map((u) => `${u.path ?? '?'} (${u.code ?? 'error'})`).join(', ')}`)
+    const broken = [...fresh.infras].filter(([, infra]) => infra?.error)
+    if (broken.length) throw unverifiable(`the configuration of ${broken.map(([id]) => id).join(', ')} is invalid`)
+    const now = new Map(hosts)
+    for (const [host, projects] of protectedHosts(fresh.infras)) now.set(host, [...new Set([...(now.get(host) ?? []), ...projects])])
+    const refusal = hostRefusal(entry, now)
+    if (refusal) throw Object.assign(new Error(refusal.message), { code: refusal.code })
   }
 
   /**
@@ -1060,10 +1183,15 @@ export function createFullVerification ({
   async function bump (record) {
     const result = { chain: [], failed: null, notRun: [], versions: {}, withheld: [], untestedCommitted: [] }
     record.outcome.bump = result
-    const projects = await projectsConfig()
-    const frameworks = [...new Set([...projects.values()].map((p) => p.framework).filter((id) => id && projects.has(id)))].sort()
+    const projects = activeInputs?.config ?? await projectsConfig()
+    const named = [...new Set([...projects.values()].map((p) => p.framework).filter((id) => id && projects.has(id)))].sort()
+    // Only a pool the cycle verified is checkpointed: every member in its scope, which holds a pool only when one of its
+    // members has a stage this cycle drives (cycleScope); any other pool is outside the freeze and never reaches the action.
+    const scope = record.scope ? new Set(record.scope.projects) : null
+    const frameworks = scope ? named.filter((f) => poolMembers(f, projects).every((m) => scope.has(m))) : named
+    for (const framework of named.filter((f) => !frameworks.includes(f))) result.notVerified = [...(result.notVerified ?? []), { framework, members: poolMembers(framework, projects), reason: 'no member of this pool has a stage this cycle drives, so it is outside the freeze and not checkpointed' }]
     const allSteps = frameworks.flatMap((framework) => poolMembers(framework, projects).map((project, i) => ({ project, framework, args: i === 0 ? ['--minor'] : [] })))
-    if (!allSteps.length) { result.reason = 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
+    if (!allSteps.length) { result.reason = named.length ? 'no pool this cycle verified names a framework, so there is nothing to bump' : 'no project names a framework (framework: in projects/<id>.yaml), so there is nothing to bump'; return }
     // Before any checkpoint: every green entry's checkouts snapshotted again and compared with what it tested.
     const green = record.projects.filter((e) => !e.verifiedThrough && e.verdict === 'green')
     for (const entry of green) await recheck(record, entry)
@@ -1272,7 +1400,12 @@ export function createFullVerification ({
    * Resume every run of an issue or a run home the freeze paused; one where an operator's pause was
    * pending as well stays paused for that operator. Refusals are recorded, never retried.
    */
-  async function resumeFrozen (record) {
+  /**
+   * Resume the runs paused as full-verification. At a cycle's end (`scope`) only those of its scope: a pause of a
+   * project outside it, left by an earlier cycle, is named in `leftPaused` and left to recover() at the next start or
+   * to an operator's resume. Without a scope (recover()), every such pause, as before.
+   */
+  async function resumeFrozen (record, { scope = null } = {}) {
     for (const p of await issues.listProjects()) {
       const project = p.id ?? p
       // The issues, and the run homes: a run of an earlier cycle this cycle froze is resumed the same way.
@@ -1283,6 +1416,7 @@ export function createFullVerification ({
         const run = await readRun(issue.path, latest.runId).catch(() => null)
         if (run?.pause?.kind !== 'full-verification') continue
         const named = { project, issueId: issue.id, runId: latest.runId }
+        if (scope && !scope.includes(project)) { (record.leftPaused ??= []).push({ ...named, cycleId: run.pause.cycleId ?? null, reason: 'outside this cycle\'s scope' }); continue }
         if (run.pause.manualPending) { record.heldForOperator.push(named); continue }
         try {
           await supervisor.resume({ ...named, actor: 'service', origin: 'full-verification' })

@@ -118,7 +118,7 @@ export default async function (t) {
     const report = operationReport(finished)
     t.ok('the model report carries bounded output, not just an exit code', report.stdout.includes('done') && typeof report.outputBounded === 'string' && !('stdoutTail' in report))
 
-    t.section('engine arguments (the daily full verification\'s --minor)')
+    t.section('engine arguments (the full verification\'s --minor)')
     t.eq('without arguments the action gets none', finished.args, [])
     t.ok('… and the script sees none', finished.stdoutTail.includes('args:[0:]'))
     const minor = await (await startProjectAction({ project, actionId: 'checkpoint', args: ['--minor'], ...opts })).done

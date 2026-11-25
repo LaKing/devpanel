@@ -2,13 +2,18 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { createFullVerification, nextTrigger, localDate, stageOf } from '../server/full-verification.mjs'
+import { createFullVerification, cycleScope, nextTrigger, localDate, readCycleConfig, stageOf } from '../server/full-verification.mjs'
+import { hostConfigDir, hostConfigSelection, overlay } from '../server/config/host-config.mjs'
+import { discoveredProjects, listProjectDirs, readProjectDirs } from '../server/project-path.mjs'
 import { slugify } from '../server/issues.js'
 import { manualClock } from '../server/runtime/clock.mjs'
 import { TARGET_MISSING } from '../server/config/release-plan.mjs'
 import { createSupervisor } from '../server/supervisor.mjs'
+import { resolvePlaybook } from '../server/config/load.mjs'
+import { sandbox } from './helpers.mjs'
+import YAML from 'yaml'
 
-export const name = 'full verification — the daily schedule on a fake clock, the freeze wait, one run per stage, the record, the hand start'
+export const name = 'full verification — the schedule on a fake clock, the scoped freeze and its wait, one run per stage, the record, the hand start'
 
 const BERLIN = { at: '06:00', timeZone: 'Europe/Berlin' }
 const iso = (ms) => new Date(ms).toISOString()
@@ -32,13 +37,14 @@ const environment = (id, hostRef, extra = {}) => ({ id, ssh: { hostRef, workdir:
  */
 function world ({ busy = [], issuesDir, paused = [], checks = {}, files = {}, frameworkOf = {}, failAction = null }) {
   const infra = {
-    'app-project': { staging: environment('stage', 'ssh-config:stage-a') },
-    'shop-project': { staging: environment('stage', 'ssh-config:stage-a') },
+    // A release target for the staging environment (the Deployment resolution's TARGET_MISSING otherwise); lib-project has none.
+    'app-project': { staging: environment('stage', 'ssh-config:stage-a'), release: { targets: { stage: {} } } },
+    'shop-project': { staging: environment('stage', 'ssh-config:stage-a'), release: { targets: { stage: {} } } },
     'lib-project': { staging: environment('stage', 'ssh-config:stage-b') },
-    'framework-project': { staging: environment('stage', 'ssh-config:stage-c', { fullVerification: 'instances' }) },
+    'framework-project': { staging: environment('stage', 'ssh-config:stage-c', { fullVerification: 'instances' }), release: { targets: { stage: {} } } },
     'tool-project': null
   }
-  const calls = { freezes: [], thaws: [], starts: [], resumes: [], createIssue: 0, issues: [], attachments: [], actions: [], order: [], homes: [] }
+  const calls = { freezes: [], scopes: [], thaws: [], starts: [], resumes: [], createIssue: 0, issues: [], attachments: [], actions: [], order: [], homes: [] }
   const runCount = new Map()
   const runs = new Map()
   const activeOnHost = new Map()
@@ -47,7 +53,7 @@ function world ({ busy = [], issuesDir, paused = [], checks = {}, files = {}, fr
   const supervisor = {
     busyList: busy,
     frozenState: null,
-    async freeze (cycleId) { calls.freezes.push(cycleId); this.frozenState = { cycleId, at: '2026-11-07T05:00:00.000Z' }; return [] },
+    async freeze (cycleId, options) { calls.freezes.push(cycleId); calls.scopes.push(options?.projects ?? null); this.frozenState = { cycleId, at: '2026-11-07T05:00:00.000Z' }; return [] },
     thaw (cycleId) { calls.thaws.push(cycleId); calls.order.push('thaw'); this.frozenState = null; return true },
     frozen () { return this.frozenState },
     busy () { return this.busyList },
@@ -97,7 +103,7 @@ function world ({ busy = [], issuesDir, paused = [], checks = {}, files = {}, fr
     activeOnHost.set(run.host, activeOnHost.get(run.host) - 1)
     return run.record
   }
-  const resolve = async (playbookId, { projectId, runOptions }) => ({ ok: true, resolved: { configHash: `hash-${projectId}`, runOptions, liveExecution: { blockers: projectId === 'lib-project' ? [{ reason: TARGET_MISSING }] : [] } } })
+  const resolve = async (playbookId, { projectId, runOptions }) => ({ ok: true, resolved: { configHash: `hash-${projectId}`, runOptions, infrastructure: infra[projectId] ?? null, liveExecution: { blockers: projectId === 'lib-project' ? [{ reason: TARGET_MISSING }] : [] } } })
   // The outcome's seams: the projects' framework: declarations, a fake checkpoint action, the versions it bumps.
   const versions = { 'framework-project': '0.4.12', 'app-project': '0.4.12-3', 'shop-project': '0.4.12-7' }
   const seams = {
@@ -263,7 +269,7 @@ export default async function (t) {
         const issue = await issues.createIssue('devpanel-project', { name: 'An ordinary issue' })
         const listed = (await issues.listIssues('devpanel-project')).map((i) => i.id)
         const entries = (await fs.readdir(path.join(issuesDir, 'devpanel-project'))).filter((n) => /^\d{4}-\d{2}-\d{2}-/.test(n))
-        const home = await issues.ensureRunHome('devpanel-project', '2026-11-07', '# Daily full verification\n')
+        const home = await issues.ensureRunHome('devpanel-project', '2026-11-07', '# Full verification\n')
         t.eq('the home is issues/<project>/.verification-<date>, id verification-<date>', [home.id, home.path, home.kind], ['verification-2026-11-07', path.join(issuesDir, 'devpanel-project', '.verification-2026-11-07'), 'verification'])
         t.eq('its parent is the project\'s issue folder', path.dirname(home.path), path.join(issuesDir, 'devpanel-project'))
         t.eq('the issue list is unchanged', (await issues.listIssues('devpanel-project')).map((i) => i.id), listed)
@@ -277,7 +283,7 @@ export default async function (t) {
         const step = await issues.createStep('devpanel-project', home.id, { name: 'turn', response: 'answered' })
         t.ok('its runs take steps', Boolean(step?.number))
         t.eq('listed as a run home', (await issues.listRunHomes('devpanel-project')).map((h) => h.id), ['verification-2026-11-07'])
-        t.eq('the task report is written once', await fs.readFile(path.join(home.path, '000-report', 'response.md'), 'utf8'), '# Daily full verification\n')
+        t.eq('the task report is written once', await fs.readFile(path.join(home.path, '000-report', 'response.md'), 'utf8'), '# Full verification\n')
       } finally {
         if (before === undefined) delete process.env.DEVPANEL_ISSUES_DIR
         else process.env.DEVPANEL_ISSUES_DIR = before
@@ -526,6 +532,355 @@ export default async function (t) {
       t.eq('every command passed but the declared report does not parse: none either', [unparsed.suiteRan, unparsed.coverageEstablished], [null, false])
       const ran = await recordOf({ result: { result: 'failed', dir, commands: [{ id: 'selftest', required: true, passed: false, exitCode: 1 }] }, gating: 'failed', selftest: { reports: [{ command: 'selftest', verdict: 'not-applicable' }] } }, { 'selftest.stdout': report })
       t.eq('the suite failed its own tests and its report parsed: established', [ran.suiteRan?.report?.command, ran.coverageEstablished], ['selftest', true])
+    }
+
+    t.section('18. the scope: projects with staging and their whole module pools, decided before the freeze and passed to it')
+    {
+      const stage = (host) => ({ staging: environment('stage', host), release: { targets: { stage: {} } } })
+      const infras = new Map([['site-project', stage('h')], ['fw-project', null], ['sibling-project', null], ['lonely-project', null], ['tool-project', null], ['broken-project', { error: 'invalid' }]])
+      const config = new Map([
+        ['site-project', { id: 'site-project', framework: 'fw-project' }],
+        ['fw-project', { id: 'fw-project' }],
+        ['sibling-project', { id: 'sibling-project', framework: 'fw-project' }],
+        ['lonely-project', { id: 'lonely-project', infrastructure: { testDrive: { modules: { collections: ['@*'] } } } }],
+        ['tool-project', { id: 'tool-project' }]
+      ])
+      t.eq('a staged instance brings its framework (through poolIdOf) and its unstaged sibling; a project with modules but no staging, one without infrastructure and an invalid one stay out', cycleScope({ infras, config }), ['fw-project', 'sibling-project', 'site-project'])
+      t.eq('a framework named by a staged instance is in scope even when its own configuration is missing', cycleScope({ infras: new Map([['site-project', stage('h')]]), config: new Map([['site-project', { id: 'site-project', framework: 'gone-project' }]]) }), ['gone-project', 'site-project'])
+      t.eq('without pools known, only the staged projects', cycleScope({ infras, config: null }), ['site-project'])
+      const w = await worldIn('devpanel-fv-scope-', { frameworkOf: instances })
+      const record = await (await cycleOf(w, {}, { projects: [...pool, 'tool-project'] })).run()
+      t.eq('the freeze is given the scope, and the record keeps it; the project without infrastructure is not in it', [w.calls.scopes, record.scope.projects], [[['app-project', 'framework-project', 'shop-project']], ['app-project', 'framework-project', 'shop-project']])
+    }
+
+    t.section('19. the supervisor\'s freeze holds only its scope: an out-of-scope run is never asked, waited for or refused, and an operator pause still pauses it')
+    {
+      const dir = await temp('devpanel-fv-scoped-supervisor-')
+      const pausedPath = path.join(dir, 'paused')
+      await fs.mkdir(path.join(pausedPath, 'runs', 'p-run'), { recursive: true })
+      await fs.writeFile(path.join(pausedPath, 'runs', 'p-run', 'run.json'), JSON.stringify({ runId: 'p-run', status: 'paused' }))
+      const issues = {
+        getRunHolder: async (project, id) => ({ id, project, path: pausedPath, packed: false }),
+        getIssue: async () => { throw Object.assign(new Error('no such issue'), { status: 404 }) },
+        listIssues: async () => [],
+        listProjects: async () => []
+      }
+      const supervisor = createSupervisor({ issues, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir })
+      const asked = []
+      const engineOf = (name) => ({ run: { status: 'running' }, requestFreeze (cycleId) { asked.push(['freeze', name]); return null }, async requestPause () { asked.push(['pause', name]) } })
+      supervisor.active.set('app-project/in', { runId: 'in-run', issuePath: path.join(dir, 'in'), project: 'app-project', issueId: 'in', phase: 'run', engine: engineOf('app'), writes: true, stopping: false })
+      supervisor.active.set('devpanel-project/out', { runId: 'out-run', issuePath: path.join(dir, 'out'), project: 'devpanel-project', issueId: 'out', phase: 'run', engine: engineOf('devpanel'), writes: true, stopping: false })
+      const frozen = await supervisor.freeze('2026-11-07.5', { projects: ['app-project', 'framework-project'] })
+      t.eq('only the scope\'s writing run is asked to stop', [frozen.map((r) => r.runId), asked], [['in-run'], [['freeze', 'app']]])
+      t.eq('the cycle waits only for it', supervisor.busy().map((r) => r.runId), ['in-run'])
+      await supervisor.pause({ project: 'devpanel-project', issueId: 'out', runId: 'out-run' })
+      await supervisor.pause({ project: 'app-project', issueId: 'in', runId: 'in-run' })
+      t.eq('an operator pause reaches both runs as an operator pause; the out-of-scope one is never asked to freeze', asked, [['freeze', 'app'], ['pause', 'devpanel'], ['pause', 'app']])
+      supervisor.active.clear()
+      const codeOf = (promise) => promise.then(() => 'ran', (error) => error.code ?? error.message)
+      const outResume = await codeOf(supervisor.resume({ project: 'devpanel-project', issueId: 'paused', runId: 'p-run', actor: 'operator', origin: 'panel' }))
+      t.ok('a continuation outside the scope is not refused for the cycle (it fails later, on this fixture, for its own reason)', outResume !== 'FULL_VERIFICATION_FREEZE', outResume)
+      t.eq('the same continuation inside the scope is refused as before', await codeOf(supervisor.resume({ project: 'app-project', issueId: 'paused', runId: 'p-run', actor: 'operator', origin: 'panel' })), 'FULL_VERIFICATION_FREEZE')
+      const outFinalize = await codeOf(supervisor.finalize({ project: 'devpanel-project', issueId: 'paused', runId: 'p-run' }))
+      t.ok('a finalize outside the scope is not refused for the cycle', outFinalize !== 'FULL_VERIFICATION_FREEZE', outFinalize)
+      t.eq('one inside it is', await codeOf(supervisor.finalize({ project: 'app-project', issueId: 'paused', runId: 'p-run' })), 'FULL_VERIFICATION_FREEZE')
+      supervisor.thaw('2026-11-07.5')
+      t.eq('after the thaw the freeze holds nothing', supervisor.frozen(), null)
+    }
+
+    t.section('20. the end of a cycle resumes only its scope\'s pauses; one of a project outside it is named and left to recovery')
+    {
+      const paused = [{ project: 'app-project', issueId: 'issue-in', runId: 'r-in' }, { project: 'tool-project', issueId: 'issue-out', runId: 'r-out' }]
+      const w = await worldIn('devpanel-fv-scoped-thaw-', { paused })
+      const { fv, run } = await cycleOf(w, {}, { projects: ['app-project', 'shop-project', 'tool-project'] })
+      const record = await run()
+      t.eq('the scope\'s pause is resumed; the out-of-scope one is not', w.calls.resumes.map((r) => r.runId), ['r-in'])
+      t.eq('and is named in leftPaused', record.leftPaused.map((r) => [r.project, r.runId, r.reason]), [['tool-project', 'r-out', 'outside this cycle\'s scope']])
+      const recovered = await fv.recover()
+      t.eq('recovery at the next start resumes every full-verification pause, that one included', recovered.resumed.map((r) => r.runId), ['r-in', 'r-out'])
+    }
+
+    t.section('21. the checkpoint chain covers only the pools the cycle verified: a pool with no staged member never reaches the action')
+    {
+      const w = await worldIn('devpanel-fv-unverified-pool-', { frameworkOf: instances })
+      const projectsConfig = async () => new Map([...pool.map((id) => [id, { id, ...(instances[id] ? { framework: instances[id] } : {}) }]), ['fw2-project', { id: 'fw2-project' }], ['inst2-project', { id: 'inst2-project', framework: 'fw2-project' }]])
+      const record = await (await cycleOf(w, { projectsConfig }, { projects: [...pool, 'fw2-project', 'inst2-project'] })).run()
+      t.eq('green, and the staged pool is checkpointed as before', [record.verdict, w.calls.actions.map((a) => a[0])], ['green', ['framework-project', 'app-project', 'shop-project']])
+      t.eq('the unstaged pool is named, never run', [record.outcome.bump.notVerified.map((n) => [n.framework, n.members]), record.outcome.bump.chain.some((s) => s.framework === 'fw2-project')], [[['fw2-project', ['fw2-project', 'inst2-project']]], false])
+    }
+
+    // The inputs a cycle reads, built from the world's own seams: `override` replaces a project's infrastructure.
+    const inputsOf = async (w, projects, override = {}, extra = {}) => {
+      const infras = new Map()
+      for (const id of projects) infras.set(id, Object.hasOwn(override, id) ? override[id] : await w.infrastructureOf(id))
+      return { projects, infras, config: await w.seams.projectsConfig(), unreadable: [], ...extra }
+    }
+
+    t.section('22. stages come from the reading the scope was decided from: a project that gains staging after the freeze gets no stage')
+    {
+      const w = await worldIn('devpanel-fv-drift-')
+      const projects = ['app-project', 'shop-project', 'tool-project']
+      let reads = 0
+      // Every reading after the first (the release guard's) shows tool-project with a staging environment.
+      const cycleInputs = async () => (++reads === 1 ? inputsOf(w, projects) : inputsOf(w, projects, { 'tool-project': { staging: environment('stage', 'ssh-config:stage-z') } }))
+      const record = await (await cycleOf(w, { cycleInputs }, { projects })).run()
+      t.ok('the configuration was read again after the freeze', reads > 1, String(reads))
+      t.eq('tool-project stays verified through its instances, outside the scope, with no run', [record.projects.find((p) => p.project === 'tool-project').verifiedThrough, record.scope.projects.includes('tool-project'), w.calls.starts.some((s) => s.project === 'tool-project')], ['instances', false, false])
+    }
+
+    t.section('23. a release starts only on the target the freeze decided, after a complete fresh reading shows its host unprotected')
+    {
+      const projects = ['app-project', 'shop-project']
+      const caseOf = async (label, { fresh = null, resolveOf = null } = {}) => {
+        const w = await worldIn(`devpanel-fv-guard-${label}-`)
+        let reads = 0
+        const cycleInputs = async () => (++reads === 1 ? inputsOf(w, projects) : (fresh ? fresh(w) : inputsOf(w, projects)))
+        const resolve = resolveOf ? (id, options) => resolveOf(w, id, options) : w.resolve
+        const record = await (await cycleOf(w, { cycleInputs, resolve }, { projects })).run()
+        const by = Object.fromEntries(record.projects.map((p) => [p.project, p]))
+        return { w, record, by, codes: projects.map((p) => by[p].refusal?.code ?? by[p].verdict), started: w.calls.starts.map((s) => s.project) }
+      }
+      const plain = await caseOf('plain')
+      t.eq('unchanged plain release stages start and finish green (no false drift)', [plain.codes, plain.started, plain.record.verdict], [['green', 'green'], ['app-project', 'shop-project'], 'green'])
+      const drifted = await caseOf('drift', { resolveOf: async (w, id, options) => { const r = await w.resolve(id, options); return options.projectId === 'shop-project' ? { ...r, resolved: { ...r.resolved, infrastructure: { staging: environment('stage', 'ssh-config:stage-z') } } } : r } })
+      t.eq('a stage whose resolved target moved since the freeze is refused STAGE_DRIFTED and never started; the other starts', [drifted.codes, drifted.started], [['green', 'STAGE_DRIFTED'], ['app-project']])
+      const unreadable = await caseOf('unreadable', { fresh: (w) => inputsOf(w, projects, {}, { unreadable: [{ path: '/host-config/projects', code: 'EACCES' }] }) })
+      t.eq('a fresh reading with something unreadable declines every release', [unreadable.codes, unreadable.started], [['STAGE_UNVERIFIABLE', 'STAGE_UNVERIFIABLE'], []])
+      const broken = await caseOf('broken', { fresh: (w) => inputsOf(w, [...projects, 'peer-project'], { 'peer-project': { error: 'invalid file' } }) })
+      t.ok('a peer whose configuration is invalid declines them too, named', broken.codes.every((c) => c === 'STAGE_UNVERIFIABLE') && /peer-project/.test(broken.by['app-project'].refusal.message) && broken.started.length === 0, JSON.stringify(broken.codes))
+      const thrown = await caseOf('thrown', { fresh: async () => { throw new Error('load failed') } })
+      t.eq('a fresh reading that throws declines them', [thrown.codes, thrown.started], [['STAGE_UNVERIFIABLE', 'STAGE_UNVERIFIABLE'], []])
+      const instanceInfra = { staging: environment('stage', 'ssh-config:stage-a'), testDrive: { modules: { instance: { create: { run: 'x' } } } } }
+      const protectedNow = await caseOf('protected', { fresh: (w) => inputsOf(w, [...projects, 'peer-project'], { 'peer-project': instanceInfra }) })
+      t.eq('a host a peer now declares dynamic instances on is refused HOST_HAS_INSTANCES', [protectedNow.codes, protectedNow.started], [['HOST_HAS_INSTANCES', 'HOST_HAS_INSTANCES'], []])
+    }
+
+    t.section('24. the production reading: an unreadable root, project, marker or host-config directory refuses the cycle before anything is frozen')
+    {
+      const dir = await temp('devpanel-fv-unreadable-')
+      const probe = path.join(dir, 'probe')
+      await fs.mkdir(probe)
+      await fs.chmod(probe, 0o000)
+      const blocked = await fs.readdir(probe).then(() => false, () => true)
+      await fs.chmod(probe, 0o755)
+      if (!blocked) t.skip('chmod 000 does not stop a read here (running as root): the unreadable cases cannot be made')
+      else {
+        // A discovery root with one project the process cannot enter: the listing drops it silently, the reading names it.
+        const root = path.join(dir, 'root')
+        await fs.mkdir(path.join(root, 'shop', '.git'), { recursive: true })
+        await fs.mkdir(path.join(root, 'locked', '.git'), { recursive: true })
+        const discovery = { pattern: '*', markers: ['.git'] }
+        await fs.chmod(path.join(root, 'locked'), 0o000)
+        try {
+          t.eq('the cached discovery leaves the unreadable project out without a word (the old fallback)', [...discoveredProjects(root, discovery).keys()], ['shop-project'])
+          const read = await readProjectDirs(root, discovery)
+          t.eq('readProjectDirs lists what it found and names the marker it could not read', [read.projects.map((p) => p.id), read.unreadable.map((u) => [path.relative(root, u.path), u.code])], [['shop-project'], [['locked/.git', 'EACCES']]])
+        } finally { await fs.chmod(path.join(root, 'locked'), 0o755) }
+        const plainRoot = path.join(dir, 'plain')
+        await fs.mkdir(path.join(plainRoot, 'a-project'), { recursive: true })
+        await fs.chmod(plainRoot, 0o000)
+        try {
+          t.eq('an unreadable root lists as empty, as always', await listProjectDirs(plainRoot), [])
+          t.eq('and readProjectDirs names it', (await readProjectDirs(plainRoot, null)).unreadable.map((u) => [u.path, u.code]), [[plainRoot, 'EACCES']])
+        } finally { await fs.chmod(plainRoot, 0o755) }
+        // A data root holding host-config that the process cannot traverse, and no host-config in the config root.
+        const configRoot = path.join(dir, 'config')
+        await fs.mkdir(configRoot)
+        const dataRoot = path.join(dir, 'data')
+        await fs.mkdir(path.join(dataRoot, 'host-config', 'projects'), { recursive: true })
+        const env = { DEVPANEL_DATA_ROOT: dataRoot }
+        await fs.chmod(dataRoot, 0o000)
+        try {
+          t.eq('hostConfigDir falls back to the in-tree directory without a word (the old fallback)', hostConfigDir({ root: configRoot, env }), path.join(configRoot, 'host-config'))
+          t.eq('hostConfigSelection names the data root\'s host-config it could not stat', hostConfigSelection({ root: configRoot, env }).unreadable.map((u) => [u.path, u.code]), [[path.join(dataRoot, 'host-config'), 'EACCES']])
+          // Through the production path: createFullVerification without injected readers.
+          const w = world({ issuesDir: await temp('devpanel-fv-unreadable-issues-') })
+          const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+          const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: plainRoot, discovery: null, env, log: { warn () {} } })
+          let refused = null
+          try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
+          t.eq('the cycle is refused 503 FULL_VERIFICATION_SCOPE_UNREADABLE naming the directory', [refused?.status, refused?.code, refused?.unreadable?.map((u) => u.path)], [503, 'FULL_VERIFICATION_SCOPE_UNREADABLE', [path.join(dataRoot, 'host-config')]])
+          t.eq('nothing was frozen and no record written', [w.calls.freezes, await fs.readdir(verificationDir).catch(() => [])], [[], []])
+        } finally { await fs.chmod(dataRoot, 0o755) }
+        // An absent data root is not unreadable.
+        t.eq('a data root that does not exist reports nothing', hostConfigSelection({ root: configRoot, env: { DEVPANEL_DATA_ROOT: path.join(dir, 'nowhere') } }).unreadable, [])
+      }
+    }
+
+    t.section('25. one configuration load at freeze time: staging and pool membership agree even when the files change right after it')
+    {
+      const dir = await temp('devpanel-fv-one-load-')
+      const projectsDir = path.join(dir, 'projects-root')
+      for (const id of ['site-project', 'fw-project']) await fs.mkdir(path.join(projectsDir, id), { recursive: true })
+      const site = { id: 'site-project', framework: 'fw-project', infrastructure: { staging: environment('stage', 'h'), release: { targets: { stage: {} } } } }
+      const loads = []
+      // The loader as the cycle sees it; right after the first load the site leaves staging and the pool.
+      const load = async ({ hostDir }) => {
+        loads.push(hostDir)
+        const projects = new Map(loads.length === 1 ? [['site-project', site], ['fw-project', { id: 'fw-project' }]] : [['site-project', { id: 'site-project' }], ['fw-project', { id: 'fw-project' }]])
+        return { projects, errors: [], unreadable: [] }
+      }
+      const first = await readCycleConfig({ root: dir, projectsDir, discovery: null, env: {}, load })
+      t.eq('loaded once; the scope reads staging and the framework from that one load', [loads.length, cycleScope(first)], [1, ['fw-project', 'site-project']])
+      const second = await readCycleConfig({ root: dir, projectsDir, discovery: null, env: {}, load })
+      t.eq('a later reading sees neither, consistently', [loads.length, cycleScope(second)], [2, []])
+    }
+
+    t.section('26. a pool with no stage the cycle drives is not in the scope and never checkpointed: its unstaged subscriber is not frozen')
+    {
+      const instancesOnly = { staging: environment('stage', 'ssh-config:stage-c', { fullVerification: 'instances' }) }
+      t.eq('an instances-only framework and its unstaged subscriber stay out; the unrelated staged project is in', cycleScope({
+        infras: new Map([['fw-project', instancesOnly], ['sub-project', null], ['shop-project', { staging: environment('stage', 'h'), release: { targets: { stage: {} } } }]]),
+        config: new Map([['fw-project', { id: 'fw-project' }], ['sub-project', { id: 'sub-project', framework: 'fw-project' }], ['shop-project', { id: 'shop-project' }]])
+      }), ['shop-project'])
+      const w = await worldIn('devpanel-fv-undriven-pool-')
+      const projectsConfig = async () => new Map([['framework-project', { id: 'framework-project' }], ['sub-project', { id: 'sub-project', framework: 'framework-project' }], ['shop-project', { id: 'shop-project' }]])
+      const record = await (await cycleOf(w, { projectsConfig }, { projects: ['framework-project', 'sub-project', 'shop-project'] })).run()
+      t.eq('the freeze holds only the driven project', [w.calls.scopes, record.scope.projects], [[['shop-project']], ['shop-project']])
+      t.eq('green on the unrelated stage, and the undriven pool never reaches the checkpoint', [record.verdict, w.calls.actions, record.outcome.bump.notVerified?.map((n) => n.framework)], ['green', [], ['framework-project']])
+    }
+
+    t.section('27. a file where the projects root or the projects category belongs is unreadable (ENOTDIR), not an empty listing; a file in place of a host-config candidate is passed over as before')
+    {
+      const dir = await temp('devpanel-fv-enotdir-')
+      const file = path.join(dir, 'not-a-directory')
+      await fs.writeFile(file, 'x')
+      t.eq('a regular file as the projects root: readProjectDirs names it ENOTDIR', (await readProjectDirs(file, null)).unreadable.map((u) => [u.path, u.code]), [[file, 'ENOTDIR']])
+      t.eq('a regular file as a discovery root: the walk names it ENOTDIR', (await readProjectDirs(file, { pattern: '*', markers: ['.git'] })).unreadable.map((u) => [u.path, u.code]), [[file, 'ENOTDIR']])
+      const files = await overlay({ tree: path.join(dir, 'missing'), host: file, match: (n) => n.endsWith('.yaml') })
+      t.eq('a regular file as the host projects directory: the overlay lists nothing and names it ENOTDIR; a missing in-tree one is simply absent', [files.length, files.unreadable.map((u) => [u.dir, u.code])], [0, [[file, 'ENOTDIR']]])
+      const configRoot = path.join(dir, 'config')
+      await fs.mkdir(configRoot)
+      const dataRoot = path.join(dir, 'data')
+      await fs.mkdir(dataRoot)
+      await fs.writeFile(path.join(dataRoot, 'host-config'), 'x')
+      t.eq('a file named host-config in the data root is not a candidate: nothing reported, the in-tree path chosen', hostConfigSelection({ root: configRoot, env: { DEVPANEL_DATA_ROOT: dataRoot } }), { dir: path.join(configRoot, 'host-config'), unreadable: [] })
+      const w = world({ issuesDir: await temp('devpanel-fv-enotdir-issues-') })
+      const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, projectsDir: file, discovery: null, env: {}, log: { warn () {} } })
+      let refused = null
+      try { await fv.startNow({ by: 'tester' }) } catch (error) { refused = error }
+      t.eq('through the production path the cycle refuses FULL_VERIFICATION_SCOPE_UNREADABLE, nothing frozen', [refused?.code, refused?.unreadable?.map((u) => u.code), w.calls.freezes], ['FULL_VERIFICATION_SCOPE_UNREADABLE', ['ENOTDIR'], []])
+    }
+
+    t.section('28. the cycle reads the projects root the issue store and supervisor hold, not a later reading of the setting')
+    {
+      const dir = await temp('devpanel-fv-root-')
+      const storeRoot = path.join(dir, 'store-root')
+      await fs.mkdir(path.join(storeRoot, 'a-project'), { recursive: true })
+      const laterRoot = path.join(dir, 'later-root')
+      await fs.writeFile(laterRoot, 'not a directory')
+      const configRoot = path.join(dir, 'config')
+      await fs.mkdir(configRoot)
+      const w = world({ issuesDir: await temp('devpanel-fv-root-issues-') })
+      w.issues.PROJECTS_DIR = storeRoot
+      const saved = process.env.DEVPANEL_PROJECTS_DIR
+      // The setting now names another (here unusable) root; the issue store still holds storeRoot.
+      process.env.DEVPANEL_PROJECTS_DIR = laterRoot
+      try {
+        const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+        const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, resolve: w.resolve, readRun: w.readRun, configRoot, discovery: null, env: {}, log: { warn () {} } })
+        const started = await fv.startNow({ by: 'tester' }).catch((error) => ({ refused: error.code ?? error.message }))
+        await fv.settle()
+        t.ok('the cycle starts from the issue store\'s root, not refused over the later setting', Boolean(started.id), JSON.stringify(started))
+        const record = started.id ? await readJson(path.join(verificationDir, started.date, 'cycle.json')) : null
+        t.eq('and lists that root\'s projects', record?.projects.map((p) => p.project), ['a-project'])
+      } finally {
+        if (saved === undefined) delete process.env.DEVPANEL_PROJECTS_DIR
+        else process.env.DEVPANEL_PROJECTS_DIR = saved
+      }
+    }
+
+    t.section('29. a pool whose only stage is refused up front (a release to a host another project protects) is not in the scope: its unstaged writer is not frozen, its pool never checkpointed')
+    {
+      const peer = (fullSuite) => ({ staging: environment('stage', 'ssh-config:stage-a'), testDrive: { modules: { instance: { create: { run: 'x' }, ...(fullSuite ? { fullSuite: { run: 'y' } } : {}) } } } })
+      const config = new Map([['peer-project', { id: 'peer-project' }], ['app-project', { id: 'app-project', framework: 'fw-project' }], ['fw-project', { id: 'fw-project' }], ['writer-project', { id: 'writer-project', framework: 'fw-project' }]])
+      const infras = (fullSuite) => new Map([['peer-project', peer(fullSuite)], ['app-project', { staging: environment('stage', 'ssh-config:stage-a') }], ['fw-project', null], ['writer-project', null]])
+      t.eq('the release stage on the protected host brings nothing in; the protecting instance project is in', cycleScope({ infras: new Map([...infras(true)].map(([id, i]) => [id, id === 'app-project' ? { ...i, release: { targets: { stage: {} } } } : i])), config }), ['peer-project'])
+      t.eq('an instance stage without a full suite is refused up front too: nothing in scope', cycleScope({ infras: infras(false), config }), [])
+      const w = await worldIn('devpanel-fv-refused-pool-')
+      const projects = ['peer-project', 'app-project', 'fw-project', 'writer-project']
+      const record = await (await cycleOf(w, { infrastructureOf: async (id) => infras(false).get(id) ?? null, projectsConfig: async () => config }, { projects })).run()
+      t.eq('through the cycle: the freeze holds nobody, the refused stage is red, nothing is checkpointed', [w.calls.scopes, record.projects.find((p) => p.project === 'app-project').refusal?.code, w.calls.actions], [[[]], 'HOST_HAS_INSTANCES', []])
+    }
+
+    t.section('30. the protected-host check is the last step before the start: a peer that declares instances on the host during the checkout reading stops the release')
+    {
+      const w = await worldIn('devpanel-fv-guard-late-')
+      const projects = ['app-project', 'shop-project']
+      let protectedNow = false
+      const peer = { staging: environment('stage', 'ssh-config:stage-a'), testDrive: { modules: { instance: { create: { run: 'x' } } } } }
+      const cycleInputs = async () => inputsOf(w, protectedNow ? [...projects, 'peer-project'] : projects, protectedNow ? { 'peer-project': peer } : {})
+      // The checkout reading before the start is awaited; the peer's declaration lands while it runs.
+      const readMotion = async () => { protectedNow = true; return { checkouts: [] } }
+      const record = await (await cycleOf(w, { cycleInputs, readMotion, projectPathOf: async (id) => `/fixture/${id}` }, { projects })).run()
+      t.eq('both releases are refused HOST_HAS_INSTANCES and supervisor.start is never called', [record.projects.map((p) => p.refusal?.code ?? p.verdict), w.calls.starts.length], [['HOST_HAS_INSTANCES', 'HOST_HAS_INSTANCES'], 0])
+    }
+
+    t.section('31. a release stage with no staging release target (the real loader and resolver) brings nothing into the freeze: the unstaged writer is not frozen, the stage ends TARGET_MISSING, nothing is checkpointed')
+    {
+      const env = (id) => ({ id, ssh: { hostRef: `ssh-config:${id}.invalid`, workdir: '/tmp' }, projectRoot: '/tmp/fixture', files: {} })
+      const configRoot = await sandbox(async (dir) => {
+        await fs.mkdir(path.join(dir, 'projects'))
+        await fs.writeFile(path.join(dir, 'projects', 'app-project.yaml'), YAML.stringify({ id: 'app-project', framework: 'fw-project', infrastructure: { kind: 'boilerplate', orientation: 'Fixture', staging: env('stage'), deployments: [env('prod')], testDrive: { requirement: 'optional', commands: [{ id: 'noop', run: 'true' }] } } }))
+        await fs.writeFile(path.join(dir, 'projects', 'fw-project.yaml'), YAML.stringify({ id: 'fw-project', workspace: { base: 'working-tree' } }))
+        await fs.writeFile(path.join(dir, 'projects', 'writer-project.yaml'), YAML.stringify({ id: 'writer-project', framework: 'fw-project' }))
+      })
+      const projectsDir = await temp('devpanel-fv-no-target-projects-')
+      for (const id of ['app-project', 'fw-project', 'writer-project']) await fs.mkdir(path.join(projectsDir, id))
+      const inputs = await readCycleConfig({ root: configRoot, projectsDir, discovery: null, env: {} })
+      t.eq('the real loader reads the fixture with no invalid project and nothing unreadable', [[...inputs.infras.values()].filter((i) => i?.error), inputs.unreadable], [[], []])
+      const resolution = await resolvePlaybook('deployment', { root: configRoot, runOptions: { environment: 'staging' }, projectId: 'app-project' })
+      t.ok('the real Deployment resolution reports the missing target', (resolution.resolved?.liveExecution?.blockers ?? resolution.errors ?? []).some((b) => (b.reason ?? b.message) === TARGET_MISSING), JSON.stringify(resolution.resolved?.liveExecution?.blockers ?? resolution.errors))
+      t.eq('and the scope from that same reading is empty', cycleScope(inputs), [])
+      const w = world({ issuesDir: await temp('devpanel-fv-no-target-issues-'), frameworkOf: {} })
+      const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+      const fv = createFullVerification({ supervisor: w.supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, ...w.seams, projectsConfig: undefined, log: { warn () {} } })
+      const started = await fv.startNow({ by: 'tester' })
+      await fv.settle()
+      const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
+      t.eq('through the cycle (real loader and resolver): nobody frozen, the stage refused TARGET_MISSING, no start, no checkpoint', [w.calls.scopes, record.projects.find((p) => p.project === 'app-project').refusal?.code, w.calls.starts.length, w.calls.actions], [[[]], 'TARGET_MISSING', 0, []])
+    }
+
+    t.section('32. a stage the frozen reading left out is never started in that cycle: a release target written right after the freeze changes nothing until the next cycle')
+    {
+      const env = (id) => ({ id, ssh: { hostRef: `ssh-config:${id}.invalid`, workdir: '/tmp' }, projectRoot: '/tmp/fixture', files: {} })
+      const target = { workdir: '/tmp', ownership: 'fixture', rollback: 'manual', commands: Object.fromEntries(['inspect', 'checkpoint', 'verifyCheckpoint', 'apply', 'verifyRelease', 'restart', 'observe', 'test', 'restore', 'verifyRestore'].map((id) => [id, { run: 'true', timeoutSeconds: 10 }])) }
+      const app = (withTarget) => ({ id: 'app-project', framework: 'fw-project', infrastructure: { kind: 'boilerplate', orientation: 'Fixture', staging: env('stage'), deployments: [env('prod')], testDrive: { requirement: 'optional', commands: [{ id: 'noop', run: 'true' }] }, ...(withTarget ? { release: { targets: { stage: target, prod: target } } } : {}) } })
+      const configRoot = await sandbox(async (dir) => {
+        await fs.mkdir(path.join(dir, 'projects'))
+        await fs.writeFile(path.join(dir, 'projects', 'app-project.yaml'), YAML.stringify(app(false)))
+        await fs.writeFile(path.join(dir, 'projects', 'fw-project.yaml'), YAML.stringify({ id: 'fw-project', workspace: { base: 'working-tree' } }))
+        await fs.writeFile(path.join(dir, 'projects', 'writer-project.yaml'), YAML.stringify({ id: 'writer-project', framework: 'fw-project' }))
+      })
+      const projectsDir = await temp('devpanel-fv-late-target-projects-')
+      for (const id of ['app-project', 'fw-project', 'writer-project']) await fs.mkdir(path.join(projectsDir, id))
+      const dir = await temp('devpanel-fv-late-target-supervisor-')
+      const real = createSupervisor({ issues: { getRunHolder: async () => { throw new Error('none') }, getIssue: async () => { throw new Error('none') }, listIssues: async () => [], listProjects: async () => [] }, availabilityFile: path.join(dir, 'availability.json'), harnessDir: path.join(dir, 'harness'), projectsDir: dir, configRoot: dir })
+      const asked = []
+      // The unstaged pool writer, live and writing.
+      real.active.set('writer-project/w', { runId: 'writer-run', project: 'writer-project', issueId: 'w', phase: 'run', writes: true, engine: { run: { status: 'running' }, requestFreeze () { asked.push('writer-run'); return null } } })
+      let starts = 0
+      const supervisor = {
+        ...real,
+        // The real freeze, then a valid staging release target lands at once.
+        async freeze (...args) { const r = await real.freeze(...args); await fs.writeFile(path.join(configRoot, 'projects', 'app-project.yaml'), YAML.stringify(app(true))); return r },
+        async start () { starts++; throw new Error('a stage outside the frozen scope reached supervisor.start') }
+      }
+      const w = world({ issuesDir: await temp('devpanel-fv-late-target-issues-') })
+      const verificationDir = path.join(w.issues.ISSUES_DIR, '.verification')
+      const actions = []
+      const fv = createFullVerification({ supervisor, issues: w.issues, clock: manualClock(Date.parse('2026-11-07T09:00:00.000Z')), settings: () => null, verificationDir, readRun: w.readRun, configRoot, projectsDir, discovery: null, env: {}, versionOf: async () => null, runAction: async (a) => { actions.push(a); return { status: 'completed' } }, log: { warn () {} } })
+      const started = await fv.startNow({ by: 'tester' })
+      await fv.settle()
+      const record = await readJson(path.join(verificationDir, started.date, 'cycle.json'))
+      const entry = record.projects.find((p) => p.project === 'app-project')
+      t.eq('the frozen scope is empty and the live writer was never asked to pause', [record.scope.projects, asked], [[], []])
+      t.ok('the stage stays refused with the reason the frozen reading gave, though a target exists now', entry.refusal?.code === 'TARGET_MISSING' && /read when the cycle froze/.test(entry.refusal.message), JSON.stringify(entry.refusal))
+      t.eq('supervisor.start is never called and nothing is checkpointed', [starts, actions], [0, []])
+      const now = await resolvePlaybook('deployment', { root: configRoot, runOptions: { environment: 'staging' }, projectId: 'app-project' })
+      t.ok('the late target is real: the Deployment resolution no longer reports TARGET_MISSING', now.ok && !(now.resolved.liveExecution?.blockers ?? []).some((b) => b.reason === TARGET_MISSING), JSON.stringify(now.resolved?.liveExecution?.blockers ?? now.errors))
+      real.active.clear()
     }
   } finally {
     for (const d of temps) await fs.rm(d, { recursive: true, force: true })

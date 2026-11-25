@@ -698,7 +698,7 @@ export async function reserveRun ({
   // Open cleanup entries the barrier file could not be written with (the
   // supervisor holds them): they bar an in-place start like the file's own.
   unrecordedBarrier = [],
-  // The daily full verification cycle that starts this run ({ cycleId }), or null.
+  // The full verification cycle that starts this run ({ cycleId }), or null.
   fullVerification = null,
   // Chosen by the caller when it took the run's module locks first (module-locks.mjs),
   // so the locks name the run that is about to exist.
@@ -841,10 +841,10 @@ export async function abandonReservation (reservation, { status = 'failed', bloc
  */
 export async function pauseReservation (reservation) {
   const { run, issuePath, runId, runLock, clock } = reservation
-  // The daily full verification's freeze wins over an operator's pause, and keeps it (engine.pauseAtBoundary).
+  // The full verification's freeze wins over an operator's pause, and keeps it (engine.pauseAtBoundary).
   const freeze = run.freezeRequested
   const pause = freeze
-    ? { id: crypto.randomUUID(), key: `full-verification:${crypto.randomUUID()}`, question: `Paused for the daily full verification (cycle ${freeze.cycleId}). ${run.pauseRequested ? 'An operator pause was also requested, so the cycle leaves it paused: resume it by hand.' : 'It resumes when the cycle ends.'}`, options: null, askedBy: null, kind: 'full-verification', cycleId: freeze.cycleId, manualPending: Boolean(run.pauseRequested), at: clock.iso() }
+    ? { id: crypto.randomUUID(), key: `full-verification:${crypto.randomUUID()}`, question: `Paused for the full verification (cycle ${freeze.cycleId}). ${run.pauseRequested ? 'An operator pause was also requested, so the cycle leaves it paused: resume it by hand.' : 'It resumes when the cycle ends.'}`, options: null, askedBy: null, kind: 'full-verification', cycleId: freeze.cycleId, manualPending: Boolean(run.pauseRequested), at: clock.iso() }
     : { id: crypto.randomUUID(), key: `manual:${crypto.randomUUID()}`, question: 'Paused by the operator. Resume to run the setup and continue.', options: null, askedBy: null, kind: 'manual', at: clock.iso() }
   run.status = 'paused'
   run.blockedReason = null

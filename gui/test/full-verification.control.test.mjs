@@ -4,11 +4,11 @@ import path from 'node:path'
 import { startStage } from './browser/stage.mjs'
 
 /*
- * The daily full verification against a real server: "Full verification now"
- * closes admission, a run with a turn in flight finishes that turn and pauses as
- * full-verification, a new start is refused, the cycle runs once no seat turn is
- * running (the stage's project has no infrastructure: verified through its
- * instances), writes its record and resumes the paused run.
+ * The full verification against a real server: "Full verification now" decides its scope
+ * from the configuration and freezes only the projects it verifies. The stage's project has
+ * no infrastructure, so the scope is empty: the run with a turn in flight goes on untouched,
+ * a new writing start is admitted, the cycle records itself (verified through its instances)
+ * and resumes nothing, because it paused nothing.
  */
 
 async function until (fn, label, ms = 60000) {
@@ -21,6 +21,10 @@ async function until (fn, label, ms = 60000) {
   throw new Error(`Timed out waiting for ${label}`)
 }
 
+const eventsOf = async (stage, issueId, runId) => (await fs.readFile(path.join(stage.issuesDir, stage.project, issueId, 'runs', runId, 'events.jsonl'), 'utf8'))
+  .trim().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+const touchedByCycle = (events) => events.some((e) => e.type === 'freeze-requested' || e.type === 'turn-withheld' || (e.type === 'paused' && /full-verification/.test(e.key ?? '')))
+
 export default async (t) => {
   const stage = await startStage({ control: { delayMs: 0 } })
   const route = (issueId, runId = '') => `/api/projects/${stage.project}/issues/${issueId}/runs${runId ? `/${runId}` : ''}`
@@ -29,34 +33,35 @@ export default async (t) => {
     const empty = await stage.request('/api/verification/latest')
     t.eq('no record, no schedule, admission open', [empty.status, empty.body.cycle, empty.body.schedule, empty.body.frozen], [200, null, null, null])
 
-    t.section('a hand start freezes admission; the run in flight finishes its turn and pauses')
+    t.section('a hand start with an empty scope: the run in flight goes on')
     await stage.setControl({ delayMs: 4000 })
-    const issue = await stage.createIssue('Frozen by the cycle')
+    const issue = await stage.createIssue('Beside the cycle')
     const started = await stage.request(route(issue.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
     await until(async () => (await stage.run(issue.id, started.body.runId)).active?.length > 0, 'a turn to be in flight')
     const hand = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
     t.eq('"Full verification now" is accepted with the cycle frozen', [hand.status, hand.body.state], [202, 'frozen'])
-    const again = await stage.request('/api/verification/start', { method: 'POST', body: '{}' })
-    t.eq('a second cycle is refused while one runs', [again.status, again.body?.code ?? null], [409, 'FULL_VERIFICATION_RUNNING'])
-    const other = await stage.createIssue('Started during the freeze')
-    const refused = await stage.request(route(other.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
-    t.eq('no new run starts while admission is closed', [refused.status, refused.body?.code ?? null], [409, 'FULL_VERIFICATION_FREEZE'])
+    t.eq('its scope is empty and it asked no run to pause: the project has no infrastructure', [hand.body.cycle?.scope?.projects, hand.body.cycle?.asked], [[], []])
+    const other = await stage.createIssue('Started beside the cycle')
+    // The cycle has nothing to wait for and may already have ended: the start is admitted either way.
+    const beside = await stage.request(route(other.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
+    t.eq('a new writing run of a project outside the scope is admitted', [beside.status, typeof beside.body?.runId], [201, 'string'])
     await stage.setControl({ delayMs: 0 })
 
-    t.section('the cycle runs once no seat turn is running, records itself and resumes the paused run')
+    t.section('the cycle records itself and resumes nothing')
     const ended = await until(async () => { const r = (await stage.request('/api/verification/latest')).body; return r.cycle?.state === 'ended' ? r.cycle : null }, 'the cycle to end')
     t.eq('the record is the hand start\'s', [ended.id, ended.trigger], [hand.body.cycleId, 'hand'])
     t.eq('the project without infrastructure is verified through its instances, with no run', ended.projects.map((p) => [p.project, p.verifiedThrough, p.runId ?? null]), [[stage.project, 'instances', null]])
-    t.eq('the paused run was resumed by the cycle', ended.resumed.map((r) => r.runId), [started.body.runId])
+    t.eq('nothing was paused, so nothing is resumed, held or left paused', [ended.resumed, ended.heldForOperator, ended.leftPaused], [[], [], []])
     t.eq('no stage was verified: the outcome bumps nothing and opens nothing', [ended.verdict, ended.outcome?.bump ?? null, ended.outcome?.issues ?? null, typeof ended.outcome?.reason], ['no-stages', null, null, 'string'])
     const record = JSON.parse(await fs.readFile(path.join(stage.issuesDir, '.verification', ended.date, 'cycle.json'), 'utf8'))
     t.eq('issues/.verification/<date>/cycle.json is the record the panel shows', record.id, ended.id)
-    const finished = await until(async () => { const run = await stage.run(issue.id, started.body.runId); return run.status === 'completed' ? run : null }, 'the resumed run to complete')
-    const events = (await fs.readFile(path.join(stage.issuesDir, stage.project, issue.id, 'runs', started.body.runId, 'events.jsonl'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
-    t.ok('it paused as full-verification before it resumed', events.some((e) => e.type === 'freeze-requested') && events.some((e) => e.type === 'paused' && /full-verification/.test(e.key ?? '')))
-    t.eq('and completed', finished.status, 'completed')
-    const after = await stage.request(route(other.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
-    t.eq('admission is open again', after.status, 201)
+    const finished = await until(async () => { const run = await stage.run(issue.id, started.body.runId); return run.status === 'completed' ? run : null }, 'the run in flight to complete')
+    t.eq('the run in flight completed', finished.status, 'completed')
+    t.ok('it was never asked to freeze, withheld or paused for the cycle', !touchedByCycle(await eventsOf(stage, issue.id, started.body.runId)))
+    t.ok('nor was the run started beside the cycle', !touchedByCycle(await eventsOf(stage, other.id, beside.body.runId)) && (await stage.run(other.id, beside.body.runId)).status !== 'paused')
+    const fresh = await stage.createIssue('Started after the cycle')
+    const after = await stage.request(route(fresh.id), { method: 'POST', body: JSON.stringify({ playbook: 'implementation' }) })
+    t.eq('admission is open after the cycle', after.status, 201)
   } finally {
     await stage.stop()
   }

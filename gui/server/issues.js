@@ -35,7 +35,8 @@ import { brief, families } from './issue-family.mjs'
 
 
 // Read once, at load: tests import a fresh copy after setting the variable.
-const PROJECTS_DIR = projectsRoot()
+// The projects root this process reads, fixed at load (the supervisor's is the same reading); the full verification takes it too.
+export const PROJECTS_DIR = projectsRoot()
 
 export const ISSUES_DIR = issuesRoot()
 
@@ -876,7 +877,7 @@ async function stepOwners (dir) {
 // --- full verification run homes -----------------------------------------
 
 /*
- * The daily full verification (server/full-verification.mjs) starts its
+ * The full verification (server/full-verification.mjs) starts its
  * Deployment runs in a run home, issues/<project>/.verification-<date>/, id
  * verification-<date>. It holds a task report, runs and their steps like an
  * issue folder, but it is not an issue: its name never matches ISSUE_PATTERN,
@@ -895,7 +896,7 @@ const homePath = (project, id) => {
 
 function describeHome (project, id, dir, runs = []) {
   const date = HOME_PATTERN.exec(id)[1]
-  return { id, project, name: `Daily full verification ${date}`, openedOn: date, kind: 'verification', home: true, packed: false, archived: false,
+  return { id, project, name: `Full verification ${date}`, openedOn: date, kind: 'verification', home: true, packed: false, archived: false,
     path: dir, location: dir, latestRun: runs[0] ?? null, runCount: runs.length }
 }
 

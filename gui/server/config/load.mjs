@@ -170,6 +170,9 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
   const playbooks = new Map()
   const sources = {}
   const shadowed = []
+  // Category directories that could not be read for another reason than absence (host-config.mjs overlay): they
+  // load as empty, as always; a caller that must not take that for an empty category reads `unreadable`.
+  const unreadable = []
   // One read of the schemas per load, when the first file needs them.
   let validating = null
   const validator = () => (validating ??= getValidator(root))
@@ -177,6 +180,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     const files = await discover(id, { root, hostDir })
     sources[id] = { tree: files.filter((f) => f.source === 'tree').length, host: files.filter((f) => f.source === 'host').length }
     for (const f of files) if (f.shadows) shadowed.push({ category: id, name: f.name, tree: f.shadows, host: f.file })
+    for (const u of files.unreadable ?? []) unreadable.push({ category: id, ...u })
     return files
   }
 
@@ -287,7 +291,7 @@ export async function loadConfig ({ root = CONFIG_ROOT, hostDir = hostConfigDir(
     if (problems.length) projects.delete(project.id)
   }
 
-  return { root, hostDir, unmatchedPricing, invalidPricing, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, disabledModels }
+  return { root, hostDir, unmatchedPricing, invalidPricing, roster, strategies, playbooks, harnesses, projects, errors, sources, shadowed, unreadable, disabledModels }
 }
 
 /** A project's source repository and integration branch, declared or defaulted. */
@@ -535,7 +539,7 @@ export async function resolvePlaybook (id, { root = CONFIG_ROOT, config = null, 
     blockers.push(...planned.blockers)
     for (const message of planned.errors) err(errors, message, playbook.file, '/runOptions/releaseId')
   } else if (runOptions.releaseId || runOptions.environment) err(errors,'releaseId/environment only apply to staging or deployment',playbook.file,'/runOptions')
-  // The daily full verification's run: a staging Deployment on a project with a test
+  // The full verification's run: a staging Deployment on a project with a test
   // drive, which also drives the full tier on its snapshot (runtime/full-verification-drive.mjs).
   // The target is the project's own, with no cache or timing: the baseline is the previous green cycle.
   let fullVerification = null
