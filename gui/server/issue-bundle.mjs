@@ -33,8 +33,10 @@ import { readJournalFinding } from './runtime/store.mjs'
  *                    (report-identity.mjs); it outlives a restore, as notes do
  *
  * Packing is verified before anything is removed: the bundle must list every
- * file that was packed. Restore unpacks it back into the project folder, after
- * which the three files go. A run cannot be resumed after its issue was packed
+ * file that was packed. Before anything is read, owner access is restored on what
+ * the panel's own user owns (restoreOwnerAccess); the bundle keeps the modes as
+ * restored, and run scratch is packed like everything else. Restore unpacks it
+ * back into the project folder, after which the three files go. A run cannot be resumed after its issue was packed
  * — its worktree is gone — but everything it recorded comes back.
  *
  * An id names one issue. The bundle, its summary and its run records hold their id
@@ -102,6 +104,29 @@ async function filesIn (dir, rel = '') {
     else if (entry.isFile() || entry.isSymbolicLink()) out.push(child)
   }
   return out
+}
+
+/*
+ * A seat can leave files or directories it made unreadable to itself (mode 000)
+ * in its scratch or elsewhere under runs/. tar could not read them and the archive
+ * would fail, so owner read/write (and search, on a directory) is added back on
+ * everything under the issue folder that the panel's own user owns, before
+ * anything is listed or read. Nothing is left out of the bundle instead: scratch
+ * is part of what the run recorded. Only owner bits are added; links are not
+ * followed (a link is packed as a link); what another user owns is not touched,
+ * and tar still refuses it. If the pack fails later the folder simply keeps the
+ * added bits.
+ */
+async function restoreOwnerAccess (dir, uid = process.getuid?.()) {
+  if (uid === undefined) return
+  const st = await fs.lstat(dir)
+  if (st.uid !== uid) return
+  if (st.isDirectory()) {
+    if ((st.mode & 0o700) !== 0o700) await fs.chmod(dir, (st.mode & 0o7777) | 0o700)
+    for (const name of await fs.readdir(dir)) await restoreOwnerAccess(path.join(dir, name), uid)
+  } else if (st.isFile() && (st.mode & 0o600) !== 0o600) {
+    await fs.chmod(dir, (st.mode & 0o7777) | 0o600)
+  }
 }
 
 /** Each run's record, with the configuration hash it was cut from made explicit. */
@@ -214,6 +239,8 @@ export async function packIssue ({ issuesDir, project, id, issue, releaseWorktre
     // Before a worktree is touched: a refused issue stays exactly as it was.
     if (!await exists(dir)) throw Object.assign(new Error(`${id} has no folder to pack; it was packed already.`), { status: 409 })
     await refuseArchiveOverBundle(issuesDir, project, id)
+    // Before the run records, results and worktrees are read: they read nothing an unreadable mode hid.
+    await restoreOwnerAccess(dir)
 
     const runs = await runRecords(dir)
     const { runs: runList = [], ...described } = issue

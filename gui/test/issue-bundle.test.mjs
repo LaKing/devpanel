@@ -52,7 +52,15 @@ export default async function (t) {
       steps: [], startedAt: '2026-09-28T10:00:00.000Z', endedAt: '2026-09-28T10:05:00.000Z', participants: {},
       workspace: { path: wt, baseCommit: base, state: 'retained' }
     }))
+    // A seat may leave what it made unreadable to itself in its scratch: a mode-000 file,
+    // and a mode-000 directory with a file in it (tar could read neither, the listing not the directory).
+    await fs.writeFile(path.join(runDir, 'scratch', 'locked.txt'), 'kept anyway\n')
+    await fs.chmod(path.join(runDir, 'scratch', 'locked.txt'), 0o000)
+    await fs.mkdir(path.join(runDir, 'scratch', 'sealed'))
+    await fs.writeFile(path.join(runDir, 'scratch', 'sealed', 'inner.txt'), 'inside\n')
     const before = (await exec('find', [dir, '-type', 'f', '-not', '-path', `${wt}/*`])).stdout.split('\n').filter(Boolean).length
+    await fs.chmod(path.join(runDir, 'scratch', 'sealed'), 0o000)
+    if (process.getuid?.() === 0) t.skip('as root, mode-000 files are readable anyway: the unreadable-scratch case proves nothing here')
 
     t.section('archiving packs the issue')
     const archived = await issues.setIssueArchived(project, opened.id, true, { overrideReason: 'test fixture' })
@@ -64,6 +72,7 @@ export default async function (t) {
     const listed = (await exec('tar', ['-tzf', bundle])).stdout
     t.ok('it holds the issue', listed.includes(`${opened.id}/issue.json`))
     t.ok('and a file whose name carries backslashes and a quote', listed.includes('scratch/"@mod/\\\\303\\\\237.file.mjs"') || listed.includes('scratch/"@mod/\\303\\237.file.mjs"'))
+    t.ok('and what a seat left unreadable in its scratch', listed.includes(`runs/${runId}/scratch/locked.txt`) && listed.includes(`runs/${runId}/scratch/sealed/inner.txt`))
     t.ok('but no worktree', !listed.includes(`${opened.id}/runs/worktree-`))
     t.ok('the worktree\'s own changes were saved as a patch', listed.includes(`runs/${runId}/artifacts/worktree-at-archive.patch`))
     t.ok('the worktree was handed back to git', !(await git(repo, 'worktree', 'list')).includes(wt))
@@ -88,6 +97,8 @@ export default async function (t) {
     t.eq('every file is back, plus the saved patch', after.length, before + 1)
     t.eq('the saved patch holds the tracked change', (await fs.readFile(path.join(runDir, 'artifacts', 'worktree-at-archive.patch'), 'utf8')).includes('+two'), true)
     t.ok('and the untracked file', (await fs.readFile(path.join(runDir, 'artifacts', 'worktree-at-archive.patch'), 'utf8')).includes('untracked work'))
+    t.eq('the unreadable scratch file comes back readable, with owner read/write', [await fs.readFile(path.join(runDir, 'scratch', 'locked.txt'), 'utf8'), ((await fs.stat(path.join(runDir, 'scratch', 'locked.txt'))).mode & 0o600)], ['kept anyway\n', 0o600])
+    t.eq('and so does the sealed directory\'s file', await fs.readFile(path.join(runDir, 'scratch', 'sealed', 'inner.txt'), 'utf8'), 'inside\n')
     t.eq('the run knows its worktree is gone', JSON.parse(await fs.readFile(path.join(runDir, 'run.json'), 'utf8')).workspace.state, 'removed')
     t.eq('the bundle files are gone', await exists(bundle), false)
 
